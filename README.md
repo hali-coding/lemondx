@@ -175,7 +175,10 @@ and the prelude's `install_ssh_keys USER` writes them to that user's
 `authorized_keys` with the right ownership and permissions.
 
 Keys come from `~/.ssh/*.pub` (`--all-ssh-keys`, or ticked in the UI),
-`--ssh-key PATH`, or pasted into the UI. Every key is validated before it goes
+`--ssh-key PATH`, or pasted into the UI. Selecting a key-installing module
+promotes the key picker into the main create dialog — outside the collapsible
+Bootstrap section — and creation is blocked until at least one key is chosen,
+since it would otherwise fail in the container. Every key is validated before it goes
 anywhere: only known public-key types are accepted, anything containing
 `PRIVATE KEY` is refused outright, and embedded newlines and control
 characters are rejected so nothing can smuggle a second `authorized_keys`

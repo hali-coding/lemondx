@@ -634,3 +634,11 @@ button, input, select, textarea { font: inherit; color: inherit; }
   margin-top: 5px;
 }
 .key-fp { display: block; font-size: 11px; margin-top: 1px; }
+
+/* SSH keys sit at the top level of the create dialog, not inside the
+   collapsible bootstrap block, so give them the same weight as Name/Image. */
+.ssh-keys > label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}

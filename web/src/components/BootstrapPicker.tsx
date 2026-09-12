@@ -1,31 +1,17 @@
-import { useMemo, useState } from 'react'
-import { api } from '../lib/api'
-import type { BootstrapModule, BootstrapSelection, SshKey } from '../lib/types'
+import type { BootstrapModule, BootstrapSelection } from '../lib/types'
 
 interface Props {
   modules: BootstrapModule[]
-  hostKeys: SshKey[]
   value: BootstrapSelection
   onChange: (next: BootstrapSelection) => void
   disabled?: boolean
 }
 
 /**
- * Module checkboxes, their parameters, and SSH key selection. Shared by the
- * create dialog and the drawer's Bootstrap tab.
+ * Module checkboxes and their parameters. Key selection is deliberately not
+ * here: see SshKeyPicker, which the create dialog renders at the top level.
  */
-export function BootstrapPicker({ modules, hostKeys, value, onChange, disabled }: Props) {
-  const [pasted, setPasted] = useState('')
-  const [pasteError, setPasteError] = useState<string | null>(null)
-  const [extraKeys, setExtraKeys] = useState<SshKey[]>([])
-
-  const selected = useMemo(
-    () => modules.filter((m) => value.modules.includes(m.id)),
-    [modules, value.modules],
-  )
-  const needsKeys = selected.some((m) => m.uses_ssh_keys)
-  const allKeys = [...hostKeys, ...extraKeys]
-
+export function BootstrapPicker({ modules, value, onChange, disabled }: Props) {
   function toggleModule(id: string) {
     const next = value.modules.includes(id)
       ? value.modules.filter((m) => m !== id)
@@ -37,27 +23,7 @@ export function BootstrapPicker({ modules, hostKeys, value, onChange, disabled }
     onChange({ ...value, params: { ...value.params, [name]: next } })
   }
 
-  function toggleKey(line: string) {
-    const next = value.ssh_keys.includes(line)
-      ? value.ssh_keys.filter((k) => k !== line)
-      : [...value.ssh_keys, line]
-    onChange({ ...value, ssh_keys: next })
-  }
 
-  async function addPastedKey() {
-    const text = pasted.trim()
-    if (!text) return
-    try {
-      // The server is the authority on what counts as an acceptable key.
-      const key = await api.validateSshKey(text)
-      if (!allKeys.some((k) => k.line === key.line)) setExtraKeys((k) => [...k, key])
-      onChange({ ...value, ssh_keys: [...new Set([...value.ssh_keys, key.line])] })
-      setPasted('')
-      setPasteError(null)
-    } catch (cause) {
-      setPasteError((cause as Error).message)
-    }
-  }
 
   if (modules.length === 0) {
     return (
@@ -116,60 +82,6 @@ export function BootstrapPicker({ modules, hostKeys, value, onChange, disabled }
         })}
       </div>
 
-      {needsKeys && (
-        <div className="field" style={{ marginTop: 4 }}>
-          <label>SSH public keys</label>
-          {allKeys.length === 0 && (
-            <span className="hint">
-              No keys found in <span className="mono">~/.ssh</span>. Paste one below.
-            </span>
-          )}
-          {allKeys.map((key) => (
-            <label className="checkbox key-row" key={key.line}>
-              <input
-                type="checkbox"
-                checked={value.ssh_keys.includes(key.line)}
-                disabled={disabled}
-                onChange={() => toggleKey(key.line)}
-              />
-              <span className="list-row-main">
-                <strong>{key.source ?? key.comment ?? key.type}</strong>{' '}
-                <span className="faint">{key.type}</span>
-                <span className="mono faint key-fp">{key.fingerprint}</span>
-              </span>
-            </label>
-          ))}
-
-          <div className="console-form" style={{ marginTop: 6 }}>
-            <input
-              className="input mono"
-              value={pasted}
-              placeholder="ssh-ed25519 AAAA… you@host"
-              aria-label="Paste a public key"
-              autoComplete="off"
-              spellCheck={false}
-              disabled={disabled}
-              onChange={(event) => setPasted(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  event.preventDefault()
-                  addPastedKey()
-                }
-              }}
-            />
-            <button type="button" className="btn" onClick={addPastedKey}
-              disabled={disabled || !pasted.trim()}>
-              Add
-            </button>
-          </div>
-          {pasteError && (
-            <span className="hint" style={{ color: 'var(--danger)' }}>{pasteError}</span>
-          )}
-          <span className="hint">
-            Public keys only — never paste a private key.
-          </span>
-        </div>
-      )}
     </>
   )
 }

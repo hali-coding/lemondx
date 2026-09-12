@@ -3,6 +3,7 @@ import { api } from '../lib/api'
 import type { BootstrapSelection, CreateRequest, Images, Status } from '../lib/types'
 import { useBootstrapData } from '../hooks/useBootstrapData'
 import { BootstrapPicker } from './BootstrapPicker'
+import { SshKeyPicker } from './SshKeyPicker'
 import { Modal } from './Modal'
 
 interface Props {
@@ -44,7 +45,21 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
   const quotaless = rootPool !== null && !rootPool.supports_quota
 
   const nameValid = NAME_RULE.test(name)
-  const canSubmit = nameValid && image.trim().length > 0 && !busy
+
+  // Modules that install keys make the key picker a first-class part of the
+  // dialog, and a required one -- creating without keys would just fail.
+  const needsKeys = modules.some(
+    (m) => m.uses_ssh_keys && bootstrap.modules.includes(m.id))
+  const keysMissing = needsKeys && bootstrap.ssh_keys.length === 0
+
+  // Keys without a listening sshd is a dead end, so say so -- softly, since
+  // exec-only containers and externally-managed sshd are both legitimate.
+  const SSH_SERVER = 'ssh-server'
+  const hasSshServerModule = modules.some((m) => m.id === SSH_SERVER)
+  const noSshServer = needsKeys && hasSshServerModule
+    && !bootstrap.modules.includes(SSH_SERVER)
+
+  const canSubmit = nameValid && image.trim().length > 0 && !busy && !keysMissing
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
@@ -229,12 +244,37 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
           </p>
           <BootstrapPicker
             modules={modules}
-            hostKeys={hostKeys}
             value={bootstrap}
             onChange={setBootstrap}
             disabled={busy}
           />
         </details>
+
+        {needsKeys && (
+          <SshKeyPicker
+            hostKeys={hostKeys}
+            value={bootstrap.ssh_keys}
+            onChange={(keys) => setBootstrap({ ...bootstrap, ssh_keys: keys })}
+            disabled={busy}
+          />
+        )}
+
+        {noSshServer && !keysMissing && (
+          <span className="hint" style={{ marginTop: -8 }}>
+            Keys will be installed, but nothing will be listening — add the{' '}
+            <strong>SSH server</strong> module if you want to ssh in.
+          </span>
+        )}
+
+        {keysMissing && (
+          <span className="hint" style={{ color: 'var(--warn)', marginTop: -8 }}>
+            Select at least one key — {modules
+              .filter((m) => m.uses_ssh_keys && bootstrap.modules.includes(m.id))
+              .map((m) => m.name)
+              .join(' and ')}{' '}
+            installs keys.
+          </span>
+        )}
 
         {busy && bootstrap.modules.length > 0 && (
           <p className="hint">
