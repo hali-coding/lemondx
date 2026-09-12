@@ -1,6 +1,7 @@
 import type {
-  Container, ContainerDetail, CreateRequest, ExecResult, Images,
-  SetupResult, Snapshot, StateAction, Status,
+  BootstrapModule, BootstrapResult, BootstrapSelection, Container,
+  ContainerDetail, CreateRequest, ExecResult, Images, SetupResult, Snapshot,
+  SshKey, StateAction, Status,
 } from './types'
 
 /** Error carrying the HTTP status so callers can react to 401/409 specifically. */
@@ -131,4 +132,15 @@ export const api = {
       { method: 'POST' }),
 
   images: (signal?: AbortSignal) => request<Images>('/images', { signal }),
+
+  modules: (signal?: AbortSignal) => request<BootstrapModule[]>('/modules', { signal }),
+
+  sshKeys: (signal?: AbortSignal) => request<SshKey[]>('/ssh-keys', { signal }),
+
+  validateSshKey: (key: string) =>
+    request<SshKey>('/ssh-keys/validate', { method: 'POST', body: { key } }),
+
+  bootstrap: (name: string, selection: BootstrapSelection) =>
+    request<BootstrapResult>(`/containers/${encodeURIComponent(name)}/bootstrap`,
+      { method: 'POST', body: selection }),
 }

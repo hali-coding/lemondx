@@ -113,6 +113,9 @@ the pool.
 ./lemondx restore NAME SNAP
 ./lemondx snap-delete NAME SNAP
 ./lemondx images                 # cached images + suggested aliases
+./lemondx modules                # bootstrap modules
+./lemondx ssh-keys               # public keys found in ~/.ssh
+./lemondx bootstrap NAME -b docker   # run modules on an existing container
 ./lemondx serve                  # web UI + API
 ```
 
@@ -125,6 +128,102 @@ Every command takes `--json` for scripting:
 Images are given as `remote:alias`; `lemondx images` lists what the current
 daemon knows. A bare alias assumes `ubuntu:` on LXD and `images:` on Incus,
 and `local:FINGERPRINT` uses an already-cached image.
+
+## Bootstrap modules
+
+A module is a plain shell script that runs *inside* a container after it
+starts. Pick the ones you want when creating a container, or run them later
+against an existing one.
+
+```bash
+./lemondx modules                       # what is available
+./lemondx create dev -i images:debian/12 \
+    -b base -b user -b ssh-server \
+    --param USERNAME=hampus --all-ssh-keys
+./lemondx bootstrap dev -b docker       # add more later; modules are re-runnable
+```
+
+In the web UI the create dialog has a **Bootstrap** section, and each container
+has a **Bootstrap** tab with the same picker and a live log.
+
+### Shipped modules
+
+| id | what it does | parameters |
+| --- | --- | --- |
+| `base` | package index, curl, CA certs, sudo, editor | — |
+| `ssh-server` | install and start OpenSSH | `PERMIT_ROOT_LOGIN`, `PASSWORD_AUTH` |
+| `user` | user with passwordless sudo + your keys | `USERNAME`, `SHELL_PATH` |
+| `ssh-keys` | add keys to an existing account | `TARGET_USER` |
+| `docker` | Docker plus the service | — |
+| `nodejs` | Node.js and npm | — |
+
+Modules run in `order`, low to high, so `base` (10) precedes `user` (25)
+whatever sequence you tick them in. A failing module stops the run and its
+output is reported.
+
+### SSH keys
+
+Modules marked **ssh-keys** receive the keys you select as `LEMONDX_SSH_KEYS`,
+and the prelude's `install_ssh_keys USER` writes them to that user's
+`authorized_keys` with the right ownership and permissions.
+
+Keys come from `~/.ssh/*.pub` (`--all-ssh-keys`, or ticked in the UI),
+`--ssh-key PATH`, or pasted into the UI. Every key is validated before it goes
+anywhere: only known public-key types are accepted, anything containing
+`PRIVATE KEY` is refused outright, and embedded newlines and control
+characters are rejected so nothing can smuggle a second `authorized_keys`
+entry or an options field past the parser. **Private keys are never read** —
+only `*.pub` files are ever opened.
+
+Accounts created by the `user` module get shadow field `*` (no usable
+password) rather than `!` (locked): OpenSSH built without PAM, as on Alpine,
+refuses a locked account even for key authentication.
+
+### Writing your own
+
+Drop a `.sh` file in `modules/`, or in `~/.config/lemondx/modules` to keep it
+outside the repo (a file there shadows a shipped module of the same name).
+`LEMONDX_MODULES` adds more directories.
+
+```sh
+#!/bin/sh
+# name: Redis
+# description: Install Redis and start it.
+# order: 60
+# param: REDIS_PORT=6379  Port to listen on
+
+pkg_install redis
+svc_enable redis
+log "redis on port ${REDIS_PORT}"
+```
+
+Every module is prepended with `modules/_prelude.sh`, which provides
+`log` / `warn` / `die`, `have`, `pkg_refresh`, `pkg_install`, `svc_enable` and
+`install_ssh_keys`, and sets `LEMONDX_OS_ID` and `LEMONDX_PKG`. The package
+helpers cover apt, dnf/yum/microdnf, apk, pacman and zypper; `svc_enable`
+handles systemd and OpenRC.
+
+Modules run under `/bin/sh` — dash on Debian, busybox ash on Alpine — because
+minimal images often have no bash. **Keep them POSIX.** `dash -n module.sh`
+catches most mistakes.
+
+Declared `param` values arrive as environment variables, with the declared
+default applied when you do not override it.
+
+### If modules cannot install anything
+
+Bootstrap checks outbound connectivity first and stops with an explanation
+rather than letting a package manager hang. The usual culprit on a host that
+also runs Docker is Docker setting the iptables `FORWARD` policy to `DROP`,
+which blocks the container bridge:
+
+```bash
+sudo iptables -S FORWARD | head -1          # says: -P FORWARD DROP
+sudo iptables -I DOCKER-USER -i lxdbr0 -j ACCEPT
+sudo iptables -I DOCKER-USER -o lxdbr0 -j ACCEPT
+```
+
+These rules are not persistent; save them if you want them after a reboot.
 
 ## REST API
 
@@ -147,6 +246,10 @@ with a matching HTTP status.
 | `DELETE` | `/api/containers/{name}/snapshots/{snap}` | delete |
 | `POST` | `/api/containers/{name}/snapshots/{snap}/restore` | restore |
 | `GET` | `/api/images` | cached images, suggested catalog, remotes |
+| `GET` | `/api/modules` | bootstrap modules with their parameters |
+| `GET` | `/api/ssh-keys` | public keys found in `~/.ssh` |
+| `POST` | `/api/ssh-keys/validate` | check one pasted public key |
+| `POST` | `/api/containers/{name}/bootstrap` | run modules in a container |
 | `GET` | `/api/profiles` | available profiles |
 
 ```bash
@@ -220,6 +323,9 @@ src/lemondx/
   service.py       # domain logic shared by the API and the CLI
   server.py        # HTTP routing, JSON API, static hosting
   cli.py           # argparse front end
+  bootstrap.py     # module discovery, SSH key validation, the runner
+modules/           # bootstrap modules (POSIX sh)
+  _prelude.sh      # helpers prepended to every module
 web/               # Vite + React + TypeScript UI
   src/lib/api.ts   # typed client for the REST API
   dist/            # committed build output, served by `lemondx serve`

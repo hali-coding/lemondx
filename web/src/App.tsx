@@ -113,10 +113,25 @@ export default function App() {
   const create = useCallback(async (request: CreateRequest) => {
     mutating.current += 1
     try {
-      await api.createContainer(request)
+      const created = await api.createContainer(request)
       setShowCreate(false)
       notify('success', `Created ${request.name}`,
         request.start ? 'It is starting up now.' : 'It was created but not started.')
+
+      // Modules run as part of creation; report how they went, and open the
+      // container so the full log is one click away.
+      const result = created?.bootstrap
+      if (result) {
+        const failed = result.modules.find((m) => m.exit_code !== 0)
+        if (result.ok) {
+          notify('success', `Bootstrapped ${request.name}`,
+            `${result.modules.length} module(s) ran successfully.`)
+        } else {
+          notify('error', `Bootstrap failed on “${failed?.name ?? 'a module'}”`,
+            (failed?.stderr || failed?.stdout || '').trim().split('\n').slice(-2).join(' '))
+          setSelected(request.name)
+        }
+      }
     } finally {
       mutating.current -= 1
       await refresh()

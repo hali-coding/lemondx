@@ -365,6 +365,41 @@ class LXDClient:
         except LXDError:
             pass  # Best effort: a stale log file is harmless.
 
+    def push_file(self, name, path, content, mode="0644", uid=0, gid=0):
+        """Write a file inside an instance.
+
+        LXD reads ``X-LXD-*`` metadata headers and Incus reads ``X-Incus-*``;
+        both ignore headers they do not know, so we send each spelling.
+        """
+        if isinstance(content, str):
+            content = content.encode()
+        headers = {"Content-Type": "application/octet-stream"}
+        for prefix in ("X-LXD", "X-Incus"):
+            headers["%s-uid" % prefix] = str(uid)
+            headers["%s-gid" % prefix] = str(gid)
+            headers["%s-mode" % prefix] = mode
+            headers["%s-type" % prefix] = "file"
+
+        endpoint = "/1.0/instances/%s/files?path=%s" % (_seg(name), _seg(path))
+        conn = _UnixHTTPConnection(self.socket_path, self.timeout)
+        try:
+            conn.request("POST", endpoint, body=content, headers=headers)
+            response = conn.getresponse()
+            data = response.read()
+            if response.status >= 400:
+                raise LXDError(_decode_error(data, response.status), response.status)
+        except (OSError, http.client.HTTPException) as exc:
+            raise LXDError("Cannot write %s in %s: %s" % (path, name, exc), 503) from exc
+        finally:
+            conn.close()
+
+    def delete_file(self, name, path):
+        try:
+            self._request("DELETE", "/1.0/instances/%s/files" % _seg(name),
+                          params={"path": path})
+        except LXDError:
+            pass  # best effort cleanup
+
     def console_log(self, name):
         try:
             return self._request(

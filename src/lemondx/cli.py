@@ -223,16 +223,37 @@ def cmd_create(args, service):
     if not args.json:
         print(DIM("Creating %s from %s (this pulls the image on first use)..."
                   % (args.name, image)), flush=True)
+    bootstrap = None
+    if args.module:
+        bootstrap = {
+            "modules": args.module,
+            "params": parse_params(args.param),
+            "ssh_keys": collect_ssh_keys(args.ssh_key, args.all_ssh_keys),
+        }
+        if not args.json:
+            print(DIM("Will run bootstrap modules: %s" % ", ".join(args.module)),
+                  flush=True)
+
     container = service.create_container(
         name=args.name, image=image,
         instance_type="virtual-machine" if args.vm else "container",
         profiles=args.profile or None, cpu=args.cpu, memory=args.memory,
         disk=args.disk, description=args.description, ephemeral=args.ephemeral,
-        start=not args.no_start,
+        start=not args.no_start, bootstrap=bootstrap,
     )
-    emit(args, container, lambda c: "%s %s is %s%s" % (
-        GREEN("+"), BOLD(c["name"]), c["status"].lower(),
-        (" at " + ", ".join(c["ipv4"])) if c["ipv4"] else ""))
+
+    def render(c):
+        lines = ["%s %s is %s%s" % (
+            GREEN("+"), BOLD(c["name"]), c["status"].lower(),
+            (" at " + ", ".join(c["ipv4"])) if c["ipv4"] else "")]
+        if c.get("bootstrap"):
+            lines.append("")
+            lines.append(render_bootstrap(c["bootstrap"]))
+        return "\n".join(lines)
+
+    emit(args, container, render)
+    if container.get("bootstrap") and not container["bootstrap"]["ok"]:
+        return 1
     return 0
 
 
@@ -319,6 +340,101 @@ def cmd_snap_delete(args, service):
     return 0
 
 
+def cmd_modules(args, service):
+    modules = service.list_modules()
+
+    def render(items):
+        if not items:
+            return DIM("No bootstrap modules found.")
+        out = []
+        for module in items:
+            flags = []
+            if module["uses_ssh_keys"]:
+                flags.append(CYAN("ssh-keys"))
+            if module["os"]:
+                flags.append(DIM("os: " + " ".join(module["os"])))
+            head = "%s  %s" % (BOLD(module["id"]), module["name"])
+            if flags:
+                head += "  " + " ".join(flags)
+            out.append(head)
+            if module["description"]:
+                out.append("    " + DIM(module["description"]))
+            for param in module["params"]:
+                out.append("    %s=%s  %s" % (
+                    param["name"], param["default"] or DIM("(empty)"),
+                    DIM(param["description"])))
+            out.append("")
+        return "\n".join(out).rstrip()
+
+    emit(args, modules, render)
+    return 0
+
+
+def cmd_ssh_keys(args, service):
+    keys = service.list_ssh_keys()
+    emit(args, keys, lambda items: table(
+        [[k["source"], k["type"], k["fingerprint"], k["comment"] or "-"] for k in items],
+        ["file", "type", "fingerprint", "comment"]))
+    return 0
+
+
+def collect_ssh_keys(paths, use_all):
+    """Read public keys named on the command line, plus ~/.ssh/*.pub if asked."""
+    from .bootstrap import list_host_ssh_keys, parse_public_key
+    keys = []
+    for path in paths or []:
+        expanded = os.path.expanduser(path)
+        try:
+            with open(expanded, encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError as exc:
+            raise ServiceError("Cannot read SSH key '%s': %s" % (path, exc))
+        keys.append(parse_public_key(text)["line"])
+    if use_all:
+        keys.extend(k["line"] for k in list_host_ssh_keys())
+    # Preserve order, drop duplicates.
+    return list(dict.fromkeys(keys))
+
+
+def parse_params(pairs):
+    params = {}
+    for pair in pairs or []:
+        if "=" not in pair:
+            raise ServiceError("Parameter '%s' must be KEY=VALUE." % pair)
+        key, _, value = pair.partition("=")
+        params[key.strip()] = value
+    return params
+
+
+def render_bootstrap(result):
+    lines = []
+    for module in result["modules"]:
+        ok = module["exit_code"] == 0
+        mark = GREEN("+") if ok else RED("!")
+        lines.append("%s %s (%ss)" % (mark, BOLD(module["name"]), module["duration"]))
+        body = (module["stdout"] or "") + (module["stderr"] or "")
+        for line in body.splitlines():
+            lines.append("    " + (line if ok else RED(line)))
+        if not ok:
+            lines.append("    " + RED("exited with code %d" % module["exit_code"]))
+    lines.append("")
+    lines.append(GREEN("bootstrap finished") if result["ok"]
+                 else RED("bootstrap failed"))
+    return "\n".join(lines)
+
+
+def cmd_bootstrap(args, service):
+    result = service.bootstrap(
+        args.name,
+        modules=args.module,
+        params=parse_params(args.param),
+        ssh_keys=collect_ssh_keys(args.ssh_key, args.all_ssh_keys),
+        timeout=args.timeout,
+    )
+    emit(args, result, render_bootstrap)
+    return 0 if result["ok"] else 1
+
+
 def cmd_images(args, service):
     images = service.list_images()
 
@@ -362,6 +478,18 @@ def build_parser():
         kwargs.setdefault("parents", [common])
         return sub.add_parser(name, **kwargs)
 
+    # Bootstrap selection, shared by `create` and `bootstrap`.
+    boot = argparse.ArgumentParser(add_help=False)
+    # -b, not -m: `create` already uses -m for --memory.
+    boot.add_argument("-b", "--module", action="append", metavar="ID",
+                      help="bootstrap module to run (repeatable; see `lemondx modules`)")
+    boot.add_argument("--param", action="append", metavar="KEY=VALUE",
+                      help="parameter passed to the modules (repeatable)")
+    boot.add_argument("--ssh-key", action="append", metavar="PATH",
+                      help="public key file to install (repeatable)")
+    boot.add_argument("--all-ssh-keys", action="store_true",
+                      help="install every public key in ~/.ssh")
+
     p = add("serve", help="run the web UI and REST API")
     p.add_argument("--host", default=DEFAULT_HOST)
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -391,7 +519,7 @@ def build_parser():
     p.add_argument("name")
     p.set_defaults(func=cmd_info)
 
-    p = add("create", help="create a container")
+    p = add("create", parents=[common, boot], help="create a container")
     p.add_argument("name")
     p.add_argument("-i", "--image",
                    help="image alias, e.g. ubuntu:24.04 or images:debian/12 "
@@ -459,6 +587,19 @@ def build_parser():
 
     p = add("images", help="list cached and suggested images")
     p.set_defaults(func=cmd_images)
+
+    p = add("modules", help="list available bootstrap modules")
+    p.set_defaults(func=cmd_modules)
+
+    p = add("ssh-keys", help="list public keys found in ~/.ssh")
+    p.set_defaults(func=cmd_ssh_keys)
+
+    p = add("bootstrap", parents=[common, boot],
+            help="run bootstrap modules against an existing container")
+    p.add_argument("name")
+    p.add_argument("--timeout", type=int, default=900,
+                   help="seconds allowed per module (default: 900)")
+    p.set_defaults(func=cmd_bootstrap)
 
     return parser
 

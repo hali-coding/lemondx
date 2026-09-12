@@ -55,6 +55,8 @@ export interface ContainerDetail extends Container {
   expanded_devices: Record<string, Record<string, string>>
   snapshots: Snapshot[]
   network_detail: NetworkInterface[]
+  /** Present when modules ran as part of creating this container. */
+  bootstrap?: BootstrapResult
 }
 
 export interface StoragePool {
@@ -132,6 +134,7 @@ export interface CreateRequest {
   description?: string
   ephemeral?: boolean
   start?: boolean
+  bootstrap?: BootstrapSelection
 }
 
 export interface SetupResult {
@@ -142,3 +145,51 @@ export interface SetupResult {
 }
 
 export type StateAction = 'start' | 'stop' | 'restart' | 'freeze' | 'unfreeze'
+
+export interface ModuleParam {
+  name: string
+  default: string
+  description: string
+}
+
+export interface BootstrapModule {
+  id: string
+  name: string
+  description: string
+  /** Distro IDs the module targets; empty means any. */
+  os: string[]
+  order: number
+  params: ModuleParam[]
+  uses_ssh_keys: boolean
+}
+
+export interface SshKey {
+  type: string
+  comment: string
+  fingerprint: string
+  line: string
+  /** Filename it came from, for keys discovered in ~/.ssh. */
+  source?: string
+}
+
+export interface ModuleResult {
+  id: string
+  name: string
+  exit_code: number
+  stdout: string
+  stderr: string
+  duration: number
+}
+
+export interface BootstrapResult {
+  container: string
+  modules: ModuleResult[]
+  ok: boolean
+}
+
+/** What the create dialog and the drawer panel collect before running. */
+export interface BootstrapSelection {
+  modules: string[]
+  params: Record<string, string>
+  ssh_keys: string[]
+}

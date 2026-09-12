@@ -82,6 +82,7 @@ def build_router(service):
         ephemeral=body.get("ephemeral", False),
         start=body.get("start", True),
         config=body.get("config"),
+        bootstrap=body.get("bootstrap"),
     ))
 
     r.add("GET", r"/api/containers/%s" % NAME,
@@ -113,6 +114,18 @@ def build_router(service):
           lambda body, q, name, snap: service.delete_snapshot(name, snap))
     r.add("POST", r"/api/containers/%s/snapshots/%s/restore" % (NAME, NAME),
           lambda body, q, name, snap: service.restore_snapshot(name, snap))
+
+    r.add("GET", r"/api/modules", lambda body, q: service.list_modules())
+    r.add("GET", r"/api/ssh-keys", lambda body, q: service.list_ssh_keys())
+    r.add("POST", r"/api/ssh-keys/validate",
+          lambda body, q: service.validate_ssh_key(body.get("key", "")))
+    r.add("POST", r"/api/containers/%s/bootstrap" % NAME,
+          lambda body, q, name: service.bootstrap(
+              name,
+              modules=body.get("modules") or [],
+              params=body.get("params"),
+              ssh_keys=body.get("ssh_keys"),
+              timeout=int(body.get("timeout", 900))))
 
     r.add("GET", r"/api/images", lambda body, q: service.list_images())
     r.add("GET", r"/api/profiles", lambda body, q: service.list_profiles())

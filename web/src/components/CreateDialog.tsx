@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { api } from '../lib/api'
-import type { CreateRequest, Images, Status } from '../lib/types'
+import type { BootstrapSelection, CreateRequest, Images, Status } from '../lib/types'
+import { useBootstrapData } from '../hooks/useBootstrapData'
+import { BootstrapPicker } from './BootstrapPicker'
 import { Modal } from './Modal'
 
 interface Props {
@@ -24,6 +26,9 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
   const [start, setStart] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const { modules, hostKeys } = useBootstrapData()
+  const [bootstrap, setBootstrap] = useState<BootstrapSelection>(
+    { modules: [], params: {}, ssh_keys: [] })
 
   useEffect(() => {
     const controller = new AbortController()
@@ -56,6 +61,7 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
         disk: disk.trim() || undefined,
         ephemeral,
         start,
+        bootstrap: bootstrap.modules.length > 0 ? bootstrap : undefined,
       })
     } catch (cause) {
       setError((cause as Error).message)
@@ -189,9 +195,13 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
           <label className="checkbox">
-            <input type="checkbox" checked={start} disabled={busy}
+            <input type="checkbox" checked={start}
+              disabled={busy || bootstrap.modules.length > 0}
               onChange={(e) => setStart(e.target.checked)} />
             Start immediately after creating
+            {bootstrap.modules.length > 0 && (
+              <span className="hint">— required by the selected modules</span>
+            )}
           </label>
           <label className="checkbox">
             <input type="checkbox" checked={isVm} disabled={busy}
@@ -204,6 +214,32 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
             Ephemeral — delete automatically when stopped
           </label>
         </div>
+
+        <details className="bootstrap-section" open={bootstrap.modules.length > 0}>
+          <summary>
+            Bootstrap
+            {bootstrap.modules.length > 0 && (
+              <span className="badge badge-info">{bootstrap.modules.length} selected</span>
+            )}
+          </summary>
+          <p className="hint" style={{ marginBottom: 10 }}>
+            Bash modules run inside the container once it is up, in order.
+          </p>
+          <BootstrapPicker
+            modules={modules}
+            hostKeys={hostKeys}
+            value={bootstrap}
+            onChange={setBootstrap}
+            disabled={busy}
+          />
+        </details>
+
+        {busy && bootstrap.modules.length > 0 && (
+          <p className="hint">
+            Running {bootstrap.modules.length} module(s) — installing packages can
+            take a minute.
+          </p>
+        )}
 
         {error && (
           <div className="banner banner-error" style={{ margin: 0, padding: '10px 12px' }}>

@@ -3,10 +3,11 @@ import { api } from '../lib/api'
 import { absoluteTime, bytes, cpuTime, relativeTime } from '../lib/format'
 import type { ContainerDetail, StateAction } from '../lib/types'
 import { CameraIcon, CloseIcon, PauseIcon, PlayIcon, RestartIcon, StopIcon, TrashIcon } from './Icons'
+import { BootstrapPanel } from './BootstrapPanel'
 import { ExecConsole } from './ExecConsole'
 import { StatusBadge } from './StatusBadge'
 
-type Tab = 'overview' | 'snapshots' | 'console'
+type Tab = 'overview' | 'snapshots' | 'bootstrap' | 'console'
 
 interface Props {
   name: string
@@ -110,7 +111,7 @@ export function ContainerDrawer({
         </div>
 
         <div className="tabs" role="tablist">
-          {(['overview', 'snapshots', 'console'] as Tab[]).map((id) => (
+          {(['overview', 'snapshots', 'bootstrap', 'console'] as Tab[]).map((id) => (
             <button
               key={id}
               className="tab"
@@ -120,6 +121,7 @@ export function ContainerDrawer({
             >
               {id === 'overview' ? 'Overview'
                 : id === 'snapshots' ? `Snapshots${detail?.snapshots.length ? ` (${detail.snapshots.length})` : ''}`
+                : id === 'bootstrap' ? 'Bootstrap'
                 : 'Console'}
             </button>
           ))}
@@ -254,6 +256,10 @@ export function ContainerDrawer({
                 ))
               )}
             </>
+          )}
+
+          {detail && tab === 'bootstrap' && (
+            <BootstrapPanel key={name} name={name} running={running} onFinished={load} />
           )}
 
           {detail && tab === 'console' && (

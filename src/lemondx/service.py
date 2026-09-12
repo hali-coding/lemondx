@@ -7,6 +7,8 @@ front ends can never drift apart in behaviour.
 from __future__ import annotations
 
 import re
+from .bootstrap import (BootstrapError, BootstrapRunner, list_host_ssh_keys,
+                        parse_public_key, public_modules)
 from .lxd import INCUS, LXDClient, LXDError
 
 VALID_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,61}$")
@@ -233,7 +235,7 @@ class ContainerService:
     def create_container(self, name, image, instance_type="container",
                          profiles=None, cpu=None, memory=None, disk=None,
                          description=None, ephemeral=False, start=True,
-                         config=None, wait=True):
+                         config=None, wait=True, bootstrap=None):
         if not VALID_NAME.match(name or ""):
             raise ServiceError(
                 "Invalid name '%s'. Use letters, digits and dashes, starting "
@@ -273,10 +275,31 @@ class ContainerService:
                 "root": {"type": "disk", "path": "/", "pool": pool, "size": str(disk)}
             }
 
+        if bootstrap and bootstrap.get("modules") and not (start and wait):
+            raise ServiceError(
+                "Bootstrap modules need the container to start, so 'start' "
+                "cannot be disabled."
+            )
+
         self.lxd.create_instance(payload, wait=wait)
         if start and wait:
             self.lxd.set_state(name, "start")
-        return self.get_container(name) if wait else {"name": name, "status": "Pending"}
+
+        if not wait:
+            return {"name": name, "status": "Pending"}
+
+        container = self.get_container(name)
+        if bootstrap and bootstrap.get("modules"):
+            # Report bootstrap failures alongside the container rather than
+            # raising: the container exists either way and the user needs to
+            # see which module failed and why.
+            container["bootstrap"] = self.bootstrap(
+                name,
+                modules=bootstrap["modules"],
+                params=bootstrap.get("params"),
+                ssh_keys=bootstrap.get("ssh_keys"),
+            )
+        return container
 
     def root_pool_info(self, profiles=None):
         """The pool a new container lands on, and whether it enforces quotas."""
@@ -411,6 +434,32 @@ class ContainerService:
         catalog = (IMAGE_CATALOG_INCUS if self.lxd.flavor == INCUS
                    else IMAGE_CATALOG_LXD)
         return catalog[0]["alias"]
+
+    # -- bootstrap ---------------------------------------------------------
+
+    def list_modules(self):
+        return public_modules()
+
+    def list_ssh_keys(self):
+        """Public keys found on the host, offered for installing into containers."""
+        return list_host_ssh_keys()
+
+    def bootstrap(self, name, modules, params=None, ssh_keys=None, timeout=900):
+        """Run the selected bash modules inside a running container."""
+        if not modules:
+            raise ServiceError("No bootstrap modules selected.")
+        try:
+            return BootstrapRunner(self.lxd).run(
+                name, modules, params=params, ssh_keys=ssh_keys, timeout=timeout
+            )
+        except BootstrapError as exc:
+            raise ServiceError(exc.message, exc.code) from exc
+
+    def validate_ssh_key(self, text):
+        try:
+            return parse_public_key(text)
+        except BootstrapError as exc:
+            raise ServiceError(exc.message, exc.code) from exc
 
     def list_profiles(self):
         return [
