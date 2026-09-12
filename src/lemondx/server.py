@@ -126,6 +126,24 @@ def build_router(service):
           lambda body, q, name: service.get_network(name))
 
     r.add("GET", r"/api/modules", lambda body, q: service.list_modules())
+    r.add("POST", r"/api/modules", lambda body, q: service.upload_module(
+        body.get("name"), body.get("content"), bool(body.get("overwrite"))))
+    r.add("GET", r"/api/modules/%s/source" % NAME,
+          lambda body, q, mid: service.get_module_source(mid))
+    r.add("PUT", r"/api/modules/%s/settings" % NAME,
+          lambda body, q, mid: service.update_module_settings(
+              mid, params=body.get("params"), is_default=body.get("is_default")))
+    r.add("DELETE", r"/api/modules/%s" % NAME,
+          lambda body, q, mid: service.remove_module(mid))
+
+    r.add("GET", r"/api/bootstrap-profiles",
+          lambda body, q: service.list_bootstrap_profiles())
+    r.add("PUT", r"/api/bootstrap-profiles/%s" % NAME,
+          lambda body, q, name: service.save_bootstrap_profile(
+              name, body.get("modules") or [], body.get("params"),
+              body.get("description", "")))
+    r.add("DELETE", r"/api/bootstrap-profiles/%s" % NAME,
+          lambda body, q, name: service.delete_bootstrap_profile(name))
     r.add("GET", r"/api/ssh-keys", lambda body, q: service.list_ssh_keys())
     r.add("POST", r"/api/ssh-keys/validate",
           lambda body, q: service.validate_ssh_key(body.get("key", "")))
@@ -173,6 +191,9 @@ class LemondxHandler(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         self._handle("PATCH")
+
+    def do_PUT(self):
+        self._handle("PUT")
 
     def do_DELETE(self):
         self._handle("DELETE")
@@ -235,7 +256,7 @@ class LemondxHandler(BaseHTTPRequestHandler):
         if self.allow_origin:
             self.send_header("Access-Control-Allow-Origin", self.allow_origin)
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 
     def _send_json(self, payload, status=200):
         body = json.dumps(payload).encode()

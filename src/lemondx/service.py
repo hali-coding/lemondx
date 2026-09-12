@@ -7,8 +7,12 @@ front ends can never drift apart in behaviour.
 from __future__ import annotations
 
 import re
-from .bootstrap import (BootstrapError, BootstrapRunner, list_host_ssh_keys,
-                        parse_public_key, public_modules)
+from . import store
+from .bootstrap import (BootstrapError, BootstrapRunner, delete_module,
+                        discover_modules, effective_params,
+                        list_host_ssh_keys, module_source,
+                        normalise_module_id, parse_public_key,
+                        public_modules, save_module)
 from .lxd import INCUS, LXDClient, LXDError
 from .simplestreams import CatalogError, fetch_catalog
 
@@ -499,23 +503,166 @@ class ContainerService:
 
     # -- bootstrap ---------------------------------------------------------
 
+    PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$")
+
     def list_modules(self):
         return public_modules()
+
+    def get_module_source(self, module_id):
+        try:
+            return module_source(module_id)
+        except BootstrapError as exc:
+            raise ServiceError(exc.message, exc.code) from exc
+
+    def upload_module(self, name, content, overwrite=False):
+        try:
+            return save_module(name, content, overwrite=overwrite)
+        except BootstrapError as exc:
+            raise ServiceError(exc.message, exc.code) from exc
+
+    def remove_module(self, module_id):
+        try:
+            return delete_module(module_id)
+        except BootstrapError as exc:
+            raise ServiceError(exc.message, exc.code) from exc
+
+    def update_module_settings(self, module_id, params=None, is_default=None):
+        """Persist a module's parameter defaults and whether it is pre-selected."""
+        module = discover_modules().get(module_id)
+        if not module:
+            raise ServiceError("No such module '%s'." % module_id, 404)
+
+        declared = {p["name"] for p in module["params"]}
+        if params is not None:
+            unknown = sorted(set(params) - declared)
+            if unknown:
+                raise ServiceError(
+                    "'%s' does not declare %s." % (module_id, ", ".join(unknown)))
+
+        def mutate(settings):
+            if params is not None:
+                saved = settings.setdefault("module_params", {})
+                # An empty value means "go back to the module's own default".
+                kept = {k: str(v) for k, v in params.items() if str(v) != ""}
+                if kept:
+                    saved[module_id] = kept
+                else:
+                    saved.pop(module_id, None)
+            if is_default is not None:
+                defaults = [m for m in (settings.get("default_modules") or [])
+                            if m != module_id]
+                if is_default:
+                    defaults.append(module_id)
+                settings["default_modules"] = defaults
+
+        store.update(mutate)
+        return next(m for m in public_modules() if m["id"] == module_id)
+
+    # -- bootstrap profiles ------------------------------------------------
+    # Named module selections. Not to be confused with LXD/Incus profiles,
+    # which configure devices and limits -- these only bundle bootstrap steps.
+
+    def list_bootstrap_profiles(self):
+        profiles = store.load().get("profiles") or {}
+        return [
+            {
+                "name": name,
+                "description": profile.get("description", ""),
+                "modules": profile.get("modules") or [],
+                "params": profile.get("params") or {},
+            }
+            for name, profile in sorted(profiles.items())
+        ]
+
+    def save_bootstrap_profile(self, name, modules, params=None, description=""):
+        name = (name or "").strip()
+        if not self.PROFILE_NAME.match(name):
+            raise ServiceError(
+                "Invalid profile name '%s'. Use letters, digits, spaces, dots, "
+                "dashes and underscores." % name)
+        if not modules:
+            raise ServiceError("A profile needs at least one module.")
+
+        available = discover_modules()
+        unknown = [m for m in modules if m not in available]
+        if unknown:
+            raise ServiceError("Unknown module(s): %s" % ", ".join(unknown))
+
+        entry = {
+            "description": str(description or "")[:200],
+            "modules": list(dict.fromkeys(modules)),
+            "params": {str(k): str(v) for k, v in (params or {}).items()},
+        }
+        store.update(lambda s: s.setdefault("profiles", {}).__setitem__(name, entry))
+        return dict(entry, name=name)
+
+    def delete_bootstrap_profile(self, name):
+        def mutate(settings):
+            if name not in (settings.get("profiles") or {}):
+                raise ServiceError("No such profile '%s'." % name, 404)
+            settings["profiles"].pop(name)
+        store.update(mutate)
+        return {"deleted": name}
 
     def list_ssh_keys(self):
         """Public keys found on the host, offered for installing into containers."""
         return list_host_ssh_keys()
 
-    def bootstrap(self, name, modules, params=None, ssh_keys=None, timeout=900):
-        """Run the selected bash modules inside a running container."""
+    def bootstrap(self, name, modules, params=None, ssh_keys=None, timeout=900,
+                  remember=True):
+        """Run the selected bash modules inside a running container.
+
+        Saved per-module defaults are applied first, then anything the caller
+        passed. When the run succeeds the values used become the new defaults,
+        so the next container starts from what worked last time.
+        """
         if not modules:
             raise ServiceError("No bootstrap modules selected.")
+
+        settings = store.load()
+        available = discover_modules()
+        merged = {}
+        for module_id in modules:
+            module = available.get(module_id)
+            if module:
+                merged.update(effective_params(module_id, module, settings))
+        merged.update(params or {})
+
         try:
-            return BootstrapRunner(self.lxd).run(
-                name, modules, params=params, ssh_keys=ssh_keys, timeout=timeout
+            result = BootstrapRunner(self.lxd).run(
+                name, modules, params=merged, ssh_keys=ssh_keys, timeout=timeout
             )
         except BootstrapError as exc:
             raise ServiceError(exc.message, exc.code) from exc
+
+        if remember and result["ok"]:
+            self._remember_params(modules, merged, available)
+        return result
+
+    def _remember_params(self, modules, values, available):
+        """Store the values each module declared, against that module."""
+        def mutate(settings):
+            saved = settings.setdefault("module_params", {})
+            for module_id in modules:
+                module = available.get(module_id)
+                if not module or not module["params"]:
+                    continue
+                for param in module["params"]:
+                    name = param["name"]
+                    if name not in values:
+                        continue
+                    value = str(values[name])
+                    if value == param["default"]:
+                        # Nothing to remember; keep the file tidy.
+                        saved.get(module_id, {}).pop(name, None)
+                    else:
+                        saved.setdefault(module_id, {})[name] = value
+                if not saved.get(module_id):
+                    saved.pop(module_id, None)
+        try:
+            store.update(mutate)
+        except OSError:
+            pass          # remembering is a convenience, not worth failing a run
 
     def validate_ssh_key(self, text):
         try:

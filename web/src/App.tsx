@@ -9,6 +9,7 @@ import { ContainerDrawer } from './components/ContainerDrawer'
 import { ContainerTable } from './components/ContainerTable'
 import { CreateDialog } from './components/CreateDialog'
 import { MoonIcon, PlusIcon, RefreshIcon, SunIcon } from './components/Icons'
+import { ModulesView } from './components/ModulesView'
 import { NetworkView } from './components/NetworkView'
 import { SetupBanner } from './components/SetupBanner'
 import { TokenGate } from './components/TokenGate'
@@ -30,7 +31,7 @@ export default function App() {
   const [deleting, setDeleting] = useState(false)
   const [refreshToken, setRefreshToken] = useState(0)
   const [needsToken, setNeedsToken] = useState(false)
-  const [view, setView] = useState<'containers' | 'network'>('containers')
+  const [view, setView] = useState<'containers' | 'network' | 'modules'>('containers')
 
   // Any in-flight mutation pauses polling so it cannot clobber optimistic state.
   const mutating = useRef(0)
@@ -193,14 +194,15 @@ export default function App() {
           </div>
         )}
         <nav className="topbar-nav" aria-label="Views">
-          {(['containers', 'network'] as const).map((id) => (
+          {(['containers', 'network', 'modules'] as const).map((id) => (
             <button
               key={id}
               className="topbar-nav-item"
               aria-current={view === id}
               onClick={() => setView(id)}
             >
-              {id === 'containers' ? 'Containers' : 'Network'}
+              {id === 'containers' ? 'Containers'
+                : id === 'network' ? 'Network' : 'Modules'}
             </button>
           ))}
         </nav>
@@ -239,7 +241,9 @@ export default function App() {
           <SetupBanner status={status} onSetup={runSetup} />
         )}
 
-        {view === 'network' ? (
+        {view === 'modules' ? (
+          <ModulesView onNotify={notify} />
+        ) : view === 'network' ? (
           <>
             <div className="section-head">
               <h2>Network</h2>

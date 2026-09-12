@@ -223,15 +223,19 @@ def cmd_create(args, service):
     if not args.json:
         print(DIM("Creating %s from %s (this pulls the image on first use)..."
                   % (args.name, image)), flush=True)
+    modules, params = resolve_selection(args, service)
+    if not modules and not args.no_default_modules:
+        modules = [m["id"] for m in service.list_modules() if m["is_default"]]
+
     bootstrap = None
-    if args.module:
+    if modules:
         bootstrap = {
-            "modules": args.module,
-            "params": parse_params(args.param),
+            "modules": modules,
+            "params": params,
             "ssh_keys": collect_ssh_keys(args.ssh_key, args.all_ssh_keys),
         }
         if not args.json:
-            print(DIM("Will run bootstrap modules: %s" % ", ".join(args.module)),
+            print(DIM("Will run bootstrap modules: %s" % ", ".join(modules)),
                   flush=True)
 
     container = service.create_container(
@@ -349,6 +353,10 @@ def cmd_modules(args, service):
         out = []
         for module in items:
             flags = []
+            if module.get("is_default"):
+                flags.append(GREEN("default"))
+            if not module.get("builtin", True):
+                flags.append(CYAN("uploaded"))
             if module["uses_ssh_keys"]:
                 flags.append(CYAN("ssh-keys"))
             if module["os"]:
@@ -360,9 +368,12 @@ def cmd_modules(args, service):
             if module["description"]:
                 out.append("    " + DIM(module["description"]))
             for param in module["params"]:
-                out.append("    %s=%s  %s" % (
-                    param["name"], param["default"] or DIM("(empty)"),
-                    DIM(param["description"])))
+                value = param.get("value", param["default"])
+                line = "    %s=%s" % (param["name"], value or DIM("(empty)"))
+                if param.get("saved"):
+                    line += "  " + GREEN("saved") + DIM(" (module default: %s)"
+                                                        % (param["default"] or "empty"))
+                out.append("%s  %s" % (line, DIM(param["description"])))
             out.append("")
         return "\n".join(out).rstrip()
 
@@ -423,11 +434,90 @@ def render_bootstrap(result):
     return "\n".join(lines)
 
 
+def cmd_module_add(args, service):
+    path = os.path.expanduser(args.path)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            content = handle.read()
+    except OSError as exc:
+        raise ServiceError("Cannot read '%s': %s" % (args.path, exc))
+    module = service.upload_module(args.name or os.path.basename(path), content,
+                                   overwrite=args.force)
+    if args.default:
+        service.update_module_settings(module["id"], is_default=True)
+    emit(args, module, lambda m: "%s installed module %s%s" % (
+        GREEN("+"), BOLD(m["id"]),
+        " (default for new containers)" if args.default else ""))
+    return 0
+
+
+def cmd_module_remove(args, service):
+    result = service.remove_module(args.id)
+    emit(args, result, lambda r: "%s removed module %s" % (GREEN("+"), BOLD(r["deleted"])))
+    return 0
+
+
+def cmd_module_set(args, service):
+    is_default = None
+    if args.default:
+        is_default = True
+    elif args.no_default:
+        is_default = False
+    module = service.update_module_settings(
+        args.id, params=parse_params(args.param) or None, is_default=is_default)
+    emit(args, module, lambda m: "%s %s: default=%s %s" % (
+        GREEN("+"), BOLD(m["id"]), m["is_default"],
+        " ".join("%s=%s" % (p["name"], p["value"]) for p in m["params"])))
+    return 0
+
+
+def cmd_profiles(args, service):
+    profiles = service.list_bootstrap_profiles()
+    emit(args, profiles, lambda items: table(
+        [[p["name"], " → ".join(p["modules"]),
+          " ".join("%s=%s" % kv for kv in p["params"].items()) or "-",
+          p["description"] or "-"] for p in items],
+        ["name", "modules", "params", "description"]))
+    return 0
+
+
+def cmd_profile_save(args, service):
+    profile = service.save_bootstrap_profile(
+        args.name, args.module or [], parse_params(args.param), args.description or "")
+    emit(args, profile, lambda p: "%s saved profile %s (%s)" % (
+        GREEN("+"), BOLD(p["name"]), " → ".join(p["modules"])))
+    return 0
+
+
+def cmd_profile_delete(args, service):
+    result = service.delete_bootstrap_profile(args.name)
+    emit(args, result, lambda r: "%s deleted profile %s" % (GREEN("+"), r["deleted"]))
+    return 0
+
+
+def resolve_selection(args, service):
+    """Modules and params for this run: a saved profile, plus any overrides."""
+    modules = list(args.module or [])
+    params = {}
+    if getattr(args, "bootstrap_profile", None):
+        match = next((p for p in service.list_bootstrap_profiles()
+                      if p["name"].lower() == args.bootstrap_profile.lower()), None)
+        if not match:
+            raise ServiceError(
+                "No bootstrap profile called '%s'. See `lemondx profiles`."
+                % args.bootstrap_profile)
+        modules = match["modules"] + [m for m in modules if m not in match["modules"]]
+        params.update(match["params"])
+    params.update(parse_params(args.param))
+    return modules, params
+
+
 def cmd_bootstrap(args, service):
+    modules, params = resolve_selection(args, service)
     result = service.bootstrap(
         args.name,
-        modules=args.module,
-        params=parse_params(args.param),
+        modules=modules,
+        params=params,
         ssh_keys=collect_ssh_keys(args.ssh_key, args.all_ssh_keys),
         timeout=args.timeout,
     )
@@ -489,6 +579,10 @@ def build_parser():
                       help="public key file to install (repeatable)")
     boot.add_argument("--all-ssh-keys", action="store_true",
                       help="install every public key in ~/.ssh")
+    # Not --profile: `create` already uses that for LXD/Incus profiles, which
+    # are a different thing entirely.
+    boot.add_argument("-P", "--bootstrap-profile", metavar="NAME",
+                      help="start from a saved bootstrap profile (see `lemondx profiles`)")
 
     p = add("serve", help="run the web UI and REST API")
     p.add_argument("--host", default=DEFAULT_HOST)
@@ -532,6 +626,8 @@ def build_parser():
     p.add_argument("--vm", action="store_true", help="create a virtual machine instead")
     p.add_argument("--ephemeral", action="store_true", help="delete on stop")
     p.add_argument("--no-start", action="store_true", help="create without starting")
+    p.add_argument("--no-default-modules", action="store_true",
+                   help="skip modules marked as default")
     p.set_defaults(func=cmd_create)
 
     for action, helptext in [
@@ -593,6 +689,42 @@ def build_parser():
 
     p = add("ssh-keys", help="list public keys found in ~/.ssh")
     p.set_defaults(func=cmd_ssh_keys)
+
+    p = add("module-add", help="install a module from a file")
+    p.add_argument("path", help="path to a .sh file")
+    p.add_argument("--name", help="module id (default: the filename)")
+    p.add_argument("--default", action="store_true",
+                   help="pre-select it for new containers")
+    p.add_argument("-f", "--force", action="store_true",
+                   help="replace an existing module of the same name")
+    p.set_defaults(func=cmd_module_add)
+
+    p = add("module-remove", help="remove an uploaded module")
+    p.add_argument("id")
+    p.set_defaults(func=cmd_module_remove)
+
+    p = add("module-set", help="save a module's default settings")
+    p.add_argument("id")
+    p.add_argument("--param", action="append", metavar="KEY=VALUE",
+                   help="value to remember (repeatable; empty resets it)")
+    p.add_argument("--default", action="store_true",
+                   help="pre-select for new containers")
+    p.add_argument("--no-default", action="store_true",
+                   help="stop pre-selecting it")
+    p.set_defaults(func=cmd_module_set)
+
+    p = add("profiles", help="list saved bootstrap profiles")
+    p.set_defaults(func=cmd_profiles)
+
+    p = add("profile-save", parents=[common, boot],
+            help="save a module selection as a bootstrap profile")
+    p.add_argument("name")
+    p.add_argument("--description", default="")
+    p.set_defaults(func=cmd_profile_save)
+
+    p = add("profile-delete", help="delete a bootstrap profile")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_profile_delete)
 
     p = add("bootstrap", parents=[common, boot],
             help="run bootstrap modules against an existing container")

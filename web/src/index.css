@@ -764,3 +764,45 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .browser-footer { display: flex; gap: 7px; }
 
 .choice-cached { margin-top: 4px; }
+
+/* -------------------------------------------------------------- modules */
+
+.module-card { margin-bottom: 12px; }
+
+.module-card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.module-card-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; flex: 1; }
+.module-card-title h3 { font-size: 14px; }
+.module-card-head .checkbox { font-size: 12.5px; white-space: nowrap; }
+
+.module-card-body { padding: 12px 14px; }
+.module-desc-full { margin: 0 0 11px; font-size: 13px; color: var(--text-dim); line-height: 1.5; }
+
+.module-params-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.module-params-grid label { display: flex; align-items: center; gap: 7px; }
+
+.module-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.module-source { min-height: 220px; resize: vertical; line-height: 1.5; }
+
+.profile-bar { display: flex; gap: 7px; margin-bottom: 11px; }
+.profile-bar .select { flex: 1; }
+
+.profile-row { align-items: flex-start; }

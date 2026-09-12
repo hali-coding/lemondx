@@ -1,5 +1,6 @@
 import type {
-  BootstrapModule, BootstrapResult, BootstrapSelection, Container,
+  BootstrapModule, BootstrapProfile, BootstrapResult, BootstrapSelection,
+  Container, ModuleSource,
   ContainerDetail, CreateRequest, ExecResult, ImageBrowse, Images, NetworkDetail,
   NetworkSummary, SetupResult, Snapshot, SshKey, StateAction, Status,
 } from './types'
@@ -149,6 +150,34 @@ export const api = {
     request<NetworkDetail>(`/networks/${encodeURIComponent(name)}`, { signal }),
 
   modules: (signal?: AbortSignal) => request<BootstrapModule[]>('/modules', { signal }),
+
+  uploadModule: (name: string, content: string, overwrite = false) =>
+    request<BootstrapModule>('/modules',
+      { method: 'POST', body: { name, content, overwrite } }),
+
+  moduleSource: (id: string, signal?: AbortSignal) =>
+    request<ModuleSource>(`/modules/${encodeURIComponent(id)}/source`, { signal }),
+
+  updateModuleSettings: (id: string,
+                         body: { params?: Record<string, string>; is_default?: boolean }) =>
+    request<BootstrapModule>(`/modules/${encodeURIComponent(id)}/settings`,
+      { method: 'PUT', body }),
+
+  deleteModule: (id: string) =>
+    request<{ deleted: string }>(`/modules/${encodeURIComponent(id)}`,
+      { method: 'DELETE' }),
+
+  bootstrapProfiles: (signal?: AbortSignal) =>
+    request<BootstrapProfile[]>('/bootstrap-profiles', { signal }),
+
+  saveBootstrapProfile: (name: string, body: {
+    modules: string[]; params?: Record<string, string>; description?: string
+  }) => request<BootstrapProfile>(`/bootstrap-profiles/${encodeURIComponent(name)}`,
+    { method: 'PUT', body }),
+
+  deleteBootstrapProfile: (name: string) =>
+    request<{ deleted: string }>(`/bootstrap-profiles/${encodeURIComponent(name)}`,
+      { method: 'DELETE' }),
 
   sshKeys: (signal?: AbortSignal) => request<SshKey[]>('/ssh-keys', { signal }),
 

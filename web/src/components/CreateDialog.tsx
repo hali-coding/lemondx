@@ -28,9 +28,55 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
   const [start, setStart] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const { modules, hostKeys } = useBootstrapData()
+  const { modules, profiles, hostKeys, reloadProfiles } = useBootstrapData()
   const [bootstrap, setBootstrap] = useState<BootstrapSelection>(
     { modules: [], params: {}, ssh_keys: [] })
+  const [touchedBootstrap, setTouchedBootstrap] = useState(false)
+  const [profileName, setProfileName] = useState('')
+  const [savingProfile, setSavingProfile] = useState(false)
+
+  // Until the user touches the selection, it *is* whatever they marked as
+  // default. Deriving this during render beats syncing it in an effect: there
+  // is no intermediate state where the catalogue has loaded but the defaults
+  // have not been applied.
+  const selection: BootstrapSelection = touchedBootstrap
+    ? bootstrap
+    : { ...bootstrap, modules: modules.filter((m) => m.is_default).map((m) => m.id) }
+
+  function changeBootstrap(next: BootstrapSelection) {
+    setTouchedBootstrap(true)
+    setBootstrap(next)
+  }
+
+  function applyProfile(name: string) {
+    setProfileName(name)
+    const profile = profiles.find((p) => p.name === name)
+    if (!profile) return
+    setTouchedBootstrap(true)
+    setBootstrap({
+      ...selection,
+      modules: profile.modules,
+      params: { ...profile.params },
+    })
+  }
+
+  async function saveAsProfile() {
+    const name = window.prompt('Save this module selection as:', profileName || '')
+    if (!name?.trim()) return
+    setSavingProfile(true)
+    try {
+      await api.saveBootstrapProfile(name.trim(), {
+        modules: selection.modules,
+        params: selection.params,
+      })
+      setProfileName(name.trim())
+      reloadProfiles()
+    } catch (cause) {
+      setError((cause as Error).message)
+    } finally {
+      setSavingProfile(false)
+    }
+  }
 
   // Fingerprints of images already on this host, so the quick-pick grid can
   // mark them. Best effort: the grid still works if the catalog is unreachable.
@@ -58,15 +104,15 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
   // Modules that install keys make the key picker a first-class part of the
   // dialog, and a required one -- creating without keys would just fail.
   const needsKeys = modules.some(
-    (m) => m.uses_ssh_keys && bootstrap.modules.includes(m.id))
-  const keysMissing = needsKeys && bootstrap.ssh_keys.length === 0
+    (m) => m.uses_ssh_keys && selection.modules.includes(m.id))
+  const keysMissing = needsKeys && selection.ssh_keys.length === 0
 
   // Keys without a listening sshd is a dead end, so say so -- softly, since
   // exec-only containers and externally-managed sshd are both legitimate.
   const SSH_SERVER = 'ssh-server'
   const hasSshServerModule = modules.some((m) => m.id === SSH_SERVER)
   const noSshServer = needsKeys && hasSshServerModule
-    && !bootstrap.modules.includes(SSH_SERVER)
+    && !selection.modules.includes(SSH_SERVER)
 
   const canSubmit = nameValid && image.trim().length > 0 && !busy && !keysMissing
 
@@ -85,7 +131,7 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
         disk: disk.trim() || undefined,
         ephemeral,
         start,
-        bootstrap: bootstrap.modules.length > 0 ? bootstrap : undefined,
+        bootstrap: selection.modules.length > 0 ? selection : undefined,
       })
     } catch (cause) {
       setError((cause as Error).message)
@@ -210,10 +256,10 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
           <label className="checkbox">
             <input type="checkbox" checked={start}
-              disabled={busy || bootstrap.modules.length > 0}
+              disabled={busy || selection.modules.length > 0}
               onChange={(e) => setStart(e.target.checked)} />
             Start immediately after creating
-            {bootstrap.modules.length > 0 && (
+            {selection.modules.length > 0 && (
               <span className="hint">— required by the selected modules</span>
             )}
           </label>
@@ -229,20 +275,45 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
           </label>
         </div>
 
-        <details className="bootstrap-section" open={bootstrap.modules.length > 0}>
+        <details className="bootstrap-section" open={selection.modules.length > 0}>
           <summary>
             Bootstrap
-            {bootstrap.modules.length > 0 && (
-              <span className="badge badge-info">{bootstrap.modules.length} selected</span>
+            {selection.modules.length > 0 && (
+              <span className="badge badge-info">{selection.modules.length} selected</span>
             )}
           </summary>
           <p className="hint" style={{ marginBottom: 10 }}>
             Bash modules run inside the container once it is up, in order.
           </p>
+
+          <div className="profile-bar">
+            <select
+              className="select"
+              value={profileName}
+              aria-label="Start from a saved profile"
+              disabled={busy || profiles.length === 0}
+              onChange={(event) => applyProfile(event.target.value)}
+            >
+              <option value="">
+                {profiles.length === 0 ? 'No saved profiles' : 'Start from a profile…'}
+              </option>
+              {profiles.map((profile) => (
+                <option key={profile.name} value={profile.name}>{profile.name}</option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={busy || savingProfile || selection.modules.length === 0}
+              onClick={saveAsProfile}
+            >
+              Save as profile
+            </button>
+          </div>
           <BootstrapPicker
             modules={modules}
-            value={bootstrap}
-            onChange={setBootstrap}
+            value={selection}
+            onChange={changeBootstrap}
             disabled={busy}
           />
         </details>
@@ -250,8 +321,8 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
         {needsKeys && (
           <SshKeyPicker
             hostKeys={hostKeys}
-            value={bootstrap.ssh_keys}
-            onChange={(keys) => setBootstrap({ ...bootstrap, ssh_keys: keys })}
+            value={selection.ssh_keys}
+            onChange={(keys) => changeBootstrap({ ...selection, ssh_keys: keys })}
             disabled={busy}
           />
         )}
@@ -266,16 +337,16 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
         {keysMissing && (
           <span className="hint" style={{ color: 'var(--warn)', marginTop: -8 }}>
             Select at least one key — {modules
-              .filter((m) => m.uses_ssh_keys && bootstrap.modules.includes(m.id))
+              .filter((m) => m.uses_ssh_keys && selection.modules.includes(m.id))
               .map((m) => m.name)
               .join(' and ')}{' '}
             installs keys.
           </span>
         )}
 
-        {busy && bootstrap.modules.length > 0 && (
+        {busy && selection.modules.length > 0 && (
           <p className="hint">
-            Running {bootstrap.modules.length} module(s) — installing packages can
+            Running {selection.modules.length} module(s) — installing packages can
             take a minute.
           </p>
         )}

@@ -65,13 +65,18 @@ export function BootstrapPicker({ modules, value, onChange, disabled }: Props) {
                       <input
                         id={`p-${param.name}`}
                         className="input mono"
-                        value={value.params[param.name] ?? param.default}
+                        value={value.params[param.name] ?? param.value}
                         placeholder={param.default}
                         disabled={disabled}
                         onChange={(event) => setParam(param.name, event.target.value)}
                       />
                       {param.description && (
-                        <span className="hint">{param.description}</span>
+                        <span className="hint">
+                          {param.description}
+                          {param.saved && (
+                            <span className="faint"> · saved default</span>
+                          )}
+                        </span>
                       )}
                     </div>
                   ))}

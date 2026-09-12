@@ -123,6 +123,10 @@ LXD's own reading of it — bytes — is never what anyone means in a size field
 ./lemondx modules                # bootstrap modules
 ./lemondx ssh-keys               # public keys found in ~/.ssh
 ./lemondx bootstrap NAME -b docker   # run modules on an existing container
+./lemondx module-add FILE.sh     # install a module (--default to pre-select)
+./lemondx module-set ID --param K=V --default
+./lemondx profiles               # saved bootstrap profiles
+./lemondx profile-save NAME -b base -b docker
 ./lemondx serve                  # web UI + API
 ```
 
@@ -229,6 +233,65 @@ Accounts created by the `user` module get shadow field `*` (no usable
 password) rather than `!` (locked): OpenSSH built without PAM, as on Alpine,
 refuses a locked account even for key authentication.
 
+### Defaults, saved settings and profiles
+
+The **Modules** tab manages all of this; the CLI mirrors it.
+
+**Defaults.** Tick *Default* on a module and it is pre-selected every time you
+create a container.
+
+```bash
+./lemondx module-set docker --default
+./lemondx create dev -i images:debian/12      # runs your defaults
+./lemondx create bare --no-default-modules    # opt out
+```
+
+**Saved settings.** A module's parameters are remembered. Edit them in the
+Modules tab, or just run a bootstrap — values that differed from the module's
+own default are saved automatically, so the next container starts from what
+worked last time. The UI marks these *saved* and shows the module's original
+value beside them. Blank a field to go back to that original.
+
+```bash
+./lemondx module-set user --param USERNAME=hampus --param SHELL_PATH=/bin/sh
+```
+
+**Bootstrap profiles** are named module selections with their parameters —
+"Save as profile" in the create dialog, or:
+
+```bash
+./lemondx profile-save "Web server" -b base -b ssh-server -b docker \
+    --param USERNAME=hampus --description "my usual dev box"
+./lemondx profiles
+./lemondx create web -P "Web server" --all-ssh-keys
+```
+
+These are lemondx's own; they have nothing to do with LXD/Incus profiles, which
+configure devices and limits. The CLI flag is `-P/--bootstrap-profile`, because
+`--profile` already means the daemon's kind.
+
+Everything is stored in `~/.config/lemondx/settings.json`, which you can edit
+or delete by hand. `LEMONDX_CONFIG_DIR` points it elsewhere.
+
+### Uploading modules
+
+Drop a `.sh` file into `~/.config/lemondx/modules`, or upload it through the
+Modules tab (choose a file or paste the script). From the CLI:
+
+```bash
+./lemondx module-add ./redis.sh --default
+./lemondx module-remove redis
+```
+
+Uploads are validated before they are stored: the name is reduced to a safe id
+that cannot escape the module directory, the content must be UTF-8 text under
+256 KiB, and it must parse as POSIX shell (`sh -n`, which parses without
+running anything). A module with the same name as a built-in shadows it rather
+than replacing it, and built-ins can never be deleted.
+
+Uploading does not execute anything. The script runs later, inside a container,
+and only when you select it.
+
 ### Writing your own
 
 Drop a `.sh` file in `modules/`, or in `~/.config/lemondx/modules` to keep it
@@ -303,6 +366,13 @@ with a matching HTTP status.
 | `GET` | `/api/ssh-keys` | public keys found in `~/.ssh` |
 | `POST` | `/api/ssh-keys/validate` | check one pasted public key |
 | `POST` | `/api/containers/{name}/bootstrap` | run modules in a container |
+| `POST` | `/api/modules` | upload a module |
+| `GET` | `/api/modules/{id}/source` | the module's script |
+| `PUT` | `/api/modules/{id}/settings` | save its defaults / pre-select it |
+| `DELETE` | `/api/modules/{id}` | remove an uploaded module |
+| `GET` | `/api/bootstrap-profiles` | saved module selections |
+| `PUT` | `/api/bootstrap-profiles/{name}` | create or replace one |
+| `DELETE` | `/api/bootstrap-profiles/{name}` | delete one |
 | `GET` | `/api/profiles` | available profiles |
 
 ```bash
@@ -378,6 +448,7 @@ src/lemondx/
   cli.py           # argparse front end
   bootstrap.py     # module discovery, SSH key validation, the runner
   simplestreams.py # reads remote image catalogs, with caching
+  store.py         # persistent settings: module defaults and profiles
 modules/           # bootstrap modules (POSIX sh)
   _prelude.sh      # helpers prepended to every module
 web/               # Vite + React + TypeScript UI

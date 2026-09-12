@@ -23,7 +23,10 @@ import binascii
 import hashlib
 import os
 import re
+import subprocess
 import time
+
+from . import store
 
 PRELUDE_NAME = "_prelude.sh"
 MODULE_SUFFIX = ".sh"
@@ -51,19 +54,18 @@ class BootstrapError(Exception):
 # -- module discovery ------------------------------------------------------
 
 
+def builtin_module_dir():
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(os.path.dirname(here)), "modules")
+
+
 def module_dirs():
     """Directories searched for modules, lowest priority first.
 
-    Later directories win, so a user module shadows a shipped one of the
-    same name.
+    Later directories win, so a module uploaded by the user shadows a shipped
+    one of the same name.
     """
-    here = os.path.dirname(os.path.abspath(__file__))
-    repo = os.path.dirname(os.path.dirname(here))
-    dirs = [os.path.join(repo, "modules")]
-
-    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    dirs.append(os.path.join(config_home, "lemondx", "modules"))
-
+    dirs = [builtin_module_dir(), store.user_module_dir()]
     extra = os.environ.get("LEMONDX_MODULES")
     if extra:
         dirs.extend(p for p in extra.split(os.pathsep) if p)
@@ -132,8 +134,13 @@ def parse_module(path):
     except ValueError:
         order = 50
 
+    builtin = os.path.dirname(os.path.abspath(path)) == \
+        os.path.abspath(builtin_module_dir())
+
     return {
         "id": module_id,
+        "builtin": builtin,
+        "editable": not builtin,
         "name": meta.get("name") or module_id.replace("-", " ").title(),
         "description": meta.get("description", ""),
         "os": meta.get("os", "").replace(",", " ").split(),
@@ -156,13 +163,172 @@ def _parse_param(value):
     }
 
 
-def public_modules():
-    """Module metadata for API/CLI consumption, ordered, without the script."""
-    modules = discover_modules().values()
-    return [
-        {k: v for k, v in module.items() if k not in ("body", "path")}
-        for module in sorted(modules, key=lambda m: (m["order"], m["id"]))
-    ]
+def public_modules(settings=None):
+    """Module metadata for API/CLI use, with the user's saved defaults applied.
+
+    Each parameter reports both its declared default and the effective value,
+    so a front end can show what will actually be used and offer a reset.
+    """
+    settings = settings if settings is not None else store.load()
+    saved_params = settings.get("module_params") or {}
+    default_modules = set(settings.get("default_modules") or [])
+
+    output = []
+    for module in sorted(discover_modules().values(),
+                         key=lambda m: (m["order"], m["id"])):
+        entry = {k: v for k, v in module.items() if k not in ("body", "path")}
+        overrides = saved_params.get(module["id"]) or {}
+        entry["is_default"] = module["id"] in default_modules
+        entry["params"] = [
+            dict(param,
+                 value=overrides.get(param["name"], param["default"]),
+                 saved=param["name"] in overrides)
+            for param in module["params"]
+        ]
+        output.append(entry)
+    return output
+
+
+def effective_params(module_id, module, settings=None):
+    """Declared defaults, overlaid with whatever the user saved."""
+    settings = settings if settings is not None else store.load()
+    saved = (settings.get("module_params") or {}).get(module_id) or {}
+    values = {p["name"]: p["default"] for p in module["params"]}
+    values.update({k: v for k, v in saved.items() if k in values})
+    return values
+
+
+def module_source(module_id):
+    """The raw script, for viewing or editing in a front end."""
+    module = discover_modules().get(module_id)
+    if not module:
+        raise BootstrapError("No such module '%s'." % module_id, 404)
+    return {
+        "id": module_id,
+        "builtin": module["builtin"],
+        "content": module["body"],
+        "path": module["path"],
+    }
+
+
+# -- uploading modules -----------------------------------------------------
+
+MODULE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+MAX_MODULE_BYTES = 256 * 1024
+
+
+def normalise_module_id(name):
+    """Turn a supplied filename into a safe module id, or raise.
+
+    Uploaded modules are written into the user's config directory, so the id
+    must never be able to escape it: no separators, no dots-only names.
+    """
+    candidate = os.path.basename(str(name or "").strip())
+    if candidate.endswith(MODULE_SUFFIX):
+        candidate = candidate[:-len(MODULE_SUFFIX)]
+    candidate = candidate.strip().lower().replace(" ", "-")
+
+    if not MODULE_ID.match(candidate) or candidate.strip(".") == "":
+        raise BootstrapError(
+            "Invalid module name '%s'. Use lower-case letters, digits, dashes "
+            "and dots, starting with a letter or digit." % name
+        )
+    if candidate.startswith("_"):
+        raise BootstrapError("Module names cannot start with an underscore.")
+    return candidate
+
+
+def check_shell_syntax(content):
+    """Parse the script with `sh -n`. Parsing never executes anything."""
+    try:
+        result = subprocess.run(
+            ["sh", "-n"], input=content, text=True, timeout=10,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None                     # cannot check here; not a reason to refuse
+    if result.returncode != 0:
+        message = (result.stderr or "").strip().splitlines()
+        raise BootstrapError(
+            "The script is not valid POSIX shell: %s"
+            % (message[-1] if message else "syntax error")
+        )
+    return True
+
+
+def save_module(name, content, overwrite=False):
+    """Validate an uploaded module and store it in the user's module directory.
+
+    The file is only ever *written* here -- it runs later, inside a container,
+    and only when someone selects it.
+    """
+    module_id = normalise_module_id(name)
+
+    if isinstance(content, bytes):
+        try:
+            content = content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise BootstrapError("Modules must be UTF-8 text.")
+    content = (content or "").replace("\r\n", "\n").replace("\r", "\n")
+
+    if not content.strip():
+        raise BootstrapError("The module is empty.")
+    if len(content.encode("utf-8")) > MAX_MODULE_BYTES:
+        raise BootstrapError(
+            "Module is larger than %d KiB." % (MAX_MODULE_BYTES // 1024))
+    if "\x00" in content:
+        raise BootstrapError("Modules must be text, not binary.")
+
+    check_shell_syntax(content)
+
+    existing = discover_modules().get(module_id)
+    if existing and existing["builtin"] and not overwrite:
+        raise BootstrapError(
+            "'%s' is a built-in module. Uploading with this name will shadow it "
+            "-- pass overwrite to confirm." % module_id, 409)
+
+    directory = store.user_module_dir()
+    os.makedirs(directory, exist_ok=True)
+    target = os.path.join(directory, module_id + MODULE_SUFFIX)
+    if os.path.exists(target) and not overwrite:
+        raise BootstrapError(
+            "A module called '%s' already exists. Pass overwrite to replace it."
+            % module_id, 409)
+
+    with open(target, "w", encoding="utf-8") as handle:
+        handle.write(content if content.endswith("\n") else content + "\n")
+    os.chmod(target, 0o644)
+
+    parsed = parse_module(target)
+    return {k: v for k, v in parsed.items() if k not in ("body",)}
+
+
+def delete_module(module_id):
+    """Remove an uploaded module. Built-ins are never touched."""
+    module_id = normalise_module_id(module_id)
+    module = discover_modules().get(module_id)
+    if not module:
+        raise BootstrapError("No such module '%s'." % module_id, 404)
+    if module["builtin"]:
+        raise BootstrapError(
+            "'%s' is built in and cannot be deleted. Upload a module with the "
+            "same name to shadow it instead." % module_id, 403)
+
+    target = os.path.join(store.user_module_dir(), module_id + MODULE_SUFFIX)
+    if not os.path.isfile(target):
+        raise BootstrapError("No such uploaded module '%s'." % module_id, 404)
+    os.unlink(target)
+
+    # Drop any settings that referenced it.
+    def prune(settings):
+        settings.get("module_params", {}).pop(module_id, None)
+        defaults = settings.get("default_modules") or []
+        settings["default_modules"] = [m for m in defaults if m != module_id]
+        for profile in (settings.get("profiles") or {}).values():
+            profile["modules"] = [m for m in profile.get("modules", [])
+                                  if m != module_id]
+    store.update(prune)
+    return {"deleted": module_id}
 
 
 # -- ssh keys --------------------------------------------------------------

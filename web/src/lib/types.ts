@@ -148,12 +148,22 @@ export type StateAction = 'start' | 'stop' | 'restart' | 'freeze' | 'unfreeze'
 
 export interface ModuleParam {
   name: string
+  /** The value declared in the module header. */
   default: string
   description: string
+  /** Effective value: the saved default, else the declared one. */
+  value: string
+  /** True when the user has saved an override. */
+  saved: boolean
 }
 
 export interface BootstrapModule {
   id: string
+  /** Shipped with lemondx; cannot be deleted, only shadowed. */
+  builtin: boolean
+  editable: boolean
+  /** Pre-selected when creating a container. */
+  is_default: boolean
   name: string
   description: string
   /** Distro IDs the module targets; empty means any. */
@@ -272,4 +282,19 @@ export interface NetworkDetail {
   instances: string[]
   profiles: string[]
   forwards: unknown[]
+}
+
+/** A saved module selection. Unrelated to LXD/Incus profiles. */
+export interface BootstrapProfile {
+  name: string
+  description: string
+  modules: string[]
+  params: Record<string, string>
+}
+
+export interface ModuleSource {
+  id: string
+  builtin: boolean
+  content: string
+  path: string
 }
