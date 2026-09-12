@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import mimetypes
 import os
@@ -310,8 +311,17 @@ def make_server(host=DEFAULT_HOST, port=DEFAULT_PORT, service=None, token=None,
 def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=False,
           open_browser=False):
     allow_origin = "*" if dev else None
-    httpd = make_server(host=host, port=port, token=token, allow_origin=allow_origin,
-                        quiet=quiet)
+    try:
+        httpd = make_server(host=host, port=port, token=token,
+                            allow_origin=allow_origin, quiet=quiet)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            raise SystemExit(
+                "Port %d on %s is already in use -- another lemondx may be "
+                "running. Use --port to pick a different one, or stop the other "
+                "instance." % (port, host)
+            )
+        raise SystemExit("Cannot listen on %s:%d: %s" % (host, port, exc))
 
     url = "http://%s:%d" % ("localhost" if host in ("0.0.0.0", "127.0.0.1") else host, port)
     print("lemondx API + UI listening on %s" % url)

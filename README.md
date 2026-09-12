@@ -95,6 +95,13 @@ If you want enforced disk quotas, initialize with a driver that supports them:
 CPU and memory limits are enforced on every driver; only disk size depends on
 the pool.
 
+### Units
+
+`--cpu` is a core count. `--memory` and `--disk` take a size: `4GiB`, `512MiB`,
+`20GB`, or the shorthands `4G` / `512M`. A bare number is read as **GiB**, since
+LXD's own reading of it — bytes — is never what anyone means in a size field
+(`4` would be four bytes, and rejected as under the 1MiB minimum).
+
 ## CLI
 
 ```

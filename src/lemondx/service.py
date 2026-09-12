@@ -57,6 +57,52 @@ STATE_ACTIONS = {
 }
 
 
+# Size suffixes LXD/Incus accept verbatim: decimal (kB) and binary (KiB).
+_SIZE_UNITS = {
+    "k": "kB", "kb": "kB", "kib": "KiB",
+    "m": "MiB", "mb": "MB", "mib": "MiB",
+    "g": "GiB", "gb": "GB", "gib": "GiB",
+    "t": "TiB", "tb": "TB", "tib": "TiB",
+    "p": "PiB", "pb": "PB", "pib": "PiB",
+}
+_SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]*)\s*$")
+
+
+def normalize_size(value, field="size"):
+    """Turn a human size into one LXD understands.
+
+    LXD reads a bare number as *bytes*, which is never what someone means in a
+    memory or disk field -- "4" would be four bytes and get rejected as below
+    the 1MiB minimum. Treat a bare number as GiB and expand shorthand units, so
+    4, 4G, 4g, 4GiB and "4 gib" all mean the same thing.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    match = _SIZE.match(text)
+    if not match:
+        raise ServiceError(
+            "Invalid %s '%s'. Use a number with a unit, e.g. 4GiB, 512MiB or 20GB."
+            % (field, value)
+        )
+
+    amount, unit = match.group(1), match.group(2).lower()
+    if not unit:
+        unit = "gib"                       # a bare number means gigabytes here
+    if unit not in _SIZE_UNITS:
+        raise ServiceError(
+            "Unknown unit '%s' in %s '%s'. Use kB/MB/GB/TB or KiB/MiB/GiB/TiB."
+            % (match.group(2), field, value)
+        )
+    # LXD wants integers; 1.5GiB is fine as a value but not as "1.5GiB" bytes.
+    if amount.endswith(".0"):
+        amount = amount[:-2]
+    return "%s%s" % (amount, _SIZE_UNITS[unit])
+
+
 class ServiceError(Exception):
     def __init__(self, message, code=400):
         super().__init__(message)
@@ -246,9 +292,9 @@ class ContainerService:
 
         instance_config = dict(config or {})
         if cpu:
-            instance_config["limits.cpu"] = str(cpu)
+            instance_config["limits.cpu"] = str(cpu).strip()
         if memory:
-            instance_config["limits.memory"] = str(memory)
+            instance_config["limits.memory"] = normalize_size(memory, "memory limit")
         if description:
             instance_config.setdefault("user.description", description)
 
@@ -272,7 +318,8 @@ class ContainerService:
                     "Run setup first."
                 )
             payload["devices"] = {
-                "root": {"type": "disk", "path": "/", "pool": pool, "size": str(disk)}
+                "root": {"type": "disk", "path": "/", "pool": pool,
+                         "size": normalize_size(disk, "disk size")}
             }
 
         if bootstrap and bootstrap.get("modules") and not (start and wait):
@@ -362,9 +409,9 @@ class ContainerService:
         # a limit; passing None here means "leave this one alone".
         config = {}
         if cpu is not None:
-            config["limits.cpu"] = str(cpu)
+            config["limits.cpu"] = str(cpu).strip()
         if memory is not None:
-            config["limits.memory"] = str(memory)
+            config["limits.memory"] = normalize_size(memory, "memory limit")
 
         # LXD merges the config/devices maps on PATCH but takes scalar fields
         # straight from the request, so anything we leave out is reset to its

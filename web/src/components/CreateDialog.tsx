@@ -179,7 +179,9 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
           </div>
         </div>
         <span className="hint" style={{ marginTop: -8 }}>
-          Leave blank for no limit.
+          Leave blank for no limit. CPU is a core count; memory and disk take a
+          unit (<span className="mono">4GiB</span>, <span className="mono">512MiB</span>)
+          — a bare number is read as GiB.
           {quotaless && disk.trim() && (
             <>
               {' '}
