@@ -116,6 +116,15 @@ def build_router(service):
     r.add("POST", r"/api/containers/%s/snapshots/%s/restore" % (NAME, NAME),
           lambda body, q, name, snap: service.restore_snapshot(name, snap))
 
+    r.add("GET", r"/api/images/browse", lambda body, q: service.browse_images(
+        remote=q.get("remote") or None,
+        arch=q.get("arch") or None,
+        refresh=_flag(q.get("refresh")) if "refresh" in q else False))
+
+    r.add("GET", r"/api/networks", lambda body, q: service.list_networks())
+    r.add("GET", r"/api/networks/%s" % NAME,
+          lambda body, q, name: service.get_network(name))
+
     r.add("GET", r"/api/modules", lambda body, q: service.list_modules())
     r.add("GET", r"/api/ssh-keys", lambda body, q: service.list_ssh_keys())
     r.add("POST", r"/api/ssh-keys/validate",

@@ -193,3 +193,83 @@ export interface BootstrapSelection {
   params: Record<string, string>
   ssh_keys: string[]
 }
+
+export interface RemoteImage {
+  alias: string
+  full_alias: string
+  /** Readable name, e.g. "Debian 12 (bookworm)". */
+  label: string
+  remote: string
+  os: string
+  release: string
+  release_title: string
+  variant: string
+  arch: string
+  serial: string
+  size: number
+  vm_size: number
+  container_fingerprint: string | null
+  vm_fingerprint: string | null
+  supported: boolean | null
+  eol: string | null
+  /** The container image is already on this host. */
+  cached: boolean
+  /** The VM image is already on this host. */
+  cached_vm: boolean
+}
+
+export interface ImageBrowse {
+  entries: RemoteImage[]
+  remotes: string[]
+  browsed: string[]
+  architecture: string | null
+  /** Remote name -> why its catalog could not be read. */
+  errors: Record<string, string>
+}
+
+export interface NetworkSummary {
+  name: string
+  type: string
+  managed: boolean
+  status: string
+  description: string
+  ipv4_address: string
+  ipv6_address: string
+  used_by: number
+}
+
+export interface NetworkLease {
+  hostname: string
+  address: string
+  hwaddr: string
+  type: string
+}
+
+export interface NetworkFamily {
+  address: string
+  nat: boolean
+  dhcp: boolean
+  dhcp_ranges: string
+}
+
+export interface NetworkDetail {
+  name: string
+  type: string
+  managed: boolean
+  status: string
+  description: string
+  config: Record<string, string>
+  ipv4: NetworkFamily
+  ipv6: NetworkFamily
+  dns_domain: string
+  dns_mode: string
+  mtu: number | string
+  hwaddr: string
+  state: string
+  addresses: string[]
+  counters: { rx: number; tx: number }
+  leases: NetworkLease[]
+  instances: string[]
+  profiles: string[]
+  forwards: unknown[]
+}

@@ -186,6 +186,21 @@ export function ContainerDrawer({
 
               <div className="panel">
                 <h3>Network</h3>
+                {(() => {
+                  // The NIC's parent network is the single most useful fact
+                  // here: it says which bridge the container is actually on.
+                  const nic = Object.entries(detail.expanded_devices)
+                    .find(([, device]) => device.type === 'nic')
+                  const parent = nic?.[1].network || nic?.[1].parent
+                  return parent ? (
+                    <p className="dim" style={{ fontSize: 12.5, margin: '0 0 8px' }}>
+                      Attached to <span className="mono">{parent}</span> via{' '}
+                      <span className="mono">{nic?.[0]}</span>
+                      {nic?.[1].nictype && <> ({nic[1].nictype})</>} — see the{' '}
+                      <strong>Network</strong> view for how that bridge is set up.
+                    </p>
+                  ) : null
+                })()}
                 {detail.network_detail.filter((i) => i.name !== 'lo').length === 0 ? (
                   <p className="dim" style={{ fontSize: 13, margin: 0 }}>
                     No interfaces — the container is not running.

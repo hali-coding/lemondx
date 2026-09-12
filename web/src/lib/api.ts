@@ -1,7 +1,7 @@
 import type {
   BootstrapModule, BootstrapResult, BootstrapSelection, Container,
-  ContainerDetail, CreateRequest, ExecResult, Images, SetupResult, Snapshot,
-  SshKey, StateAction, Status,
+  ContainerDetail, CreateRequest, ExecResult, ImageBrowse, Images, NetworkDetail,
+  NetworkSummary, SetupResult, Snapshot, SshKey, StateAction, Status,
 } from './types'
 
 /** Error carrying the HTTP status so callers can react to 401/409 specifically. */
@@ -132,6 +132,21 @@ export const api = {
       { method: 'POST' }),
 
   images: (signal?: AbortSignal) => request<Images>('/images', { signal }),
+
+  browseImages: (options: { remote?: string; refresh?: boolean } = {},
+                 signal?: AbortSignal) => {
+    const query = new URLSearchParams()
+    if (options.remote) query.set('remote', options.remote)
+    if (options.refresh) query.set('refresh', 'true')
+    const suffix = query.toString() ? `?${query}` : ''
+    return request<ImageBrowse>(`/images/browse${suffix}`, { signal })
+  },
+
+  networks: (signal?: AbortSignal) =>
+    request<NetworkSummary[]>('/networks', { signal }),
+
+  network: (name: string, signal?: AbortSignal) =>
+    request<NetworkDetail>(`/networks/${encodeURIComponent(name)}`, { signal }),
 
   modules: (signal?: AbortSignal) => request<BootstrapModule[]>('/modules', { signal }),
 

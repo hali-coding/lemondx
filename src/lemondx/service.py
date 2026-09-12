@@ -10,6 +10,7 @@ import re
 from .bootstrap import (BootstrapError, BootstrapRunner, list_host_ssh_keys,
                         parse_public_key, public_modules)
 from .lxd import INCUS, LXDClient, LXDError
+from .simplestreams import CatalogError, fetch_catalog
 
 VALID_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,61}$")
 
@@ -42,6 +43,20 @@ IMAGE_CATALOG_INCUS = [
 # when the backing filesystem has project quotas enabled, which we cannot
 # detect through the API -- the daemon just logs "skipping set quota" and
 # carries on -- so it is reported as unable to enforce.
+# LXD reports kernel architecture names; simplestreams uses Debian ones.
+ARCH_ALIASES = {
+    "x86_64": "amd64", "i686": "i386", "aarch64": "arm64",
+    "armv7l": "armhf", "ppc64le": "ppc64el", "s390x": "s390x",
+    "riscv64": "riscv64",
+}
+
+# Remotes worth showing in the image browser by default. The daily and minimal
+# Ubuntu streams are still reachable by name, they just add noise here.
+BROWSABLE_REMOTES = {
+    "lxd": ("ubuntu", "images"),
+    "incus": ("images",),
+}
+
 QUOTA_CAPABLE_DRIVERS = frozenset({
     "btrfs", "zfs", "lvm", "ceph", "cephfs", "pure", "powerflex", "alletra",
 })
@@ -508,6 +523,153 @@ class ContainerService:
         except BootstrapError as exc:
             raise ServiceError(exc.message, exc.code) from exc
 
+    def browse_images(self, remote=None, arch=None, refresh=False):
+        """The full catalog of one or more remotes, flagged with what is local.
+
+        Entries carry the same fingerprint LXD stores, so "already downloaded"
+        is an exact match rather than a guess from the alias.
+        """
+        remotes = self.lxd.remotes
+        if remote:
+            if remote not in remotes:
+                raise ServiceError(
+                    "Unknown remote '%s'. This daemon knows: %s"
+                    % (remote, ", ".join(sorted(remotes)))
+                )
+            wanted = [remote]
+        else:
+            wanted = [r for r in BROWSABLE_REMOTES.get(self.lxd.flavor, ("images",))
+                      if r in remotes]
+
+        if arch is None:
+            arch = self.host_architecture()
+
+        local = {img.get("fingerprint") for img in self.lxd.list_images()}
+
+        entries, errors = [], {}
+        for name in wanted:
+            try:
+                catalog = fetch_catalog(name, remotes[name], refresh=refresh)
+            except CatalogError as exc:
+                errors[name] = str(exc)
+                continue
+            for entry in catalog:
+                if arch and arch != "all" and entry["arch"] != arch:
+                    continue
+                entry = dict(entry)
+                entry["cached"] = entry["container_fingerprint"] in local
+                entry["cached_vm"] = bool(entry["vm_fingerprint"]) and \
+                    entry["vm_fingerprint"] in local
+                entries.append(entry)
+
+        return {
+            "entries": entries,
+            "remotes": sorted(remotes),
+            "browsed": wanted,
+            "architecture": arch,
+            "errors": errors,
+        }
+
+    def host_architecture(self):
+        """Host architecture in the naming simplestreams uses."""
+        architectures = (self.lxd.server_info().get("environment") or {}) \
+            .get("architectures") or []
+        for value in architectures:
+            if value in ARCH_ALIASES:
+                return ARCH_ALIASES[value]
+            if value in set(ARCH_ALIASES.values()):
+                return value
+        return None
+
+    # -- networking --------------------------------------------------------
+
+    def list_networks(self):
+        """All interfaces the daemon can see, managed ones first."""
+        summaries = []
+        for network in self.lxd.list_networks():
+            config = network.get("config") or {}
+            summaries.append({
+                "name": network.get("name"),
+                "type": network.get("type"),
+                "managed": bool(network.get("managed")),
+                "status": network.get("status"),
+                "description": network.get("description") or "",
+                "ipv4_address": config.get("ipv4.address") or "",
+                "ipv6_address": config.get("ipv6.address") or "",
+                "used_by": len(network.get("used_by") or []),
+            })
+        summaries.sort(key=lambda n: (not n["managed"], n["name"]))
+        return summaries
+
+    def get_network(self, name):
+        """Everything about one network: config, live state, and who is on it."""
+        network = self.lxd.get_network(name)
+        config = network.get("config") or {}
+        managed = bool(network.get("managed"))
+
+        state = self.lxd.get_network_state(name) or {}
+        counters = state.get("counters") or {}
+
+        leases = []
+        if managed:
+            for lease in self.lxd.network_leases(name):
+                leases.append({
+                    "hostname": lease.get("hostname") or "",
+                    "address": lease.get("address") or "",
+                    "hwaddr": lease.get("hwaddr") or "",
+                    "type": lease.get("type") or "",
+                })
+            leases.sort(key=lambda l: (l["type"] != "gateway", _address_key(l["address"])))
+
+        # used_by entries are API paths; pull out the instance names.
+        instances = []
+        for path in network.get("used_by") or []:
+            marker = "/instances/"
+            if marker in path:
+                instances.append(path.split(marker, 1)[1].split("?", 1)[0])
+        profiles = [p.split("/profiles/", 1)[1].split("?", 1)[0]
+                    for p in (network.get("used_by") or []) if "/profiles/" in p]
+
+        return {
+            "name": network.get("name"),
+            "type": network.get("type"),
+            "managed": managed,
+            "status": network.get("status"),
+            "description": network.get("description") or "",
+            "config": config,
+            "ipv4": {
+                "address": config.get("ipv4.address") or "",
+                "nat": _is_true(config.get("ipv4.nat")),
+                "dhcp": config.get("ipv4.dhcp", "true") != "false",
+                "dhcp_ranges": config.get("ipv4.dhcp.ranges") or "",
+            },
+            "ipv6": {
+                "address": config.get("ipv6.address") or "",
+                "nat": _is_true(config.get("ipv6.nat")),
+                "dhcp": config.get("ipv6.dhcp", "true") != "false",
+                "dhcp_ranges": config.get("ipv6.dhcp.ranges") or "",
+            },
+            "dns_domain": config.get("dns.domain") or ("lxd" if managed else ""),
+            "dns_mode": config.get("dns.mode") or "managed",
+            "mtu": state.get("mtu") or config.get("bridge.mtu") or "",
+            "hwaddr": state.get("hwaddr") or "",
+            "state": state.get("state") or "",
+            "addresses": [
+                "%s/%s" % (a.get("address"), a.get("netmask")) if a.get("netmask")
+                else a.get("address")
+                for a in (state.get("addresses") or [])
+                if a.get("scope") == "global"
+            ],
+            "counters": {
+                "rx": counters.get("bytes_received") or 0,
+                "tx": counters.get("bytes_sent") or 0,
+            },
+            "leases": leases,
+            "instances": sorted(set(instances)),
+            "profiles": sorted(set(profiles)),
+            "forwards": self.lxd.network_forwards(name) if managed else [],
+        }
+
     def list_profiles(self):
         return [
             {
@@ -521,6 +683,18 @@ class ContainerService:
 
 
 # -- normalisation helpers -------------------------------------------------
+
+
+def _is_true(value):
+    return str(value).lower() in ("true", "yes", "1", "on")
+
+
+def _address_key(address):
+    """Sort IPv4 numerically rather than as text."""
+    parts = str(address).split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        return (0, [int(p) for p in parts])
+    return (1, [str(address)])
 
 
 def _image_source(image, remotes):

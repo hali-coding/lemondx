@@ -441,6 +441,30 @@ class LXDClient:
     def list_networks(self):
         return self._sync("GET", "/1.0/networks", params={"recursion": "1"}) or []
 
+    def get_network(self, name):
+        return self._sync("GET", "/1.0/networks/%s" % _seg(name))
+
+    def get_network_state(self, name):
+        try:
+            return self._sync("GET", "/1.0/networks/%s/state" % _seg(name))
+        except LXDError:
+            return {}
+
+    def network_leases(self, name):
+        """DHCP leases handed out on a managed bridge."""
+        try:
+            return self._sync("GET", "/1.0/networks/%s/leases" % _seg(name)) or []
+        except LXDError:
+            return []          # unmanaged networks have none
+
+    def network_forwards(self, name):
+        try:
+            return self._sync(
+                "GET", "/1.0/networks/%s/forwards" % _seg(name),
+                params={"recursion": "1"}) or []
+        except LXDError:
+            return []          # not supported on every driver
+
     def create_network(self, name, config=None):
         return self._async(
             "POST",

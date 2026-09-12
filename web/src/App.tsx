@@ -9,6 +9,7 @@ import { ContainerDrawer } from './components/ContainerDrawer'
 import { ContainerTable } from './components/ContainerTable'
 import { CreateDialog } from './components/CreateDialog'
 import { MoonIcon, PlusIcon, RefreshIcon, SunIcon } from './components/Icons'
+import { NetworkView } from './components/NetworkView'
 import { SetupBanner } from './components/SetupBanner'
 import { TokenGate } from './components/TokenGate'
 import { Toasts } from './components/Toasts'
@@ -29,6 +30,7 @@ export default function App() {
   const [deleting, setDeleting] = useState(false)
   const [refreshToken, setRefreshToken] = useState(0)
   const [needsToken, setNeedsToken] = useState(false)
+  const [view, setView] = useState<'containers' | 'network'>('containers')
 
   // Any in-flight mutation pauses polling so it cannot clobber optimistic state.
   const mutating = useRef(0)
@@ -190,6 +192,19 @@ export default function App() {
             )}
           </div>
         )}
+        <nav className="topbar-nav" aria-label="Views">
+          {(['containers', 'network'] as const).map((id) => (
+            <button
+              key={id}
+              className="topbar-nav-item"
+              aria-current={view === id}
+              onClick={() => setView(id)}
+            >
+              {id === 'containers' ? 'Containers' : 'Network'}
+            </button>
+          ))}
+        </nav>
+
         <div className="topbar-spacer" />
         <div className="topbar-actions">
           <button className="btn btn-ghost btn-icon" onClick={() => refresh()} title="Refresh"
@@ -201,10 +216,12 @@ export default function App() {
             aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}>
             {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
           </button>
-          <button className="btn btn-primary" onClick={() => setShowCreate(true)}
-            disabled={!ready}>
-            <PlusIcon /> New
-          </button>
+          {view === 'containers' && (
+            <button className="btn btn-primary" onClick={() => setShowCreate(true)}
+              disabled={!ready}>
+              <PlusIcon /> New
+            </button>
+          )}
         </div>
       </header>
 
@@ -222,6 +239,18 @@ export default function App() {
           <SetupBanner status={status} onSetup={runSetup} />
         )}
 
+        {view === 'network' ? (
+          <>
+            <div className="section-head">
+              <h2>Network</h2>
+              <span className="faint" style={{ fontSize: 12.5 }}>
+                how {status?.product ?? 'the daemon'} wires up container networking
+              </span>
+            </div>
+            <NetworkView />
+          </>
+        ) : (
+        <>
         <div className="section-head">
           <h2>Containers</h2>
           {status?.storage_pools.length ? (
@@ -247,6 +276,8 @@ export default function App() {
             onDelete={setPendingDelete}
             onCreate={() => setShowCreate(true)}
           />
+        )}
+        </>
         )}
       </main>
 

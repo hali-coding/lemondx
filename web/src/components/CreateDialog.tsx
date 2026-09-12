@@ -3,6 +3,7 @@ import { api } from '../lib/api'
 import type { BootstrapSelection, CreateRequest, Images, Status } from '../lib/types'
 import { useBootstrapData } from '../hooks/useBootstrapData'
 import { BootstrapPicker } from './BootstrapPicker'
+import { ImageBrowser } from './ImageBrowser'
 import { SshKeyPicker } from './SshKeyPicker'
 import { Modal } from './Modal'
 
@@ -31,10 +32,18 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
   const [bootstrap, setBootstrap] = useState<BootstrapSelection>(
     { modules: [], params: {}, ssh_keys: [] })
 
+  // Fingerprints of images already on this host, so the quick-pick grid can
+  // mark them. Best effort: the grid still works if the catalog is unreachable.
+  const [cachedAliases, setCachedAliases] = useState<Set<string>>(new Set())
+
   useEffect(() => {
     const controller = new AbortController()
     api.images(controller.signal).then(setImages).catch(() => {})
     api.status(controller.signal).then(setStatus).catch(() => {})
+    api.browseImages({}, controller.signal)
+      .then((browse) => setCachedAliases(
+        new Set(browse.entries.filter((e) => e.cached).map((e) => e.full_alias))))
+      .catch(() => {})
     return () => controller.abort()
   }, [])
 
@@ -137,6 +146,9 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
                   >
                     <strong>{choice.label}</strong>
                     <span>{choice.alias}</span>
+                    {cachedAliases.has(choice.alias) && (
+                      <span className="badge badge-ok choice-cached">Downloaded</span>
+                    )}
                   </button>
                 ))}
               </div>
@@ -147,32 +159,17 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
                 onClick={() => setCustomImage(true)}
                 disabled={busy}
               >
-                Use a different image…
+                Browse all images…
               </button>
             </>
           ) : (
-            <>
-              <input
-                className="input mono"
-                value={image}
-                onChange={(e) => setImage(e.target.value)}
-                placeholder="images:debian/12"
-                autoComplete="off"
-                disabled={busy}
-              />
-              <span className="hint">
-                Remotes: {(images?.remotes ?? ['ubuntu', 'images']).join(', ')}
-              </span>
-              <button
-                type="button"
-                className="btn btn-ghost btn-sm"
-                style={{ alignSelf: 'flex-start' }}
-                onClick={() => setCustomImage(false)}
-                disabled={busy}
-              >
-                ← Back to the list
-              </button>
-            </>
+            <ImageBrowser
+              value={image}
+              forVm={isVm}
+              disabled={busy}
+              onPick={setImage}
+              onBack={() => setCustomImage(false)}
+            />
           )}
         </div>
 
