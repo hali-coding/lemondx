@@ -155,6 +155,8 @@ export interface ModuleParam {
   value: string
   /** True when the user has saved an override. */
   saved: boolean
+  /** Never stored or pre-filled; must be entered on every run. */
+  secret: boolean
 }
 
 export interface BootstrapModule {

@@ -1,0 +1,42 @@
+# System service alternative: for a machine with no interactive login where
+# lemondx should come up at boot regardless of any user session.
+#
+# Prefer systemd/lemondx.service (a --user unit) unless you specifically
+# need that: it runs lemondx as a dedicated system account rather than a
+# real user, which costs three things the user unit gets for free --
+#   - group membership: the account needs adding to `lxd`/`incus-admin`
+#     yourself (install-service.sh --system does this).
+#   - SSH keys: the bootstrap module picker offers ~/.ssh/*.pub for
+#     *this* account, which has no keys of its own unless you put them
+#     there. Pasting a key into the UI still works fine.
+#   - state: settings and uploaded modules live under this account's home
+#     (HOME= below), not yours -- a separate settings.json from the one a
+#     `--user` install or the CLI run as yourself would use.
+#
+# Install to /etc/systemd/system/lemondx.service (install-service.sh
+# --system does the account creation, group membership and this copy).
+# Manage with `systemctl` (no --user). Logs: `journalctl -u lemondx -f`.
+
+[Unit]
+Description=lemondx - web UI and API for local LXD/Incus containers
+Documentation=https://github.com/
+After=network.target lxd.service incus.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=lemondx
+Group=@LEMONDX_GROUP@
+Environment=HOME=/var/lib/lemondx
+ExecStart=/usr/bin/python3 @LEMONDX_PATH@/lemondx serve --host 127.0.0.1 --port 8099
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/lemondx
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

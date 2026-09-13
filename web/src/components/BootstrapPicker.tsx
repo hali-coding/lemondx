@@ -30,7 +30,7 @@ export function BootstrapPicker({ modules, value, onChange, disabled }: Props) {
       <p className="hint">
         No bootstrap modules found. Drop <span className="mono">.sh</span> files into{' '}
         <span className="mono">modules/</span> or{' '}
-        <span className="mono">~/.config/lemondx/modules</span>.
+        <span className="mono">~/.local/share/lemondx/modules</span>.
       </p>
     )
   }
@@ -61,20 +61,33 @@ export function BootstrapPicker({ modules, value, onChange, disabled }: Props) {
                 <div className="module-params">
                   {module.params.map((param) => (
                     <div className="field" key={param.name}>
-                      <label htmlFor={`p-${param.name}`}>{param.name}</label>
+                      <label htmlFor={`p-${param.name}`}>
+                        {param.name}
+                        {param.secret && <span className="badge badge-warn">secret</span>}
+                      </label>
                       <input
                         id={`p-${param.name}`}
                         className="input mono"
+                        // new-password stops the browser offering the user's own
+                        // saved credentials for a container's database.
+                        type={param.secret ? 'password' : 'text'}
+                        autoComplete={param.secret ? 'new-password' : 'off'}
                         value={value.params[param.name] ?? param.value}
                         placeholder={param.default}
                         disabled={disabled}
+                        aria-invalid={param.secret && !value.params[param.name]}
                         onChange={(event) => setParam(param.name, event.target.value)}
                       />
-                      {param.description && (
+                      {(param.description || param.secret) && (
                         <span className="hint">
                           {param.description}
                           {param.saved && (
                             <span className="faint"> · saved default</span>
+                          )}
+                          {param.secret && (
+                            <span className="faint">
+                              {' '}· required, never saved or shown in logs
+                            </span>
                           )}
                         </span>
                       )}

@@ -27,6 +27,10 @@ export function ContainerDrawer({
   const [tab, setTab] = useState<Tab>('overview')
   const [snapshotName, setSnapshotName] = useState('')
   const [snapBusy, setSnapBusy] = useState(false)
+  const [editingLimits, setEditingLimits] = useState(false)
+  const [limitCpu, setLimitCpu] = useState('')
+  const [limitMemory, setLimitMemory] = useState('')
+  const [savingLimits, setSavingLimits] = useState(false)
 
   const load = useCallback((signal?: AbortSignal) => {
     api.getContainer(name, signal)
@@ -71,6 +75,31 @@ export function ContainerDrawer({
       onNotify('error', 'Could not create snapshot', (cause as Error).message)
     } finally {
       setSnapBusy(false)
+    }
+  }
+
+  function startEditLimits() {
+    if (!detail) return
+    setLimitCpu(detail.limits.cpu)
+    setLimitMemory(detail.limits.memory)
+    setEditingLimits(true)
+  }
+
+  async function saveLimits(event: React.FormEvent) {
+    event.preventDefault()
+    setSavingLimits(true)
+    try {
+      // Sending "" (not omitting the key) is how the API clears a limit, so
+      // both fields go over every time, blank or not -- see update_limits()
+      // in service.py.
+      await api.updateLimits(name, { cpu: limitCpu.trim(), memory: limitMemory.trim() })
+      onNotify('success', `Updated limits for ${name}`)
+      setEditingLimits(false)
+      load()
+    } catch (cause) {
+      onNotify('error', 'Could not update limits', (cause as Error).message)
+    } finally {
+      setSavingLimits(false)
     }
   }
 
@@ -178,8 +207,65 @@ export function ContainerDrawer({
                   <dt>Last used</dt>
                   <dd title={absoluteTime(detail.last_used_at)}>{relativeTime(detail.last_used_at)}</dd>
                   <dt>Profiles</dt><dd>{detail.profiles.join(', ') || '—'}</dd>
-                  <dt>CPU limit</dt><dd>{detail.limits.cpu || 'unlimited'}</dd>
-                  <dt>Memory limit</dt><dd>{detail.limits.memory || 'unlimited'}</dd>
+                  {editingLimits ? (
+                    <>
+                      <dt>CPU limit</dt>
+                      <dd>
+                        <input
+                          className="input" style={{ maxWidth: 140 }}
+                          value={limitCpu} disabled={savingLimits}
+                          placeholder="e.g. 2" autoComplete="off"
+                          aria-label="CPU limit"
+                          onChange={(e) => setLimitCpu(e.target.value)}
+                        />
+                      </dd>
+                      <dt>Memory limit</dt>
+                      <dd>
+                        <input
+                          className="input" style={{ maxWidth: 140 }}
+                          value={limitMemory} disabled={savingLimits}
+                          placeholder="e.g. 2GiB" autoComplete="off"
+                          aria-label="Memory limit"
+                          onChange={(e) => setLimitMemory(e.target.value)}
+                        />
+                      </dd>
+                      <dt />
+                      <dd>
+                        <div className="btn-group">
+                          <button className="btn btn-sm btn-primary" disabled={savingLimits}
+                            onClick={saveLimits}>
+                            {savingLimits && <span className="spinner" />}
+                            Save
+                          </button>
+                          <button className="btn btn-sm" disabled={savingLimits}
+                            onClick={() => setEditingLimits(false)}>
+                            Cancel
+                          </button>
+                        </div>
+                        <span className="hint" style={{ display: 'block', marginTop: 6 }}>
+                          Leave blank for no limit. CPU is a core count; memory takes a
+                          unit (<span className="mono">2GiB</span>,{' '}
+                          <span className="mono">512MiB</span>) — a bare number is read
+                          as GiB.
+                        </span>
+                      </dd>
+                    </>
+                  ) : (
+                    <>
+                      <dt>CPU limit</dt><dd>{detail.limits.cpu || 'unlimited'}</dd>
+                      <dt>Memory limit</dt>
+                      <dd>
+                        {detail.limits.memory || 'unlimited'}
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          style={{ marginLeft: 8, padding: '1px 7px', fontSize: 11 }}
+                          onClick={startEditLimits}
+                        >
+                          Edit
+                        </button>
+                      </dd>
+                    </>
+                  )}
                   {detail.ephemeral && <><dt>Ephemeral</dt><dd>deleted when stopped</dd></>}
                 </dl>
               </div>

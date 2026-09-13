@@ -806,3 +806,6 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .profile-bar .select { flex: 1; }
 
 .profile-row { align-items: flex-start; }
+
+/* A secret parameter has no stored value to show, only a reminder. */
+.secret-placeholder { color: var(--text-faint); font-style: italic; }

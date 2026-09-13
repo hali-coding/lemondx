@@ -180,7 +180,20 @@ export function ModulesView({ onNotify }: Props) {
               ) : (
                 <>
                   <div className="module-params-grid">
-                    {module.params.map((param) => (
+                    {module.params.map((param) => param.secret ? (
+                      // Secrets have nothing to save, so there is nothing to edit.
+                      <div className="field" key={param.name}>
+                        <label>
+                          {param.name}
+                          <span className="badge badge-warn">secret</span>
+                        </label>
+                        <div className="input mono secret-placeholder">entered on each run</div>
+                        <span className="hint">
+                          {param.description}
+                          {param.description && ' · '}never saved, never shown in logs
+                        </span>
+                      </div>
+                    ) : (
                       <div className="field" key={param.name}>
                         <label htmlFor={`s-${module.id}-${param.name}`}>
                           {param.name}
@@ -205,6 +218,7 @@ export function ModulesView({ onNotify }: Props) {
                       </div>
                     ))}
                   </div>
+                  {module.params.some((param) => !param.secret) && (
                   <div className="module-card-actions">
                     <button
                       className="btn btn-sm btn-primary"
@@ -219,6 +233,7 @@ export function ModulesView({ onNotify }: Props) {
                       are also remembered automatically after a successful run.
                     </span>
                   </div>
+                  )}
                 </>
               )}
             </div>

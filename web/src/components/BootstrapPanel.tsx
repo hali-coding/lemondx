@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { api } from '../lib/api'
+import { missingSecrets } from '../lib/bootstrap'
 import { useBootstrapData } from '../hooks/useBootstrapData'
 import type { BootstrapResult, BootstrapSelection } from '../lib/types'
 import { BootstrapLog } from './BootstrapLog'
@@ -24,13 +25,7 @@ export function BootstrapPanel({ name, running, onFinished }: Props) {
   const needsKeys = modules.some(
     (m) => m.uses_ssh_keys && selection.modules.includes(m.id))
   const keysMissing = needsKeys && selection.ssh_keys.length === 0
-
-  // Keys without a listening sshd is a dead end, so say so -- softly, since
-  // exec-only containers and externally-managed sshd are both legitimate.
-  const SSH_SERVER = 'ssh-server'
-  const hasSshServerModule = modules.some((m) => m.id === SSH_SERVER)
-  const noSshServer = needsKeys && hasSshServerModule
-    && !selection.modules.includes(SSH_SERVER)
+  const secretsMissing = missingSecrets(modules, selection)
 
   async function run() {
     setBusy(true)
@@ -43,6 +38,13 @@ export function BootstrapPanel({ name, running, onFinished }: Props) {
       setError((cause as Error).message)
     } finally {
       setBusy(false)
+      // Don't leave a password sitting in the form once it has been used.
+      setSelection((current) => ({
+        ...current,
+        params: Object.fromEntries(Object.entries(current.params).filter(
+          ([param]) => !modules.some((m) => m.params.some(
+            (p) => p.secret && p.name === param)))),
+      }))
     }
   }
 
@@ -77,10 +79,9 @@ export function BootstrapPanel({ name, running, onFinished }: Props) {
         </div>
       )}
 
-      {noSshServer && !keysMissing && (
-        <p className="hint" style={{ marginTop: 8 }}>
-          Keys will be installed, but nothing will be listening — add the{' '}
-          <strong>SSH server</strong> module if you want to ssh in.
+      {secretsMissing.length > 0 && (
+        <p className="hint" style={{ marginTop: 8, color: 'var(--warn)' }}>
+          Enter {secretsMissing.join(' and ')} to run — secrets are never saved.
         </p>
       )}
 
@@ -88,7 +89,8 @@ export function BootstrapPanel({ name, running, onFinished }: Props) {
         className="btn btn-primary"
         style={{ marginTop: 12 }}
         onClick={run}
-        disabled={busy || selection.modules.length === 0 || keysMissing}
+        disabled={busy || selection.modules.length === 0 || keysMissing
+          || secretsMissing.length > 0}
       >
         {busy && <span className="spinner" />}
         {busy ? 'Running…' : `Run ${selection.modules.length || ''} module${

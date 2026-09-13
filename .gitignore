@@ -3,6 +3,7 @@ __pycache__/
 node_modules/
 .DS_Store
 
+
 # web/dist is deliberately committed: it lets `./lemondx serve` work straight
 # from a clone, with no Node toolchain. Rebuild it with:
 #   npm --prefix web install && npm --prefix web run build
