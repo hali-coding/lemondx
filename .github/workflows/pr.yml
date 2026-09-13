@@ -1,0 +1,111 @@
+# Runs on every pull request: the checks documented in CLAUDE.md's
+# "Commands" section, since that's the closest thing this project has to a
+# test suite. There is no live LXD/Incus daemon here, so nothing that needs
+# one (`lemondx status`, `create`, etc.) runs -- see CLAUDE.md for how to
+# verify those by hand against a real daemon.
+name: PR
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the PR supersedes the run already in flight for it.
+concurrency:
+  group: pr-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor from pyproject.toml's requires-python, and a recent one --
+        # `from __future__ import annotations` is what keeps every module
+        # syntax-valid on 3.9, and compileall below is what actually checks it.
+        python-version: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Syntax check (no post-3.9 syntax; see CLAUDE.md "Hard constraints")
+        run: python3 -m compileall -q src/lemondx
+
+      - name: Import every module
+        # compileall only parses; it will not catch an accidentally-added
+        # third-party import (dependencies = [] in pyproject.toml is a hard
+        # constraint) or any other error that only surfaces at import time.
+        # A fresh setup-python install has nothing but the stdlib, so this
+        # fails loudly if a module reaches outside it.
+        run: python3 .github/scripts/check_imports.py
+
+      - name: CLI parser builds cleanly (./lemondx --help)
+        # build_parser() constructs every subcommand eagerly, so this alone
+        # catches things like two subcommands accidentally claiming the same
+        # short flag -- argparse raises before anything is even printed.
+        run: ./lemondx --help
+
+  modules:
+    name: Bootstrap modules (POSIX sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: sh -n every module
+        # Modules run under /bin/sh in the container -- dash on Debian/Ubuntu,
+        # busybox ash on Alpine -- never bash, which minimal images often lack.
+        # ubuntu-latest's /bin/sh is dash, so this is the same check CLAUDE.md
+        # tells a contributor to run by hand.
+        run: |
+          status=0
+          for f in modules/*.sh; do
+            if ! sh -n "$f"; then
+              echo "::error file=$f::does not parse as POSIX sh"
+              status=1
+            fi
+          done
+          exit "$status"
+
+  web:
+    name: Web (lint, typecheck, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+        working-directory: web
+
+      - name: Lint (oxlint)
+        run: npm run lint
+        working-directory: web
+
+      - name: Typecheck and build (tsc -b && vite build)
+        run: npm run build
+        working-directory: web
+
+      - name: web/dist must match this build
+        # Hard constraint from CLAUDE.md: web/dist is committed so a clone
+        # runs with no Node install, which means a PR that touches web/src
+        # must ship the rebuilt dist in the same change. `npm run build`
+        # above just regenerated it from source -- if that differs at all
+        # from what's committed (new content-hashed filenames included),
+        # the PR is missing that rebuild.
+        run: |
+          if [ -n "$(git status --porcelain -- web/dist)" ]; then
+            echo "::error::web/dist does not match a fresh build. Run 'npm --prefix web run build' and commit the result."
+            git status --porcelain -- web/dist
+            exit 1
+          fi
