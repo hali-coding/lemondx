@@ -78,3 +78,26 @@ export const BoxIcon = ({ size = 15 }: Props) => (
     <path d="M21 8l-9-5-9 5 9 5 9-5zM3 8v8l9 5 9-5V8" />
   </svg>
 )
+
+export const PencilIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" />
+  </svg>
+)
+
+export const CopyIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15V5a2 2 0 0 1 2-2h8" />
+  </svg>
+)
+
+export const CheckIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}><path d="M5 12.5l4.5 4.5L19 7" /></svg>
+)
+
+export const TerminalIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M5 8l4 4-4 4M12 17h7" />
+  </svg>
+)

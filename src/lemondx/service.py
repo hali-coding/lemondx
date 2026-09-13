@@ -7,7 +7,12 @@ front ends can never drift apart in behaviour.
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
+import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from . import store
 from .bootstrap import (BootstrapError, BootstrapRunner, delete_module,
                         discover_modules, effective_params,
@@ -18,10 +23,15 @@ from .lxd import INCUS, LXDClient, LXDError, window_resize_message
 from .simplestreams import CatalogError, fetch_catalog
 
 VALID_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,61}$")
+# Launched instances are named <prefix>-<n>; 50 leaves room for the number.
+VALID_PREFIX = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,49}$")
+# Set on every instance a template launches, so front ends can group them.
+TEMPLATE_CONFIG_KEY = "user.lemondx.template"
 # A shell the caller asks for by path. Deliberately narrow: it is handed to the
 # daemon as argv[0], and an absolute path with no metacharacters cannot become
 # anything else on the way.
 VALID_SHELL = re.compile(r"^/[A-Za-z0-9._/-]{1,127}$")
+ZFS_KSTAT_ROOT = "/proc/spl/kstat/zfs"
 
 # Handy starting points for the "new container" form. Anything the remotes
 # publish still works -- the UI keeps a free-text field alongside these.
@@ -66,9 +76,56 @@ BROWSABLE_REMOTES = {
     "incus": ("images",),
 }
 
+LOCAL_STORAGE_DRIVERS = frozenset({"dir", "btrfs", "lvm", "zfs"})
+
+# Keep generic config input narrow so this surface cannot become an accidental
+# path to remote backends or credentials.
+_COMMON_POOL_CONFIG = frozenset({
+    "rsync.bwlimit", "rsync.compression", "volume.size",
+    "volume.block.filesystem", "volume.block.mount_options",
+})
+LOCAL_POOL_CONFIG = {
+    "dir": _COMMON_POOL_CONFIG,
+    "btrfs": _COMMON_POOL_CONFIG | {"btrfs.mount_options", "btrfs.rsync_path"},
+    "lvm": _COMMON_POOL_CONFIG | {
+        "lvm.thinpool_name", "lvm.vg_name", "lvm.use_thinpool",
+        "lvm.stripes", "lvm.stripes.size",
+    },
+    "zfs": _COMMON_POOL_CONFIG | {
+        "zfs.pool_name", "zfs.clone_copy", "zfs.remove_snapshots",
+        "zfs.use_refquota", "zfs.reserve_space",
+    },
+}
+LOCAL_VOLUME_CONFIG = frozenset({
+    "block.filesystem", "block.mount_options", "security.shifted",
+    "security.unmapped", "snapshots.expiry", "snapshots.pattern",
+    "snapshots.schedule",
+})
+
 QUOTA_CAPABLE_DRIVERS = frozenset({
     "btrfs", "zfs", "lvm", "ceph", "cephfs", "pure", "powerflex", "alletra",
 })
+
+# What a VM gets when its config says nothing. A container without a limit
+# shares the whole host, but a VM has to be handed a fixed machine, so both
+# daemons fill in these values -- and they count against the host just the
+# same as explicit ones.
+VM_DEFAULTS = {"cpu": 1, "memory": "1GiB", "disk": "10GiB"}
+
+# Statuses in which an instance is holding its CPU and memory right now. A
+# frozen instance keeps its memory even though it is not scheduled.
+ACTIVE_STATUSES = frozenset({"Running", "Frozen"})
+
+# The daemon's own size grammar, which unlike normalize_size() reads a bare
+# number as bytes: these values come from the daemon, not from a person.
+_BYTE_UNITS = {
+    "": 1, "b": 1,
+    "kb": 1000, "mb": 1000 ** 2, "gb": 1000 ** 3, "tb": 1000 ** 4,
+    "pb": 1000 ** 5, "eb": 1000 ** 6,
+    "kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4,
+    "pib": 1024 ** 5, "eib": 1024 ** 6,
+}
+_BYTE_SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]*)\s*$")
 
 STATE_ACTIONS = {
     "start": "start",
@@ -239,6 +296,14 @@ def terminal_size(cols, rows):
 class ContainerService:
     def __init__(self, client=None, **kwargs):
         self.lxd = client or LXDClient(**kwargs)
+        # Template launches, recreates and destroys in progress or last
+        # finished, by template name. See _tracked().
+        self._runs = {}
+        self._runs_lock = threading.Lock()
+        # Creates in progress, and recently finished, by instance name. See
+        # _track_create().
+        self._creates = {}
+        self._creates_lock = threading.Lock()
 
     # -- readiness ---------------------------------------------------------
 
@@ -405,9 +470,21 @@ class ContainerService:
     # -- lifecycle ---------------------------------------------------------
 
     def create_container(self, name, image, instance_type="container",
-                         profiles=None, cpu=None, memory=None, disk=None,
+                         profiles=None, cpu=None, memory=None, disk=None, pool=None,
                          description=None, ephemeral=False, start=True,
-                         config=None, wait=True, bootstrap=None):
+                         config=None, wait=True, bootstrap=None,
+                         remember_params=True, background=False):
+        """Create an instance, start it and run its bootstrap modules.
+
+        With ``background`` everything that can be checked up front still is
+        -- a bad name, a missing pool, the same name already being created --
+        and raised to the caller, but the create itself runs on a thread and
+        the call returns its progress record at once. Follow it with
+        ``creates()``. The web UI always does this: a request held open for the
+        minutes an image pull and bootstrap take is one the browser, a proxy or
+        a closed tab can drop, and the page has no business being the thing
+        that keeps work alive.
+        """
         if not VALID_NAME.match(name or ""):
             raise ServiceError(
                 "Invalid name '%s'. Use letters, digits and dashes, starting "
@@ -434,19 +511,22 @@ class ContainerService:
         }
         if description:
             payload["description"] = description
-        if disk:
+        if pool or disk:
             # Overriding the root disk at instance level replaces the profile's
             # device outright, and LXD requires an explicit pool on it.
-            pool = self._root_pool(payload["profiles"])
-            if not pool:
+            pool_name = str(pool).strip() if pool else self._root_pool(payload["profiles"])
+            if not pool_name:
                 raise ServiceError(
                     "Cannot set a disk size: no storage pool is configured. "
                     "Run setup first."
                 )
-            payload["devices"] = {
-                "root": {"type": "disk", "path": "/", "pool": pool,
-                         "size": normalize_size(disk, "disk size")}
-            }
+            if pool and pool_name not in {
+                    item.get("name") for item in self.lxd.list_storage_pools()}:
+                raise ServiceError("No storage pool called '%s'." % pool_name, 404)
+            root = {"type": "disk", "path": "/", "pool": pool_name}
+            if disk:
+                root["size"] = normalize_size(disk, "disk size")
+            payload["devices"] = {"root": root}
 
         if bootstrap and bootstrap.get("modules") and not (start and wait):
             raise ServiceError(
@@ -454,29 +534,132 @@ class ContainerService:
                 "cannot be disabled."
             )
 
-        self.lxd.create_instance(payload, wait=wait)
-        if start and wait:
-            self.lxd.set_state(name, "start")
-
         if not wait:
+            self.lxd.create_instance(payload, wait=False)
             return {"name": name, "status": "Pending"}
 
-        container = self.get_container(name)
-        if bootstrap and bootstrap.get("modules"):
-            # Report bootstrap failures alongside the container rather than
-            # raising: the container exists either way and the user needs to
-            # see which module failed and why.
-            container["bootstrap"] = self.bootstrap(
-                name,
-                modules=bootstrap["modules"],
-                params=bootstrap.get("params"),
-                ssh_keys=bootstrap.get("ssh_keys"),
-            )
-        return container
+        modules = (bootstrap or {}).get("modules") or []
+        record = self._begin_create(name, image, instance_type,
+                                    instance_config.get(TEMPLATE_CONFIG_KEY), len(modules))
 
-    def root_pool_info(self, profiles=None):
+        def work():
+            return self._run_create(record, payload, start, bootstrap, remember_params)
+
+        if background:
+            self._in_background("create-%s" % name, work)
+            return self._create_snapshot(record)
+        return work()
+
+    def _run_create(self, record, payload, start, bootstrap, remember_params):
+        name = payload["name"]
+        modules = (bootstrap or {}).get("modules") or []
+        try:
+            self.lxd.create_instance(payload, wait=True)
+            if start:
+                self._create_stage(record, stage="starting")
+                self.lxd.set_state(name, "start")
+
+            container = self.get_container(name)
+            if modules:
+                self._create_stage(record, stage="bootstrapping")
+                # Report bootstrap failures alongside the container rather than
+                # raising: the container exists either way and the user needs
+                # to see which module failed and why.
+                result = self.bootstrap(
+                    name,
+                    modules=modules,
+                    params=bootstrap.get("params"),
+                    ssh_keys=bootstrap.get("ssh_keys"),
+                    remember=remember_params,
+                )
+                container["bootstrap"] = result
+                failed = next((m for m in result["modules"] if m["exit_code"] != 0), None)
+                if failed:
+                    tail = (failed["stderr"] or failed["stdout"] or "").strip().splitlines()
+                    self._create_stage(record, ok=False, failed_module=failed["name"],
+                                       error_detail=" ".join(tail[-2:])[:300] or None)
+            self._create_stage(record, ok=record["ok"] is not False)
+            return container
+        except (ServiceError, LXDError, BootstrapError) as exc:
+            self._create_stage(record, ok=False, error=str(exc))
+            raise
+        except BaseException:
+            self._create_stage(record, ok=False, error="Unexpected error while creating.")
+            raise
+        finally:
+            self._create_stage(record, stage="done", finished_at=time.time())
+
+    # Finished creates stay listed this long, so a page reloaded mid-create
+    # can still find out how it ended.
+    CREATE_RETENTION = 600
+
+    def _begin_create(self, name, image, instance_type, template, module_count):
+        """Record a create before it starts, so every client can follow it.
+
+        Only one create per name runs at a time; a second is refused here,
+        before anything reaches the daemon.
+        """
+        now = time.time()
+        with self._creates_lock:
+            for key, old in list(self._creates.items()):
+                if old["finished_at"] and now - old["finished_at"] > self.CREATE_RETENTION:
+                    del self._creates[key]
+            current = self._creates.get(name)
+            if current and current["finished_at"] is None:
+                raise ServiceError("'%s' is already being created." % name, 409)
+            record = {
+                "name": name, "image": image, "type": instance_type,
+                "template": template, "modules": module_count,
+                "stage": "creating", "started_at": now, "finished_at": None,
+                "ok": None, "error": None, "failed_module": None, "error_detail": None,
+            }
+            self._creates[name] = record
+        return record
+
+    def _create_stage(self, record, **changes):
+        with self._creates_lock:
+            record.update(changes)
+
+    def _create_snapshot(self, record):
+        with self._creates_lock:
+            return dict(record)
+
+    def creates(self):
+        """Creates in progress or finished in the last few minutes, oldest first.
+
+        Held by this process: a create run by the CLI in another process is not
+        listed.
+        """
+        with self._creates_lock:
+            return sorted((dict(r) for r in self._creates.values()),
+                          key=lambda r: r["started_at"])
+
+    @staticmethod
+    def _in_background(label, work):
+        """Run ``work`` on its own thread; its own bookkeeping records failures."""
+        def target():
+            try:
+                work()
+            except Exception:                         # noqa: BLE001
+                pass
+        # A daemon thread, so it cannot keep a stopped server alive by itself;
+        # serve() waits on pending_work() instead, where it can say what for.
+        threading.Thread(target=target, name="lemondx-%s" % label, daemon=True).start()
+
+    def pending_work(self):
+        """Human descriptions of every create and template run still going."""
+        with self._runs_lock:
+            runs = ["%s of %d from template '%s'" % (r["action"], r["count"], r["template"])
+                    for r in self._runs.values() if r["finished_at"] is None]
+        with self._creates_lock:
+            creates = ["create of '%s' (%s)" % (r["name"], r["stage"])
+                       for r in self._creates.values()
+                       if r["finished_at"] is None and not r["template"]]
+        return runs + creates
+
+    def root_pool_info(self, profiles=None, pool=None):
         """The pool a new container lands on, and whether it enforces quotas."""
-        name = self._root_pool(profiles or ["default"])
+        name = pool or self._root_pool(profiles or ["default"])
         if not name:
             return None
         for pool in self.lxd.list_storage_pools():
@@ -727,56 +910,493 @@ class ContainerService:
     # Named module selections. Not to be confused with LXD/Incus profiles,
     # which configure devices and limits -- these only bundle bootstrap steps.
 
-    def list_bootstrap_profiles(self):
-        available = discover_modules()
-
-        def public_params(profile):
-            # Profile files are shared and hand-edited; a secret written into
-            # one is dropped rather than silently reused.
-            secret = secret_param_names(
-                available[m] for m in profile.get("modules") or [] if m in available)
-            return {k: v for k, v in (profile.get("params") or {}).items()
-                    if k not in secret}
-
-        return [
-            {
-                "name": name,
-                "description": profile.get("description", ""),
-                "modules": profile.get("modules") or [],
-                "params": public_params(profile),
-            }
-            for name, profile in sorted(store.load_profiles().items())
-        ]
-
-    def save_bootstrap_profile(self, name, modules, params=None, description=""):
+    def _record_name(self, name, kind):
         name = (name or "").strip()
         if not self.PROFILE_NAME.match(name):
             raise ServiceError(
-                "Invalid profile name '%s'. Use letters, digits, spaces, dots, "
-                "dashes and underscores." % name)
-        if not modules:
-            raise ServiceError("A profile needs at least one module.")
+                "Invalid %s name '%s'. Use letters, digits, spaces, dots, "
+                "dashes and underscores." % (kind, name))
+        return name
 
-        available = discover_modules()
+    def _stored_selection(self, modules, params, ssh_keys, available):
+        """Validate a module selection for saving, and complete it.
+
+        What is stored is every non-secret parameter the modules declare, not
+        just the ones someone edited: filled from module defaults and saved
+        settings as they are *now*, so the record keeps doing the same thing
+        after those change, and a file copied to another machine brings its
+        values along.
+        """
+        modules = list(dict.fromkeys(str(m) for m in modules or []))
         unknown = [m for m in modules if m not in available]
         if unknown:
             raise ServiceError("Unknown module(s): %s" % ", ".join(unknown))
+        selected = [available[m] for m in modules]
 
-        # Saving from the create dialog sends everything typed, password
-        # included. Keep the selection, never the secret.
-        secret = secret_param_names(available[m] for m in modules)
-        entry = {
-            "description": str(description or "")[:200],
-            "modules": list(dict.fromkeys(modules)),
-            "params": {str(k): str(v) for k, v in (params or {}).items()
-                       if str(k) not in secret},
+        given = {str(k): "" if v is None else str(v) for k, v in (params or {}).items()}
+        undeclared = sorted(set(given) - {p["name"] for m in selected for p in m["params"]})
+        if undeclared:
+            raise ServiceError(
+                "%s is not a parameter of the selected modules."
+                % ", ".join(undeclared))
+
+        settings = store.load()
+        values = {}
+        for module_id, module in zip(modules, selected):
+            values.update(effective_params(module_id, module, settings))
+        values.update(given)
+
+        keys = []
+        for key in ssh_keys or []:
+            try:
+                keys.append(parse_public_key(str(key))["line"])
+            except BootstrapError as exc:
+                raise ServiceError(exc.message, exc.code) from exc
+
+        # Saving from a form sends everything typed, password included. Keep
+        # the selection, never the secret.
+        secret = secret_param_names(selected)
+        return {
+            "modules": modules,
+            "params": {k: v for k, v in values.items() if k not in secret},
+            "ssh_keys": list(dict.fromkeys(keys)),
         }
+
+    @staticmethod
+    def _public_selection(record, available):
+        """A stored selection as it is safe to list and to run.
+
+        Profile and template files are shared and hand-edited; a secret written
+        into one is dropped rather than silently reused, and a key that no
+        longer parses is dropped rather than handed to a container.
+        """
+        secret = secret_param_names(
+            available[m] for m in record["modules"] if m in available)
+        keys = []
+        for key in record["ssh_keys"]:
+            try:
+                keys.append(parse_public_key(key)["line"])
+            except BootstrapError:
+                continue
+        return {
+            "modules": record["modules"],
+            "params": {k: v for k, v in record["params"].items() if k not in secret},
+            "ssh_keys": list(dict.fromkeys(keys)),
+        }
+
+    def list_bootstrap_profiles(self):
+        available = discover_modules()
+        return [
+            dict({"name": name, "description": profile["description"]},
+                 **self._public_selection(profile, available))
+            for name, profile in sorted(store.load_profiles().items())
+        ]
+
+    def save_bootstrap_profile(self, name, modules, params=None, description="",
+                               ssh_keys=None):
+        name = self._record_name(name, "profile")
+        if not modules:
+            raise ServiceError("A profile needs at least one module.")
+        entry = self._stored_selection(modules, params, ssh_keys, discover_modules())
+        entry["description"] = str(description or "")[:200]
         return store.save_profile(name, entry)
 
     def delete_bootstrap_profile(self, name):
         if not store.delete_profile(name):
             raise ServiceError("No such profile '%s'." % name, 404)
         return {"deleted": name}
+
+    # -- templates ---------------------------------------------------------
+    # Everything the create form collects except the name, saved so that one
+    # or many identical instances are a click away.
+
+    MAX_LAUNCH = 20
+    # Each create pulls from the same image and each bootstrap runs a package
+    # manager; beyond a few at once the host is the bottleneck, not lemondx.
+    LAUNCH_WORKERS = 4
+
+    def list_templates(self):
+        available = discover_modules()
+        return [
+            dict(template, bootstrap=self._public_selection(template["bootstrap"], available))
+            for _, template in sorted(store.load_templates().items())
+        ]
+
+    def save_template(self, name, image, instance_type="container", cpu=None,
+                      memory=None, disk=None, pool=None, profiles=None,
+                      ephemeral=False, start=True, bootstrap=None, description="",
+                      name_prefix=None):
+        name = self._record_name(name, "template")
+        image = str(image or "").strip()
+        if not image:
+            raise ServiceError("A template needs an image, e.g. 'ubuntu:24.04'.")
+        if instance_type not in store.INSTANCE_TYPES:
+            raise ServiceError("Unknown instance type '%s'. Try: %s"
+                               % (instance_type, ", ".join(store.INSTANCE_TYPES)))
+        prefix = str(name_prefix or "").strip() or instance_prefix(name)
+        if not VALID_PREFIX.match(prefix):
+            raise ServiceError(
+                "Invalid name prefix '%s'. Use letters, digits and dashes, "
+                "starting with a letter (max 50 chars)." % prefix)
+
+        available = discover_modules()
+        bootstrap = bootstrap or {}
+        selection = self._stored_selection(
+            bootstrap.get("modules"), bootstrap.get("params"),
+            bootstrap.get("ssh_keys"), available)
+        if selection["modules"] and not start:
+            raise ServiceError(
+                "Bootstrap modules need the instance to start, so 'start' "
+                "cannot be disabled.")
+        # Launching is meant to be one click, so anything it would need asking
+        # for -- other than a secret, which cannot be kept -- is required now.
+        needs_keys = [available[m]["name"] for m in selection["modules"]
+                      if available[m]["uses_ssh_keys"]]
+        if needs_keys and not selection["ssh_keys"]:
+            raise ServiceError(
+                "%s installs SSH keys, so the template needs at least one."
+                % " and ".join(needs_keys))
+
+        return store.save_template(name, {
+            "description": str(description or "")[:200],
+            "name_prefix": prefix,
+            "image": image,
+            "type": instance_type,
+            "cpu": str(cpu).strip() if cpu else "",
+            # Checked now so a typo fails on save rather than on every launch.
+            "memory": normalize_size(memory, "memory limit") or "",
+            "disk": normalize_size(disk, "disk size") or "",
+            "pool": str(pool).strip() if pool else "",
+            "profiles": [str(p) for p in profiles or []],
+            "ephemeral": bool(ephemeral),
+            "start": bool(start),
+            "bootstrap": selection,
+        })
+
+    def delete_template(self, name):
+        if not store.delete_template(name):
+            raise ServiceError("No such template '%s'." % name, 404)
+        return {"deleted": name}
+
+    def _template(self, name):
+        template = next((t for t in self.list_templates() if t["name"] == name), None)
+        if not template:
+            raise ServiceError("No such template '%s'." % name, 404)
+        return template
+
+    def _launch_bootstrap(self, template, params):
+        """The bootstrap a launch of ``template`` would run, or raise.
+
+        Anything that would fail for every instance -- a missing secret, a
+        module deleted since the template was saved -- is caught here, before
+        anything is created or destroyed.
+        """
+        selection = template["bootstrap"]
+        if not selection["modules"]:
+            return None
+        available = discover_modules()
+        gone = [m for m in selection["modules"] if m not in available]
+        if gone:
+            raise ServiceError(
+                "Template '%s' uses module(s) that no longer exist: %s"
+                % (template["name"], ", ".join(gone)), 409)
+        selected = [available[m] for m in selection["modules"]]
+        values = dict(selection["params"])
+        values.update({str(k): str(v) for k, v in (params or {}).items()})
+        missing = sorted(n for n in secret_param_names(selected) if not values.get(n))
+        if missing:
+            raise ServiceError(
+                "Supply a value for %s -- secrets are never saved in a "
+                "template." % ", ".join(missing))
+        if any(m["uses_ssh_keys"] for m in selected) and not selection["ssh_keys"]:
+            raise ServiceError(
+                "Template '%s' has no usable SSH key; edit it to add one."
+                % template["name"], 409)
+        return {"modules": selection["modules"], "params": values,
+                "ssh_keys": selection["ssh_keys"]}
+
+    def _create_from_template(self, template, bootstrap, instance_name):
+        """One instance, reported rather than raised so its siblings carry on."""
+        try:
+            container = self.create_container(
+                name=instance_name, image=template["image"],
+                instance_type=template["type"],
+                profiles=template["profiles"] or None,
+                cpu=template["cpu"] or None, memory=template["memory"] or None,
+                disk=template["disk"] or None, pool=template["pool"] or None,
+                ephemeral=template["ephemeral"], start=template["start"],
+                config={TEMPLATE_CONFIG_KEY: template["name"]}, bootstrap=bootstrap,
+                # A template launches its own values; it should not quietly
+                # rewrite the module settings the create form starts from.
+                remember_params=False,
+            )
+        except (ServiceError, LXDError, BootstrapError) as exc:
+            return {"name": instance_name, "ok": False, "error": str(exc),
+                    "container": None}
+        except Exception:                             # noqa: BLE001
+            return {"name": instance_name, "ok": False,
+                    "error": "Unexpected error while creating this instance.",
+                    "container": None}
+        result = container.get("bootstrap")
+        return {"name": instance_name, "ok": result is None or result["ok"],
+                "error": None, "container": container}
+
+    def _remove_instance(self, instance_name):
+        """Stop and delete one instance; reported rather than raised."""
+        try:
+            self.delete_container(instance_name, force=True)
+        except LXDError as exc:
+            # An ephemeral instance deletes itself when stopped, so the delete
+            # that follows finds nothing -- which is the outcome wanted.
+            if exc.code != 404:
+                return {"name": instance_name, "ok": False, "error": str(exc),
+                        "container": None}
+        except ServiceError as exc:
+            return {"name": instance_name, "ok": False, "error": str(exc),
+                    "container": None}
+        return {"name": instance_name, "ok": True, "error": None, "container": None}
+
+    def _each(self, names, work, workers=None):
+        """Run ``work`` over instance names a few at a time, keeping order."""
+        if not names:
+            return []
+        limit = min(len(names), workers or self.LAUNCH_WORKERS)
+        with ThreadPoolExecutor(max_workers=limit) as pool:
+            return list(pool.map(work, names))
+
+    def launch_template(self, name, count=1, prefix=None, params=None, background=False):
+        """Create ``count`` instances from a template, several at a time.
+
+        Anything that would fail for every instance -- a missing secret or
+        module, a bad count -- is refused before one is created. After that,
+        each instance reports its own outcome: one failing to create or to
+        bootstrap does not stop the others, and the ones that exist stay.
+        """
+        template = self._template(name)
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            raise ServiceError("Count must be a whole number.")
+        if not 1 <= count <= self.MAX_LAUNCH:
+            raise ServiceError("Launch between 1 and %d instances at a time."
+                               % self.MAX_LAUNCH)
+        prefix = (str(prefix or "").strip() or template["name_prefix"]
+                  or instance_prefix(template["name"]))
+        if not VALID_PREFIX.match(prefix):
+            raise ServiceError(
+                "Invalid name prefix '%s'. Use letters, digits and dashes, "
+                "starting with a letter (max 50 chars)." % prefix)
+        bootstrap = self._launch_bootstrap(template, params)
+
+        def work():
+            # Names are picked inside the run, so two launches cannot pick alike.
+            return self._each(
+                self._free_names(prefix, count),
+                lambda n: self._create_from_template(template, bootstrap, n))
+        return self._tracked(template["name"], "launch", count, work, background)
+
+    def template_instances(self, name):
+        """Names of the instances launched from template ``name``, sorted."""
+        return sorted(c["name"] for c in self.list_containers() if c["template"] == name)
+
+    def _confirmed_instances(self, name, confirmed):
+        """The template's instances, provided they are exactly what was confirmed.
+
+        Destroying by tag alone would also take out an instance launched after
+        the user looked -- by another tab, or the CLI. So the caller names what
+        it showed, and any difference refuses the whole request.
+        """
+        if not isinstance(confirmed, list) or not all(isinstance(n, str) for n in confirmed):
+            raise ServiceError(
+                "List the instances to act on in 'instances', as confirmed.")
+        current = self.template_instances(name)
+        if sorted(set(confirmed)) != current:
+            raise ServiceError(
+                "The instances from template '%s' have changed since they were "
+                "confirmed (now: %s). Nothing was changed; review and try again."
+                % (name, ", ".join(current) or "none"), 409)
+        if not current:
+            raise ServiceError("No instances were launched from template '%s'." % name, 404)
+        return current
+
+    def destroy_template_instances(self, name, instances, background=False):
+        """Stop and delete every instance launched from a template.
+
+        Works for a template that has since been deleted too, since the tag on
+        the instances is all it needs.
+        """
+        names = self._confirmed_instances(name, instances)
+        return self._tracked(name, "destroy", len(names),
+                             lambda: self._each(names, self._remove_instance), background)
+
+    def recreate_template_instances(self, name, instances, params=None, background=False):
+        """Replace each of a template's instances with a fresh one of the same name.
+
+        The new instances take the template as it is now, so this is also how
+        an edited template reaches instances launched before the edit. Every
+        check that could fail for all of them runs before anything is deleted;
+        after that, an instance that fails to delete is left alone rather than
+        recreated alongside itself.
+        """
+        template = self._template(name)
+        names = self._confirmed_instances(name, instances)
+        bootstrap = self._launch_bootstrap(template, params)
+
+        def replace(instance_name):
+            removed = self._remove_instance(instance_name)
+            if not removed["ok"]:
+                return dict(removed, error="Not recreated: could not delete it: %s"
+                            % removed["error"])
+            return self._create_from_template(template, bootstrap, instance_name)
+
+        return self._tracked(name, "recreate", len(names),
+                             lambda: self._each(names, replace), background)
+
+    # A command is mostly waiting on the guest, not on the host, so it can
+    # fan out wider than a create.
+    EXEC_WORKERS = 10
+    # Each stream is cut to its last part: run records are polled every few
+    # seconds, and a chatty command on twenty instances would otherwise ship
+    # megabytes each time.
+    EXEC_OUTPUT_LIMIT = 32 * 1024
+    MAX_EXEC_TIMEOUT = 3600
+
+    def exec_template_instances(self, name, command, instances, timeout=300,
+                                background=False):
+        """Run one shell command on some or all of a template's instances at once.
+
+        ``instances`` names where to run it -- what the user picked -- and each
+        must still be one of the template's. Unlike destroy, a subset is the
+        normal case: stopped instances cannot run anything. A command that
+        runs and exits non-zero is a result for that instance, not an error for
+        the whole run.
+        """
+        command = str(command or "").strip()
+        if not command:
+            raise ServiceError("No command given.")
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            raise ServiceError("Timeout must be a whole number of seconds.")
+        if not 1 <= timeout <= self.MAX_EXEC_TIMEOUT:
+            raise ServiceError("Timeout must be between 1 and %d seconds."
+                               % self.MAX_EXEC_TIMEOUT)
+        names = self._members_among(name, instances)
+        limit = self.EXEC_OUTPUT_LIMIT
+
+        def tail(text):
+            text = text or ""
+            return (text[-limit:], True) if len(text) > limit else (text, False)
+
+        def run_one(instance_name):
+            try:
+                outcome = self.exec_command(instance_name, command, timeout=timeout)
+            except (ServiceError, LXDError) as exc:
+                return {"name": instance_name, "ok": False, "error": str(exc),
+                        "container": None, "exec": None}
+            stdout, cut_out = tail(outcome.get("stdout"))
+            stderr, cut_err = tail(outcome.get("stderr"))
+            exit_code = outcome.get("exit_code", 0)
+            return {"name": instance_name, "ok": exit_code == 0, "error": None,
+                    "container": None,
+                    "exec": {"exit_code": exit_code, "stdout": stdout, "stderr": stderr,
+                             "truncated": cut_out or cut_err}}
+
+        return self._tracked(
+            name, "exec", len(names),
+            lambda: self._each(names, run_one, workers=self.EXEC_WORKERS),
+            background, command=command)
+
+    def _members_among(self, name, instances):
+        """The named instances, provided every one still belongs to the template."""
+        if (not isinstance(instances, list) or not instances
+                or not all(isinstance(n, str) for n in instances)):
+            raise ServiceError("List the instances to run on in 'instances'.")
+        members = set(self.template_instances(name))
+        strangers = sorted(set(instances) - members)
+        if strangers:
+            raise ServiceError(
+                "%s %s not from template '%s' (any more). Nothing was run."
+                % (", ".join(strangers), "is" if len(strangers) == 1 else "are", name), 409)
+        return sorted(set(instances))
+
+    def _tracked(self, name, action, count, work, background=False, command=None):
+        """Run ``work`` as the one operation on a template's instances.
+
+        The run is recorded so any client can follow it and find its result.
+        With ``background`` the call returns that record at once and the work
+        runs on a thread -- how the web UI starts every run, so nothing depends
+        on the request staying open. Without, it blocks and returns the result,
+        which is what the CLI wants. Only one runs per template, since a second
+        recreate or destroy would be deleting instances the first is in the
+        middle of bootstrapping.
+        """
+        with self._runs_lock:
+            current = self._runs.get(name)
+            if current and current["finished_at"] is None:
+                raise ServiceError(
+                    "Template '%s' is already busy: %s of %d instance(s) is still "
+                    "running. Wait for it to finish." % (
+                        name, current["action"], current["count"]), 409)
+            run = {"template": name, "action": action, "count": count,
+                   "command": command, "started_at": time.time(), "finished_at": None,
+                   "result": None, "error": None}
+            self._runs[name] = run
+
+        def execute():
+            result = error = None
+            try:
+                instances = work()
+                result = {"template": name, "ok": all(i["ok"] for i in instances),
+                          "instances": instances}
+                return result
+            except (ServiceError, LXDError, BootstrapError) as exc:
+                error = str(exc)
+                raise
+            except Exception:
+                error = "Unexpected error while running %s." % action
+                raise
+            finally:
+                with self._runs_lock:
+                    run.update(finished_at=time.time(), result=result, error=error)
+
+        if background:
+            self._in_background("%s-%s" % (action, name), execute)
+            with self._runs_lock:
+                return dict(run)
+        return execute()
+
+    def template_runs(self):
+        """Every recorded run, in progress or finished, oldest first.
+
+        Kept by this process only, for as long as it runs: the CLI in another
+        process neither sees these nor is blocked by them.
+        """
+        with self._runs_lock:
+            return sorted((dict(run) for run in self._runs.values()),
+                          key=lambda run: run["started_at"])
+
+    def dismiss_template_run(self, name):
+        """Forget a finished run's result. One still running cannot be dismissed."""
+        with self._runs_lock:
+            run = self._runs.get(name)
+            if not run:
+                raise ServiceError("No recorded run for template '%s'." % name, 404)
+            if run["finished_at"] is None:
+                raise ServiceError("That run is still in progress.", 409)
+            del self._runs[name]
+        return {"dismissed": name}
+
+    def _free_names(self, prefix, count):
+        """The lowest ``<prefix>-<n>`` names no instance has taken."""
+        taken = {i.get("name") for i in self.lxd.list_instances()}
+        names, index = [], 1
+        while len(names) < count:
+            candidate = "%s-%d" % (prefix, index)
+            if candidate not in taken:
+                names.append(candidate)
+            index += 1
+        return names
 
     def list_ssh_keys(self):
         """Public keys found on the host, offered for installing into containers."""
@@ -1002,8 +1622,487 @@ class ContainerService:
             for p in self.lxd.list_profiles()
         ]
 
+    # -- storage ----------------------------------------------------------
+
+    def storage(self):
+        """Storage pools and volumes, with local-driver management flags."""
+        environment = (self.lxd.server_info() or {}).get("environment") or {}
+        available = self._available_storage_drivers(environment)
+        clustered = bool(environment.get("server_clustered"))
+        root_pool = self._root_pool(["default"])
+        pools = []
+        volumes = []
+
+        for record in self.lxd.list_storage_pools():
+            pool = self._storage_pool_summary(record, root_pool, available, clustered)
+            pool_volumes = [
+                self._storage_volume_summary(pool["name"], volume, pool["manageable"])
+                for volume in self.lxd.list_storage_volumes(pool["name"])
+            ]
+            pool["volume_count"] = len(pool_volumes)
+            pool["delete_plan"] = self._storage_pool_delete_plan(pool, pool_volumes)
+            pools.append(pool)
+            volumes.extend(pool_volumes)
+
+        pools.sort(key=lambda pool: pool["name"] or "")
+        volumes.sort(key=lambda volume: (volume["pool"] or "", volume["name"] or ""))
+        return {
+            "clustered": clustered,
+            "local_drivers": [
+                {
+                    "name": name,
+                    "available": name in available,
+                    "supports_quota": name in QUOTA_CAPABLE_DRIVERS,
+                    "supports_custom_block": True,
+                }
+                for name in sorted(LOCAL_STORAGE_DRIVERS)
+            ],
+            "pools": pools,
+            "volumes": volumes,
+        }
+
+    def get_storage_pool(self, name):
+        overview = self.storage()
+        pool = next((pool for pool in overview["pools"] if pool["name"] == name), None)
+        if pool is None:
+            raise ServiceError("No storage pool called '%s'." % name, 404)
+        pool["volumes"] = [
+            volume for volume in overview["volumes"] if volume["pool"] == name
+        ]
+        return pool
+
+    def create_storage_pool(self, name, driver, source=None, size=None,
+                            description="", config=None):
+        self._check_storage_name(name, "pool")
+        driver = str(driver or "").strip().lower()
+        available = self._storage_mutation_context()
+        if driver not in LOCAL_STORAGE_DRIVERS:
+            raise ServiceError(
+                "Storage driver '%s' is not managed by lemondx. Use one of: %s."
+                % (driver, ", ".join(sorted(LOCAL_STORAGE_DRIVERS)))
+            )
+        if driver not in available:
+            raise ServiceError(
+                "Storage driver '%s' is not available on this host. Available local "
+                "drivers: %s." % (
+                    driver, ", ".join(sorted(available & LOCAL_STORAGE_DRIVERS)) or "none")
+            )
+        values = self._storage_config(config, LOCAL_POOL_CONFIG[driver])
+        if "volume.size" in values:
+            values["volume.size"] = normalize_size(values["volume.size"], "default volume size")
+        if source:
+            values["source"] = str(source).strip()
+        if size:
+            if driver == "dir":
+                raise ServiceError("The dir driver does not accept a pool size.")
+            if source:
+                raise ServiceError(
+                    "Pool size is only supported for daemon-managed loop-backed storage.")
+            values["size"] = normalize_size(size, "pool size")
+        self.lxd.create_storage_pool(name, driver, values)
+        if description:
+            created = self.lxd.get_storage_pool(name)
+            self.lxd.update_storage_pool(name, description, created.get("config") or {})
+        return self.get_storage_pool(name)
+
+    def update_storage_pool(self, name, description=None, size=None, config=None):
+        available = self._storage_mutation_context()
+        current = self.lxd.get_storage_pool(name)
+        driver = self._require_local_pool(current, available)
+        values = dict(current.get("config") or {})
+        updates = self._storage_config(config, LOCAL_POOL_CONFIG[driver])
+        if "volume.size" in updates:
+            updates["volume.size"] = normalize_size(
+                updates["volume.size"], "default volume size")
+        values.update(updates)
+        if size is not None:
+            if driver == "dir":
+                raise ServiceError("The dir driver does not accept a pool size.")
+            current_size = (current.get("config") or {}).get("size")
+            if not current_size:
+                raise ServiceError(
+                    "Only loop-backed storage pools can be resized by lemondx.")
+            normalized = normalize_size(size, "pool size")
+            new_bytes = parse_byte_size(normalized)
+            current_bytes = parse_byte_size(current_size)
+            if new_bytes is None:
+                raise ServiceError("Pool size cannot be empty.")
+            if current_bytes is None:
+                raise ServiceError("The pool's current size cannot be determined safely.")
+            if new_bytes < current_bytes:
+                raise ServiceError("Storage pools can grow but cannot be shrunk.")
+            values["size"] = normalized
+        current_description = current.get("description") or ""
+        self.lxd.update_storage_pool(
+            name, current_description if description is None else description, values)
+        return self.get_storage_pool(name)
+
+    def delete_storage_pool(self, name, force=False, confirmation=None,
+                            expected_plan=None):
+        available = self._storage_mutation_context()
+        current = self.lxd.get_storage_pool(name)
+        self._require_local_pool(current, available)
+        volumes = self.lxd.list_storage_volumes(name)
+        used_by = current.get("used_by") or []
+        plan = self._storage_pool_delete_plan(current, volumes)
+        if force:
+            if confirmation != name:
+                raise ServiceError("Type the pool name exactly to confirm force deletion.")
+            if expected_plan != plan:
+                raise ServiceError(
+                    "The resources in storage pool '%s' changed. Review them and confirm again."
+                    % name, 409)
+            if plan["other_references"] or plan["other_volumes"]:
+                raise ServiceError(
+                    "Storage pool '%s' has resources lemondx cannot safely remove: %s."
+                    % (name, ", ".join(
+                        plan["other_references"] + plan["other_volumes"])), 409)
+        if used_by or volumes:
+            if not force:
+                raise ServiceError(
+                    "Storage pool '%s' is still in use (%d references, %d volumes)."
+                    % (name, len(used_by), len(volumes)), 409)
+
+            for instance in plan["instances"]:
+                self.delete_container(instance, force=True)
+            for instance in plan["attached_instances"]:
+                self.delete_container(instance, force=True)
+            for profile_name in plan["profiles"]:
+                profile = self.lxd.get_profile(profile_name)
+                devices = {
+                    key: value for key, value in (profile.get("devices") or {}).items()
+                    if value.get("pool") != name
+                }
+                self.lxd.update_profile(profile_name, {
+                    "description": profile.get("description") or "",
+                    "config": profile.get("config") or {},
+                    "devices": devices,
+                })
+            for fingerprint in plan["images"]:
+                self.lxd.delete_image(fingerprint)
+            for volume_name in plan["custom_volumes"]:
+                self.lxd.delete_storage_volume(name, volume_name)
+        detached = current.get("driver") == "zfs"
+        if detached:
+            config = current.get("config") or {}
+            source = config.get("zfs.pool_name") or config.get("source") or name
+            zpool = source.split("/", 1)[0]
+            if not zpool or zpool in (".", "..") or not os.path.isdir(ZFS_KSTAT_ROOT):
+                raise ServiceError(
+                    "Cannot verify whether ZFS pool '%s' is imported. Export it on the "
+                    "host, then retry." % zpool, 409)
+            if os.path.isdir(os.path.join(ZFS_KSTAT_ROOT, zpool)):
+                raise ServiceError(
+                    "LXD resources were removed. To preserve ZFS pool '%s', run "
+                    "'sudo zpool export %s' on the host, then retry this deletion to "
+                    "remove only the LXD registration." % (zpool, zpool), 409)
+
+        self.lxd.delete_storage_pool(name)
+        return {
+            "deleted": name,
+            "detached": detached,
+            "cascade": plan if force else None,
+        }
+
+    def _storage_pool_delete_plan(self, pool, volumes):
+        instances = set()
+        attached_instances = set()
+        images = set()
+        profiles = set()
+        custom_volumes = set()
+        other_references = set()
+        other_volumes = set()
+
+        def classify_reference(reference, attached=False):
+            parsed = urllib.parse.urlsplit(str(reference or ""))
+            query = urllib.parse.parse_qs(parsed.query)
+            active_project = getattr(self.lxd, "project", "default") or "default"
+            reference_project = (query.get("project") or [active_project])[0]
+            if reference_project != active_project:
+                other_references.add(str(reference))
+                return
+            path = parsed.path.rstrip("/")
+            parts = path.split("/")
+            if len(parts) >= 4 and parts[1] == "1.0":
+                kind, value = parts[2], urllib.parse.unquote(parts[3])
+                if kind == "instances":
+                    (attached_instances if attached else instances).add(value)
+                    return
+                if kind == "images":
+                    images.add(value)
+                    return
+                if kind == "profiles":
+                    profiles.add(value)
+                    return
+            if reference:
+                other_references.add(str(reference))
+
+        for reference in pool.get("used_by") or []:
+            classify_reference(reference)
+        for volume in volumes:
+            volume_type = volume.get("type") or ""
+            volume_name = volume.get("name") or ""
+            if volume_type in ("container", "virtual-machine"):
+                instances.add(volume_name.split("/", 1)[0])
+            elif volume_type == "image":
+                images.add(volume_name)
+            elif volume_type == "custom":
+                custom_volumes.add(volume_name)
+                for reference in volume.get("used_by") or []:
+                    classify_reference(reference, attached=True)
+            else:
+                other_volumes.add("%s/%s" % (volume_type or "unknown", volume_name))
+        return {
+            "instances": sorted(instances),
+            "attached_instances": sorted(attached_instances - instances),
+            "images": sorted(images),
+            "custom_volumes": sorted(custom_volumes),
+            "profiles": sorted(profiles),
+            "other_references": sorted(other_references),
+            "other_volumes": sorted(other_volumes),
+        }
+
+    def get_storage_volume(self, pool, name):
+        pool_record = self.lxd.get_storage_pool(pool)
+        environment = (self.lxd.server_info() or {}).get("environment") or {}
+        available = self._available_storage_drivers(environment)
+        manageable = (
+            pool_record.get("driver") in LOCAL_STORAGE_DRIVERS
+            and pool_record.get("driver") in available
+            and not environment.get("server_clustered")
+        )
+        try:
+            volume = self.lxd.get_storage_volume(pool, "custom", name)
+        except LXDError as exc:
+            if exc.code == 404:
+                raise ServiceError(
+                    "No custom volume '%s' in pool '%s'." % (name, pool), 404) from exc
+            raise
+        return self._storage_volume_summary(pool, volume, manageable)
+
+    def create_storage_volume(self, pool, name, content_type="filesystem", size=None,
+                              description="", config=None):
+        self._check_storage_name(name, "volume")
+        self._require_local_pool(
+            self.lxd.get_storage_pool(pool), self._storage_mutation_context())
+        if content_type not in ("filesystem", "block"):
+            raise ServiceError("Content type must be 'filesystem' or 'block'.")
+        values = self._storage_config(config, LOCAL_VOLUME_CONFIG)
+        if size:
+            values["size"] = normalize_size(size, "volume size")
+        self.lxd.create_storage_volume(
+            pool, name, content_type=content_type, config=values,
+            description=description)
+        return self.get_storage_volume(pool, name)
+
+    def update_storage_volume(self, pool, name, description=None, size=None, config=None):
+        self._require_local_pool(
+            self.lxd.get_storage_pool(pool), self._storage_mutation_context())
+        current = self.lxd.get_storage_volume(pool, "custom", name)
+        values = dict(current.get("config") or {})
+        values.update(self._storage_config(config, LOCAL_VOLUME_CONFIG))
+        if size is not None:
+            normalized = normalize_size(size, "volume size")
+            current_size = (current.get("config") or {}).get("size")
+            if current.get("content_type") == "block" and current_size:
+                new_bytes = parse_byte_size(normalized)
+                current_bytes = parse_byte_size(current_size)
+                if new_bytes is None:
+                    raise ServiceError("Volume size cannot be empty.")
+                if current_bytes is None:
+                    raise ServiceError(
+                        "The volume's current size cannot be determined safely.")
+                if new_bytes < current_bytes:
+                    raise ServiceError("Block volumes can grow but cannot be shrunk.")
+            values["size"] = normalized
+        current_description = current.get("description") or ""
+        self.lxd.update_storage_volume(
+            pool, name, current_description if description is None else description, values)
+        return self.get_storage_volume(pool, name)
+
+    def delete_storage_volume(self, pool, name):
+        self._require_local_pool(
+            self.lxd.get_storage_pool(pool), self._storage_mutation_context())
+        current = self.lxd.get_storage_volume(pool, "custom", name)
+        if current.get("used_by"):
+            raise ServiceError(
+                "Storage volume '%s' is attached and cannot be deleted." % name, 409)
+        self.lxd.delete_storage_volume(pool, name)
+        return {"deleted": name, "pool": pool}
+
+    def _storage_pool_summary(self, record, root_pool, available, clustered):
+        name = record.get("name")
+        driver = record.get("driver") or ""
+        space = (self.lxd.storage_pool_resources(name) or {}).get("space") or {}
+        manageable = driver in LOCAL_STORAGE_DRIVERS and driver in available and not clustered
+        config = _safe_storage_config(record.get("config") or {})
+        if driver not in LOCAL_STORAGE_DRIVERS:
+            config.pop("source", None)
+        return {
+            "name": name,
+            "driver": driver,
+            "description": record.get("description") or "",
+            "config": config,
+            "source": config.get("source") or "",
+            "used_by": list(record.get("used_by") or []),
+            "used_by_count": len(record.get("used_by") or []),
+            "total": space.get("total") or 0,
+            "used": space.get("used") or 0,
+            "root": name == root_pool,
+            "supports_quota": driver in QUOTA_CAPABLE_DRIVERS,
+            "manageable": manageable,
+            "read_only_reason": "" if manageable else (
+                "Clustered storage is read-only in lemondx." if clustered
+                else "Only dir, btrfs, lvm and zfs pools are managed by lemondx."
+            ),
+        }
+
+    def _storage_volume_summary(self, pool, record, pool_manageable):
+        volume_type = record.get("type") or ""
+        return {
+            "pool": pool,
+            "name": record.get("name"),
+            "type": volume_type,
+            "content_type": record.get("content_type") or "filesystem",
+            "description": record.get("description") or "",
+            "config": _safe_storage_config(record.get("config") or {}),
+            "size": (record.get("config") or {}).get("size") or "",
+            "used_by": list(record.get("used_by") or []),
+            "manageable": pool_manageable and volume_type == "custom",
+        }
+
+    def _available_storage_drivers(self, environment=None):
+        if environment is None:
+            environment = (self.lxd.server_info() or {}).get("environment") or {}
+        return {
+            driver.get("Name") for driver in environment.get("storage_supported_drivers") or []
+            if driver.get("Name")
+        }
+
+    def _storage_mutation_context(self):
+        environment = (self.lxd.server_info() or {}).get("environment") or {}
+        if environment.get("server_clustered"):
+            raise ServiceError("Storage changes are not supported on clustered servers.", 409)
+        return self._available_storage_drivers(environment)
+
+    def _require_local_pool(self, record, available):
+        driver = record.get("driver") or ""
+        if driver not in LOCAL_STORAGE_DRIVERS:
+            raise ServiceError(
+                "Pool '%s' uses the unsupported '%s' driver and is read-only."
+                % (record.get("name") or "", driver), 409)
+        if driver not in available:
+            raise ServiceError(
+                "Pool '%s' uses '%s', which is not available on this host."
+                % (record.get("name") or "", driver), 409)
+        return driver
+
+    def _storage_config(self, config, allowed):
+        if config is None:
+            return {}
+        if not isinstance(config, dict):
+            raise ServiceError("Storage config must be an object of key/value strings.")
+        result = {}
+        for key, value in config.items():
+            if key not in allowed:
+                raise ServiceError("Storage config key '%s' is not supported." % key)
+            if not isinstance(value, (str, int, float, bool)):
+                raise ServiceError("Storage config value for '%s' must be a string." % key)
+            result[key] = str(value).lower() if isinstance(value, bool) else str(value)
+        return result
+
+    def _check_storage_name(self, name, what):
+        if not VALID_NAME.match(name or ""):
+            raise ServiceError(
+                "Invalid %s name '%s'. Use letters, digits and dashes, starting "
+                "with a letter (max 62 chars)." % (what, name)
+            )
+
+    # -- resources ---------------------------------------------------------
+
+    def resources(self):
+        """What the host has, and how much of it instances have claimed.
+
+        "Allocated" is the sum of limits, not a measurement: an instance with
+        no limit can use everything and is listed by name instead of being
+        guessed at. CPU and memory only count for instances that are running
+        or frozen, with what stopped ones would add reported separately; disk
+        counts for every instance, since a stopped one still occupies its pool.
+        Allocations are for the current project, host figures for the host.
+        """
+        host = self.lxd.resources() or {}
+        cpu_info = host.get("cpu") or {}
+        memory_info = host.get("memory") or {}
+        sockets = cpu_info.get("sockets") or []
+        threads = cpu_info.get("total") or 0
+        memory_total = memory_info.get("total") or 0
+
+        pools = self.lxd.list_storage_pools()
+        pool_config = {p.get("name"): p.get("config") or {} for p in pools}
+
+        instances = [_instance_allocation(i, memory_total, pool_config)
+                     for i in self.lxd.list_instances()]
+        instances.sort(key=lambda i: i["name"] or "")
+        active = [i for i in instances if i["active"]]
+        stopped = [i for i in instances if not i["active"]]
+
+        def claimed(rows, kind, unit):
+            return sum(r[kind][unit] for r in rows if r[kind][unit] is not None)
+
+        storage = []
+        for pool in pools:
+            name = pool.get("name")
+            space = (self.lxd.storage_pool_resources(name) or {}).get("space") or {}
+            on_pool = [i for i in instances if i["disk"]["pool"] == name]
+            storage.append({
+                "name": name,
+                "driver": pool.get("driver"),
+                "supports_quota": pool.get("driver") in QUOTA_CAPABLE_DRIVERS,
+                "total": space.get("total") or 0,
+                "used": space.get("used") or 0,
+                "allocated": claimed(on_pool, "disk", "bytes"),
+                "unlimited": [i["name"] for i in on_pool if i["disk"]["bytes"] is None],
+            })
+
+        return {
+            "host": {
+                "architecture": cpu_info.get("architecture") or "",
+                "cpu_model": (sockets[0].get("name") or "") if sockets else "",
+                "cpu_sockets": len(sockets),
+                "cpu_cores": sum(len(s.get("cores") or []) for s in sockets),
+                "cpu_threads": threads,
+                "memory_total": memory_total,
+                "memory_used": memory_info.get("used") or 0,
+            },
+            "cpu": {
+                "total": threads,
+                "allocated": claimed(active, "cpu", "count"),
+                "stopped": claimed(stopped, "cpu", "count"),
+                "unlimited": [i["name"] for i in active if i["cpu"]["count"] is None],
+            },
+            "memory": {
+                "total": memory_total,
+                "used": memory_info.get("used") or 0,
+                "instances_used": sum(i["memory"]["usage"] for i in active),
+                "allocated": claimed(active, "memory", "bytes"),
+                "stopped": claimed(stopped, "memory", "bytes"),
+                "unlimited": [i["name"] for i in active if i["memory"]["bytes"] is None],
+            },
+            "storage": storage,
+            "instances": instances,
+        }
+
 
 # -- normalisation helpers -------------------------------------------------
+
+
+def _safe_storage_config(config):
+    """Return storage config without values that could contain credentials."""
+    sensitive = ("password", "token", "secret", "private", "credential", "api_key")
+    return {
+        key: value for key, value in config.items()
+        if not any(part in key.lower() for part in sensitive)
+    }
 
 
 def _is_true(value):
@@ -1016,6 +2115,110 @@ def _address_key(address):
     if len(parts) == 4 and all(p.isdigit() for p in parts):
         return (0, [int(p) for p in parts])
     return (1, [str(address)])
+
+
+def parse_byte_size(value, total=None):
+    """Bytes in a size the daemon wrote, or None if it is unset or unreadable.
+
+    ``total`` resolves a percentage, which ``limits.memory`` allows.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("%"):
+        try:
+            percent = float(text[:-1])
+        except ValueError:
+            return None
+        return int(total * percent / 100) if total else None
+    match = _BYTE_SIZE.match(text)
+    if not match or match.group(2).lower() not in _BYTE_UNITS:
+        return None
+    return int(float(match.group(1)) * _BYTE_UNITS[match.group(2).lower()])
+
+
+def cpu_count(value):
+    """How many CPUs ``limits.cpu`` grants, or None if it is unset or unreadable.
+
+    The key is overloaded: a bare number is a count, while a range or list
+    ("0-3", "1,5", even "2-2") pins specific CPUs and grants that many.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    pinned = set()
+    for part in text.split(","):
+        low, _, high = part.strip().partition("-")
+        if not low.isdigit() or (high and not high.isdigit()):
+            return None
+        pinned.update(range(int(low), int(high or low) + 1))
+    return len(pinned) or None
+
+
+def _instance_allocation(instance, memory_total, pool_config):
+    """One instance's claim on CPU, memory and disk, with where it came from.
+
+    ``implicit`` marks a value the daemon supplied rather than the config, so
+    a front end can tell a chosen limit from a default.
+    """
+    config = instance.get("expanded_config") or instance.get("config") or {}
+    devices = instance.get("expanded_devices") or instance.get("devices") or {}
+    state = instance.get("state") or {}
+    status = instance.get("status") or state.get("status") or "Unknown"
+    is_vm = instance.get("type") == "virtual-machine"
+
+    cpu_limit = str(config.get("limits.cpu") or "").strip()
+    cpu_implicit = is_vm and not cpu_limit
+    if cpu_implicit:
+        cpu_limit = str(VM_DEFAULTS["cpu"])
+
+    memory_limit = str(config.get("limits.memory") or "").strip()
+    memory_implicit = is_vm and not memory_limit
+    if memory_implicit:
+        memory_limit = VM_DEFAULTS["memory"]
+
+    root_name, root = next(
+        ((n, d) for n, d in sorted(devices.items())
+         if d.get("type") == "disk" and d.get("path") == "/"),
+        (None, {}))
+    pool = root.get("pool")
+    disk_size = str(root.get("size") or "").strip()
+    disk_implicit = False
+    if not disk_size:
+        # A pool's volume.size applies to every volume created without one.
+        disk_size = str((pool_config.get(pool) or {}).get("volume.size") or "").strip()
+        if not disk_size and is_vm:
+            disk_size = VM_DEFAULTS["disk"]
+        disk_implicit = bool(disk_size)
+    disk_state = (state.get("disk") or {}).get(root_name) or {}
+
+    return {
+        "name": instance.get("name"),
+        "type": instance.get("type") or "container",
+        "status": status,
+        "active": status in ACTIVE_STATUSES,
+        "cpu_time_ns": (state.get("cpu") or {}).get("usage") or 0,
+        "cpu": {
+            "limit": cpu_limit,
+            "count": cpu_count(cpu_limit),
+            "implicit": cpu_implicit,
+        },
+        "memory": {
+            "limit": memory_limit,
+            "bytes": parse_byte_size(memory_limit, memory_total),
+            "usage": (state.get("memory") or {}).get("usage") or 0,
+            "implicit": memory_implicit,
+        },
+        "disk": {
+            "pool": pool,
+            "size": disk_size,
+            "bytes": parse_byte_size(disk_size),
+            "usage": disk_state.get("usage") or 0,
+            "implicit": disk_implicit,
+        },
+    }
 
 
 def _image_source(image, remotes):
@@ -1075,7 +2278,16 @@ def _summarize(instance):
         "network_rx": network_totals["rx"],
         "network_tx": network_totals["tx"],
         "snapshot_count": len(instance.get("snapshots") or []),
+        "template": config.get(TEMPLATE_CONFIG_KEY) or None,
     }
+
+
+def instance_prefix(name):
+    """A default instance-name prefix for a template called ``name``."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+    if not slug[:1].isalpha():
+        slug = ("instance-" + slug).strip("-")
+    return slug[:50].rstrip("-")
 
 
 def _image_alias(config):

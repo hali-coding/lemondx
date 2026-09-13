@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError, api } from './lib/api'
-import type { Container, CreateRequest, StateAction, Status } from './lib/types'
+import type {
+  Container, CreateProgress, CreateRequest, StateAction, Status, TemplateRun,
+} from './lib/types'
 import { useTheme } from './hooks/useTheme'
 import { useToasts } from './hooks/useToasts'
 import type { ToastKind } from './hooks/useToasts'
@@ -11,7 +13,10 @@ import { CreateDialog } from './components/CreateDialog'
 import { MoonIcon, PlusIcon, RefreshIcon, SunIcon } from './components/Icons'
 import { ModulesView } from './components/ModulesView'
 import { NetworkView } from './components/NetworkView'
+import { ResourcesView } from './components/ResourcesView'
 import { SetupBanner } from './components/SetupBanner'
+import { StorageView } from './components/StorageView'
+import { TemplatesView } from './components/TemplatesView'
 import { TokenGate } from './components/TokenGate'
 import { Toasts } from './components/Toasts'
 
@@ -23,6 +28,8 @@ export default function App() {
 
   const [status, setStatus] = useState<Status | null>(null)
   const [containers, setContainers] = useState<Container[] | null>(null)
+  const [creates, setCreates] = useState<CreateProgress[]>([])
+  const [templateRuns, setTemplateRuns] = useState<TemplateRun[]>([])
   const [connectionError, setConnectionError] = useState<string | null>(null)
   const [busy, setBusy] = useState<Record<string, boolean>>({})
   const [selected, setSelected] = useState<string | null>(null)
@@ -31,19 +38,101 @@ export default function App() {
   const [deleting, setDeleting] = useState(false)
   const [refreshToken, setRefreshToken] = useState(0)
   const [needsToken, setNeedsToken] = useState(false)
-  const [view, setView] = useState<'containers' | 'network' | 'modules'>('containers')
+  const [view, setView] = useState<
+    'containers' | 'templates' | 'resources' | 'storage' | 'network' | 'modules'
+  >('containers')
 
   // Any in-flight mutation pauses polling so it cannot clobber optimistic state.
   const mutating = useRef(0)
+  // Creates and template runs are started on the server and return at once,
+  // so a poll is the only way a page hears how one ended -- whether this page
+  // started it, another tab did, or it began before a reload. These hold the
+  // ones a poll (or the request starting them) has seen still running; a later
+  // poll finding one finished reports it, exactly once.
+  const watchedCreates = useRef(new Set<string>())
+  const watchedRuns = useRef(new Set<string>())
+
+  const notify = useCallback(
+    (kind: ToastKind, title: string, detail?: string) => push(kind, title, detail),
+    [push],
+  )
+
+  const reportCreates = useCallback((records: CreateProgress[]) => {
+    for (const record of records) {
+      if (record.finished_at === null) {
+        watchedCreates.current.add(record.name)
+        continue
+      }
+      if (!watchedCreates.current.delete(record.name)) continue
+      // Template runs report as a whole, below.
+      if (record.template) continue
+      if (record.error) {
+        notify('error', `Could not create ${record.name}`, record.error)
+      } else if (record.ok === false) {
+        notify('error', `Bootstrap of ${record.name} failed on “${record.failed_module ?? 'a module'}”`,
+          record.error_detail ?? 'The container was created, but a module did not finish.')
+      } else {
+        notify('success', `Created ${record.name}`, record.modules
+          ? `${record.modules} module(s) ran successfully.` : undefined)
+      }
+    }
+  }, [notify])
+
+  const reportRuns = useCallback((runs: TemplateRun[]) => {
+    for (const run of runs) {
+      const key = `${run.template}@${run.started_at}`
+      if (run.finished_at === null) {
+        watchedRuns.current.add(key)
+        continue
+      }
+      if (!watchedRuns.current.delete(key)) continue
+      const instances = run.result?.instances ?? []
+      const failed = instances.filter((i) => !i.ok)
+      if (run.action === 'exec') {
+        const what = `\`${run.command}\``
+        if (run.error) {
+          notify('error', `Could not run ${what} on “${run.template}”`, run.error)
+        } else if (failed.length > 0) {
+          notify('error', `${what} failed on ${failed.length} of ${instances.length} from “${run.template}”`,
+            failed.map((i) => `${i.name}: ${i.error ?? `exit ${i.exec?.exit_code}`}`).join('; '))
+        } else {
+          notify('success', `Ran ${what} on ${instances.length} from “${run.template}”`,
+            'Output is on the template’s card.')
+        }
+        continue
+      }
+      const done = { launch: 'Launched', recreate: 'Recreated', destroy: 'Destroyed' }[run.action]
+      if (run.error) {
+        notify('error', `Could not ${run.action} from “${run.template}”`, run.error)
+      } else if (failed.length > 0) {
+        notify('error', `${failed.length} of ${instances.length} from “${run.template}” failed`,
+          failed.map((i) => `${i.name}: ${i.error ?? 'a module failed'}`).join('; '))
+      } else {
+        notify('success', `${done} ${instances.length} from “${run.template}”`,
+          instances.map((i) => i.name).join(', '))
+      }
+    }
+  }, [notify])
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     try {
-      const [nextStatus, nextContainers] = await Promise.all([
+      const [nextStatus, nextContainers, nextCreates, nextRuns] = await Promise.all([
         api.status(signal),
         api.listContainers(signal),
+        // Progress is extra; a failure here must not look like losing the server.
+        api.creates(signal).catch(() => null),
+        api.templateRuns(signal).catch(() => null),
       ])
       setStatus(nextStatus)
       setContainers(nextContainers)
+      if (nextCreates) {
+        setCreates(nextCreates)
+        reportCreates(nextCreates)
+      }
+      if (nextRuns) {
+        setTemplateRuns(nextRuns)
+        reportRuns(nextRuns)
+      }
       setConnectionError(null)
     } catch (cause) {
       if ((cause as Error).name === 'AbortError') return
@@ -53,7 +142,7 @@ export default function App() {
       }
       setConnectionError((cause as Error).message)
     }
-  }, [])
+  }, [reportCreates, reportRuns])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -67,11 +156,6 @@ export default function App() {
       window.clearInterval(timer)
     }
   }, [refresh])
-
-  const notify = useCallback(
-    (kind: ToastKind, title: string, detail?: string) => push(kind, title, detail),
-    [push],
-  )
 
   /** Run a mutation with busy tracking, toasts and a refresh afterwards. */
   const mutate = useCallback(async (
@@ -114,32 +198,24 @@ export default function App() {
   }, [mutate, notify])
 
   const create = useCallback(async (request: CreateRequest) => {
-    mutating.current += 1
-    try {
-      const created = await api.createContainer(request)
-      setShowCreate(false)
-      notify('success', `Created ${request.name}`,
-        request.start ? 'It is starting up now.' : 'It was created but not started.')
-
-      // Modules run as part of creation; report how they went, and open the
-      // container so the full log is one click away.
-      const result = created?.bootstrap
-      if (result) {
-        const failed = result.modules.find((m) => m.exit_code !== 0)
-        if (result.ok) {
-          notify('success', `Bootstrapped ${request.name}`,
-            `${result.modules.length} module(s) ran successfully.`)
-        } else {
-          notify('error', `Bootstrap failed on “${failed?.name ?? 'a module'}”`,
-            (failed?.stderr || failed?.stdout || '').trim().split('\n').slice(-2).join(' '))
-          setSelected(request.name)
-        }
-      }
-    } finally {
-      mutating.current -= 1
-      await refresh()
-    }
+    // Returns once the server has accepted the create -- anything it can
+    // refuse up front, it refuses here, for the dialog to show. The create
+    // itself carries on on the server whatever this page does next.
+    const started = await api.createContainer(request)
+    watchedCreates.current.add(started.name)
+    setCreates((current) => [...current.filter((c) => c.name !== started.name), started])
+    notify('info', `Creating ${started.name}`, started.modules
+      ? `Then running ${started.modules} module(s). Progress shows in the list.`
+      : 'Progress shows in the list.')
+    refresh()
   }, [notify, refresh])
+
+  const templateRunStarted = useCallback((run: TemplateRun) => {
+    watchedRuns.current.add(`${run.template}@${run.started_at}`)
+    setTemplateRuns((current) => [...current.filter((r) => r.template !== run.template), run])
+    // New or disappearing rows should show up before the next regular poll.
+    window.setTimeout(() => refresh(), 800)
+  }, [refresh])
 
   const confirmDelete = useCallback(async () => {
     const name = pendingDelete
@@ -194,17 +270,17 @@ export default function App() {
           </div>
         )}
         <nav className="topbar-nav" aria-label="Views">
-          {(['containers', 'network', 'modules'] as const).map((id) => (
-            <button
-              key={id}
-              className="topbar-nav-item"
-              aria-current={view === id}
-              onClick={() => setView(id)}
-            >
-              {id === 'containers' ? 'Containers'
-                : id === 'network' ? 'Network' : 'Modules'}
-            </button>
-          ))}
+          {(['containers', 'templates', 'resources', 'storage', 'network', 'modules'] as const)
+            .map((id) => (
+              <button
+                key={id}
+                className="topbar-nav-item"
+                aria-current={view === id}
+                onClick={() => setView(id)}
+              >
+                {id[0].toUpperCase() + id.slice(1)}
+              </button>
+            ))}
         </nav>
 
         <div className="topbar-spacer" />
@@ -243,6 +319,43 @@ export default function App() {
 
         {view === 'modules' ? (
           <ModulesView onNotify={notify} />
+        ) : view === 'templates' ? (
+          <TemplatesView
+            containers={containers}
+            runs={templateRuns}
+            onRunStarted={templateRunStarted}
+            ready={ready}
+            onNotify={notify}
+            onOpen={setSelected}
+            // These add and remove instances but change none the table shows
+            // optimistically, so polling carries on and the table follows along.
+            onChanged={(removed) => {
+              // A recreated instance comes back under the same name, but the
+              // drawer would be showing the old one.
+              setSelected((current) => (current && removed.includes(current) ? null : current))
+              refresh()
+            }}
+          />
+        ) : view === 'storage' ? (
+          <>
+            <div className="section-head">
+              <h2>Storage</h2>
+              <span className="faint" style={{ fontSize: 12.5 }}>
+                local pools, capacity and volumes
+              </span>
+            </div>
+            <StorageView onNotify={notify} />
+          </>
+        ) : view === 'resources' ? (
+          <>
+            <div className="section-head">
+              <h2>Resources</h2>
+              <span className="faint" style={{ fontSize: 12.5 }}>
+                what instances have claimed against what this host has
+              </span>
+            </div>
+            <ResourcesView />
+          </>
         ) : view === 'network' ? (
           <>
             <div className="section-head">
@@ -272,6 +385,7 @@ export default function App() {
         ) : (
           <ContainerTable
             containers={containers ?? []}
+            creates={creates}
             selected={selected}
             busy={busy}
             canCreate={ready}
@@ -306,7 +420,8 @@ export default function App() {
       )}
 
       {showCreate && (
-        <CreateDialog onCancel={() => setShowCreate(false)} onCreate={create} />
+        <CreateDialog onCancel={() => setShowCreate(false)} onCreate={create}
+          onNotify={notify} />
       )}
 
       {pendingDelete && (

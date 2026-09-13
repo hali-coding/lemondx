@@ -1,8 +1,10 @@
 import type {
   BootstrapModule, BootstrapProfile, BootstrapResult, BootstrapSelection,
   Container, ModuleSource,
-  ContainerDetail, CreateRequest, ExecResult, ImageBrowse, Images, NetworkDetail,
-  NetworkSummary, SetupResult, Snapshot, SshKey, StateAction, Status,
+  ContainerDetail, CreateProgress, CreateRequest, ExecResult, ImageBrowse, Images, NetworkDetail,
+  InstanceTemplate, NetworkSummary, Resources, SetupResult, Snapshot, SshKey,
+  StateAction, Status, StorageOverview, StoragePoolDetail, StoragePoolRequest,
+  StorageVolume, StorageVolumeRequest, TemplateRequest, TemplateRun,
 } from './types'
 
 /** Error carrying the HTTP status so callers can react to 401/409 specifically. */
@@ -89,11 +91,17 @@ export const api = {
   listContainers: (signal?: AbortSignal) =>
     request<Container[]>('/containers', { signal }),
 
+  creates: (signal?: AbortSignal) => request<CreateProgress[]>('/creates', { signal }),
+
   getContainer: (name: string, signal?: AbortSignal) =>
     request<ContainerDetail>(`/containers/${encodeURIComponent(name)}`, { signal }),
 
+  /**
+   * Starts a create on the server and returns straight away; follow it with
+   * `creates()`. Nothing about the create depends on this page afterwards.
+   */
   createContainer: (body: CreateRequest) =>
-    request<ContainerDetail>('/containers', { method: 'POST', body }),
+    request<CreateProgress>('/containers', { method: 'POST', body: { ...body, background: true } }),
 
   deleteContainer: (name: string, force = false) =>
     request<{ deleted: string }>(
@@ -143,6 +151,39 @@ export const api = {
     return request<ImageBrowse>(`/images/browse${suffix}`, { signal })
   },
 
+  resources: (signal?: AbortSignal) => request<Resources>('/resources', { signal }),
+
+  storage: (signal?: AbortSignal) => request<StorageOverview>('/storage', { signal }),
+
+  createStoragePool: (body: StoragePoolRequest) =>
+    request<StoragePoolDetail>('/storage/pools', { method: 'POST', body }),
+
+  updateStoragePool: (name: string, body: StoragePoolRequest) =>
+    request<StoragePoolDetail>(`/storage/pools/${encodeURIComponent(name)}`,
+      { method: 'PATCH', body }),
+
+  deleteStoragePool: (name: string, force = false,
+                      expectedPlan?: StoragePoolDetail['delete_plan']) =>
+    request<{ deleted: string; detached: boolean }>(
+      `/storage/pools/${encodeURIComponent(name)}?force=${force}`,
+      { method: 'DELETE', body: force
+        ? { force, confirmation: name, expected_plan: expectedPlan }
+        : undefined }),
+
+  createStorageVolume: (pool: string, body: StorageVolumeRequest) =>
+    request<StorageVolume>(`/storage/pools/${encodeURIComponent(pool)}/volumes`,
+      { method: 'POST', body }),
+
+  updateStorageVolume: (pool: string, name: string, body: StorageVolumeRequest) =>
+    request<StorageVolume>(
+      `/storage/pools/${encodeURIComponent(pool)}/volumes/custom/${encodeURIComponent(name)}`,
+      { method: 'PATCH', body }),
+
+  deleteStorageVolume: (pool: string, name: string) =>
+    request<{ deleted: string; pool: string }>(
+      `/storage/pools/${encodeURIComponent(pool)}/volumes/custom/${encodeURIComponent(name)}`,
+      { method: 'DELETE' }),
+
   networks: (signal?: AbortSignal) =>
     request<NetworkSummary[]>('/networks', { signal }),
 
@@ -171,13 +212,54 @@ export const api = {
     request<BootstrapProfile[]>('/bootstrap-profiles', { signal }),
 
   saveBootstrapProfile: (name: string, body: {
-    modules: string[]; params?: Record<string, string>; description?: string
+    modules: string[]; params?: Record<string, string>; ssh_keys?: string[]
+    description?: string
   }) => request<BootstrapProfile>(`/bootstrap-profiles/${encodeURIComponent(name)}`,
     { method: 'PUT', body }),
 
   deleteBootstrapProfile: (name: string) =>
     request<{ deleted: string }>(`/bootstrap-profiles/${encodeURIComponent(name)}`,
       { method: 'DELETE' }),
+
+  templates: (signal?: AbortSignal) =>
+    request<InstanceTemplate[]>('/templates', { signal }),
+
+  saveTemplate: (name: string, body: TemplateRequest) =>
+    request<InstanceTemplate>(`/templates/${encodeURIComponent(name)}`,
+      { method: 'PUT', body }),
+
+  deleteTemplate: (name: string) =>
+    request<{ deleted: string }>(`/templates/${encodeURIComponent(name)}`,
+      { method: 'DELETE' }),
+
+  launchTemplate: (name: string,
+                   body: { count: number; prefix?: string; params?: Record<string, string> }) =>
+    request<TemplateRun>(`/templates/${encodeURIComponent(name)}/launch`,
+      { method: 'POST', body: { ...body, background: true } }),
+
+  templateRuns: (signal?: AbortSignal) =>
+    request<TemplateRun[]>('/template-runs', { signal }),
+
+  dismissTemplateRun: (name: string) =>
+    request<{ dismissed: string }>(`/template-runs/${encodeURIComponent(name)}`,
+      { method: 'DELETE' }),
+
+  // Launch, recreate and destroy start a run and return it at once; follow it
+  // with templateRuns(). `instances` must be exactly the ones the user
+  // confirmed, or nothing happens.
+  execTemplateInstances: (name: string, command: string, instances: string[],
+                          timeout?: number) =>
+    request<TemplateRun>(`/templates/${encodeURIComponent(name)}/exec`,
+      { method: 'POST', body: { command, instances, timeout, background: true } }),
+
+  destroyTemplateInstances: (name: string, instances: string[]) =>
+    request<TemplateRun>(`/templates/${encodeURIComponent(name)}/destroy`,
+      { method: 'POST', body: { instances, background: true } }),
+
+  recreateTemplateInstances: (name: string, instances: string[],
+                              params?: Record<string, string>) =>
+    request<TemplateRun>(`/templates/${encodeURIComponent(name)}/recreate`,
+      { method: 'POST', body: { instances, params, background: true } }),
 
   sshKeys: (signal?: AbortSignal) => request<SshKey[]>('/ssh-keys', { signal }),
 

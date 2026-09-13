@@ -20,7 +20,16 @@ export function SshKeyPicker({ hostKeys, value, onChange, disabled }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [extraKeys, setExtraKeys] = useState<SshKey[]>([])
 
-  const allKeys = [...hostKeys, ...extraKeys]
+  const known = [...hostKeys, ...extraKeys]
+  // Keys that came from a saved profile or template need not be in this
+  // host's ~/.ssh; without a row of their own they would be selected unseen.
+  const saved: SshKey[] = value
+    .filter((line) => !known.some((k) => k.line === line))
+    .map((line) => {
+      const [type, , ...comment] = line.split(' ')
+      return { type, comment: comment.join(' '), fingerprint: '', line, source: undefined }
+    })
+  const allKeys = [...known, ...saved]
 
   function toggle(line: string) {
     onChange(value.includes(line) ? value.filter((k) => k !== line) : [...value, line])
@@ -64,12 +73,16 @@ export function SshKeyPicker({ hostKeys, value, onChange, disabled }: Props) {
               onChange={() => toggle(key.line)}
             />
             <span className="list-row-main">
-              <strong>{key.source ?? key.comment ?? key.type}</strong>{' '}
+              <strong>{key.source || key.comment || key.type}</strong>{' '}
               <span className="faint">{key.type}</span>
               {key.source && key.comment && (
                 <span className="faint"> · {key.comment}</span>
               )}
-              <span className="mono faint key-fp">{key.fingerprint}</span>
+              {key.fingerprint ? (
+                <span className="mono faint key-fp">{key.fingerprint}</span>
+              ) : (
+                <span className="faint key-fp">saved key, not in ~/.ssh</span>
+              )}
             </span>
           </label>
         ))

@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 
@@ -80,12 +81,16 @@ def build_router(service):
         cpu=body.get("cpu"),
         memory=body.get("memory"),
         disk=body.get("disk"),
+        pool=body.get("pool"),
         description=body.get("description"),
         ephemeral=body.get("ephemeral", False),
         start=body.get("start", True),
         config=body.get("config"),
         bootstrap=body.get("bootstrap"),
+        background=bool(body.get("background", False)),
     ))
+
+    r.add("GET", r"/api/creates", lambda body, q: service.creates())
 
     r.add("GET", r"/api/containers/%s" % NAME,
           lambda body, q, name: service.get_container(name))
@@ -117,6 +122,41 @@ def build_router(service):
     r.add("POST", r"/api/containers/%s/snapshots/%s/restore" % (NAME, NAME),
           lambda body, q, name, snap: service.restore_snapshot(name, snap))
 
+    r.add("GET", r"/api/resources", lambda body, q: service.resources())
+
+    r.add("GET", r"/api/storage", lambda body, q: service.storage())
+    r.add("GET", r"/api/storage/pools", lambda body, q: service.storage()["pools"])
+    r.add("POST", r"/api/storage/pools", lambda body, q: service.create_storage_pool(
+        body.get("name"), body.get("driver"), source=body.get("source"),
+        size=body.get("size"), description=body.get("description", ""),
+        config=body.get("config")))
+    r.add("GET", r"/api/storage/pools/%s" % NAME,
+          lambda body, q, pool: service.get_storage_pool(pool))
+    r.add("PATCH", r"/api/storage/pools/%s" % NAME,
+          lambda body, q, pool: service.update_storage_pool(
+              pool, description=body.get("description"), size=body.get("size"),
+              config=body.get("config")))
+    r.add("DELETE", r"/api/storage/pools/%s" % NAME,
+          lambda body, q, pool: service.delete_storage_pool(
+              pool, force=_flag(q.get("force")) or bool(body.get("force")),
+              confirmation=body.get("confirmation"),
+              expected_plan=body.get("expected_plan")))
+    r.add("GET", r"/api/storage/pools/%s/volumes" % NAME,
+          lambda body, q, pool: service.get_storage_pool(pool)["volumes"])
+    r.add("POST", r"/api/storage/pools/%s/volumes" % NAME,
+          lambda body, q, pool: service.create_storage_volume(
+              pool, body.get("name"), content_type=body.get("content_type", "filesystem"),
+              size=body.get("size"), description=body.get("description", ""),
+              config=body.get("config")))
+    r.add("GET", r"/api/storage/pools/%s/volumes/custom/%s" % (NAME, NAME),
+          lambda body, q, pool, volume: service.get_storage_volume(pool, volume))
+    r.add("PATCH", r"/api/storage/pools/%s/volumes/custom/%s" % (NAME, NAME),
+          lambda body, q, pool, volume: service.update_storage_volume(
+              pool, volume, description=body.get("description"), size=body.get("size"),
+              config=body.get("config")))
+    r.add("DELETE", r"/api/storage/pools/%s/volumes/custom/%s" % (NAME, NAME),
+          lambda body, q, pool, volume: service.delete_storage_volume(pool, volume))
+
     r.add("GET", r"/api/images/browse", lambda body, q: service.browse_images(
         remote=q.get("remote") or None,
         arch=q.get("arch") or None,
@@ -142,9 +182,46 @@ def build_router(service):
     r.add("PUT", r"/api/bootstrap-profiles/%s" % NAME,
           lambda body, q, name: service.save_bootstrap_profile(
               name, body.get("modules") or [], body.get("params"),
-              body.get("description", "")))
+              body.get("description", ""), body.get("ssh_keys")))
     r.add("DELETE", r"/api/bootstrap-profiles/%s" % NAME,
           lambda body, q, name: service.delete_bootstrap_profile(name))
+
+    r.add("GET", r"/api/templates", lambda body, q: service.list_templates())
+    r.add("PUT", r"/api/templates/%s" % NAME,
+          lambda body, q, name: service.save_template(
+              name, body.get("image"),
+              instance_type=body.get("type", "container"),
+              cpu=body.get("cpu"), memory=body.get("memory"), disk=body.get("disk"),
+              pool=body.get("pool"), profiles=body.get("profiles"),
+              ephemeral=bool(body.get("ephemeral", False)),
+              start=bool(body.get("start", True)),
+              bootstrap=body.get("bootstrap"),
+              description=body.get("description", ""),
+              name_prefix=body.get("name_prefix")))
+    r.add("DELETE", r"/api/templates/%s" % NAME,
+          lambda body, q, name: service.delete_template(name))
+    r.add("POST", r"/api/templates/%s/launch" % NAME,
+          lambda body, q, name: service.launch_template(
+              name, count=body.get("count", 1), prefix=body.get("prefix"),
+              params=body.get("params"), background=bool(body.get("background", False))))
+    r.add("GET", r"/api/template-runs", lambda body, q: service.template_runs())
+    r.add("DELETE", r"/api/template-runs/%s" % NAME,
+          lambda body, q, name: service.dismiss_template_run(name))
+    r.add("GET", r"/api/templates/%s/instances" % NAME,
+          lambda body, q, name: service.template_instances(name))
+    r.add("POST", r"/api/templates/%s/destroy" % NAME,
+          lambda body, q, name: service.destroy_template_instances(
+              name, body.get("instances"),
+              background=bool(body.get("background", False))))
+    r.add("POST", r"/api/templates/%s/exec" % NAME,
+          lambda body, q, name: service.exec_template_instances(
+              name, body.get("command"), body.get("instances"),
+              timeout=body.get("timeout", 300),
+              background=bool(body.get("background", False))))
+    r.add("POST", r"/api/templates/%s/recreate" % NAME,
+          lambda body, q, name: service.recreate_template_instances(
+              name, body.get("instances"), params=body.get("params"),
+              background=bool(body.get("background", False))))
     r.add("GET", r"/api/ssh-keys", lambda body, q: service.list_ssh_keys())
     r.add("POST", r"/api/ssh-keys/validate",
           lambda body, q: service.validate_ssh_key(body.get("key", "")))
@@ -476,9 +553,31 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down.")
+        _wait_for_background_work(getattr(httpd.RequestHandlerClass, "service", None))
+        print("Shutting down.")
     finally:
         httpd.server_close()
+
+
+def _wait_for_background_work(service):
+    """Give creates and template runs the chance to finish before exiting.
+
+    They run on threads the process takes down with it, and stopping one
+    halfway leaves an instance created but never bootstrapped, or a recreate
+    that deleted without recreating. So say what is running and wait, unless
+    asked a second time.
+    """
+    pending = service.pending_work() if service else []
+    if not pending:
+        return
+    print("\nStill running: %s." % "; ".join(pending))
+    print("Waiting for it to finish -- press Ctrl-C again to stop anyway, "
+          "leaving that work half done.")
+    try:
+        while service.pending_work():
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nAbandoning: %s." % "; ".join(service.pending_work()))
 
 
 def _open(url):

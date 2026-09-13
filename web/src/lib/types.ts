@@ -29,6 +29,8 @@ export interface Container {
   network_rx: number
   network_tx: number
   snapshot_count: number
+  /** The template this instance was launched from, if any. */
+  template: string | null
 }
 
 export interface Snapshot {
@@ -124,6 +126,29 @@ export interface ExecResult {
   stderr: string
 }
 
+/**
+ * A create the server is running, or finished in the last few minutes. Held by
+ * the server process, so it outlives the dialog or page that started it.
+ */
+export interface CreateProgress {
+  name: string
+  image: string
+  type: string
+  /** Set when a template launch or recreate started it. */
+  template: string | null
+  /** How many bootstrap modules it runs. */
+  modules: number
+  stage: 'creating' | 'starting' | 'bootstrapping' | 'done'
+  started_at: number
+  finished_at: number | null
+  /** Null while running; false if it failed to create or a module failed. */
+  ok: boolean | null
+  error: string | null
+  failed_module: string | null
+  /** The last lines a failed module printed. */
+  error_detail: string | null
+}
+
 export interface CreateRequest {
   name: string
   image: string
@@ -131,6 +156,9 @@ export interface CreateRequest {
   cpu?: string
   memory?: string
   disk?: string
+  pool?: string
+  /** LXD/Incus profiles; the daemon's default when omitted. */
+  profiles?: string[]
   description?: string
   ephemeral?: boolean
   start?: boolean
@@ -286,12 +314,90 @@ export interface NetworkDetail {
   forwards: unknown[]
 }
 
-/** A saved module selection. Unrelated to LXD/Incus profiles. */
+/**
+ * A saved module selection with every non-secret parameter its modules
+ * declare and the SSH keys to install. Unrelated to LXD/Incus profiles.
+ */
 export interface BootstrapProfile {
   name: string
   description: string
   modules: string[]
   params: Record<string, string>
+  ssh_keys: string[]
+}
+
+/** What an instance is made of, apart from its name. */
+export interface InstanceSpec {
+  image: string
+  type: 'container' | 'virtual-machine'
+  cpu: string
+  memory: string
+  disk: string
+  /** Blank means the pool the default profile uses. */
+  pool: string
+  /** LXD/Incus profiles, not bootstrap ones. */
+  profiles: string[]
+  ephemeral: boolean
+  start: boolean
+  bootstrap: BootstrapSelection
+}
+
+/** A saved InstanceSpec, launched as `<name_prefix>-1`, `-2`, … */
+export interface InstanceTemplate extends InstanceSpec {
+  name: string
+  description: string
+  name_prefix: string
+}
+
+export type TemplateRequest = Partial<InstanceSpec> & {
+  image: string
+  description?: string
+  name_prefix?: string
+}
+
+export interface LaunchedInstance {
+  name: string
+  /** False if it failed to delete or create, or a module failed. */
+  ok: boolean
+  error: string | null
+  /** The new instance; null when it was destroyed or never created. */
+  container: ContainerDetail | null
+  /** What a command printed here, for a run of action `exec`. */
+  exec?: TemplateExecOutput | null
+}
+
+export interface TemplateExecOutput {
+  exit_code: number
+  stdout: string
+  stderr: string
+  /** Output was cut to its last part to keep run records small. */
+  truncated: boolean
+}
+
+/** What a launch, recreate or destroy did to each instance, in order. */
+export interface TemplateRunResult {
+  template: string
+  ok: boolean
+  instances: LaunchedInstance[]
+}
+
+/**
+ * A launch, recreate or destroy the server is running or last ran for a
+ * template. Held by the server process, so it outlives the page that started it.
+ */
+export interface TemplateRun {
+  template: string
+  action: 'launch' | 'recreate' | 'destroy' | 'exec'
+  count: number
+  /** The shell command, for `exec`. */
+  command: string | null
+  /** Unix seconds. */
+  started_at: number
+  /** Null while it is still running. */
+  finished_at: number | null
+  result: TemplateRunResult | null
+  /** Set when the run as a whole failed, rather than one instance in it. */
+  error: string | null
 }
 
 export interface ModuleSource {
@@ -299,4 +405,134 @@ export interface ModuleSource {
   builtin: boolean
   content: string
   path: string
+}
+
+/** A claim on one resource. `implicit` marks a daemon default, not a set limit. */
+export interface ResourceClaim {
+  limit: string
+  implicit: boolean
+}
+
+export interface ResourceInstance {
+  name: string
+  type: string
+  status: ContainerStatus
+  /** Running or frozen: holding its CPU and memory right now. */
+  active: boolean
+  cpu_time_ns: number
+  cpu: ResourceClaim & { count: number | null }
+  memory: ResourceClaim & { bytes: number | null; usage: number }
+  disk: {
+    pool: string | null
+    size: string
+    bytes: number | null
+    usage: number
+    implicit: boolean
+  }
+}
+
+export interface PoolResources {
+  name: string
+  driver: string
+  supports_quota: boolean
+  total: number
+  used: number
+  allocated: number
+  /** Instances on this pool with no size, which can grow to fill it. */
+  unlimited: string[]
+}
+
+export interface Resources {
+  host: {
+    architecture: string
+    cpu_model: string
+    cpu_sockets: number
+    cpu_cores: number
+    cpu_threads: number
+    memory_total: number
+    memory_used: number
+  }
+  cpu: { total: number; allocated: number; stopped: number; unlimited: string[] }
+  memory: {
+    total: number
+    used: number
+    instances_used: number
+    allocated: number
+    stopped: number
+    unlimited: string[]
+  }
+  storage: PoolResources[]
+  instances: ResourceInstance[]
+}
+
+export interface StorageDriverCapability {
+  name: 'dir' | 'btrfs' | 'lvm' | 'zfs'
+  available: boolean
+  supports_quota: boolean
+  supports_custom_block: boolean
+}
+
+export interface StorageVolume {
+  pool: string
+  name: string
+  type: string
+  content_type: string
+  description: string
+  config: Record<string, string>
+  size: string
+  used_by: string[]
+  manageable: boolean
+}
+
+export interface StoragePoolDetail {
+  name: string
+  driver: string
+  description: string
+  config: Record<string, string>
+  source: string
+  used_by: string[]
+  used_by_count: number
+  total: number
+  used: number
+  root: boolean
+  supports_quota: boolean
+  manageable: boolean
+  read_only_reason: string
+  volume_count: number
+  delete_plan: StoragePoolDeletePlan
+  volumes?: StorageVolume[]
+}
+
+export interface StoragePoolDeletePlan {
+  instances: string[]
+  attached_instances: string[]
+  images: string[]
+  custom_volumes: string[]
+  profiles: string[]
+  other_references: string[]
+  other_volumes: string[]
+}
+
+export interface StorageOverview {
+  clustered: boolean
+  local_drivers: StorageDriverCapability[]
+  pools: StoragePoolDetail[]
+  volumes: StorageVolume[]
+}
+
+export interface StoragePoolRequest {
+  name?: string
+  driver?: string
+  source?: string
+  size?: string
+  description?: string
+  config?: Record<string, string>
+}
+
+export interface StorageVolumeRequest {
+  name?: string
+  content_type?: 'filesystem' | 'block'
+  size?: string
+  description?: string
+  config?: Record<string, string>
 }
