@@ -15,6 +15,9 @@ shelling out and no parsing of CLI output.
        └── CLI ────────────────┘
 ```
 
+![Containers list](docs/screenshot1.png)
+
+
 ## Requirements
 
 - **LXD or Incus**, with the daemon running:
@@ -61,6 +64,7 @@ Want it running all the time? See [Running as a service](docs/service.md).
 ./lemondx init                   # create storage pool + bridge, wire up default profile
 ./lemondx ls                     # list containers
 ./lemondx info NAME              # details, limits, network, snapshots
+./lemondx resources              # allocated CPU/memory/disk against the host
 ./lemondx create NAME -i ubuntu:24.04 -c 2 -m 2GiB -d 10GiB
                                  # -i defaults to Ubuntu LTS for this daemon
 ./lemondx limits NAME -c 4 -m 8GiB   # change an existing container's limits
@@ -95,6 +99,8 @@ CPU is a core count; memory and disk take a unit like `4GiB` or `512MiB` — see
 [Image aliases](docs/daemons-and-storage.md#image-aliases) for what you can
 pass to `-i`.
 
+![Container detail panel](docs/screenshot2.png)
+
 ## Documentation
 
 | Doc | Covers |
@@ -102,7 +108,7 @@ pass to `-i`.
 | [Bootstrap modules](docs/modules.md) | writing and uploading modules, defaults, saved settings, profiles, secrets, the shipped modules |
 | [REST API](docs/api.md) | every endpoint, request/response shapes, curl examples |
 | [Daemons, images and storage](docs/daemons-and-storage.md) | LXD vs Incus, socket discovery, image remotes, disk quotas, units |
-| [Web UI tour](docs/web-ui.md) | the Network view and the full image browser |
+| [Web UI tour](docs/web-ui.md) | the Resources and Network views, the full image browser |
 | [Running as a service](docs/service.md) | systemd units, user vs system install |
 | [Security](docs/security.md) | binding, tokens, TLS |
 | [Frontend development](docs/development.md) | Vite dev server, rebuilding `web/dist` |
@@ -113,6 +119,8 @@ pass to `-i`.
 authorization — anyone who can reach the port controls your containers. If you
 bind it to a routable address, pass `--token`; see [Security](docs/security.md)
 for how the token is checked and why plain HTTP still needs a TLS proxy.
+
+![Network view](docs/screenshot3.png)
 
 ## Notes and limitations
 

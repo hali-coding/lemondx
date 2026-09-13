@@ -117,6 +117,8 @@ def build_router(service):
     r.add("POST", r"/api/containers/%s/snapshots/%s/restore" % (NAME, NAME),
           lambda body, q, name, snap: service.restore_snapshot(name, snap))
 
+    r.add("GET", r"/api/resources", lambda body, q: service.resources())
+
     r.add("GET", r"/api/images/browse", lambda body, q: service.browse_images(
         remote=q.get("remote") or None,
         arch=q.get("arch") or None,

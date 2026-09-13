@@ -487,6 +487,13 @@ class LXDClient:
             timeout=300,
         )
 
+    def storage_pool_resources(self, name):
+        """Space and inodes on a pool, or None where the driver cannot say."""
+        try:
+            return self._sync("GET", "/1.0/storage-pools/%s/resources" % _seg(name))
+        except LXDError:
+            return None
+
     def list_networks(self):
         return self._sync("GET", "/1.0/networks", params={"recursion": "1"}) or []
 

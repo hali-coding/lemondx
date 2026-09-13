@@ -11,6 +11,7 @@ import { CreateDialog } from './components/CreateDialog'
 import { MoonIcon, PlusIcon, RefreshIcon, SunIcon } from './components/Icons'
 import { ModulesView } from './components/ModulesView'
 import { NetworkView } from './components/NetworkView'
+import { ResourcesView } from './components/ResourcesView'
 import { SetupBanner } from './components/SetupBanner'
 import { TokenGate } from './components/TokenGate'
 import { Toasts } from './components/Toasts'
@@ -31,7 +32,7 @@ export default function App() {
   const [deleting, setDeleting] = useState(false)
   const [refreshToken, setRefreshToken] = useState(0)
   const [needsToken, setNeedsToken] = useState(false)
-  const [view, setView] = useState<'containers' | 'network' | 'modules'>('containers')
+  const [view, setView] = useState<'containers' | 'resources' | 'network' | 'modules'>('containers')
 
   // Any in-flight mutation pauses polling so it cannot clobber optimistic state.
   const mutating = useRef(0)
@@ -194,7 +195,7 @@ export default function App() {
           </div>
         )}
         <nav className="topbar-nav" aria-label="Views">
-          {(['containers', 'network', 'modules'] as const).map((id) => (
+          {(['containers', 'resources', 'network', 'modules'] as const).map((id) => (
             <button
               key={id}
               className="topbar-nav-item"
@@ -202,6 +203,7 @@ export default function App() {
               onClick={() => setView(id)}
             >
               {id === 'containers' ? 'Containers'
+                : id === 'resources' ? 'Resources'
                 : id === 'network' ? 'Network' : 'Modules'}
             </button>
           ))}
@@ -243,6 +245,16 @@ export default function App() {
 
         {view === 'modules' ? (
           <ModulesView onNotify={notify} />
+        ) : view === 'resources' ? (
+          <>
+            <div className="section-head">
+              <h2>Resources</h2>
+              <span className="faint" style={{ fontSize: 12.5 }}>
+                what instances have claimed against what this host has
+              </span>
+            </div>
+            <ResourcesView />
+          </>
         ) : view === 'network' ? (
           <>
             <div className="section-head">

@@ -20,6 +20,7 @@ with a matching HTTP status.
 | `GET`/`POST` | `/api/containers/{name}/snapshots` | list / create |
 | `DELETE` | `/api/containers/{name}/snapshots/{snap}` | delete |
 | `POST` | `/api/containers/{name}/snapshots/{snap}/restore` | restore |
+| `GET` | `/api/resources` | host CPU/memory/disk against what instances have allocated |
 | `GET` | `/api/images` | cached images, suggested catalog, remotes |
 | `GET` | `/api/images/browse` | full remote catalogs, flagged with what is local |
 | `GET` | `/api/networks` | every interface the daemon can see |
@@ -46,4 +47,5 @@ curl -s -X POST localhost:8099/api/containers \
 
 See also [Bootstrap modules](modules.md) for `/api/modules`,
 `/api/bootstrap-profiles` and `/api/containers/{name}/bootstrap`, and
-[Web UI tour](web-ui.md) for `/api/networks` and `/api/images/browse`.
+[Web UI tour](web-ui.md) for `/api/resources`, `/api/networks` and
+`/api/images/browse`.

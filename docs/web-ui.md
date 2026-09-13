@@ -2,8 +2,42 @@
 
 [← back to README](../README.md)
 
-Two parts of the web UI that are easy to miss because they are not on the
-Containers tab: the Network view and the full image browser.
+Parts of the web UI that are easy to miss because they are not on the
+Containers tab: the Resources and Network views, and the full image browser.
+
+## Resources view
+
+The **Resources** tab sets what instances have claimed against what the host
+has — CPU threads, memory, and space on each storage pool — with the host's
+processor, thread count and memory above it and a per-instance table below.
+
+Each resource has two bars. **Allocated** is the sum of configured limits, not
+a measurement: CPU and memory count only running (and frozen) instances, with
+what stopped ones would add shown as a lighter segment, while disk counts
+every instance because a stopped one still occupies its pool. The second bar
+is what is actually in use — memory split between instances and the rest of
+the host, pool space as the daemon reports it, and CPU as the threads
+instances kept busy between two polls (so it reads "measuring…" for the first
+five seconds).
+
+A few things the numbers deliberately do not hide:
+
+- An instance with **no limit** can use the whole host, so it is named under
+  the bar instead of being counted as some guessed amount.
+- A **VM without a limit** still gets a fixed machine — 1 vCPU, 1 GiB and a
+  10 GiB root disk by default — and those count, shown faint as "default".
+- Allocations **can exceed the host**. Limits are ceilings rather than
+  reservations, so this is often fine for CPU; the bar rescales, marks where
+  the host runs out and says *overcommitted*.
+- On a pool whose driver cannot enforce sizes (`dir`), disk sizes are
+  intentions, and the card says so.
+
+Allocations cover the current project; host figures cover the whole host.
+
+```bash
+./lemondx resources
+curl -s localhost:8099/api/resources | jq '.memory, .instances[].memory'
+```
 
 ## Network view
 

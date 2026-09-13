@@ -70,6 +70,27 @@ QUOTA_CAPABLE_DRIVERS = frozenset({
     "btrfs", "zfs", "lvm", "ceph", "cephfs", "pure", "powerflex", "alletra",
 })
 
+# What a VM gets when its config says nothing. A container without a limit
+# shares the whole host, but a VM has to be handed a fixed machine, so both
+# daemons fill in these values -- and they count against the host just the
+# same as explicit ones.
+VM_DEFAULTS = {"cpu": 1, "memory": "1GiB", "disk": "10GiB"}
+
+# Statuses in which an instance is holding its CPU and memory right now. A
+# frozen instance keeps its memory even though it is not scheduled.
+ACTIVE_STATUSES = frozenset({"Running", "Frozen"})
+
+# The daemon's own size grammar, which unlike normalize_size() reads a bare
+# number as bytes: these values come from the daemon, not from a person.
+_BYTE_UNITS = {
+    "": 1, "b": 1,
+    "kb": 1000, "mb": 1000 ** 2, "gb": 1000 ** 3, "tb": 1000 ** 4,
+    "pb": 1000 ** 5, "eb": 1000 ** 6,
+    "kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4,
+    "pib": 1024 ** 5, "eib": 1024 ** 6,
+}
+_BYTE_SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]*)\s*$")
+
 STATE_ACTIONS = {
     "start": "start",
     "stop": "stop",
@@ -1002,6 +1023,80 @@ class ContainerService:
             for p in self.lxd.list_profiles()
         ]
 
+    # -- resources ---------------------------------------------------------
+
+    def resources(self):
+        """What the host has, and how much of it instances have claimed.
+
+        "Allocated" is the sum of limits, not a measurement: an instance with
+        no limit can use everything and is listed by name instead of being
+        guessed at. CPU and memory only count for instances that are running
+        or frozen, with what stopped ones would add reported separately; disk
+        counts for every instance, since a stopped one still occupies its pool.
+        Allocations are for the current project, host figures for the host.
+        """
+        host = self.lxd.resources() or {}
+        cpu_info = host.get("cpu") or {}
+        memory_info = host.get("memory") or {}
+        sockets = cpu_info.get("sockets") or []
+        threads = cpu_info.get("total") or 0
+        memory_total = memory_info.get("total") or 0
+
+        pools = self.lxd.list_storage_pools()
+        pool_config = {p.get("name"): p.get("config") or {} for p in pools}
+
+        instances = [_instance_allocation(i, memory_total, pool_config)
+                     for i in self.lxd.list_instances()]
+        instances.sort(key=lambda i: i["name"] or "")
+        active = [i for i in instances if i["active"]]
+        stopped = [i for i in instances if not i["active"]]
+
+        def claimed(rows, kind, unit):
+            return sum(r[kind][unit] for r in rows if r[kind][unit] is not None)
+
+        storage = []
+        for pool in pools:
+            name = pool.get("name")
+            space = (self.lxd.storage_pool_resources(name) or {}).get("space") or {}
+            on_pool = [i for i in instances if i["disk"]["pool"] == name]
+            storage.append({
+                "name": name,
+                "driver": pool.get("driver"),
+                "supports_quota": pool.get("driver") in QUOTA_CAPABLE_DRIVERS,
+                "total": space.get("total") or 0,
+                "used": space.get("used") or 0,
+                "allocated": claimed(on_pool, "disk", "bytes"),
+                "unlimited": [i["name"] for i in on_pool if i["disk"]["bytes"] is None],
+            })
+
+        return {
+            "host": {
+                "architecture": cpu_info.get("architecture") or "",
+                "cpu_model": (sockets[0].get("name") or "") if sockets else "",
+                "cpu_sockets": len(sockets),
+                "cpu_cores": sum(len(s.get("cores") or []) for s in sockets),
+                "cpu_threads": threads,
+                "memory_total": memory_total,
+                "memory_used": memory_info.get("used") or 0,
+            },
+            "cpu": {
+                "total": threads,
+                "allocated": claimed(active, "cpu", "count"),
+                "stopped": claimed(stopped, "cpu", "count"),
+                "unlimited": [i["name"] for i in active if i["cpu"]["count"] is None],
+            },
+            "memory": {
+                "total": memory_total,
+                "used": memory_info.get("used") or 0,
+                "instances_used": sum(i["memory"]["usage"] for i in active),
+                "allocated": claimed(active, "memory", "bytes"),
+                "stopped": claimed(stopped, "memory", "bytes"),
+                "unlimited": [i["name"] for i in active if i["memory"]["bytes"] is None],
+            },
+            "storage": storage,
+            "instances": instances,
+        }
+
 
 # -- normalisation helpers -------------------------------------------------
 
@@ -1016,6 +1111,110 @@ def _address_key(address):
     if len(parts) == 4 and all(p.isdigit() for p in parts):
         return (0, [int(p) for p in parts])
     return (1, [str(address)])
+
+
+def parse_byte_size(value, total=None):
+    """Bytes in a size the daemon wrote, or None if it is unset or unreadable.
+
+    ``total`` resolves a percentage, which ``limits.memory`` allows.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("%"):
+        try:
+            percent = float(text[:-1])
+        except ValueError:
+            return None
+        return int(total * percent / 100) if total else None
+    match = _BYTE_SIZE.match(text)
+    if not match or match.group(2).lower() not in _BYTE_UNITS:
+        return None
+    return int(float(match.group(1)) * _BYTE_UNITS[match.group(2).lower()])
+
+
+def cpu_count(value):
+    """How many CPUs ``limits.cpu`` grants, or None if it is unset or unreadable.
+
+    The key is overloaded: a bare number is a count, while a range or list
+    ("0-3", "1,5", even "2-2") pins specific CPUs and grants that many.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    pinned = set()
+    for part in text.split(","):
+        low, _, high = part.strip().partition("-")
+        if not low.isdigit() or (high and not high.isdigit()):
+            return None
+        pinned.update(range(int(low), int(high or low) + 1))
+    return len(pinned) or None
+
+
+def _instance_allocation(instance, memory_total, pool_config):
+    """One instance's claim on CPU, memory and disk, with where it came from.
+
+    ``implicit`` marks a value the daemon supplied rather than the config, so
+    a front end can tell a chosen limit from a default.
+    """
+    config = instance.get("expanded_config") or instance.get("config") or {}
+    devices = instance.get("expanded_devices") or instance.get("devices") or {}
+    state = instance.get("state") or {}
+    status = instance.get("status") or state.get("status") or "Unknown"
+    is_vm = instance.get("type") == "virtual-machine"
+
+    cpu_limit = str(config.get("limits.cpu") or "").strip()
+    cpu_implicit = is_vm and not cpu_limit
+    if cpu_implicit:
+        cpu_limit = str(VM_DEFAULTS["cpu"])
+
+    memory_limit = str(config.get("limits.memory") or "").strip()
+    memory_implicit = is_vm and not memory_limit
+    if memory_implicit:
+        memory_limit = VM_DEFAULTS["memory"]
+
+    root_name, root = next(
+        ((n, d) for n, d in sorted(devices.items())
+         if d.get("type") == "disk" and d.get("path") == "/"),
+        (None, {}))
+    pool = root.get("pool")
+    disk_size = str(root.get("size") or "").strip()
+    disk_implicit = False
+    if not disk_size:
+        # A pool's volume.size applies to every volume created without one.
+        disk_size = str((pool_config.get(pool) or {}).get("volume.size") or "").strip()
+        if not disk_size and is_vm:
+            disk_size = VM_DEFAULTS["disk"]
+        disk_implicit = bool(disk_size)
+    disk_state = (state.get("disk") or {}).get(root_name) or {}
+
+    return {
+        "name": instance.get("name"),
+        "type": instance.get("type") or "container",
+        "status": status,
+        "active": status in ACTIVE_STATUSES,
+        "cpu_time_ns": (state.get("cpu") or {}).get("usage") or 0,
+        "cpu": {
+            "limit": cpu_limit,
+            "count": cpu_count(cpu_limit),
+            "implicit": cpu_implicit,
+        },
+        "memory": {
+            "limit": memory_limit,
+            "bytes": parse_byte_size(memory_limit, memory_total),
+            "usage": (state.get("memory") or {}).get("usage") or 0,
+            "implicit": memory_implicit,
+        },
+        "disk": {
+            "pool": pool,
+            "size": disk_size,
+            "bytes": parse_byte_size(disk_size),
+            "usage": disk_state.get("usage") or 0,
+            "implicit": disk_implicit,
+        },
+    }
 
 
 def _image_source(image, remotes):

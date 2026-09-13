@@ -15,6 +15,13 @@ interface Props {
 
 const NAME_RULE = /^[a-zA-Z][a-zA-Z0-9-]{0,61}$/
 
+// What a blank CPU or memory field means here. Only the dialog applies these:
+// the API and `lemondx create` still treat an omitted limit as none, so
+// scripts keep the daemon's behaviour. Shown as the placeholders, so the
+// value a blank field sends is the value it appears to hold.
+const DEFAULT_CPU = '4'
+const DEFAULT_MEMORY = '2GiB'
+
 export function CreateDialog({ onCancel, onCreate }: Props) {
   const [images, setImages] = useState<Images | null>(null)
   const [status, setStatus] = useState<Status | null>(null)
@@ -125,8 +132,8 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
         name: name.trim(),
         image: image.trim(),
         type: isVm ? 'virtual-machine' : 'container',
-        cpu: cpu.trim() || undefined,
-        memory: memory.trim() || undefined,
+        cpu: cpu.trim() || DEFAULT_CPU,
+        memory: memory.trim() || DEFAULT_MEMORY,
         disk: disk.trim() || undefined,
         ephemeral,
         start,
@@ -222,12 +229,12 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
           <div className="field">
             <label htmlFor="c-cpu">CPU limit</label>
             <input id="c-cpu" className="input" value={cpu} disabled={busy}
-              onChange={(e) => setCpu(e.target.value)} placeholder="2" autoComplete="off" />
+              onChange={(e) => setCpu(e.target.value)} placeholder={DEFAULT_CPU} autoComplete="off" />
           </div>
           <div className="field">
             <label htmlFor="c-mem">Memory</label>
             <input id="c-mem" className="input" value={memory} disabled={busy}
-              onChange={(e) => setMemory(e.target.value)} placeholder="2GiB" autoComplete="off" />
+              onChange={(e) => setMemory(e.target.value)} placeholder={DEFAULT_MEMORY} autoComplete="off" />
           </div>
           <div className="field">
             <label htmlFor="c-disk">Disk</label>
@@ -236,7 +243,9 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
           </div>
         </div>
         <span className="hint" style={{ marginTop: -8 }}>
-          Leave blank for no limit. CPU is a core count; memory and disk take a
+          Blank CPU and memory default to {DEFAULT_CPU} cores and{' '}
+          <span className="mono">{DEFAULT_MEMORY}</span>; blank disk means no size.
+          CPU is a core count; memory and disk take a
           unit (<span className="mono">4GiB</span>, <span className="mono">512MiB</span>)
           — a bare number is read as GiB.
           {quotaless && disk.trim() && (

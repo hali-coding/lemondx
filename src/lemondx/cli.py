@@ -565,6 +565,86 @@ def cmd_bootstrap(args, service):
     return 0 if result["ok"] else 1
 
 
+def meter(part, whole, width=20):
+    """A text bar for part/whole; past full it is coloured as a warning."""
+    if not whole:
+        return DIM("[%s]" % ("." * width))
+    ratio = part / whole
+    filled = min(width, int(round(ratio * width)))
+    bar = "[%s%s]" % ("#" * filled, "." * (width - filled))
+    painted = RED(bar) if ratio > 1 else YELLOW(bar) if ratio >= 0.9 else bar
+    return "%s %3d%%" % (painted, round(ratio * 100))
+
+
+def cmd_resources(args, service):
+    resources = service.resources()
+
+    def unlimited(names, what):
+        if not names:
+            return ""
+        return YELLOW("  %d without a %s limit: %s" % (len(names), what, ", ".join(names)))
+
+    def render(r):
+        host, cpu, memory = r["host"], r["cpu"], r["memory"]
+        lines = [
+            "%s  %s" % (DIM("host   "), " · ".join(part for part in (
+                host["cpu_model"],
+                "%d threads" % host["cpu_threads"],
+                "%s RAM" % human_bytes(host["memory_total"]),
+                host["architecture"]) if part)),
+            "",
+            "%s  %s  %s of %d threads allocated%s" % (
+                BOLD("cpu    "), meter(cpu["allocated"], cpu["total"]),
+                cpu["allocated"], cpu["total"],
+                DIM(" (+%d stopped)" % cpu["stopped"]) if cpu["stopped"] else ""),
+        ]
+        if cpu["unlimited"]:
+            lines.append(unlimited(cpu["unlimited"], "CPU"))
+        lines.append("%s  %s  %s of %s allocated%s" % (
+            BOLD("memory "), meter(memory["allocated"], memory["total"]),
+            human_bytes(memory["allocated"]), human_bytes(memory["total"]),
+            DIM(" (+%s stopped)" % human_bytes(memory["stopped"]))
+            if memory["stopped"] else ""))
+        lines.append("%s  %s  %s in use on the host, %s by instances" % (
+            DIM("  used "), meter(memory["used"], memory["total"]),
+            human_bytes(memory["used"]), human_bytes(memory["instances_used"])))
+        if memory["unlimited"]:
+            lines.append(unlimited(memory["unlimited"], "memory"))
+        for pool in r["storage"]:
+            lines.append("%s  %s  %s of %s allocated on %s (%s)%s" % (
+                BOLD("disk   "), meter(pool["allocated"], pool["total"]),
+                human_bytes(pool["allocated"]), human_bytes(pool["total"]),
+                pool["name"], pool["driver"],
+                "" if pool["supports_quota"] else DIM(", not enforced")))
+            lines.append("%s  %s  %s used" % (
+                DIM("  used "), meter(pool["used"], pool["total"]),
+                human_bytes(pool["used"])))
+            if pool["unlimited"]:
+                lines.append(unlimited(pool["unlimited"], "disk"))
+
+        def limit(entry, value):
+            if not entry["limit"]:
+                return DIM("unlimited")
+            return DIM("%s (default)" % value) if entry["implicit"] else value
+
+        lines.append("")
+        lines.append(table(
+            [[BOLD(i["name"]),
+              STATUS_COLORS.get(i["status"], str)(i["status"]),
+              "vm" if i["type"] == "virtual-machine" else "container",
+              limit(i["cpu"], i["cpu"]["limit"]),
+              limit(i["memory"], i["memory"]["limit"]),
+              human_bytes(i["memory"]["usage"]) if i["active"] else "-",
+              limit({"limit": i["disk"]["size"], "implicit": i["disk"]["implicit"]},
+                    i["disk"]["size"])]
+             for i in r["instances"]],
+            ["name", "state", "type", "cpu", "memory", "in use", "disk"]))
+        return "\n".join(lines)
+
+    emit(args, resources, render)
+    return 0
+
+
 def cmd_images(args, service):
     images = service.list_images()
 
@@ -644,6 +724,9 @@ def build_parser():
     p.add_argument("--bridge", default="lxdbr0", help="bridge name")
     p.add_argument("--ipv6", action="store_true", help="also hand out IPv6")
     p.set_defaults(func=cmd_init)
+
+    p = add("resources", help="show allocated CPU/memory/disk against the host")
+    p.set_defaults(func=cmd_resources)
 
     p = add("list", aliases=["ls"], help="list containers")
     p.add_argument("--running", action="store_true", help="only running containers")

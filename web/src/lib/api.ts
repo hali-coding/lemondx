@@ -2,7 +2,7 @@ import type {
   BootstrapModule, BootstrapProfile, BootstrapResult, BootstrapSelection,
   Container, ModuleSource,
   ContainerDetail, CreateRequest, ExecResult, ImageBrowse, Images, NetworkDetail,
-  NetworkSummary, SetupResult, Snapshot, SshKey, StateAction, Status,
+  NetworkSummary, Resources, SetupResult, Snapshot, SshKey, StateAction, Status,
 } from './types'
 
 /** Error carrying the HTTP status so callers can react to 401/409 specifically. */
@@ -142,6 +142,8 @@ export const api = {
     const suffix = query.toString() ? `?${query}` : ''
     return request<ImageBrowse>(`/images/browse${suffix}`, { signal })
   },
+
+  resources: (signal?: AbortSignal) => request<Resources>('/resources', { signal }),
 
   networks: (signal?: AbortSignal) =>
     request<NetworkSummary[]>('/networks', { signal }),

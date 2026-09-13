@@ -300,3 +300,61 @@ export interface ModuleSource {
   content: string
   path: string
 }
+
+/** A claim on one resource. `implicit` marks a daemon default, not a set limit. */
+export interface ResourceClaim {
+  limit: string
+  implicit: boolean
+}
+
+export interface ResourceInstance {
+  name: string
+  type: string
+  status: ContainerStatus
+  /** Running or frozen: holding its CPU and memory right now. */
+  active: boolean
+  cpu_time_ns: number
+  cpu: ResourceClaim & { count: number | null }
+  memory: ResourceClaim & { bytes: number | null; usage: number }
+  disk: {
+    pool: string | null
+    size: string
+    bytes: number | null
+    usage: number
+    implicit: boolean
+  }
+}
+
+export interface PoolResources {
+  name: string
+  driver: string
+  supports_quota: boolean
+  total: number
+  used: number
+  allocated: number
+  /** Instances on this pool with no size, which can grow to fill it. */
+  unlimited: string[]
+}
+
+export interface Resources {
+  host: {
+    architecture: string
+    cpu_model: string
+    cpu_sockets: number
+    cpu_cores: number
+    cpu_threads: number
+    memory_total: number
+    memory_used: number
+  }
+  cpu: { total: number; allocated: number; stopped: number; unlimited: string[] }
+  memory: {
+    total: number
+    used: number
+    instances_used: number
+    allocated: number
+    stopped: number
+    unlimited: string[]
+  }
+  storage: PoolResources[]
+  instances: ResourceInstance[]
+}
