@@ -84,15 +84,22 @@ value beside them. Blank a field to go back to that original.
 ./lemondx module-set ssh-access --param USERNAME=hampus --param SHELL_PATH=/bin/sh
 ```
 
-**Bootstrap profiles** are named module selections with their parameters —
-"Save as profile" in the create dialog, or:
+**Bootstrap profiles** are named module selections with their parameters and
+SSH public keys — "Save as profile" in the create dialog, or:
 
 ```bash
 ./lemondx profile-save "Web server" -b base -b ssh-access -b docker \
-    --param USERNAME=hampus --description "my usual dev box"
+    --param USERNAME=hampus --all-ssh-keys --description "my usual dev box"
 ./lemondx profiles
-./lemondx create web -P "Web server" --all-ssh-keys
+./lemondx create web -P "Web server"
 ```
+
+A profile stores every non-secret parameter of its modules, not only the ones
+you changed: values you gave, then your saved settings at that moment, then the
+module's defaults. So it keeps doing the same thing when those settings change
+later. Keys given alongside `-P` are added to the profile's own. To save the
+image, limits and everything else as well, use an
+[instance template](templates.md).
 
 Deleting a module drops it from every profile that used it; a profile left with
 nothing to run is removed rather than kept as an empty shell.
@@ -111,6 +118,8 @@ to be readable and editable by hand:
   settings.json         default modules and remembered parameter values
   profiles/
     web-server.json     one file per bootstrap profile
+  templates/
+    web-server.json     one file per instance template
   modules/
     redis.sh            uploaded modules
 ```
@@ -126,7 +135,8 @@ real name inside it:
   "name": "Web server",
   "description": "my usual dev box",
   "modules": ["base", "ssh-access", "docker"],
-  "params": { "USERNAME": "hampus" }
+  "params": { "USERNAME": "hampus", "SHELL_PATH": "/bin/bash" },
+  "ssh_keys": ["ssh-ed25519 AAAA… hampus@laptop"]
 }
 ```
 
@@ -201,7 +211,7 @@ grammar, different handling:
 A secret has no default (anything after `=` is ignored) and must be supplied on
 every run; bootstrap refuses to start without it. It is never remembered as a
 setting, cannot be saved with `module-set`, is stripped from bootstrap profiles
-(including hand-edited ones), and every occurrence of its value is replaced
+and templates (including hand-edited ones), and every occurrence of its value is replaced
 with `********` in the output shown in the UI, the terminal and `--json`. The
 UI renders it as a password field and clears it once used.
 

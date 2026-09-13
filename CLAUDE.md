@@ -139,16 +139,32 @@ local disk).
 `~/.local/share/lemondx` (`LEMONDX_DATA_DIR`, or `XDG_DATA_HOME`, moves it;
 `LEMONDX_CONFIG_DIR` is still honoured as the name it had before the move):
 `settings.json` for default modules and remembered params, `profiles/` for one
-JSON file per bootstrap profile, `modules/` for uploads. Nothing else in the
-codebase builds those paths — go through `store.py` so migration and atomic
-writes apply.
+JSON file per bootstrap profile, `templates/` for one per instance template,
+`modules/` for uploads. Nothing else in the codebase builds those paths — go
+through `store.py` so migration and atomic writes apply.
 
-Profiles are one file each so they can be copied between machines or checked
-into a project, which means **every profile file is untrusted input**: the name
-in the file is authoritative, the filename is only `profile_slug()` of it (two
-names that slug alike get `-2`, `-3` suffixes), and `_clean_profile()`
-normalises every record on read. A file that no longer parses is skipped rather
-than failing the listing.
+Profiles and templates share one `_Records` implementation and are one file
+each so they can be copied between machines or checked into a project, which
+means **every such file is untrusted input**: the name in the file is
+authoritative, the filename is only `profile_slug()` of it (two names that slug
+alike get `-2`, `-3` suffixes), and `_clean_profile()`/`_clean_template()`
+normalise every record on read. A file that no longer parses is skipped rather
+than failing the listing. The service then drops secrets and re-parses SSH keys
+on every listing (`_public_selection()`), and on save completes the selection
+with every non-secret parameter its modules declare (`_stored_selection()`).
+
+A template is a create request minus the name. `launch_template()` refuses
+anything that would fail for every instance before creating one, then creates
+`<prefix>-<n>` instances on a small thread pool (the LXD client opens a socket
+per request, so this is safe), tags each with `user.lemondx.template`, and
+passes `remember_params=False` so launches never rewrite module settings.
+Recreate and destroy take the instance list the user confirmed and refuse with
+409 if the tagged set differs (`_confirmed_instances()`); recreate runs
+`_launch_bootstrap()`'s checks before deleting anything. All three run through
+`_tracked()`, which records the run on the service instance (one per `serve`
+process) and refuses a second one on the same template, so the UI reads
+progress from `/api/template-runs` rather than holding it in component state
+that unmounting would lose.
 
 `_migrate()` runs once per process, is best-effort (an `OSError` must never
 stop lemondx from starting) and handles both older layouts: adopting
@@ -165,9 +181,20 @@ change.** `web/src/lib/api.ts` is the only place `fetch` is called; it throws `A
 with the status so `App.tsx` can treat 401 as "prompt for token" (`TokenGate`, kept in
 `sessionStorage` for that tab only).
 
-`App.tsx` polls `/api/status` and `/api/containers` every 3s and holds a `mutating` ref
-that pauses polling while a mutation is in flight, so a poll cannot clobber optimistic
-state. Long operations (create, bootstrap) block on the daemon and show a spinner.
+`App.tsx` polls `/api/status`, `/api/containers` and `/api/creates` every 3s and holds a
+`mutating` ref that pauses polling while a mutation is in flight, so a poll cannot clobber
+optimistic state. Long operations **must not depend on the page that started them**: a
+user closes the dialog, switches tab or reloads, and a request held open for minutes also
+ties up one of the browser's few connections per host. So the UI starts creates and
+template runs with `background: true` -- the service validates, records the job
+(`_begin_create()`, `_tracked()`), runs it on a daemon thread and returns the record at
+once -- and `App.tsx` follows every job through the same 3s poll, reporting each one
+exactly once when a poll finds it finished. Without the flag the same calls block, which
+is what the CLI and scripts get. `serve()` waits on `pending_work()` at Ctrl-C. Template exec is the same
+kind of run (action `exec`); its output is cut to `EXEC_OUTPUT_LIMIT` per stream
+because run records are re-sent on every poll.
+`BootstrapPanel` (modules on an existing container) still keeps its progress in component
+state.
 
 ## Style
 

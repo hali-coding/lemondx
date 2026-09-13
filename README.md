@@ -65,6 +65,8 @@ Want it running all the time? See [Running as a service](docs/service.md).
 ./lemondx ls                     # list containers
 ./lemondx info NAME              # details, limits, network, snapshots
 ./lemondx resources              # allocated CPU/memory/disk against the host
+./lemondx storage pools          # local pools, capacity and management status
+./lemondx storage volumes        # custom, instance and image volumes
 ./lemondx create NAME -i ubuntu:24.04 -c 2 -m 2GiB -d 10GiB
                                  # -i defaults to Ubuntu LTS for this daemon
 ./lemondx limits NAME -c 4 -m 8GiB   # change an existing container's limits
@@ -85,6 +87,10 @@ Want it running all the time? See [Running as a service](docs/service.md).
 ./lemondx module-set ID --param K=V --default
 ./lemondx profiles               # saved bootstrap profiles
 ./lemondx profile-save NAME -b base -b docker
+./lemondx template-save NAME -i images:debian/12 -c 2 -b base   # a whole instance setup
+./lemondx launch NAME -n 3       # create NAME's instances: prefix-1..3
+./lemondx template-recreate|template-destroy NAME   # every instance from NAME
+./lemondx template-exec NAME -- uptime              # on every running one
 ./lemondx serve                  # web UI + API
 ```
 
@@ -106,6 +112,7 @@ pass to `-i`.
 | Doc | Covers |
 | --- | --- |
 | [Bootstrap modules](docs/modules.md) | writing and uploading modules, defaults, saved settings, profiles, secrets, the shipped modules |
+| [Instance templates](docs/templates.md) | saving a full instance setup and launching one or many from it |
 | [REST API](docs/api.md) | every endpoint, request/response shapes, curl examples |
 | [Daemons, images and storage](docs/daemons-and-storage.md) | LXD vs Incus, socket discovery, image remotes, disk quotas, units |
 | [Web UI tour](docs/web-ui.md) | the Resources and Network views, the full image browser |

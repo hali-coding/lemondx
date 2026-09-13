@@ -5,13 +5,15 @@ interface Props {
   value: BootstrapSelection
   onChange: (next: BootstrapSelection) => void
   disabled?: boolean
+  /** Show secrets as asked for on launch instead of as inputs (templates). */
+  secretsAtLaunch?: boolean
 }
 
 /**
  * Module checkboxes and their parameters. Key selection is deliberately not
  * here: see SshKeyPicker, which the create dialog renders at the top level.
  */
-export function BootstrapPicker({ modules, value, onChange, disabled }: Props) {
+export function BootstrapPicker({ modules, value, onChange, disabled, secretsAtLaunch }: Props) {
   function toggleModule(id: string) {
     const next = value.modules.includes(id)
       ? value.modules.filter((m) => m !== id)
@@ -22,8 +24,6 @@ export function BootstrapPicker({ modules, value, onChange, disabled }: Props) {
   function setParam(name: string, next: string) {
     onChange({ ...value, params: { ...value.params, [name]: next } })
   }
-
-
 
   if (modules.length === 0) {
     return (
@@ -59,7 +59,16 @@ export function BootstrapPicker({ modules, value, onChange, disabled }: Props) {
 
               {on && module.params.length > 0 && (
                 <div className="module-params">
-                  {module.params.map((param) => (
+                  {module.params.map((param) => param.secret && secretsAtLaunch ? (
+                    <div className="field" key={param.name}>
+                      <label>
+                        {param.name}
+                        <span className="badge badge-warn">secret</span>
+                      </label>
+                      <div className="input mono secret-placeholder">asked for on launch</div>
+                      {param.description && <span className="hint">{param.description}</span>}
+                    </div>
+                  ) : (
                     <div className="field" key={param.name}>
                       <label htmlFor={`p-${param.name}`}>
                         {param.name}

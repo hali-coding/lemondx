@@ -479,6 +479,9 @@ class LXDClient:
     def list_storage_pools(self):
         return self._sync("GET", "/1.0/storage-pools", params={"recursion": "1"}) or []
 
+    def get_storage_pool(self, name):
+        return self._sync("GET", "/1.0/storage-pools/%s" % _seg(name))
+
     def create_storage_pool(self, name, driver, config=None):
         return self._async(
             "POST",
@@ -487,12 +490,67 @@ class LXDClient:
             timeout=300,
         )
 
+    def update_storage_pool(self, name, description, config):
+        return self._async(
+            "PUT",
+            "/1.0/storage-pools/%s" % _seg(name),
+            {"description": description or "", "config": config or {}},
+            timeout=300,
+        )
+
+    def delete_storage_pool(self, name):
+        return self._async(
+            "DELETE", "/1.0/storage-pools/%s" % _seg(name), timeout=300
+        )
+
     def storage_pool_resources(self, name):
         """Space and inodes on a pool, or None where the driver cannot say."""
         try:
             return self._sync("GET", "/1.0/storage-pools/%s/resources" % _seg(name))
         except LXDError:
             return None
+
+    def list_storage_volumes(self, pool):
+        return self._sync(
+            "GET", "/1.0/storage-pools/%s/volumes" % _seg(pool),
+            params={"recursion": "1"},
+        ) or []
+
+    def get_storage_volume(self, pool, volume_type, name):
+        return self._sync(
+            "GET", "/1.0/storage-pools/%s/volumes/%s/%s"
+            % (_seg(pool), _seg(volume_type), _seg(name))
+        )
+
+    def create_storage_volume(self, pool, name, content_type="filesystem", config=None,
+                              description=""):
+        return self._async(
+            "POST",
+            "/1.0/storage-pools/%s/volumes/custom" % _seg(pool),
+            {
+                "name": name,
+                "type": "custom",
+                "content_type": content_type,
+                "description": description or "",
+                "config": config or {},
+            },
+            timeout=300,
+        )
+
+    def update_storage_volume(self, pool, name, description, config):
+        return self._async(
+            "PUT",
+            "/1.0/storage-pools/%s/volumes/custom/%s" % (_seg(pool), _seg(name)),
+            {"description": description or "", "config": config or {}},
+            timeout=300,
+        )
+
+    def delete_storage_volume(self, pool, name):
+        return self._async(
+            "DELETE",
+            "/1.0/storage-pools/%s/volumes/custom/%s" % (_seg(pool), _seg(name)),
+            timeout=300,
+        )
 
     def list_networks(self):
         return self._sync("GET", "/1.0/networks", params={"recursion": "1"}) or []

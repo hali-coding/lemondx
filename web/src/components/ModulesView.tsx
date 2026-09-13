@@ -244,7 +244,7 @@ export function ModulesView({ onNotify }: Props) {
       <div className="section-head" style={{ marginTop: 26 }}>
         <h2>Bootstrap profiles</h2>
         <span className="faint" style={{ fontSize: 12.5 }}>
-          saved module selections — save one from the create dialog
+          saved modules with every setting and SSH key — save one from the create dialog
         </span>
       </div>
 
@@ -253,8 +253,8 @@ export function ModulesView({ onNotify }: Props) {
           <div className="empty">
             <h3>No profiles yet</h3>
             <p>
-              Pick your modules when creating a container, then use “Save as
-              profile” to reuse that exact set later.
+              Pick your modules, settings and keys when creating a container,
+              then use “Save as profile” to reuse that exact set later.
             </p>
           </div>
         </div>
@@ -271,6 +271,9 @@ export function ModulesView({ onNotify }: Props) {
                 {Object.keys(profile.params).length > 0 && (
                   <> · {Object.entries(profile.params)
                     .map(([k, v]) => `${k}=${v}`).join(' ')}</>
+                )}
+                {profile.ssh_keys.length > 0 && (
+                  <> · {profile.ssh_keys.length} SSH key{profile.ssh_keys.length === 1 ? '' : 's'}</>
                 )}
               </div>
             </div>

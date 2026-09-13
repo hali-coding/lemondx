@@ -6,11 +6,12 @@ import argparse
 import getpass
 import json
 import os
+import shlex
 import shutil
 import sys
 
 from .lxd import LXDError
-from .service import ContainerService, ServiceError
+from .service import ContainerService, LOCAL_STORAGE_DRIVERS, ServiceError
 from .server import DEFAULT_HOST, DEFAULT_PORT, serve
 
 # ANSI colours, disabled when stdout is not a terminal or NO_COLOR is set.
@@ -214,7 +215,7 @@ def cmd_info(args, service):
 def cmd_create(args, service):
     image = args.image or service.default_image()
     if args.disk and not args.json:
-        pool = service.root_pool_info(args.profile)
+        pool = service.root_pool_info(args.profile, args.pool)
         if pool and not pool["supports_quota"]:
             print(YELLOW(
                 "! Pool '%s' uses the %s driver, which cannot enforce a disk "
@@ -224,7 +225,7 @@ def cmd_create(args, service):
     if not args.json:
         print(DIM("Creating %s from %s (this pulls the image on first use)..."
                   % (args.name, image)), flush=True)
-    modules, params = resolve_selection(args, service)
+    modules, params, ssh_keys = resolve_selection(args, service)
     if not modules and not args.no_default_modules:
         modules = [m["id"] for m in service.list_modules() if m["is_default"]]
     fill_secrets(modules, params, service)
@@ -234,7 +235,7 @@ def cmd_create(args, service):
         bootstrap = {
             "modules": modules,
             "params": params,
-            "ssh_keys": collect_ssh_keys(args.ssh_key, args.all_ssh_keys),
+            "ssh_keys": ssh_keys,
         }
         if not args.json:
             print(DIM("Will run bootstrap modules: %s" % ", ".join(modules)),
@@ -244,7 +245,7 @@ def cmd_create(args, service):
         name=args.name, image=image,
         instance_type="virtual-machine" if args.vm else "container",
         profiles=args.profile or None, cpu=args.cpu, memory=args.memory,
-        disk=args.disk, description=args.description, ephemeral=args.ephemeral,
+        disk=args.disk, pool=args.pool, description=args.description, ephemeral=args.ephemeral,
         start=not args.no_start, bootstrap=bootstrap,
     )
 
@@ -488,16 +489,19 @@ def cmd_profiles(args, service):
     emit(args, profiles, lambda items: table(
         [[p["name"], " → ".join(p["modules"]),
           " ".join("%s=%s" % kv for kv in p["params"].items()) or "-",
+          len(p["ssh_keys"]) or "-",
           p["description"] or "-"] for p in items],
-        ["name", "modules", "params", "description"]))
+        ["name", "modules", "params", "keys", "description"]))
     return 0
 
 
 def cmd_profile_save(args, service):
+    modules, params, ssh_keys = resolve_selection(args, service)
     profile = service.save_bootstrap_profile(
-        args.name, args.module or [], parse_params(args.param), args.description or "")
-    emit(args, profile, lambda p: "%s saved profile %s (%s)" % (
-        GREEN("+"), BOLD(p["name"]), " → ".join(p["modules"])))
+        args.name, modules, params, args.description or "", ssh_keys)
+    emit(args, profile, lambda p: "%s saved profile %s (%s%s)" % (
+        GREEN("+"), BOLD(p["name"]), " → ".join(p["modules"]),
+        ", %d key(s)" % len(p["ssh_keys"]) if p["ssh_keys"] else ""))
     return 0
 
 
@@ -508,9 +512,10 @@ def cmd_profile_delete(args, service):
 
 
 def resolve_selection(args, service):
-    """Modules and params for this run: a saved profile, plus any overrides."""
+    """Modules, params and keys for this run: a saved profile, plus overrides."""
     modules = list(args.module or [])
     params = {}
+    ssh_keys = []
     if getattr(args, "bootstrap_profile", None):
         match = next((p for p in service.list_bootstrap_profiles()
                       if p["name"].lower() == args.bootstrap_profile.lower()), None)
@@ -520,8 +525,176 @@ def resolve_selection(args, service):
                 % args.bootstrap_profile)
         modules = match["modules"] + [m for m in modules if m not in match["modules"]]
         params.update(match["params"])
+        ssh_keys.extend(match["ssh_keys"])
     params.update(parse_params(args.param))
-    return modules, params
+    ssh_keys.extend(collect_ssh_keys(args.ssh_key, args.all_ssh_keys))
+    return modules, params, list(dict.fromkeys(ssh_keys))
+
+
+def find_template(service, name):
+    """A template by name, ignoring case the way profile lookups do."""
+    match = next((t for t in service.list_templates()
+                  if t["name"].lower() == (name or "").lower()), None)
+    if not match:
+        raise ServiceError("No template called '%s'. See `lemondx templates`." % name)
+    return match
+
+
+def describe_template(t):
+    size = ", ".join(part for part in (
+        "%s cpu" % t["cpu"] if t["cpu"] else "",
+        t["memory"], "disk " + t["disk"] if t["disk"] else "") if part)
+    return "%s%s%s" % (t["image"], " (vm)" if t["type"] == "virtual-machine" else "",
+                       " · " + size if size else "")
+
+
+def cmd_templates(args, service):
+    templates = service.list_templates()
+    emit(args, templates, lambda items: table(
+        [[t["name"], describe_template(t), t["name_prefix"] + "-N",
+          " → ".join(t["bootstrap"]["modules"]) or "-",
+          len(t["bootstrap"]["ssh_keys"]) or "-",
+          t["description"] or "-"] for t in items],
+        ["name", "instance", "names", "modules", "keys", "description"]))
+    return 0
+
+
+def cmd_template_save(args, service):
+    modules, params, ssh_keys = resolve_selection(args, service)
+    template = service.save_template(
+        args.name, args.image or service.default_image(),
+        instance_type="virtual-machine" if args.vm else "container",
+        cpu=args.cpu, memory=args.memory, disk=args.disk, pool=args.pool,
+        profiles=args.profile, ephemeral=args.ephemeral, start=not args.no_start,
+        bootstrap={"modules": modules, "params": params, "ssh_keys": ssh_keys},
+        description=args.description or "", name_prefix=args.prefix,
+    )
+    emit(args, template, lambda t: "%s saved template %s: %s%s" % (
+        GREEN("+"), BOLD(t["name"]), describe_template(t),
+        (" · " + " → ".join(t["bootstrap"]["modules"]))
+        if t["bootstrap"]["modules"] else ""))
+    return 0
+
+
+def cmd_template_delete(args, service):
+    result = service.delete_template(args.name)
+    emit(args, result, lambda r: "%s deleted template %s" % (GREEN("+"), r["deleted"]))
+    return 0
+
+
+def render_template_run(result):
+    """Per-instance outcome of a launch, recreate or destroy."""
+    lines = []
+    for instance in result["instances"]:
+        container = instance["container"]
+        if instance["error"]:
+            lines.append("%s %s: %s" % (RED("!"), BOLD(instance["name"]), instance["error"]))
+        elif container is None:
+            lines.append("%s deleted %s" % (GREEN("+"), BOLD(instance["name"])))
+        else:
+            lines.append("%s %s is %s%s" % (
+                GREEN("+") if instance["ok"] else RED("!"), BOLD(instance["name"]),
+                container["status"].lower(),
+                (" at " + ", ".join(container["ipv4"])) if container["ipv4"] else ""))
+            if container.get("bootstrap") and not container["bootstrap"]["ok"]:
+                lines.append(render_bootstrap(container["bootstrap"]))
+    return "\n".join(lines)
+
+
+def confirm_template_instances(args, service, verb):
+    """The instances to act on, after the user has seen and accepted them."""
+    names = service.template_instances(args.template)
+    if not names:
+        raise ServiceError("No instances were launched from template '%s'." % args.template)
+    if not args.json:
+        print("Instances from %s: %s" % (BOLD(args.template), ", ".join(names)))
+    if not confirm("%s all %d? Their filesystems and snapshots are deleted."
+                   % (verb, len(names)), args.yes):
+        return None
+    return names
+
+
+def cmd_template_destroy(args, service):
+    names = confirm_template_instances(args, service, "Destroy")
+    if names is None:
+        print(DIM("nothing destroyed"))
+        return 1
+    result = service.destroy_template_instances(args.template, names)
+    emit(args, result, render_template_run)
+    return 0 if result["ok"] else 1
+
+
+def cmd_template_recreate(args, service):
+    template = find_template(service, args.template)
+    args.template = template["name"]
+    params = parse_params(args.param)
+    names = confirm_template_instances(args, service, "Recreate")
+    if names is None:
+        print(DIM("nothing recreated"))
+        return 1
+    fill_secrets(template["bootstrap"]["modules"], params, service)
+    if not args.json:
+        print(DIM("Recreating %d instance(s) from %s..." % (len(names), template["name"])),
+              flush=True)
+    result = service.recreate_template_instances(template["name"], names, params=params)
+    emit(args, result, render_template_run)
+    return 0 if result["ok"] else 1
+
+
+def cmd_template_exec(args, service):
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not command:
+        raise ServiceError("Give a command to run, e.g. `lemondx template-exec web -- uptime`.")
+    members = [c for c in service.list_containers() if c["template"] == args.template]
+    if not members:
+        raise ServiceError("No instances were launched from template '%s'." % args.template)
+    names = [c["name"] for c in members if c["status"] == "Running"]
+    skipped = [c["name"] for c in members if c["status"] != "Running"]
+    if not names:
+        raise ServiceError("None of the instances from '%s' are running." % args.template)
+    if skipped and not args.json:
+        print(DIM("skipping %s (not running)" % ", ".join(skipped)), file=sys.stderr)
+
+    # One string, run by sh -c on each: quoting keeps the words as they were
+    # typed, so `-- echo "a b"` means the same here as in a local shell.
+    result = service.exec_template_instances(
+        args.template, command[0] if len(command) == 1 else shlex.join(command),
+        names, timeout=args.timeout)
+
+    def render(r):
+        lines = []
+        for instance in r["instances"]:
+            outcome = instance["exec"]
+            if instance["error"]:
+                lines.append("%s %s: %s" % (RED("!"), BOLD(instance["name"]), instance["error"]))
+                continue
+            code = outcome["exit_code"]
+            lines.append("%s %s %s" % (GREEN("+") if code == 0 else RED("!"),
+                                       BOLD(instance["name"]),
+                                       DIM("exit %d" % code)))
+            for stream, colour in (("stdout", str), ("stderr", RED)):
+                for line in (outcome[stream] or "").splitlines():
+                    lines.append("    " + colour(line))
+            if outcome["truncated"]:
+                lines.append("    " + DIM("(output cut to its last %d KiB)"
+                                          % (service.EXEC_OUTPUT_LIMIT // 1024)))
+        return "\n".join(lines)
+
+    emit(args, result, render)
+    return 0 if result["ok"] else 1
+
+
+def cmd_launch(args, service):
+    template = find_template(service, args.template)
+    params = parse_params(args.param)
+    fill_secrets(template["bootstrap"]["modules"], params, service)
+    if not args.json:
+        print(DIM("Launching %d instance(s) from %s (this pulls the image on first "
+                  "use)..." % (args.count, template["name"])), flush=True)
+    result = service.launch_template(template["name"], count=args.count,
+                                     prefix=args.prefix, params=params)
+    emit(args, result, render_template_run)
+    return 0 if result["ok"] else 1
 
 
 def fill_secrets(modules, params, service):
@@ -552,13 +725,13 @@ def fill_secrets(modules, params, service):
 
 
 def cmd_bootstrap(args, service):
-    modules, params = resolve_selection(args, service)
+    modules, params, ssh_keys = resolve_selection(args, service)
     fill_secrets(modules, params, service)
     result = service.bootstrap(
         args.name,
         modules=modules,
         params=params,
-        ssh_keys=collect_ssh_keys(args.ssh_key, args.all_ssh_keys),
+        ssh_keys=ssh_keys,
         timeout=args.timeout,
     )
     emit(args, result, render_bootstrap)
@@ -645,6 +818,164 @@ def cmd_resources(args, service):
     return 0
 
 
+def cmd_storage_pools(args, service):
+    pools = service.storage()["pools"]
+    emit(args, pools, lambda items: table([
+        [
+            BOLD(pool["name"]), pool["driver"],
+            human_bytes(pool["used"]), human_bytes(pool["total"]),
+            pool["volume_count"],
+            "yes" if pool["manageable"] else "read-only",
+        ]
+        for pool in items
+    ], ["name", "driver", "used", "total", "volumes", "managed"]))
+    return 0
+
+
+def cmd_storage_pool_show(args, service):
+    pool = service.get_storage_pool(args.name)
+
+    def render(item):
+        lines = [
+            "%s  %s" % (BOLD(item["name"]), item["driver"]),
+            "%s  %s of %s" % (DIM("space "), human_bytes(item["used"]),
+                                human_bytes(item["total"])),
+            "%s  %s" % (DIM("source"), item["source"] or "-"),
+            "%s  %s" % (DIM("status"), "managed" if item["manageable"] else "read-only"),
+        ]
+        if item["description"]:
+            lines.append("%s  %s" % (DIM("about "), item["description"]))
+        if item["used_by"]:
+            lines.append("%s  %s" % (DIM("used by"), ", ".join(item["used_by"])))
+        if item["config"]:
+            lines.append("")
+            lines.append(BOLD("configuration"))
+            lines.extend("  %s=%s" % pair for pair in sorted(item["config"].items()))
+        return "\n".join(lines)
+
+    emit(args, pool, render)
+    return 0
+
+
+def cmd_storage_pool_create(args, service):
+    pool = service.create_storage_pool(
+        args.name, args.driver, source=args.source, size=args.size,
+        description=args.description or "", config=parse_params(args.config))
+    emit(args, pool, lambda item: "%s created pool %s (%s)" % (
+        GREEN("+"), BOLD(item["name"]), item["driver"]))
+    return 0
+
+
+def cmd_storage_pool_set(args, service):
+    if args.description is None and args.size is None and not args.config:
+        raise ServiceError("Give at least one of --description, --size or --config.")
+    pool = service.update_storage_pool(
+        args.name, description=args.description, size=args.size,
+        config=parse_params(args.config))
+    emit(args, pool, lambda item: "%s updated pool %s" % (
+        GREEN("+"), BOLD(item["name"])))
+    return 0
+
+
+def cmd_storage_pool_delete(args, service):
+    force = bool(args.force)
+    plan = None
+    confirmation = None
+    if force:
+        pool = service.get_storage_pool(args.name)
+        plan = pool["delete_plan"]
+        if not args.json:
+            labels = (
+                ("instances stored here", plan["instances"]),
+                ("instances attached to custom volumes", plan["attached_instances"]),
+                ("cached images", plan["images"]),
+                ("custom volumes", plan["custom_volumes"]),
+                ("profiles to update", plan["profiles"]),
+                ("unsupported references", plan["other_references"]),
+                ("unsupported volumes", plan["other_volumes"]),
+            )
+            print(RED("Force deletion will permanently remove:"), file=sys.stderr)
+            for label, values in labels:
+                if values:
+                    print("  %s: %s" % (label, ", ".join(values)), file=sys.stderr)
+            if pool["driver"] == "zfs":
+                print("  The backing zpool will be preserved; export it when prompted.",
+                      file=sys.stderr)
+        if args.confirm_name is not None:
+            confirmation = args.confirm_name
+        elif sys.stdin.isatty():
+            confirmation = input("Type '%s' to confirm: " % args.name).strip()
+        if confirmation != args.name:
+            raise ServiceError(
+                "Type the pool name exactly, or pass --confirm-name %s." % args.name)
+    elif not confirm("Delete storage pool '%s'?" % args.name, args.yes):
+        print(DIM("skipped %s" % args.name))
+        return 0
+    result = service.delete_storage_pool(
+        args.name, force=force, confirmation=confirmation, expected_plan=plan)
+    emit(args, result, lambda item: "%s %s pool %s" % (
+        GREEN("+"), "detached" if item.get("detached") else "deleted",
+        BOLD(item["deleted"])))
+    return 0
+
+
+def cmd_storage_volumes(args, service):
+    volumes = service.storage()["volumes"]
+    if args.pool:
+        volumes = [volume for volume in volumes if volume["pool"] == args.pool]
+    emit(args, volumes, lambda items: table([
+        [
+            BOLD(volume["name"]), volume["pool"], volume["type"],
+            volume["content_type"], volume["size"] or "-",
+            "yes" if volume["manageable"] else "read-only",
+        ]
+        for volume in items
+    ], ["name", "pool", "type", "content", "size", "managed"]))
+    return 0
+
+
+def cmd_storage_volume_show(args, service):
+    volume = service.get_storage_volume(args.pool, args.name)
+    emit(args, volume, lambda item: "\n".join([
+        "%s  %s" % (BOLD(item["name"]), item["content_type"]),
+        "%s  %s" % (DIM("pool  "), item["pool"]),
+        "%s  %s" % (DIM("size  "), item["size"] or "unlimited"),
+        "%s  %s" % (DIM("status"), "managed" if item["manageable"] else "read-only"),
+    ]))
+    return 0
+
+
+def cmd_storage_volume_create(args, service):
+    volume = service.create_storage_volume(
+        args.pool, args.name, content_type=args.content_type, size=args.size,
+        description=args.description or "", config=parse_params(args.config))
+    emit(args, volume, lambda item: "%s created volume %s in %s" % (
+        GREEN("+"), BOLD(item["name"]), item["pool"]))
+    return 0
+
+
+def cmd_storage_volume_set(args, service):
+    if args.description is None and args.size is None and not args.config:
+        raise ServiceError("Give at least one of --description, --size or --config.")
+    volume = service.update_storage_volume(
+        args.pool, args.name, description=args.description, size=args.size,
+        config=parse_params(args.config))
+    emit(args, volume, lambda item: "%s updated volume %s" % (
+        GREEN("+"), BOLD(item["name"])))
+    return 0
+
+
+def cmd_storage_volume_delete(args, service):
+    label = "%s/%s" % (args.pool, args.name)
+    if not confirm("Delete storage volume '%s'?" % label, args.yes):
+        print(DIM("skipped %s" % label))
+        return 0
+    result = service.delete_storage_volume(args.pool, args.name)
+    emit(args, result, lambda item: "%s deleted volume %s/%s" % (
+        GREEN("+"), item["pool"], BOLD(item["deleted"])))
+    return 0
+
+
 def cmd_images(args, service):
     images = service.list_images()
 
@@ -728,6 +1059,85 @@ def build_parser():
     p = add("resources", help="show allocated CPU/memory/disk against the host")
     p.set_defaults(func=cmd_resources)
 
+    storage = add("storage", help="view and manage local storage")
+    storage_sub = storage.add_subparsers(dest="storage_command", metavar="<storage-command>")
+
+    p = storage_sub.add_parser("pools", parents=[common], help="list storage pools")
+    p.set_defaults(func=cmd_storage_pools)
+
+    pool = storage_sub.add_parser("pool", help="manage a storage pool")
+    pool_sub = pool.add_subparsers(dest="pool_command", metavar="<pool-command>")
+
+    p = pool_sub.add_parser("show", parents=[common], help="show a storage pool")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_storage_pool_show)
+
+    p = pool_sub.add_parser("create", parents=[common], help="create a local storage pool")
+    p.add_argument("name")
+    p.add_argument("--driver", required=True, choices=sorted(LOCAL_STORAGE_DRIVERS))
+    p.add_argument("--source", help="existing directory, device, volume group or zpool")
+    p.add_argument("--size", help="loop-backed pool size, e.g. 30GiB")
+    p.add_argument("--description")
+    p.add_argument("--config", action="append", metavar="KEY=VALUE",
+                   help="allowlisted local-driver option (repeatable)")
+    p.set_defaults(func=cmd_storage_pool_create)
+
+    p = pool_sub.add_parser("set", parents=[common], help="update a local storage pool")
+    p.add_argument("name")
+    p.add_argument("--size", help="new size for a managed loop-backed pool")
+    p.add_argument("--description")
+    p.add_argument("--config", action="append", metavar="KEY=VALUE",
+                   help="allowlisted local-driver option (repeatable)")
+    p.set_defaults(func=cmd_storage_pool_set)
+
+    p = pool_sub.add_parser("delete", parents=[common], help="delete a local pool")
+    p.add_argument("name")
+    p.add_argument("--force", action="store_true",
+                   help="delete resources in the pool first")
+    p.add_argument("--confirm-name", metavar="NAME",
+                   help="exact pool name required for non-interactive force deletion")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="do not ask for normal empty-pool confirmation")
+    p.set_defaults(func=cmd_storage_pool_delete)
+
+    p = storage_sub.add_parser("volumes", parents=[common], help="list storage volumes")
+    p.add_argument("--pool", help="only volumes in this pool")
+    p.set_defaults(func=cmd_storage_volumes)
+
+    volume = storage_sub.add_parser("volume", help="manage a custom storage volume")
+    volume_sub = volume.add_subparsers(dest="volume_command", metavar="<volume-command>")
+
+    p = volume_sub.add_parser("show", parents=[common], help="show a custom volume")
+    p.add_argument("pool")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_storage_volume_show)
+
+    p = volume_sub.add_parser("create", parents=[common], help="create a custom volume")
+    p.add_argument("pool")
+    p.add_argument("name")
+    p.add_argument("--content-type", choices=("filesystem", "block"),
+                   default="filesystem")
+    p.add_argument("--size", help="volume size, e.g. 20GiB")
+    p.add_argument("--description")
+    p.add_argument("--config", action="append", metavar="KEY=VALUE",
+                   help="allowlisted volume option (repeatable)")
+    p.set_defaults(func=cmd_storage_volume_create)
+
+    p = volume_sub.add_parser("set", parents=[common], help="update a custom volume")
+    p.add_argument("pool")
+    p.add_argument("name")
+    p.add_argument("--size", help="new volume size")
+    p.add_argument("--description")
+    p.add_argument("--config", action="append", metavar="KEY=VALUE",
+                   help="allowlisted volume option (repeatable)")
+    p.set_defaults(func=cmd_storage_volume_set)
+
+    p = volume_sub.add_parser("delete", parents=[common], help="delete a custom volume")
+    p.add_argument("pool")
+    p.add_argument("name")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_storage_volume_delete)
+
     p = add("list", aliases=["ls"], help="list containers")
     p.add_argument("--running", action="store_true", help="only running containers")
     p.set_defaults(func=cmd_list)
@@ -736,19 +1146,23 @@ def build_parser():
     p.add_argument("name")
     p.set_defaults(func=cmd_info)
 
-    p = add("create", parents=[common, boot], help="create a container")
+    # What an instance is made of, shared by `create` and `template-save`.
+    spec = argparse.ArgumentParser(add_help=False)
+    spec.add_argument("-i", "--image",
+                      help="image alias, e.g. ubuntu:24.04 or images:debian/12 "
+                           "(default: latest Ubuntu LTS for this daemon)")
+    spec.add_argument("-c", "--cpu", help="CPU limit, e.g. 2")
+    spec.add_argument("-m", "--memory", help="memory limit, e.g. 2GiB")
+    spec.add_argument("-d", "--disk", help="root disk size, e.g. 10GiB")
+    spec.add_argument("--pool", help="storage pool for the root disk")
+    spec.add_argument("--profile", action="append", help="profile to apply (repeatable)")
+    spec.add_argument("--vm", action="store_true", help="create a virtual machine instead")
+    spec.add_argument("--ephemeral", action="store_true", help="delete on stop")
+    spec.add_argument("--no-start", action="store_true", help="create without starting")
+
+    p = add("create", parents=[common, spec, boot], help="create a container")
     p.add_argument("name")
-    p.add_argument("-i", "--image",
-                   help="image alias, e.g. ubuntu:24.04 or images:debian/12 "
-                        "(default: latest Ubuntu LTS for this daemon)")
-    p.add_argument("-c", "--cpu", help="CPU limit, e.g. 2")
-    p.add_argument("-m", "--memory", help="memory limit, e.g. 2GiB")
-    p.add_argument("-d", "--disk", help="root disk size, e.g. 10GiB")
     p.add_argument("--description", help="free-text description")
-    p.add_argument("--profile", action="append", help="profile to apply (repeatable)")
-    p.add_argument("--vm", action="store_true", help="create a virtual machine instead")
-    p.add_argument("--ephemeral", action="store_true", help="delete on stop")
-    p.add_argument("--no-start", action="store_true", help="create without starting")
     p.add_argument("--no-default-modules", action="store_true",
                    help="skip modules marked as default")
     p.set_defaults(func=cmd_create)
@@ -854,6 +1268,53 @@ def build_parser():
     p = add("profile-delete", help="delete a bootstrap profile")
     p.add_argument("name")
     p.set_defaults(func=cmd_profile_delete)
+
+    p = add("templates", help="list saved instance templates")
+    p.set_defaults(func=cmd_templates)
+
+    p = add("template-save", parents=[common, spec, boot],
+            help="save an instance spec and bootstrap selection as a template")
+    p.add_argument("name")
+    p.add_argument("--description", default="", help="what the template is for")
+    p.add_argument("--prefix", help="instance name prefix (default: from the name)")
+    p.set_defaults(func=cmd_template_save)
+
+    p = add("template-delete", help="delete an instance template")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_template_delete)
+
+    p = add("template-destroy",
+            help="stop and delete every instance launched from a template")
+    # The instance tag, not the template: this works after the template is gone.
+    p.add_argument("template")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_template_destroy)
+
+    p = add("template-recreate",
+            help="replace every instance from a template with a fresh one")
+    p.add_argument("template")
+    p.add_argument("--param", action="append", metavar="KEY=VALUE",
+                   help="override a saved parameter or supply a secret (repeatable)")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_template_recreate)
+
+    p = add("template-exec",
+            help="run a command on every running instance from a template")
+    p.add_argument("template")
+    p.add_argument("command", nargs=argparse.REMAINDER,
+                   help="command to run (prefix with -- to pass flags)")
+    p.add_argument("--timeout", type=int, default=300,
+                   help="seconds allowed per instance (default: 300)")
+    p.set_defaults(func=cmd_template_exec)
+
+    p = add("launch", help="create one or more instances from a template")
+    p.add_argument("template")
+    p.add_argument("-n", "--count", type=int, default=1,
+                   help="how many instances (default: 1)")
+    p.add_argument("--prefix", help="name them <prefix>-N instead of the template's")
+    p.add_argument("--param", action="append", metavar="KEY=VALUE",
+                   help="override a saved parameter or supply a secret (repeatable)")
+    p.set_defaults(func=cmd_launch)
 
     p = add("bootstrap", parents=[common, boot],
             help="run bootstrap modules against an existing container")
