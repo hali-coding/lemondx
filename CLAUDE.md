@@ -2,9 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-lemondx is a web UI and CLI for local LXD/Incus containers. `README.md` is the user-facing
-reference (CLI commands, REST endpoints, module authoring, socket discovery) and is kept
-current — read it for behaviour; this file covers how the code is put together.
+lemondx is a web UI and CLI for local LXD/Incus containers. `README.md` and `docs/*.md`
+are the user-facing reference (CLI commands, REST endpoints, module authoring, socket
+discovery) and are kept current — read them for behaviour; this file covers how the code
+is put together. README.md is deliberately short: it links out to docs/ for anything more
+than a paragraph, so update the doc a change actually affects rather than growing the
+README back -- see `docs/` for the current split (modules, REST API, daemons/storage,
+web UI, service, security, frontend dev).
 
 ## Commands
 
