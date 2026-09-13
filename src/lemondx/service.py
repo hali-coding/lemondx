@@ -6,17 +6,22 @@ front ends can never drift apart in behaviour.
 
 from __future__ import annotations
 
+import json
 import re
 from . import store
 from .bootstrap import (BootstrapError, BootstrapRunner, delete_module,
                         discover_modules, effective_params,
                         list_host_ssh_keys, module_source,
                         normalise_module_id, parse_public_key,
-                        public_modules, save_module)
-from .lxd import INCUS, LXDClient, LXDError
+                        public_modules, save_module, secret_param_names)
+from .lxd import INCUS, LXDClient, LXDError, window_resize_message
 from .simplestreams import CatalogError, fetch_catalog
 
 VALID_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,61}$")
+# A shell the caller asks for by path. Deliberately narrow: it is handed to the
+# daemon as argv[0], and an absolute path with no metacharacters cannot become
+# anything else on the way.
+VALID_SHELL = re.compile(r"^/[A-Za-z0-9._/-]{1,127}$")
 
 # Handy starting points for the "new container" form. Anything the remotes
 # publish still works -- the UI keeps a free-text field alongside these.
@@ -127,6 +132,108 @@ class ServiceError(Exception):
         super().__init__(message)
         self.message = message
         self.code = code
+
+
+class TerminalSession:
+    """One attached interactive session, from the domain's point of view.
+
+    Holds the daemon's two channels -- data, and the control channel that
+    carries window resizes -- and knows how the browser asks for things. The
+    byte pumping itself is the HTTP layer's job, in server.py.
+    """
+
+    def __init__(self, client, operation, data, control, what):
+        self.lxd = client
+        self.operation = operation
+        self.data = data
+        self.control = control
+        self.what = what              # "shell" or "console", for messages
+
+    def read(self):
+        """The next chunk of guest output, or None once the session is over.
+
+        The daemon signals end of stream with a zero-length message rather than
+        by closing the channel, so an empty read is the end and not a no-op.
+        Miss that and the session never finishes: the channel stays open, the
+        exit status is never collected, and the reader blocks for good.
+        """
+        message = self.data.recv()
+        if message is None:
+            return None
+        return message[1] or None
+
+    def write(self, payload):
+        """Send keystrokes to the guest."""
+        self.data.send(payload)
+
+    def handle_control(self, payload):
+        """Act on a control message from the browser. Junk is ignored."""
+        try:
+            message = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return
+        if not isinstance(message, dict):
+            return
+        resize = message.get("resize")
+        if isinstance(resize, dict):
+            self.resize(resize.get("cols"), resize.get("rows"))
+
+    def resize(self, cols, rows):
+        """Tell the guest's TTY it changed size, if the daemon gave us a way."""
+        if self.control is None:
+            return
+        cols, rows = terminal_size(cols, rows)
+        try:
+            self.control.send_text(window_resize_message(cols, rows))
+        except Exception:             # noqa: BLE001 - a lost resize is not fatal
+            pass
+
+    def exit_code(self):
+        """What the command exited with, or None if that is not knowable.
+
+        Hangs up first, deliberately: the daemon holds the operation open
+        while any of its channels are attached, and only a finished operation
+        carries the exit status. Reading it without closing first finds an
+        operation still marked running, whatever the guest has already done.
+
+        A console attachment has no exit status at all, and an operation that
+        has already been reaped answers nothing useful either.
+        """
+        if self.what != "shell":
+            return None
+        self.close()
+        record = None
+        try:
+            record = self.lxd.wait_for_operation(self.operation, timeout=5)
+        except LXDError:
+            # The daemon reports some non-zero exits as a failed operation, but
+            # the record still carries the real code. Same recovery as exec.
+            try:
+                record = self.lxd.get_operation(self.operation)
+            except LXDError:
+                return None
+        value = ((record or {}).get("metadata") or {}).get("return")
+        return value if isinstance(value, int) else None
+
+    def close(self):
+        """Hang up both channels. Safe to call more than once."""
+        for channel in (self.data, self.control):
+            if channel is not None:
+                try:
+                    channel.close()
+                except Exception:     # noqa: BLE001 - closing must never raise
+                    pass
+
+
+def terminal_size(cols, rows):
+    """A window size the daemon will accept, whatever the client claimed."""
+    def clamp(value, fallback):
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return fallback
+        return max(1, min(1000, number))
+    return clamp(cols, 80), clamp(rows, 24)
 
 
 class ContainerService:
@@ -474,6 +581,59 @@ class ContainerService:
 
     # -- catalogue ---------------------------------------------------------
 
+    # -- interactive terminals ---------------------------------------------
+
+    TERMINAL_KINDS = ("shell", "console")
+
+    # Minimal images often ship no bash, and `exec` on a missing binary kills
+    # the session outright, so ask before committing to one.
+    _SHELL_PROBE = "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi"
+
+    def open_terminal(self, name, kind="shell", shell=None, cols=80, rows=24):
+        """Attach to a guest and hand back the live session.
+
+        ``shell`` runs a real TTY on a shell inside the container; ``console``
+        attaches to the guest's own console device, which is what a VM needs
+        and what shows a login prompt on a container.
+        """
+        if kind not in self.TERMINAL_KINDS:
+            raise ServiceError(
+                "Unknown terminal '%s'. Try: %s"
+                % (kind, ", ".join(self.TERMINAL_KINDS)), 404)
+        if not VALID_NAME.match(name or ""):
+            raise ServiceError("Invalid container name '%s'." % name, 404)
+
+        status = (self.lxd.get_state(name) or {}).get("status")
+        if status != "Running":
+            raise ServiceError(
+                "Container '%s' is %s. Start it to open a %s."
+                % (name, (status or "not running").lower(), kind), 409)
+
+        cols, rows = terminal_size(cols, rows)
+        if kind == "console":
+            operation, fds = self.lxd.console_session(name, cols, rows)
+        else:
+            if shell and not VALID_SHELL.match(shell):
+                raise ServiceError(
+                    "A shell must be an absolute path, such as /bin/zsh.")
+            command = [shell] if shell else ["/bin/sh", "-c", self._SHELL_PROBE]
+            operation, fds = self.lxd.exec_interactive(
+                name, command,
+                # Without TERM the guest assumes a dumb terminal and no curses
+                # program will draw anything.
+                environment={"TERM": "xterm-256color"},
+                width=cols, height=rows,
+            )
+
+        data = self.lxd.attach(operation, fds["0"])
+        control = None
+        if fds.get("control"):
+            try:
+                control = self.lxd.attach(operation, fds["control"])
+            except LXDError:
+                pass          # resizing will not work, but the session will
+        return TerminalSession(self.lxd, operation, data, control, kind)
+
     def list_images(self):
         local = []
         for image in self.lxd.list_images():
@@ -538,6 +698,11 @@ class ContainerService:
             if unknown:
                 raise ServiceError(
                     "'%s' does not declare %s." % (module_id, ", ".join(unknown)))
+            secret = sorted(set(params) & secret_param_names([module]))
+            if secret:
+                raise ServiceError(
+                    "%s is a secret and is never stored; supply it when you run "
+                    "the module." % ", ".join(secret))
 
         def mutate(settings):
             if params is not None:
@@ -563,15 +728,24 @@ class ContainerService:
     # which configure devices and limits -- these only bundle bootstrap steps.
 
     def list_bootstrap_profiles(self):
-        profiles = store.load().get("profiles") or {}
+        available = discover_modules()
+
+        def public_params(profile):
+            # Profile files are shared and hand-edited; a secret written into
+            # one is dropped rather than silently reused.
+            secret = secret_param_names(
+                available[m] for m in profile.get("modules") or [] if m in available)
+            return {k: v for k, v in (profile.get("params") or {}).items()
+                    if k not in secret}
+
         return [
             {
                 "name": name,
                 "description": profile.get("description", ""),
                 "modules": profile.get("modules") or [],
-                "params": profile.get("params") or {},
+                "params": public_params(profile),
             }
-            for name, profile in sorted(profiles.items())
+            for name, profile in sorted(store.load_profiles().items())
         ]
 
     def save_bootstrap_profile(self, name, modules, params=None, description=""):
@@ -588,20 +762,20 @@ class ContainerService:
         if unknown:
             raise ServiceError("Unknown module(s): %s" % ", ".join(unknown))
 
+        # Saving from the create dialog sends everything typed, password
+        # included. Keep the selection, never the secret.
+        secret = secret_param_names(available[m] for m in modules)
         entry = {
             "description": str(description or "")[:200],
             "modules": list(dict.fromkeys(modules)),
-            "params": {str(k): str(v) for k, v in (params or {}).items()},
+            "params": {str(k): str(v) for k, v in (params or {}).items()
+                       if str(k) not in secret},
         }
-        store.update(lambda s: s.setdefault("profiles", {}).__setitem__(name, entry))
-        return dict(entry, name=name)
+        return store.save_profile(name, entry)
 
     def delete_bootstrap_profile(self, name):
-        def mutate(settings):
-            if name not in (settings.get("profiles") or {}):
-                raise ServiceError("No such profile '%s'." % name, 404)
-            settings["profiles"].pop(name)
-        store.update(mutate)
+        if not store.delete_profile(name):
+            raise ServiceError("No such profile '%s'." % name, 404)
         return {"deleted": name}
 
     def list_ssh_keys(self):
@@ -649,7 +823,7 @@ class ContainerService:
                     continue
                 for param in module["params"]:
                     name = param["name"]
-                    if name not in values:
+                    if name not in values or param.get("secret"):
                         continue
                     value = str(values[name])
                     if value == param["default"]:

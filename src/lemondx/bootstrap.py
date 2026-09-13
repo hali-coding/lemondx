@@ -119,8 +119,8 @@ def parse_module(path):
         if not match:
             continue
         key, value = match.group(1).lower(), match.group(2).strip()
-        if key == "param":
-            parsed = _parse_param(value)
+        if key in ("param", "secret"):
+            parsed = _parse_param(value, secret=key == "secret")
             if parsed:
                 meta["param"].append(parsed)
         elif key == "uses":
@@ -152,15 +152,23 @@ def parse_module(path):
     }
 
 
-def _parse_param(value):
+def _parse_param(value, secret=False):
     match = _PARAM.match(value)
     if not match:
         return None
     return {
         "name": match.group(1),
-        "default": match.group(2),
+        # A secret never ships a default: a password baked into a module file
+        # is a password every container shares.
+        "default": "" if secret else match.group(2),
         "description": match.group(3).strip(),
+        "secret": secret,
     }
+
+
+def secret_param_names(modules):
+    """Names of every secret parameter the given module records declare."""
+    return {p["name"] for m in modules for p in m["params"] if p.get("secret")}
 
 
 def public_modules(settings=None):
@@ -180,6 +188,7 @@ def public_modules(settings=None):
         overrides = saved_params.get(module["id"]) or {}
         entry["is_default"] = module["id"] in default_modules
         entry["params"] = [
+            dict(param, value="", saved=False) if param.get("secret") else
             dict(param,
                  value=overrides.get(param["name"], param["default"]),
                  saved=param["name"] in overrides)
@@ -194,7 +203,9 @@ def effective_params(module_id, module, settings=None):
     settings = settings if settings is not None else store.load()
     saved = (settings.get("module_params") or {}).get(module_id) or {}
     values = {p["name"]: p["default"] for p in module["params"]}
-    values.update({k: v for k, v in saved.items() if k in values})
+    # A secret that somehow reached settings.json is ignored, not used.
+    values.update({k: v for k, v in saved.items()
+                   if k in values and k not in secret_param_names([module])})
     return values
 
 
@@ -319,15 +330,7 @@ def delete_module(module_id):
         raise BootstrapError("No such uploaded module '%s'." % module_id, 404)
     os.unlink(target)
 
-    # Drop any settings that referenced it.
-    def prune(settings):
-        settings.get("module_params", {}).pop(module_id, None)
-        defaults = settings.get("default_modules") or []
-        settings["default_modules"] = [m for m in defaults if m != module_id]
-        for profile in (settings.get("profiles") or {}).values():
-            profile["modules"] = [m for m in profile.get("modules", [])
-                                  if m != module_id]
-    store.update(prune)
+    store.prune_module(module_id)          # drop it from defaults and profiles
     return {"deleted": module_id}
 
 
@@ -442,6 +445,16 @@ class BootstrapRunner:
         if keys:
             environment["LEMONDX_SSH_KEYS"] = "\n".join(keys)
 
+        # Secrets have no default, so an empty one is always a mistake -- and
+        # far cheaper to catch here than halfway through a package install.
+        missing = sorted(n for n in secret_param_names(selected)
+                         if not environment.get(n))
+        if missing:
+            raise BootstrapError(
+                "Supply a value for %s -- secret parameters have no default."
+                % ", ".join(missing))
+        secrets = [environment[n] for n in secret_param_names(selected)]
+
         self._wait_until_reachable(name)
         self._require_connectivity(name)
         # Package indexes are refreshed once per run, not once per module.
@@ -455,6 +468,12 @@ class BootstrapRunner:
             results.append(result)
             if result["exit_code"] != 0 and stop_on_error:
                 break
+
+        # Output goes to the UI, the terminal and --json. A module should never
+        # print a secret, but `set -x` or a chatty tool can, so scrub it anyway.
+        for result in results:
+            result["stdout"] = redact(result["stdout"], secrets)
+            result["stderr"] = redact(result["stderr"], secrets)
 
         return {
             "container": name,
@@ -558,6 +577,15 @@ exit 2
                         return
             time.sleep(1)
         # No address is not fatal -- a module may not need the network.
+
+
+def redact(text, secrets):
+    """Replace every occurrence of each secret value with a fixed mask."""
+    if not text:
+        return text
+    for value in sorted((v for v in secrets if v), key=len, reverse=True):
+        text = text.replace(value, "********")
+    return text
 
 
 def _clean_env(params):

@@ -1,0 +1,36 @@
+# User service (recommended): install-service.sh copies this to
+# ~/.config/systemd/user/lemondx.service and fills in @LEMONDX_PATH@.
+#
+# Runs as the invoking user, which is what lemondx wants: it needs that
+# user's membership in the `lxd`/`incus-admin` group to reach the daemon
+# socket, reads that user's ~/.ssh/*.pub for the SSH-key picker, and keeps
+# its state under that user's ~/.local/share/lemondx. A system service
+# running as a separate account would need all three set up by hand for an
+# account that has no login shell to set them up with.
+#
+# Manage with `systemctl --user`, not `systemctl`. Logs: `journalctl --user
+# -u lemondx -f`. Runs at boot without a graphical login only after
+# `loginctl enable-linger $USER` (install-service.sh prints this reminder when needed).
+
+[Unit]
+Description=lemondx - web UI and API for local LXD/Incus containers
+Documentation=https://github.com/
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 @LEMONDX_PATH@/lemondx serve --host 127.0.0.1 --port 8099
+Restart=on-failure
+RestartSec=5
+
+# lemondx is stdlib-only and touches nothing outside its own state
+# directory, the daemon socket, and (for bootstrap) ~/.ssh/*.pub -- so it
+# costs little to also ask systemd to enforce that.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/lemondx
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

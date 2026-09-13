@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../lib/api'
+import { missingSecrets } from '../lib/bootstrap'
 import type { BootstrapSelection, CreateRequest, Images, Status } from '../lib/types'
 import { useBootstrapData } from '../hooks/useBootstrapData'
 import { BootstrapPicker } from './BootstrapPicker'
@@ -67,7 +68,9 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
     try {
       await api.saveBootstrapProfile(name.trim(), {
         modules: selection.modules,
-        params: selection.params,
+        params: Object.fromEntries(Object.entries(selection.params).filter(
+          ([name]) => !modules.some((m) => m.params.some(
+            (param) => param.secret && param.name === name)))),
       })
       setProfileName(name.trim())
       reloadProfiles()
@@ -107,14 +110,10 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
     (m) => m.uses_ssh_keys && selection.modules.includes(m.id))
   const keysMissing = needsKeys && selection.ssh_keys.length === 0
 
-  // Keys without a listening sshd is a dead end, so say so -- softly, since
-  // exec-only containers and externally-managed sshd are both legitimate.
-  const SSH_SERVER = 'ssh-server'
-  const hasSshServerModule = modules.some((m) => m.id === SSH_SERVER)
-  const noSshServer = needsKeys && hasSshServerModule
-    && !selection.modules.includes(SSH_SERVER)
+  const secretsMissing = missingSecrets(modules, selection)
 
   const canSubmit = nameValid && image.trim().length > 0 && !busy && !keysMissing
+    && secretsMissing.length === 0
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
@@ -327,10 +326,10 @@ export function CreateDialog({ onCancel, onCreate }: Props) {
           />
         )}
 
-        {noSshServer && !keysMissing && (
-          <span className="hint" style={{ marginTop: -8 }}>
-            Keys will be installed, but nothing will be listening — add the{' '}
-            <strong>SSH server</strong> module if you want to ssh in.
+        {secretsMissing.length > 0 && (
+          <span className="hint" style={{ color: 'var(--warn)', marginTop: -8 }}>
+            Enter {secretsMissing.join(' and ')} in the Bootstrap section — secrets
+            have no default and are never saved.
           </span>
         )}
 

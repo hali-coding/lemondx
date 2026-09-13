@@ -3,7 +3,7 @@
 # description: Refresh the package index and install curl, CA certificates, sudo and a text editor.
 # order: 10
 
-pkg_install ca-certificates curl
+pkg_install ca-certificates curl tmux
 
 # Package names differ a little between families.
 case "$LEMONDX_PKG" in

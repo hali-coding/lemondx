@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import shutil
@@ -226,6 +227,7 @@ def cmd_create(args, service):
     modules, params = resolve_selection(args, service)
     if not modules and not args.no_default_modules:
         modules = [m["id"] for m in service.list_modules() if m["is_default"]]
+    fill_secrets(modules, params, service)
 
     bootstrap = None
     if modules:
@@ -258,6 +260,16 @@ def cmd_create(args, service):
     emit(args, container, render)
     if container.get("bootstrap") and not container["bootstrap"]["ok"]:
         return 1
+    return 0
+
+
+def cmd_limits(args, service):
+    if args.cpu is None and args.memory is None:
+        raise ServiceError("Give at least one of --cpu or --memory.")
+    container = service.update_limits(args.name, cpu=args.cpu, memory=args.memory)
+    emit(args, container, lambda c: "%s %s: cpu=%s memory=%s" % (
+        GREEN("+"), BOLD(c["name"]),
+        c["limits"]["cpu"] or "unlimited", c["limits"]["memory"] or "unlimited"))
     return 0
 
 
@@ -512,8 +524,36 @@ def resolve_selection(args, service):
     return modules, params
 
 
+def fill_secrets(modules, params, service):
+    """Supply secret parameters without putting them on the command line.
+
+    A value in --param works but lands in shell history and `ps`. So for each
+    secret still missing, use an environment variable of the same name (the
+    PGPASSWORD convention), else prompt without echo when there is a terminal.
+    Anything still missing is left for the service to reject with a clear
+    message.
+    """
+    for module in service.list_modules():
+        if module["id"] not in modules:
+            continue
+        for param in module["params"]:
+            name = param["name"]
+            if not param.get("secret") or params.get(name):
+                continue
+            if os.environ.get(name):
+                params[name] = os.environ[name]
+            elif sys.stdin.isatty():
+                label = "%s (%s)" % (name, param["description"]) if param["description"] \
+                    else name
+                value = getpass.getpass("%s: " % label)
+                if value:
+                    params[name] = value
+    return params
+
+
 def cmd_bootstrap(args, service):
     modules, params = resolve_selection(args, service)
+    fill_secrets(modules, params, service)
     result = service.bootstrap(
         args.name,
         modules=modules,
@@ -629,6 +669,12 @@ def build_parser():
     p.add_argument("--no-default-modules", action="store_true",
                    help="skip modules marked as default")
     p.set_defaults(func=cmd_create)
+
+    p = add("limits", help="change a container's CPU/memory limits")
+    p.add_argument("name")
+    p.add_argument("-c", "--cpu", help="CPU limit, e.g. 2 (pass '' to clear)")
+    p.add_argument("-m", "--memory", help="memory limit, e.g. 2GiB (pass '' to clear)")
+    p.set_defaults(func=cmd_limits)
 
     for action, helptext in [
         ("start", "start containers"),

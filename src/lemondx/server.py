@@ -12,6 +12,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 
+from . import websocket
 from .lxd import LXDError
 from .service import ContainerService, ServiceError
 
@@ -166,6 +167,7 @@ class LemondxHandler(BaseHTTPRequestHandler):
 
     # Injected by make_server().
     router = None
+    service = None
     token = None
     web_root = None
     allow_origin = None
@@ -202,7 +204,9 @@ class LemondxHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         query = _parse_query(urlparse(self.path).query)
 
-        if path.startswith("/api/"):
+        if method == "GET" and websocket.is_upgrade(self.headers):
+            self._handle_upgrade(path, query)
+        elif path.startswith("/api/"):
             self._handle_api(method, path, query)
         elif method == "GET":
             self._serve_static(path)
@@ -229,6 +233,54 @@ class LemondxHandler(BaseHTTPRequestHandler):
             self.log_message("unhandled error: %r", exc)
             self._send_json({"error": "Internal error: %s" % exc}, 500)
 
+    # -- interactive terminals ---------------------------------------------
+
+    TERMINALS = re.compile(r"^/api/containers/([^/]+)/(shell|console)$")
+
+    def _handle_upgrade(self, path, query):
+        """Turn this connection into a terminal attached to a container."""
+        match = self.TERMINALS.match(path)
+        if not match:
+            self._send_json({"error": "Not a terminal endpoint: %s" % path}, 404)
+            return
+        # A browser cannot put headers on a WebSocket, so the token arrives in
+        # the query string here rather than in Authorization.
+        if not self._authorized(query.get("token")):
+            self._send_json({"error": "Unauthorized: missing or bad API token"}, 401)
+            return
+
+        name, kind = unquote(match.group(1)), match.group(2)
+        try:
+            session = self.service.open_terminal(
+                name, kind, shell=query.get("shell"),
+                cols=query.get("cols"), rows=query.get("rows"),
+            )
+        except (ServiceError, LXDError) as exc:
+            # Still an ordinary HTTP response: the upgrade never happened, so
+            # the browser sees the status and the reason.
+            self._send_json({"error": exc.message}, _http_code(exc.code))
+            return
+
+        # Past this point the connection is no longer HTTP and must not be
+        # reused for another request.
+        self.close_connection = True
+        try:
+            websocket.server_handshake(self.headers, self.wfile.write)
+        except (websocket.WebSocketError, OSError) as exc:
+            session.close()
+            self._send_json({"error": "Bad WebSocket upgrade: %s" % exc}, 400)
+            return
+
+        browser = websocket.WebSocket(
+            self.rfile, self.wfile.write,
+            closer=websocket.shutdown_closer(self.connection),
+        )
+        self.log_message('"%s" attached %s', self.path, kind)
+        try:
+            _bridge(browser, session)
+        finally:
+            session.close()
+
     def _read_body(self):
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
@@ -242,12 +294,14 @@ class LemondxHandler(BaseHTTPRequestHandler):
             raise ServiceError("Request body must be a JSON object.")
         return parsed
 
-    def _authorized(self):
+    def _authorized(self, query_token=None):
         if not self.token:
             return True
         header = self.headers.get("Authorization") or ""
         if header.startswith("Bearer "):
             return secrets.compare_digest(header[7:], self.token)
+        if query_token is not None:
+            return secrets.compare_digest(query_token, self.token)
         return secrets.compare_digest(self.headers.get("X-Lemondx-Token") or "", self.token)
 
     # -- responses ---------------------------------------------------------
@@ -305,6 +359,55 @@ class LemondxHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def _bridge(browser, session):
+    """Pump bytes between a browser and an attached session until one stops.
+
+    One thread per direction, both doing blocking reads. A select loop would be
+    tempting, but the browser's bytes arrive through the request handler's
+    buffered reader, and select on the socket beneath it cannot see what is
+    already sitting in that buffer.
+    """
+    def to_guest():
+        try:
+            while True:
+                message = browser.recv()
+                if message is None:
+                    break
+                opcode, payload = message
+                if opcode == websocket.TEXT:
+                    session.handle_control(payload)      # resizes, not keystrokes
+                else:
+                    session.write(payload)
+        except (websocket.WebSocketError, OSError):
+            pass
+        finally:
+            # Whatever ended this direction ends the session: closing the
+            # daemon's channel frees the reader below.
+            session.close()
+
+    pump = threading.Thread(target=to_guest, name="terminal-in", daemon=True)
+    pump.start()
+
+    try:
+        while True:
+            chunk = session.read()
+            if chunk is None:
+                break
+            browser.send(chunk)
+    except (websocket.WebSocketError, OSError):
+        pass
+
+    # Say why it ended before hanging up, so the page can show it.
+    code = session.exit_code()
+    if code is not None:
+        try:
+            browser.send_text(json.dumps({"exit": code}))
+        except (websocket.WebSocketError, OSError):
+            pass
+    browser.close(websocket.GOING_AWAY)
+    pump.join(timeout=2)
+
+
 def _parse_query(query):
     out = {}
     for part in (query or "").split("&"):
@@ -328,6 +431,7 @@ def make_server(host=DEFAULT_HOST, port=DEFAULT_PORT, service=None, token=None,
     service = service or ContainerService()
     handler = type("BoundHandler", (LemondxHandler,), {
         "router": build_router(service),
+        "service": service,
         "token": token,
         "web_root": os.path.realpath(web_root) if web_root else None,
         "allow_origin": allow_origin,

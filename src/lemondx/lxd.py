@@ -19,6 +19,8 @@ import os
 import socket
 import urllib.parse
 
+from .websocket import WebSocketError, connect_unix
+
 LXD = "lxd"
 INCUS = "incus"
 
@@ -365,6 +367,53 @@ class LXDClient:
         except LXDError:
             pass  # Best effort: a stale log file is harmless.
 
+    # -- interactive sessions ----------------------------------------------
+    #
+    # Unlike exec_command above, these need a real terminal, which the daemon
+    # offers only over WebSockets: the POST returns an operation holding one
+    # secret per channel, and the session begins when those are attached to.
+
+    def exec_interactive(self, name, command, environment=None, width=80, height=24):
+        """Start a command with a TTY, ready for a WebSocket to attach.
+
+        Returns ``(operation_id, fds)``; fds maps ``"0"`` to the data channel's
+        secret and ``"control"`` to the one that carries window resizes.
+        """
+        return self._attachable("/1.0/instances/%s/exec" % _seg(name), {
+            "command": command,
+            "wait-for-websocket": True,
+            "interactive": True,
+            "environment": environment or {},
+            "width": int(width),
+            "height": int(height),
+        })
+
+    def console_session(self, name, width=80, height=24):
+        """Attach to the guest's own console device, as `lxc console` does."""
+        return self._attachable("/1.0/instances/%s/console" % _seg(name), {
+            "type": "console",
+            "width": int(width),
+            "height": int(height),
+        })
+
+    def _attachable(self, path, body):
+        started = self._request("POST", path, body)
+        operation = (started.get("operation") or "").rsplit("/", 1)[-1]
+        fds = ((started.get("metadata") or {}).get("metadata") or {}).get("fds") or {}
+        if not operation or "0" not in fds:
+            raise LXDError(
+                "%s did not offer a terminal to attach to." % self.product_name, 502)
+        return operation, fds
+
+    def attach(self, operation_id, secret):
+        """Open one of a waiting operation's WebSocket channels."""
+        path = "/1.0/operations/%s/websocket?secret=%s" % (
+            _seg(operation_id), urllib.parse.quote(secret))
+        try:
+            return connect_unix(self.socket_path, path)
+        except WebSocketError as exc:
+            raise LXDError("Cannot attach to %s: %s" % (self.product_name, exc), 502)
+
     def push_file(self, name, path, content, mode="0644", uid=0, gid=0):
         """Write a file inside an instance.
 
@@ -472,6 +521,17 @@ class LXDClient:
             {"name": name, "type": "bridge", "config": config or {}},
             timeout=120,
         )
+
+
+def window_resize_message(width, height):
+    """The control-channel message that retells the TTY its size.
+
+    The daemon wants the numbers as strings; it rejects the message otherwise.
+    """
+    return json.dumps({
+        "command": "window-resize",
+        "args": {"width": str(int(width)), "height": str(int(height))},
+    })
 
 
 def _seg(value):

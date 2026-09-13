@@ -287,6 +287,10 @@ export default function App() {
 
       {selected && (
         <ContainerDrawer
+          // Remounts on every switch, so per-container UI state (the active
+          // tab, an in-progress limits edit, a half-typed snapshot name)
+          // never leaks from one container into another.
+          key={selected}
           name={selected}
           busy={!!busy[selected]}
           refreshToken={refreshToken}
