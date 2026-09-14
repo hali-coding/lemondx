@@ -53,6 +53,13 @@ CLIENT_BINARY = {LXD: "lxc", INCUS: "incus"}
 # The group that grants access to the socket, for error messages.
 ADMIN_GROUP = {LXD: "lxd", INCUS: "incus-admin"}
 
+# VM config that boots UEFI without secure boot, for images whose bootloader
+# is not signed. LXD replaced security.secureboot with boot.mode; Incus kept it.
+NO_SECUREBOOT_CONFIG = {
+    LXD: {"boot.mode": "uefi-nosecureboot"},
+    INCUS: {"security.secureboot": "false"},
+}
+
 
 class LXDError(Exception):
     """An error reported by the daemon (or a failure reaching it)."""
@@ -151,7 +158,7 @@ class LXDClient:
 
     # -- transport ---------------------------------------------------------
 
-    def _request(self, method, path, body=None, params=None, raw=False):
+    def _request(self, method, path, body=None, params=None, raw=False, timeout=None):
         query = dict(params or {})
         # Every instance-scoped call must carry the project or LXD assumes default.
         if self.project and self.project != "default":
@@ -165,7 +172,8 @@ class LXDClient:
             payload = json.dumps(body).encode()
             headers["Content-Type"] = "application/json"
 
-        conn = _UnixHTTPConnection(self.socket_path, self.timeout)
+        conn = _UnixHTTPConnection(
+            self.socket_path, self.timeout if timeout is None else timeout)
         try:
             conn.request(method, path, body=payload, headers=headers)
             response = conn.getresponse()
@@ -214,13 +222,13 @@ class LXDClient:
         """Block until an operation finishes; raise LXDError if it failed."""
         wait = timeout if timeout is not None else self.timeout
         # The socket read must outlast the server-side wait or we time out first.
-        original, self.timeout = self.timeout, wait + 15
-        try:
-            result = self._request(
-                "GET", "/1.0/operations/%s/wait" % operation_id, params={"timeout": wait}
-            )
-        finally:
-            self.timeout = original
+        # Passed per request, never set on the client: creates, bootstraps and
+        # polls share one client across threads, and a timeout swapped on it
+        # leaks into whichever request another thread makes meanwhile.
+        result = self._request(
+            "GET", "/1.0/operations/%s/wait" % operation_id, params={"timeout": wait},
+            timeout=wait + 15,
+        )
 
         metadata = result.get("metadata") or {}
         if metadata.get("status_code", 0) not in (200, 0) or metadata.get("err"):
@@ -579,13 +587,25 @@ class LXDClient:
         except LXDError:
             return []          # not supported on every driver
 
-    def create_network(self, name, config=None):
+    def create_network(self, name, config=None, description=""):
         return self._async(
             "POST",
             "/1.0/networks",
-            {"name": name, "type": "bridge", "config": config or {}},
+            {"name": name, "type": "bridge", "description": description or "",
+             "config": config or {}},
             timeout=120,
         )
+
+    def update_network(self, name, description, config):
+        return self._async(
+            "PUT",
+            "/1.0/networks/%s" % _seg(name),
+            {"description": description or "", "config": config or {}},
+            timeout=120,
+        )
+
+    def delete_network(self, name):
+        return self._async("DELETE", "/1.0/networks/%s" % _seg(name), timeout=120)
 
 
 def window_resize_message(width, height):

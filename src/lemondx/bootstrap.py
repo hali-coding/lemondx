@@ -94,10 +94,17 @@ def discover_modules():
             path = os.path.join(directory, entry)
             if not os.path.isfile(path):
                 continue
+            module_id = entry[:-len(MODULE_SUFFIX)]
             try:
-                modules[entry[:-len(MODULE_SUFFIX)]] = parse_module(path)
+                parsed = parse_module(path)
             except OSError:
                 continue
+            shadowed = modules.get(module_id)
+            # Deleting a shadow brings the built-in back, which a front end
+            # should say rather than call it plain removal.
+            parsed["shadows_builtin"] = bool(shadowed) and (
+                shadowed["builtin"] or shadowed["shadows_builtin"])
+            modules[module_id] = parsed
     return modules
 
 
@@ -134,13 +141,16 @@ def parse_module(path):
     except ValueError:
         order = 50
 
-    builtin = os.path.dirname(os.path.abspath(path)) == \
-        os.path.abspath(builtin_module_dir())
+    directory = os.path.dirname(os.path.abspath(path))
+    builtin = directory == os.path.abspath(builtin_module_dir())
 
     return {
         "id": module_id,
         "builtin": builtin,
-        "editable": not builtin,
+        # Only uploads can be rewritten or deleted from lemondx; a module from
+        # $LEMONDX_MODULES belongs to whoever put it there.
+        "editable": directory == os.path.abspath(store.user_module_dir()),
+        "shadows_builtin": False,
         "name": meta.get("name") or module_id.replace("-", " ").title(),
         "description": meta.get("description", ""),
         "os": meta.get("os", "").replace(",", " ").split(),
@@ -293,6 +303,13 @@ def save_module(name, content, overwrite=False):
     check_shell_syntax(content)
 
     existing = discover_modules().get(module_id)
+    if existing and not existing["builtin"] and not existing["editable"]:
+        # $LEMONDX_MODULES outranks the upload directory, so the copy written
+        # here would never run while reporting itself as the module.
+        raise BootstrapError(
+            "'%s' comes from %s (via $LEMONDX_MODULES), which takes precedence "
+            "over uploads. Change it there, or upload under another name."
+            % (module_id, os.path.dirname(existing["path"])), 409)
     if existing and existing["builtin"] and not overwrite:
         raise BootstrapError(
             "'%s' is a built-in module. Uploading with this name will shadow it "
@@ -311,6 +328,8 @@ def save_module(name, content, overwrite=False):
     os.chmod(target, 0o644)
 
     parsed = parse_module(target)
+    parsed["shadows_builtin"] = bool(existing) and (
+        existing["builtin"] or existing["shadows_builtin"])
     return {k: v for k, v in parsed.items() if k not in ("body",)}
 
 
@@ -324,14 +343,22 @@ def delete_module(module_id):
         raise BootstrapError(
             "'%s' is built in and cannot be deleted. Upload a module with the "
             "same name to shadow it instead." % module_id, 403)
+    if not module["editable"]:
+        # Removing an upload hidden underneath would change nothing that runs.
+        raise BootstrapError(
+            "'%s' comes from %s (via $LEMONDX_MODULES) and is not managed by "
+            "lemondx." % (module_id, os.path.dirname(module["path"])), 403)
 
     target = os.path.join(store.user_module_dir(), module_id + MODULE_SUFFIX)
     if not os.path.isfile(target):
         raise BootstrapError("No such uploaded module '%s'." % module_id, 404)
     os.unlink(target)
 
-    store.prune_module(module_id)          # drop it from defaults and profiles
-    return {"deleted": module_id}
+    # A shadow's removal brings the built-in back under the same id, so the
+    # defaults and profiles naming it still have something to run.
+    if not module["shadows_builtin"]:
+        store.prune_module(module_id)      # drop it from defaults and profiles
+    return {"deleted": module_id, "restored_builtin": module["shadows_builtin"]}
 
 
 # -- ssh keys --------------------------------------------------------------

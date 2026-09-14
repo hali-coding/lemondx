@@ -211,6 +211,7 @@ export function TemplatesView({
               template.memory,
               template.disk && `${template.disk} disk`,
               template.pool && `pool ${template.pool}`,
+              template.network && `network ${template.network}`,
             ].filter(Boolean).join(' · ')
 
             return (
@@ -220,6 +221,7 @@ export function TemplatesView({
                     <h3>{template.name}</h3>
                     {template.type === 'virtual-machine' && <span className="vm-tag">VM</span>}
                     {template.ephemeral && <span className="vm-tag">EPH</span>}
+                    {!template.secureboot && <span className="vm-tag">NO SECURE BOOT</span>}
                   </div>
                   <button className="btn btn-sm btn-icon btn-ghost"
                     aria-label={`Edit template ${template.name}`} title="Edit"

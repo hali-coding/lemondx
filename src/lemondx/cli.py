@@ -245,8 +245,9 @@ def cmd_create(args, service):
         name=args.name, image=image,
         instance_type="virtual-machine" if args.vm else "container",
         profiles=args.profile or None, cpu=args.cpu, memory=args.memory,
-        disk=args.disk, pool=args.pool, description=args.description, ephemeral=args.ephemeral,
-        start=not args.no_start, bootstrap=bootstrap,
+        disk=args.disk, pool=args.pool, network=args.network,
+        description=args.description, ephemeral=args.ephemeral,
+        start=not args.no_start, secureboot=not args.no_secureboot, bootstrap=bootstrap,
     )
 
     def render(c):
@@ -466,7 +467,9 @@ def cmd_module_add(args, service):
 
 def cmd_module_remove(args, service):
     result = service.remove_module(args.id)
-    emit(args, result, lambda r: "%s removed module %s" % (GREEN("+"), BOLD(r["deleted"])))
+    emit(args, result, lambda r: "%s removed module %s%s" % (
+        GREEN("+"), BOLD(r["deleted"]),
+        " -- the built-in module is back" if r["restored_builtin"] else ""))
     return 0
 
 
@@ -544,7 +547,10 @@ def describe_template(t):
     size = ", ".join(part for part in (
         "%s cpu" % t["cpu"] if t["cpu"] else "",
         t["memory"], "disk " + t["disk"] if t["disk"] else "") if part)
-    return "%s%s%s" % (t["image"], " (vm)" if t["type"] == "virtual-machine" else "",
+    kind = ""
+    if t["type"] == "virtual-machine":
+        kind = " (vm)" if t["secureboot"] else " (vm, no secure boot)"
+    return "%s%s%s" % (t["image"], kind,
                        " · " + size if size else "")
 
 
@@ -565,7 +571,8 @@ def cmd_template_save(args, service):
         args.name, args.image or service.default_image(),
         instance_type="virtual-machine" if args.vm else "container",
         cpu=args.cpu, memory=args.memory, disk=args.disk, pool=args.pool,
-        profiles=args.profile, ephemeral=args.ephemeral, start=not args.no_start,
+        network=args.network, profiles=args.profile, ephemeral=args.ephemeral,
+        start=not args.no_start, secureboot=not args.no_secureboot,
         bootstrap={"modules": modules, "params": params, "ssh_keys": ssh_keys},
         description=args.description or "", name_prefix=args.prefix,
     )
@@ -976,6 +983,100 @@ def cmd_storage_volume_delete(args, service):
     return 0
 
 
+def cmd_networks(args, service):
+    networks = service.list_networks()
+    emit(args, networks, lambda items: table([
+        [
+            BOLD(n["name"]) + (DIM(" (default)") if n["default"] else ""),
+            n["type"], n["ipv4_address"] or "-", n["ipv6_address"] or "-",
+            n["used_by"],
+            "yes" if n["manageable"] else ("host" if not n["managed"] else "read-only"),
+        ]
+        for n in items
+    ], ["name", "type", "ipv4", "ipv6", "used by", "managed"]))
+    return 0
+
+
+def cmd_network_show(args, service):
+    network = service.get_network(args.name)
+
+    def render(n):
+        def family(f):
+            if not f["address"] or f["address"] == "none":
+                return "disabled"
+            return "%s  nat %s, dhcp %s" % (f["address"], "on" if f["nat"] else "off",
+                                            "on" if f["dhcp"] else "off")
+        lines = [
+            "%s  %s%s" % (BOLD(n["name"]), n["type"], DIM(" (default)") if n["default"] else ""),
+            "%s  %s" % (DIM("ipv4   "), family(n["ipv4"])),
+            "%s  %s" % (DIM("ipv6   "), family(n["ipv6"])),
+            "%s  %s" % (DIM("dns    "), n["dns_domain"] or "-"),
+            "%s  %s" % (DIM("status "), "managed" if n["manageable"]
+                        else "read-only: " + n["read_only_reason"]),
+        ]
+        if n["description"]:
+            lines.append("%s  %s" % (DIM("about  "), n["description"]))
+        if n["instances"] or n["profiles"]:
+            lines.append("%s  %s" % (DIM("used by"), ", ".join(
+                ["profile " + p for p in n["profiles"]] + n["instances"])))
+        if n["leases"]:
+            lines.append("")
+            lines.append(table([[l["hostname"] or "-", l["address"], l["hwaddr"] or "-",
+                                 l["type"]] for l in n["leases"]],
+                               ["name", "address", "mac", "kind"]))
+        return "\n".join(lines)
+
+    emit(args, network, render)
+    return 0
+
+
+def cmd_network_subnets(args, service):
+    subnets = service.subnets()
+    emit(args, subnets, lambda items: table(
+        [[s["subnet"], s["interface"]] for s in items], ["subnet", "interface"]))
+    return 0
+
+
+def network_config(args):
+    """The bridge config keys the flags stand for, plus any --config pairs."""
+    config = parse_params(args.config)
+    for flag, key in (("ipv4", "ipv4.address"), ("ipv6", "ipv6.address"),
+                      ("dns_domain", "dns.domain"), ("mtu", "bridge.mtu")):
+        if getattr(args, flag) is not None:
+            config[key] = getattr(args, flag)
+    if args.nat is not None:
+        config["ipv4.nat"] = "true" if args.nat else "false"
+        if config.get("ipv6.address", "none") != "none":
+            config["ipv6.nat"] = config["ipv4.nat"]
+    return config
+
+
+def cmd_network_create(args, service):
+    network = service.create_network(
+        args.name, description=args.description or "", config=network_config(args))
+    emit(args, network, lambda n: "%s created network %s (%s)" % (
+        GREEN("+"), BOLD(n["name"]), n["ipv4"]["address"] or "no IPv4"))
+    return 0
+
+
+def cmd_network_set(args, service):
+    config = network_config(args)
+    if args.description is None and not config:
+        raise ServiceError("Give at least one setting to change.")
+    network = service.update_network(args.name, description=args.description, config=config)
+    emit(args, network, lambda n: "%s updated network %s" % (GREEN("+"), BOLD(n["name"])))
+    return 0
+
+
+def cmd_network_delete(args, service):
+    if not confirm("Delete network '%s'?" % args.name, args.yes):
+        print(DIM("skipped %s" % args.name))
+        return 0
+    result = service.delete_network(args.name)
+    emit(args, result, lambda r: "%s deleted network %s" % (GREEN("+"), BOLD(r["deleted"])))
+    return 0
+
+
 def cmd_images(args, service):
     images = service.list_images()
 
@@ -1138,6 +1239,53 @@ def build_parser():
     p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     p.set_defaults(func=cmd_storage_volume_delete)
 
+    network = add("network", help="view and manage networks")
+    network_sub = network.add_subparsers(dest="network_command", metavar="<network-command>")
+
+    p = network_sub.add_parser("list", aliases=["ls"], parents=[common],
+                               help="list networks and host interfaces")
+    p.set_defaults(func=cmd_networks)
+
+    p = network_sub.add_parser("subnets", parents=[common],
+                               help="subnets already on the host, to pick a free block")
+    p.set_defaults(func=cmd_network_subnets)
+
+    p = network_sub.add_parser("show", parents=[common], help="show one network")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_network_show)
+
+    # Shared by `network create` and `network set`.
+    bridge = argparse.ArgumentParser(add_help=False)
+    bridge.add_argument("--ipv4", metavar="ADDR",
+                        help="CIDR block, e.g. 10.10.0.0/24 (bridge takes .1), or auto/none")
+    bridge.add_argument("--ipv6", metavar="ADDR",
+                        help="CIDR block, e.g. fd42:1::/64 (bridge takes ::1), or auto/none")
+    bridge.add_argument("--nat", dest="nat", action="store_true", default=None,
+                        help="NAT outbound traffic behind the host")
+    bridge.add_argument("--no-nat", dest="nat", action="store_false",
+                        help="route instead of NAT (needs a route on your network)")
+    bridge.add_argument("--dns-domain", help="DNS domain for instances on the bridge")
+    bridge.add_argument("--mtu", help="bridge MTU")
+    bridge.add_argument("--description")
+    bridge.add_argument("--config", action="append", metavar="KEY=VALUE",
+                        help="allowlisted bridge option (repeatable; empty value unsets)")
+
+    p = network_sub.add_parser("create", parents=[common, bridge],
+                               help="create a managed bridge")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_network_create)
+
+    p = network_sub.add_parser("set", parents=[common, bridge],
+                               help="change a managed bridge")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_network_set)
+
+    p = network_sub.add_parser("delete", aliases=["rm"], parents=[common],
+                               help="delete a managed bridge nothing uses")
+    p.add_argument("name")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_network_delete)
+
     p = add("list", aliases=["ls"], help="list containers")
     p.add_argument("--running", action="store_true", help="only running containers")
     p.set_defaults(func=cmd_list)
@@ -1155,8 +1303,12 @@ def build_parser():
     spec.add_argument("-m", "--memory", help="memory limit, e.g. 2GiB")
     spec.add_argument("-d", "--disk", help="root disk size, e.g. 10GiB")
     spec.add_argument("--pool", help="storage pool for the root disk")
+    spec.add_argument("--network", help="network for eth0 (default: the default profile's)")
     spec.add_argument("--profile", action="append", help="profile to apply (repeatable)")
     spec.add_argument("--vm", action="store_true", help="create a virtual machine instead")
+    spec.add_argument("--no-secureboot", action="store_true",
+                      help="boot a VM without UEFI secure boot, for images that "
+                           "are incompatible with it")
     spec.add_argument("--ephemeral", action="store_true", help="delete on stop")
     spec.add_argument("--no-start", action="store_true", help="create without starting")
 

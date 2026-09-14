@@ -2,7 +2,7 @@ import type {
   BootstrapModule, BootstrapProfile, BootstrapResult, BootstrapSelection,
   Container, ModuleSource,
   ContainerDetail, CreateProgress, CreateRequest, ExecResult, ImageBrowse, Images, NetworkDetail,
-  InstanceTemplate, NetworkSummary, Resources, SetupResult, Snapshot, SshKey,
+  InstanceTemplate, NetworkRequest, NetworkSummary, SubnetInUse, Resources, SetupResult, Snapshot, SshKey,
   StateAction, Status, StorageOverview, StoragePoolDetail, StoragePoolRequest,
   StorageVolume, StorageVolumeRequest, TemplateRequest, TemplateRun,
 } from './types'
@@ -190,6 +190,17 @@ export const api = {
   network: (name: string, signal?: AbortSignal) =>
     request<NetworkDetail>(`/networks/${encodeURIComponent(name)}`, { signal }),
 
+  subnets: (signal?: AbortSignal) => request<SubnetInUse[]>('/subnets', { signal }),
+
+  createNetwork: (body: NetworkRequest) =>
+    request<NetworkDetail>('/networks', { method: 'POST', body }),
+
+  updateNetwork: (name: string, body: NetworkRequest) =>
+    request<NetworkDetail>(`/networks/${encodeURIComponent(name)}`, { method: 'PATCH', body }),
+
+  deleteNetwork: (name: string) =>
+    request<{ deleted: string }>(`/networks/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
   modules: (signal?: AbortSignal) => request<BootstrapModule[]>('/modules', { signal }),
 
   uploadModule: (name: string, content: string, overwrite = false) =>
@@ -205,7 +216,7 @@ export const api = {
       { method: 'PUT', body }),
 
   deleteModule: (id: string) =>
-    request<{ deleted: string }>(`/modules/${encodeURIComponent(id)}`,
+    request<{ deleted: string; restored_builtin: boolean }>(`/modules/${encodeURIComponent(id)}`,
       { method: 'DELETE' }),
 
   bootstrapProfiles: (signal?: AbortSignal) =>

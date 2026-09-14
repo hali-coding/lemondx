@@ -67,8 +67,10 @@ Want it running all the time? See [Running as a service](docs/service.md).
 ./lemondx resources              # allocated CPU/memory/disk against the host
 ./lemondx storage pools          # local pools, capacity and management status
 ./lemondx storage volumes        # custom, instance and image volumes
+./lemondx network ls             # networks; network create|set|delete manage bridges
 ./lemondx create NAME -i ubuntu:24.04 -c 2 -m 2GiB -d 10GiB
                                  # -i defaults to Ubuntu LTS for this daemon
+                                 # --pool and --network pick where it lands
 ./lemondx limits NAME -c 4 -m 8GiB   # change an existing container's limits
                                  # pass '' to clear one: -m ''
 ./lemondx start|stop|restart|pause|resume NAME...

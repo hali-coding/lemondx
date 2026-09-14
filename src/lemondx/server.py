@@ -82,9 +82,11 @@ def build_router(service):
         memory=body.get("memory"),
         disk=body.get("disk"),
         pool=body.get("pool"),
+        network=body.get("network"),
         description=body.get("description"),
         ephemeral=body.get("ephemeral", False),
         start=body.get("start", True),
+        secureboot=bool(body.get("secureboot", True)),
         config=body.get("config"),
         bootstrap=body.get("bootstrap"),
         background=bool(body.get("background", False)),
@@ -163,8 +165,17 @@ def build_router(service):
         refresh=_flag(q.get("refresh")) if "refresh" in q else False))
 
     r.add("GET", r"/api/networks", lambda body, q: service.list_networks())
+    r.add("GET", r"/api/subnets", lambda body, q: service.subnets())
+    r.add("POST", r"/api/networks", lambda body, q: service.create_network(
+        body.get("name"), description=body.get("description", ""),
+        config=body.get("config")))
     r.add("GET", r"/api/networks/%s" % NAME,
           lambda body, q, name: service.get_network(name))
+    r.add("PATCH", r"/api/networks/%s" % NAME,
+          lambda body, q, name: service.update_network(
+              name, description=body.get("description"), config=body.get("config")))
+    r.add("DELETE", r"/api/networks/%s" % NAME,
+          lambda body, q, name: service.delete_network(name))
 
     r.add("GET", r"/api/modules", lambda body, q: service.list_modules())
     r.add("POST", r"/api/modules", lambda body, q: service.upload_module(
@@ -192,9 +203,11 @@ def build_router(service):
               name, body.get("image"),
               instance_type=body.get("type", "container"),
               cpu=body.get("cpu"), memory=body.get("memory"), disk=body.get("disk"),
-              pool=body.get("pool"), profiles=body.get("profiles"),
+              pool=body.get("pool"), network=body.get("network"),
+              profiles=body.get("profiles"),
               ephemeral=bool(body.get("ephemeral", False)),
               start=bool(body.get("start", True)),
+              secureboot=bool(body.get("secureboot", True)),
               bootstrap=body.get("bootstrap"),
               description=body.get("description", ""),
               name_prefix=body.get("name_prefix")))
