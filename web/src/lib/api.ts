@@ -1,4 +1,5 @@
 import type {
+  ApiToken, AuthInfo, CreatedApiToken, HealthReport, LocalUser, Role,
   BootstrapModule, BootstrapProfile, BootstrapResult, BootstrapSelection,
   Container, ModuleSource,
   ContainerDetail, CreateProgress, CreateRequest, ExecResult, ImageBrowse, Images, NetworkDetail,
@@ -18,8 +19,10 @@ export class ApiError extends Error {
   }
 }
 
-// Set when the backend was started with --token. Kept in sessionStorage so a
-// reload does not re-prompt, but never in localStorage: it is a credential.
+// Set when the user pastes an API token instead of logging in. Kept in
+// sessionStorage so a reload does not re-prompt, but never in localStorage: it
+// is a credential. A password login uses an HttpOnly cookie instead, which
+// this code never sees.
 const TOKEN_KEY = 'lemondx-token'
 
 let authToken: string | null = readStoredToken()
@@ -280,4 +283,33 @@ export const api = {
   bootstrap: (name: string, selection: BootstrapSelection) =>
     request<BootstrapResult>(`/containers/${encodeURIComponent(name)}/bootstrap`,
       { method: 'POST', body: selection }),
+
+  /** The server's latest health checks; they run on its own schedule, not on request. */
+  health: (signal?: AbortSignal) => request<HealthReport>('/health', { signal }),
+
+  /** Answers without credentials too: what the server accepts, and who we are. */
+  authInfo: (signal?: AbortSignal) => request<AuthInfo>('/auth', { signal }),
+
+  login: (username: string, password: string) =>
+    request<AuthInfo>('/auth/login', { method: 'POST', body: { username, password } }),
+
+  logout: () => request<{ logged_out: boolean }>('/auth/logout', { method: 'POST' }),
+
+  apiTokens: (signal?: AbortSignal) => request<ApiToken[]>('/auth/tokens', { signal }),
+
+  createApiToken: (body: { name: string; role: Role; expires_days: number | null }) =>
+    request<CreatedApiToken>('/auth/tokens', { method: 'POST', body }),
+
+  revokeApiToken: (id: string) =>
+    request<{ revoked: string }>(`/auth/tokens/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  users: (signal?: AbortSignal) => request<LocalUser[]>('/auth/users', { signal }),
+
+  /** Creates the user, or changes an existing one's password and/or role. */
+  saveUser: (name: string, body: { password?: string; role?: Role }) =>
+    request<{ name: string; role: Role; created: boolean }>(
+      `/auth/users/${encodeURIComponent(name)}`, { method: 'PUT', body }),
+
+  removeUser: (name: string) =>
+    request<{ removed: string }>(`/auth/users/${encodeURIComponent(name)}`, { method: 'DELETE' }),
 }

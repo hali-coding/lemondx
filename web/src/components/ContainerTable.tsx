@@ -1,6 +1,8 @@
-import type { Container, CreateProgress, StateAction } from '../lib/types'
+import type { Container, CreateProgress, HealthRecord, StateAction } from '../lib/types'
+import { useCanWrite } from '../hooks/useAuth'
 import { bytes } from '../lib/format'
 import { CopyButton } from './CopyButton'
+import { HealthDot } from './HealthDot'
 import { StatusBadge } from './StatusBadge'
 import { PlayIcon, PlusIcon, RestartIcon, StopIcon, TrashIcon } from './Icons'
 
@@ -8,6 +10,8 @@ interface Props {
   containers: Container[]
   /** Creates the server is running or recently finished, including other tabs'. */
   creates: CreateProgress[]
+  /** Latest health check per instance name; absent when never checked. */
+  health: Record<string, HealthRecord>
   selected: string | null
   busy: Record<string, boolean>
   onSelect: (name: string) => void
@@ -31,8 +35,9 @@ function stageText(progress: CreateProgress) {
 }
 
 export function ContainerTable({
-  containers, creates, selected, busy, onSelect, onAction, onDelete, onCreate, canCreate,
+  containers, creates, health, selected, busy, onSelect, onAction, onDelete, onCreate, canCreate,
 }: Props) {
+  const canWrite = useCanWrite()
   const inProgress = new Map(
     creates.filter((c) => c.finished_at === null).map((c) => [c.name, c]))
   // The daemon lists an instance only once its image is unpacked, so a create
@@ -50,7 +55,7 @@ export function ContainerTable({
               ? 'Create your first one — images are pulled automatically.'
               : 'Set up LXD above, then create your first container.'}
           </p>
-          <button className="btn btn-primary" onClick={onCreate} disabled={!canCreate}>
+          <button className="btn btn-primary" onClick={onCreate} disabled={!canCreate || !canWrite}>
             <PlusIcon /> New container
           </button>
         </div>
@@ -131,7 +136,12 @@ export function ContainerTable({
                     ? <span className="badge badge-warn"><span className="spinner" />{stageText(progress)}</span>
                     : busy[container.name]
                       ? <span className="badge badge-warn"><span className="spinner" />working</span>
-                      : <StatusBadge status={container.status} />}
+                      : <>
+                        <StatusBadge status={container.status} />
+                        {container.status === 'Running' && health[container.name] && (
+                          <HealthDot record={health[container.name]} />
+                        )}
+                      </>}
                 </td>
                 <td className="optional dim truncate" style={{ maxWidth: 190 }}>
                   {container.image_alias || container.image || '—'}
@@ -154,7 +164,7 @@ export function ContainerTable({
                           className="btn btn-sm btn-icon"
                           title="Restart"
                           aria-label={`Restart ${container.name}`}
-                          disabled={isBusy}
+                          disabled={isBusy || !canWrite}
                           onClick={() => onAction(container.name, 'restart')}
                         >
                           <RestartIcon />
@@ -163,7 +173,7 @@ export function ContainerTable({
                           className="btn btn-sm btn-icon"
                           title="Stop"
                           aria-label={`Stop ${container.name}`}
-                          disabled={isBusy}
+                          disabled={isBusy || !canWrite}
                           onClick={() => onAction(container.name, 'stop')}
                         >
                           <StopIcon />
@@ -174,7 +184,7 @@ export function ContainerTable({
                         className="btn btn-sm btn-icon"
                         title="Start"
                         aria-label={`Start ${container.name}`}
-                        disabled={isBusy}
+                        disabled={isBusy || !canWrite}
                         onClick={() => onAction(container.name, 'start')}
                       >
                         <PlayIcon />
@@ -184,7 +194,7 @@ export function ContainerTable({
                       className="btn btn-sm btn-icon btn-danger"
                       title="Delete"
                       aria-label={`Delete ${container.name}`}
-                      disabled={busy[container.name]}
+                      disabled={busy[container.name] || !canWrite}
                       onClick={() => onDelete(container.name)}
                     >
                       <TrashIcon />

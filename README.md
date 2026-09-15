@@ -65,6 +65,7 @@ Want it running all the time? See [Running as a service](docs/service.md).
 ./lemondx ls                     # list containers
 ./lemondx info NAME              # details, limits, network, snapshots
 ./lemondx resources              # allocated CPU/memory/disk against the host
+./lemondx health                 # are running instances responsive, overloaded, near their limits?
 ./lemondx storage pools          # local pools, capacity and management status
 ./lemondx storage volumes        # custom, instance and image volumes
 ./lemondx network ls             # networks; network create|set|delete manage bridges
@@ -119,15 +120,17 @@ pass to `-i`.
 | [Daemons, images and storage](docs/daemons-and-storage.md) | LXD vs Incus, socket discovery, image remotes, disk quotas, units |
 | [Web UI tour](docs/web-ui.md) | the Resources and Network views, the full image browser |
 | [Running as a service](docs/service.md) | systemd units, user vs system install |
-| [Security](docs/security.md) | binding, tokens, TLS |
+| [Security](docs/security.md) | logins (local users, PAM, proxy), roles, API tokens, TLS |
 | [Frontend development](docs/development.md) | Vite dev server, rebuilding `web/dist` |
 
 ## Security
 
-`serve` binds to `127.0.0.1` by default and the API has no per-user
-authorization — anyone who can reach the port controls your containers. If you
-bind it to a routable address, pass `--token`; see [Security](docs/security.md)
-for how the token is checked and why plain HTTP still needs a TLS proxy.
+`serve` binds to `127.0.0.1` by default with authentication off — anyone who
+can reach the port controls your containers. Run `lemondx configure auth` to
+turn on logins — local users, PAM, a trusted proxy or API tokens, with read-only
+and admin roles — or pass `--auth` flags to `serve`, and
+use `--tls-cert`/`--tls-key` or a TLS proxy before exposing it; see
+[Security](docs/security.md).
 
 ![Network view](docs/screenshot3.png)
 

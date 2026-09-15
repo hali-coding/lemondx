@@ -29,9 +29,16 @@ User=lemondx
 Group=@LEMONDX_GROUP@
 Environment=HOME=/var/lib/lemondx
 ExecStart=/usr/bin/python3 @LEMONDX_PATH@/lemondx serve --host 127.0.0.1 --port 8099
+# Authentication is off until configured: run
+#   sudo -u lemondx env HOME=/var/lib/lemondx lemondx configure auth
+# and restart. Flags appended here override the saved settings.
+# See docs/service.md#authentication.
 Restart=on-failure
 RestartSec=5
 
+# --auth pam as this non-root account: add SupplementaryGroups=shadow so
+# pam_unix can read /etc/shadow itself (Debian/Ubuntu; on distributions where
+# it is root-only, use --auth local or proxy instead).
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

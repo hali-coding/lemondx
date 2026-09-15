@@ -7,6 +7,8 @@ Everything lemondx keeps between runs lives under one data directory,
     profiles/         one JSON file per bootstrap profile
     templates/        one JSON file per instance template
     modules/          uploaded modules
+    auth/             local users and API tokens (0700; only hashes, never secrets)
+    config/           one JSON file per `lemondx configure` section, e.g. auth.json
 
 This is state lemondx writes for itself rather than hand-authored
 configuration, which is what ``XDG_DATA_HOME`` is for. Earlier versions kept it
@@ -75,6 +77,14 @@ def profiles_dir():
 
 def templates_dir():
     return os.path.join(data_dir(), "templates")
+
+
+def auth_dir():
+    return os.path.join(data_dir(), "auth")
+
+
+def config_dir():
+    return os.path.join(data_dir(), "config")
 
 
 # -- migration -------------------------------------------------------------
@@ -420,3 +430,118 @@ def prune_module(module_id):
         if module_id in bootstrap["modules"]:
             save_template(name, dict(record, bootstrap=dict(
                 bootstrap, modules=[m for m in bootstrap["modules"] if m != module_id])))
+
+
+# -- users and API tokens --------------------------------------------------
+#
+# Only hashes are stored, but a hash of a weak password is still worth
+# something to an attacker, so the directory is 0700 and every file 0600 (the
+# temp file _write_json replaces it with is created 0600). The records are
+# opaque here: auth.py validates them on read, since these files are as
+# hand-editable as everything else under the data directory.
+
+AUTH_KINDS = ("users", "tokens")
+
+
+def _auth_path(kind):
+    if kind not in AUTH_KINDS:
+        raise ValueError("unknown auth record kind: %r" % (kind,))
+    return os.path.join(auth_dir(), "%s.json" % kind)
+
+
+def auth_mtime(kind):
+    """A fingerprint of a record file's current version, or None when it is missing.
+
+    The server compares this per request so a token revoked from the CLI stops
+    working at once, without a restart and without re-reading the file. The
+    inode is part of it because every save replaces the file, and two saves
+    inside one timestamp tick would otherwise look the same.
+    """
+    try:
+        info = os.stat(_auth_path(kind))
+    except OSError:
+        return None
+    return (info.st_ino, info.st_mtime_ns, info.st_size)
+
+
+def load_auth(kind):
+    """``{key: record}`` for users or tokens; empty when missing or corrupt."""
+    try:
+        with open(_auth_path(kind), encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    records = stored.get(kind) if isinstance(stored, dict) else None
+    return {k: v for k, v in records.items() if isinstance(v, dict)} \
+        if isinstance(records, dict) else {}
+
+
+def update_auth(kind, mutate):
+    """Read-modify-write one record file under the lock; returns mutate's result."""
+    # Resolved before taking the lock: the first data_dir() call may migrate,
+    # and migration saves through save(), which takes the same lock.
+    directory = auth_dir()
+    with _lock:
+        records = load_auth(kind)
+        result = mutate(records)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        _write_json(_auth_path(kind), {"version": 1, kind: records})
+    return result
+
+
+# -- configuration sections ------------------------------------------------
+#
+# Written by `lemondx configure <section>` and read at startup. Unlike the
+# rest of the data directory, a file here that does not parse is an error
+# rather than an empty default: silently falling back could mean, for auth,
+# a server that starts with authentication off. The contents are validated
+# by whichever module owns the section, not here.
+
+_SECTION = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+
+
+def config_path(section):
+    if not _SECTION.match(section or ""):
+        raise ValueError("not a configuration section name: %r" % (section,))
+    return os.path.join(config_dir(), "%s.json" % section)
+
+
+def load_config(section):
+    """The saved dict for a section, or None when it was never configured.
+
+    Raises ValueError when the file exists but is unreadable or not a JSON
+    object, so callers can refuse to start instead of guessing.
+    """
+    path = config_path(section)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise ValueError("%s: %s" % (path, exc))
+    if not isinstance(stored, dict):
+        raise ValueError("%s: expected a JSON object" % path)
+    return stored
+
+
+def save_config(section, payload):
+    """Write a section atomically; the directory is 0700 as it may name secrets' paths."""
+    path = config_path(section)          # resolved before the lock; see update_auth
+    directory = os.path.dirname(path)
+    with _lock:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        _write_json(path, payload)
+    return path
+
+
+def delete_config(section):
+    try:
+        os.unlink(config_path(section))
+        return True
+    except FileNotFoundError:
+        return False

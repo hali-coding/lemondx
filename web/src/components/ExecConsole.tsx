@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useCanWrite } from '../hooks/useAuth'
 import { api } from '../lib/api'
 
 interface Entry {
@@ -9,6 +10,7 @@ interface Entry {
 }
 
 export function ExecConsole({ name, running }: { name: string; running: boolean }) {
+  const canWrite = useCanWrite()
   const [entries, setEntries] = useState<Entry[]>([])
   const [command, setCommand] = useState('')
   const [busy, setBusy] = useState(false)
@@ -97,7 +99,7 @@ export function ExecConsole({ name, running }: { name: string; running: boolean 
           spellCheck={false}
           disabled={busy}
         />
-        <button className="btn btn-primary" type="submit" disabled={busy || !command.trim()}>
+        <button className="btn btn-primary" type="submit" disabled={busy || !canWrite || !command.trim()}>
           Run
         </button>
       </form>

@@ -53,6 +53,11 @@ CLIENT_BINARY = {LXD: "lxc", INCUS: "incus"}
 # The group that grants access to the socket, for error messages.
 ADMIN_GROUP = {LXD: "lxd", INCUS: "incus-admin"}
 
+# What a container's cgroup is named on the host, before the instance name.
+# Both run containers through liblxc, which picks the name; the Incus entry is
+# from its source, not a live host.
+CGROUP_PAYLOAD_PREFIX = {LXD: "lxc.payload.", INCUS: "lxc.payload."}
+
 # VM config that boots UEFI without secure boot, for images whose bootloader
 # is not signed. LXD replaced security.secureboot with boot.mode; Incus kept it.
 NO_SECUREBOOT_CONFIG = {
@@ -447,6 +452,40 @@ class LXDClient:
                 raise LXDError(_decode_error(data, response.status), response.status)
         except (OSError, http.client.HTTPException) as exc:
             raise LXDError("Cannot write %s in %s: %s" % (path, name, exc), 503) from exc
+        finally:
+            conn.close()
+
+    def read_file(self, name, path, timeout=None):
+        """A file's bytes from inside an instance.
+
+        A VM serves this through its agent, so it fails while the agent is not
+        running -- which is also what makes it a useful liveness probe.
+
+        A file in /proc has no real size, and the daemon's Content-Length can
+        come from a different read than the body it then sends: /proc/loadavg
+        changes length whenever its task count or last pid does, and the reply
+        falls a byte short. That is still the file, so a short body on a
+        successful response is returned rather than raised.
+        """
+        query = {"path": path}
+        if self.project and self.project != "default":
+            query["project"] = self.project
+        endpoint = "/1.0/instances/%s/files?%s" % (_seg(name), urllib.parse.urlencode(query))
+        conn = _UnixHTTPConnection(self.socket_path, self.timeout if timeout is None else timeout)
+        try:
+            conn.request("GET", endpoint)
+            response = conn.getresponse()
+            try:
+                data = response.read()
+            except http.client.IncompleteRead as exc:
+                if response.status >= 400:
+                    raise
+                data = exc.partial
+            if response.status >= 400:
+                raise LXDError(_decode_error(data, response.status), response.status)
+            return data
+        except (OSError, http.client.HTTPException) as exc:
+            raise LXDError("Cannot read %s in %s: %s" % (path, name, exc), 503) from exc
         finally:
             conn.close()
 

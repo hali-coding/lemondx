@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { useCanWrite } from '../hooks/useAuth'
 import { api } from '../lib/api'
 import type {
   BootstrapModule, Container, InstanceTemplate, LaunchedInstance, TemplateRun,
@@ -52,6 +53,7 @@ function secretParams(template: InstanceTemplate, modules: BootstrapModule[]) {
 export function TemplatesView({
   containers, ready, runs: runList, onRunStarted, onNotify, onOpen, onChanged,
 }: Props) {
+  const canWrite = useCanWrite()
   const [templates, setTemplates] = useState<InstanceTemplate[] | null>(null)
   const [modules, setModules] = useState<BootstrapModule[]>([])
   const [error, setError] = useState<string | null>(null)
@@ -169,7 +171,7 @@ export function TemplatesView({
           saved instance setups, launched one or many at a time
         </span>
         <div className="topbar-spacer" />
-        <button className="btn btn-primary btn-sm" onClick={() => setEditing('new')}>
+        <button className="btn btn-primary btn-sm" disabled={!canWrite} onClick={() => setEditing('new')}>
           <PlusIcon /> New template
         </button>
       </div>
@@ -225,12 +227,12 @@ export function TemplatesView({
                   </div>
                   <button className="btn btn-sm btn-icon btn-ghost"
                     aria-label={`Edit template ${template.name}`} title="Edit"
-                    disabled={!!busy} onClick={() => setEditing(template)}>
+                    disabled={!!busy || !canWrite} onClick={() => setEditing(template)}>
                     <PencilIcon />
                   </button>
                   <button className="btn btn-sm btn-icon btn-danger"
                     aria-label={`Delete template ${template.name}`} title="Delete template"
-                    disabled={!!busy} onClick={() => setPendingDelete(template.name)}>
+                    disabled={!!busy || !canWrite} onClick={() => setPendingDelete(template.name)}>
                     <TrashIcon />
                   </button>
                 </header>
@@ -299,7 +301,7 @@ export function TemplatesView({
                         ...current, [template.name]: event.target.value }))}
                     />
                     <button className="btn btn-primary"
-                      disabled={!ready || !!busy || gone.length > 0}
+                      disabled={!ready || !canWrite || !!busy || gone.length > 0}
                       onClick={() => requestLaunch(template)}>
                       {busy?.action === 'launch' && <span className="spinner" />}
                       {busy?.action === 'launch' ? `Launching ${busy.count}…` : 'Launch'}
@@ -313,21 +315,21 @@ export function TemplatesView({
                       <div className="template-fleet">
                         <button className="btn btn-sm"
                           title="Run a shell command on the running instances from this template"
-                          disabled={!!busy || running === 0}
+                          disabled={!!busy || !canWrite || running === 0}
                           onClick={() => setConfirming({ template, action: 'exec' })}>
                           {busy?.action === 'exec' ? <span className="spinner" /> : <TerminalIcon size={13} />}
                           {busy?.action === 'exec' ? `Running on ${busy.count}…` : 'Run command'}
                         </button>
                         <button className="btn btn-sm"
                           title="Delete every instance from this template and create it again, with the template as it is now"
-                          disabled={!ready || !!busy || gone.length > 0}
+                          disabled={!ready || !canWrite || !!busy || gone.length > 0}
                           onClick={() => setConfirming({ template, action: 'recreate' })}>
                           {busy?.action === 'recreate' ? <span className="spinner" /> : <RestartIcon size={13} />}
                           {busy?.action === 'recreate' ? `Recreating ${busy.count}…` : 'Recreate all'}
                         </button>
                         <button className="btn btn-sm btn-danger"
                           title="Stop and delete every instance from this template"
-                          disabled={!ready || !!busy}
+                          disabled={!ready || !canWrite || !!busy}
                           onClick={() => setConfirming({ template, action: 'destroy' })}>
                           {busy?.action === 'destroy' ? <span className="spinner" /> : <TrashIcon size={13} />}
                           {busy?.action === 'destroy' ? `Destroying ${busy.count}…` : 'Destroy all'}
