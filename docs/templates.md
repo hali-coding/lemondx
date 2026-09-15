@@ -3,8 +3,8 @@
 [← back to README](../README.md)
 
 A template is a whole instance setup saved under a name: image, container or
-VM, CPU/memory/disk limits, storage pool, daemon profiles, the ephemeral and
-start flags, and a bootstrap selection — modules, every one of their
+VM, CPU/memory/disk limits, storage pool, network, daemon profiles, the ephemeral,
+start and secure boot flags, and a bootstrap selection — modules, every one of their
 parameters, and the SSH public keys to install. Launching one creates one or
 many identical instances in a single step.
 
@@ -16,9 +16,9 @@ can start its module selection from a profile.
 
 The **Templates** tab lists every template with what it creates and which
 instances were launched from it. Pick a count and press **Launch**; the names
-the launch will use are shown beside the button. Instances are created four at
-a time and each reports its own result, so one that fails to create or
-bootstrap does not stop the rest, and the ones that exist are kept.
+the launch will use are shown beside the button. Instances are created one per
+host CPU core at a time, and each reports its own result, so one that fails to
+create or bootstrap does not stop the rest, and the ones that exist are kept.
 
 Once a template has instances, its card also offers **Run command**,
 **Recreate all** and **Destroy all** — see
@@ -101,10 +101,10 @@ lost. Secrets are asked for as on launch, and every check that could fail for
 all of them runs before anything is deleted. An instance that fails to delete
 is left as it is rather than recreated.
 
-Both run four instances at a time and report each one. To avoid destroying an
-instance someone launched after you looked, the request carries the list of
-instances you confirmed; if the template's instances no longer match it,
-nothing happens and the request fails with `409`.
+Both run one instance per host CPU core at a time and report each one. To avoid
+destroying an instance someone launched after you looked, the request carries
+the list of instances you confirmed; if the template's instances no longer
+match it, nothing happens and the request fails with `409`.
 
 ## Naming
 
@@ -187,9 +187,11 @@ or check them into a project:
   "memory": "2GiB",
   "disk": "",
   "pool": "",
+  "network": "",
   "profiles": [],
   "ephemeral": false,
   "start": true,
+  "secureboot": true,
   "bootstrap": {
     "modules": ["base", "ssh-access"],
     "params": { "USERNAME": "hampus", "SHELL_PATH": "/bin/bash" },
@@ -198,6 +200,9 @@ or check them into a project:
 }
 ```
 
-A blank `pool` means whichever pool the daemon's default profile uses. A file
+A blank `pool` or `network` means whichever one the daemon's default profile
+uses. `"secureboot": false` launches VMs from an image that is incompatible
+with UEFI secure boot, by setting `boot.mode=uefi-nosecureboot` (on Incus,
+`security.secureboot=false`); it is ignored for a container. A file
 that no longer parses is skipped; a secret or an invalid key written into one
 by hand is ignored.

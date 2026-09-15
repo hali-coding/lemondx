@@ -282,10 +282,13 @@ def _clean_template(stored, name):
         "memory": _text(stored.get("memory"), 32),
         "disk": _text(stored.get("disk"), 32),
         "pool": _text(stored.get("pool"), 64),
+        "network": _text(stored.get("network"), 64),
         "profiles": _strings(stored.get("profiles")),
         "ephemeral": stored.get("ephemeral") is True,
         # Absent means start: an instance that never boots cannot be bootstrapped.
         "start": stored.get("start") is not False,
+        # Absent means on, and only a VM can have it off.
+        "secureboot": not (kind == "virtual-machine" and stored.get("secureboot") is False),
         "bootstrap": _clean_selection(bootstrap if isinstance(bootstrap, dict) else {}),
     }
 

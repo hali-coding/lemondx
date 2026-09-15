@@ -63,10 +63,13 @@ refuses a locked account even for key authentication.
 
 ## Defaults, saved settings and profiles
 
-The **Modules** tab manages all of this; the CLI mirrors it.
+The **Modules** tab manages all of this; the CLI mirrors it. It lists every
+module with how many settings it has, which profiles and templates use it, and
+whether it is pre-selected; click one to open its page, which has its settings,
+its script, and the facts from its header. Profiles have their own sub-tab.
 
-**Defaults.** Tick *Default* on a module and it is pre-selected every time you
-create a container.
+**Defaults.** Tick *Pre-selected* on a module and it is pre-selected every time
+you create a container.
 
 ```bash
 ./lemondx module-set docker --default
@@ -75,10 +78,10 @@ create a container.
 ```
 
 **Saved settings.** A module's parameters are remembered. Edit them in the
-Modules tab, or just run a bootstrap — values that differed from the module's
+module's page, or just run a bootstrap — values that differed from the module's
 own default are saved automatically, so the next container starts from what
 worked last time. The UI marks these *saved* and shows the module's original
-value beside them. Blank a field to go back to that original.
+value beside them, with *Reset* to go back to it.
 
 ```bash
 ./lemondx module-set ssh-access --param USERNAME=hampus --param SHELL_PATH=/bin/sh
@@ -152,7 +155,12 @@ whole directory; a directory you name explicitly is never migrated away from.
 ## Uploading modules
 
 Drop a `.sh` file into `~/.local/share/lemondx/modules`, or upload it through
-the Modules tab (choose a file or paste the script). From the CLI:
+the Modules tab (choose a file or paste the script). An uploaded module's
+script can be edited on its page, and a built-in one can be *customised*:
+saving writes your copy under the same name, which shadows the built-in until
+*Revert to built-in* deletes it. Reverting keeps the defaults, profiles and
+templates that name the module, since the built-in is still there to run.
+From the CLI:
 
 ```bash
 ./lemondx module-add ./redis.sh --default
@@ -172,7 +180,8 @@ and only when you select it.
 
 Drop a `.sh` file in `modules/`, or in `~/.local/share/lemondx/modules` to keep
 it outside the repo (a file there shadows a shipped module of the same name).
-`LEMONDX_MODULES` adds more directories.
+`LEMONDX_MODULES` adds more directories. Those win over uploads, so lemondx
+refuses to upload over, or delete, a module one of them supplies.
 
 ```sh
 #!/bin/sh

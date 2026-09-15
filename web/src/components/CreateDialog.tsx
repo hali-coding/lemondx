@@ -111,9 +111,11 @@ export function CreateDialog({ onCancel, onCreate, onNotify }: Props) {
         memory: resolved.memory,
         disk: resolved.disk || undefined,
         pool: resolved.pool || undefined,
+        network: resolved.network || undefined,
         profiles: resolved.profiles.length > 0 ? resolved.profiles : undefined,
         ephemeral: resolved.ephemeral,
         start: resolved.start,
+        secureboot: resolved.secureboot,
         bootstrap: selected > 0 ? resolved.bootstrap : undefined,
       })
       // Accepted: the create runs on the server from here, and the list shows it.

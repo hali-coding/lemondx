@@ -109,12 +109,57 @@ instances), and the live DHCP lease table showing which container holds which
 address.
 
 Host interfaces the daemon does not manage (`docker0`, physical NICs) are
-listed separately so it is clear what is and is not under its control.
+listed separately so it is clear what is and is not under its control, with
+host bridges marked as ones a new instance can join.
+
+### Managing networks
+
+**New network** creates a managed bridge. Each address family is *Pick a free
+subnet for me* (the daemon's `auto`), *Choose the CIDR block…*, or *Disabled*,
+with NAT and DHCP toggles.
+
+Choosing the block prefills a /24 (or /64) nothing on the host uses, and you
+can type any other, such as `10.44.8.0/22`. The bridge takes the block's first
+host (`10.44.8.1`); type a host address instead (`10.44.8.254/22`) to give it
+that one. Below the field you see the bridge address, how many addresses are
+left for instances and the usable range, plus every subnet already on the
+host. A block that overlaps one of them — another bridge, `docker0`, your LAN —
+is refused before you can submit, and again by the server, because the daemon
+itself accepts it and routing to both then quietly breaks. Public IPv4 ranges
+and IPv6 prefixes other than /64 are allowed but get a warning. The defaults are what `lemondx init`
+creates: a free IPv4 subnet behind NAT and no IPv6. DNS domain, MTU and a
+short allowlist of other bridge keys (`ipv4.dhcp.ranges`, `ipv4.routing`,
+`dns.mode`, …) are available too; `raw.dnsmasq`, tunnels and uplinks are left
+to the daemon's own CLI. Names are limited to 15 characters, the kernel's
+limit for an interface.
+
+**Edit** sends only the keys that changed, so a network with options lemondx
+does not allow can still be edited. **Delete** is refused while any profile
+or instance uses the network, and the dialog lists them. lemondx will not
+detach them for you, because an instance whose NIC is removed keeps running
+with no network. Only managed bridges on non-clustered servers can be edited
+or deleted.
+
+The new-instance dialog (and the template editor) has a **Network** selector
+next to **Storage pool**. It defaults to the network the default profile's NIC
+joins and lists managed networks and host bridges. Picking another one adds an
+instance-level NIC under the profile's device name, which replaces the
+profile's NIC rather than adding a second one; the profile itself does not
+change. On a host bridge the instance gets its address from whatever serves
+that network, not from the daemon. **New network…** creates a bridge in place,
+with the same CIDR block picker, and selects it.
 
 From the CLI:
 
 ```bash
-curl -s localhost:8099/api/networks | jq
+./lemondx network ls
+./lemondx network show lxdbr0
+./lemondx network subnets                             # what a new block must avoid
+./lemondx network create labbr0 --ipv4 10.20.0.0/24 --dns-domain lab
+./lemondx network set labbr0 --no-nat --mtu 1400
+./lemondx network set labbr0 --config dns.domain=   # an empty value unsets a key
+./lemondx create lab1 --network labbr0
+./lemondx network delete labbr0
 curl -s localhost:8099/api/networks/lxdbr0 | jq '.ipv4, .leases'
 ```
 

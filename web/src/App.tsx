@@ -43,7 +43,12 @@ export default function App() {
   >('containers')
 
   // Any in-flight mutation pauses polling so it cannot clobber optimistic state.
+  // That stops new polls only; refreshSequence drops a response once a newer
+  // refresh has started, so one already under way cannot land after the
+  // refresh following a mutation -- nor re-watch a job that refresh reported
+  // finished, which would report it a second time.
   const mutating = useRef(0)
+  const refreshSequence = useRef(0)
   // Creates and template runs are started on the server and return at once,
   // so a poll is the only way a page hears how one ended -- whether this page
   // started it, another tab did, or it began before a reload. These hold the
@@ -115,6 +120,7 @@ export default function App() {
   }, [notify])
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
+    const sequence = ++refreshSequence.current
     try {
       const [nextStatus, nextContainers, nextCreates, nextRuns] = await Promise.all([
         api.status(signal),
@@ -123,6 +129,7 @@ export default function App() {
         api.creates(signal).catch(() => null),
         api.templateRuns(signal).catch(() => null),
       ])
+      if (sequence !== refreshSequence.current) return
       setStatus(nextStatus)
       setContainers(nextContainers)
       if (nextCreates) {
@@ -135,7 +142,7 @@ export default function App() {
       }
       setConnectionError(null)
     } catch (cause) {
-      if ((cause as Error).name === 'AbortError') return
+      if ((cause as Error).name === 'AbortError' || sequence !== refreshSequence.current) return
       if (cause instanceof ApiError && cause.status === 401) {
         setNeedsToken(true)
         return
@@ -364,7 +371,7 @@ export default function App() {
                 how {status?.product ?? 'the daemon'} wires up container networking
               </span>
             </div>
-            <NetworkView />
+            <NetworkView onNotify={notify} />
           </>
         ) : (
         <>
@@ -372,8 +379,9 @@ export default function App() {
           <h2>Containers</h2>
           {status?.storage_pools.length ? (
             <span className="faint" style={{ fontSize: 12.5 }}>
-              pool {status.storage_pools[0].name} ({status.storage_pools[0].driver})
-              {status.networks[0] ? ` · ${status.networks[0].name}` : ''}
+              pool {(status.root_pool ?? status.storage_pools[0]).name}{' '}
+              ({(status.root_pool ?? status.storage_pools[0]).driver})
+              {status.default_network ? ` · ${status.default_network}` : ''}
             </span>
           ) : null}
         </div>

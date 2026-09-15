@@ -88,6 +88,8 @@ export interface Status {
   socket: string
   /** The pool a new container would land on, or null before setup. */
   root_pool: StoragePool | null
+  /** The network the default profile's NIC joins, or null before setup. */
+  default_network: string | null
   server_version: string | null
   kernel: string | null
   driver: string | null
@@ -157,11 +159,15 @@ export interface CreateRequest {
   memory?: string
   disk?: string
   pool?: string
+  /** Replaces the profiles' NIC; the default profile's network when omitted. */
+  network?: string
   /** LXD/Incus profiles; the daemon's default when omitted. */
   profiles?: string[]
   description?: string
   ephemeral?: boolean
   start?: boolean
+  /** VMs only; false boots UEFI without secure boot. */
+  secureboot?: boolean
   bootstrap?: BootstrapSelection
 }
 
@@ -191,7 +197,10 @@ export interface BootstrapModule {
   id: string
   /** Shipped with lemondx; cannot be deleted, only shadowed. */
   builtin: boolean
+  /** An upload: its script can be rewritten and the module deleted. */
   editable: boolean
+  /** An upload that replaces a built-in of the same id; deleting it restores that. */
+  shadows_builtin: boolean
   /** Pre-selected when creating a container. */
   is_default: boolean
   name: string
@@ -276,6 +285,27 @@ export interface NetworkSummary {
   ipv4_address: string
   ipv6_address: string
   used_by: number
+  /** The network the default profile's NIC joins. */
+  default: boolean
+  /** Managed networks and host bridges; what an instance can be put on. */
+  attachable: boolean
+  /** A managed bridge lemondx can edit and delete. */
+  manageable: boolean
+  read_only_reason: string
+}
+
+/** A subnet already on the host, which a new bridge must not overlap. */
+export interface SubnetInUse {
+  interface: string
+  subnet: string
+  family: 4 | 6
+}
+
+/** Bridge settings as daemon config keys; an empty value unsets one on update. */
+export interface NetworkRequest {
+  name?: string
+  description?: string
+  config?: Record<string, string>
 }
 
 export interface NetworkLease {
@@ -298,6 +328,10 @@ export interface NetworkDetail {
   managed: boolean
   status: string
   description: string
+  default: boolean
+  attachable: boolean
+  manageable: boolean
+  read_only_reason: string
   config: Record<string, string>
   ipv4: NetworkFamily
   ipv6: NetworkFamily
@@ -335,10 +369,14 @@ export interface InstanceSpec {
   disk: string
   /** Blank means the pool the default profile uses. */
   pool: string
+  /** Blank means the network the default profile's NIC joins. */
+  network: string
   /** LXD/Incus profiles, not bootstrap ones. */
   profiles: string[]
   ephemeral: boolean
   start: boolean
+  /** VMs only; always true for a container. */
+  secureboot: boolean
   bootstrap: BootstrapSelection
 }
 
@@ -360,10 +398,21 @@ export interface LaunchedInstance {
   /** False if it failed to delete or create, or a module failed. */
   ok: boolean
   error: string | null
-  /** The new instance; null when it was destroyed or never created. */
-  container: ContainerDetail | null
+  /**
+   * The new instance, as much of it as a run record keeps: module output only
+   * survives, cut to its tail, for modules that failed. Null when it was
+   * destroyed or never created.
+   */
+  container: LaunchedContainer | null
   /** What a command printed here, for a run of action `exec`. */
   exec?: TemplateExecOutput | null
+}
+
+export interface LaunchedContainer {
+  name: string
+  status: string
+  ipv4: string[]
+  bootstrap: BootstrapResult | null
 }
 
 export interface TemplateExecOutput {

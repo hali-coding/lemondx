@@ -6,6 +6,7 @@ front ends can never drift apart in behaviour.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -19,7 +20,7 @@ from .bootstrap import (BootstrapError, BootstrapRunner, delete_module,
                         list_host_ssh_keys, module_source,
                         normalise_module_id, parse_public_key,
                         public_modules, save_module, secret_param_names)
-from .lxd import INCUS, LXDClient, LXDError, window_resize_message
+from .lxd import INCUS, NO_SECUREBOOT_CONFIG, LXDClient, LXDError, window_resize_message
 from .simplestreams import CatalogError, fetch_catalog
 
 VALID_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,61}$")
@@ -101,6 +102,26 @@ LOCAL_VOLUME_CONFIG = frozenset({
     "security.unmapped", "snapshots.expiry", "snapshots.pattern",
     "snapshots.schedule",
 })
+
+# A bridge is a host interface, and Linux caps those at 15 bytes.
+VALID_NETWORK_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,14}$")
+_DNS_DOMAIN = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,62}\.)*[a-zA-Z0-9-]{1,63}$")
+
+# What a local bridge needs, and no more -- the same narrowing as the pool
+# config above. `raw.dnsmasq`, tunnels and uplinks stay with the daemon's CLI.
+BRIDGE_CONFIG = frozenset({
+    "ipv4.address", "ipv4.nat", "ipv4.dhcp", "ipv4.dhcp.ranges",
+    "ipv4.dhcp.expiry", "ipv4.routing", "ipv4.firewall",
+    "ipv6.address", "ipv6.nat", "ipv6.dhcp", "ipv6.dhcp.stateful",
+    "ipv6.dhcp.ranges", "ipv6.dhcp.expiry", "ipv6.routing", "ipv6.firewall",
+    "dns.domain", "dns.mode", "bridge.mtu",
+})
+_BRIDGE_BOOLEANS = frozenset({
+    "ipv4.nat", "ipv4.dhcp", "ipv4.routing", "ipv4.firewall",
+    "ipv6.nat", "ipv6.dhcp", "ipv6.dhcp.stateful", "ipv6.routing", "ipv6.firewall",
+})
+# What `lemondx init` has always created: NATed IPv4 on a free subnet, no IPv6.
+BRIDGE_DEFAULTS = {"ipv4.address": "auto", "ipv4.nat": "true", "ipv6.address": "none"}
 
 QUOTA_CAPABLE_DRIVERS = frozenset({
     "btrfs", "zfs", "lvm", "ceph", "cephfs", "pure", "powerflex", "alletra",
@@ -304,6 +325,10 @@ class ContainerService:
         # _track_create().
         self._creates = {}
         self._creates_lock = threading.Lock()
+        # Held from _check_subnets_free() until the daemon has the bridge, as
+        # the daemon does not reject an explicit block that overlaps another.
+        # It only covers this process, not lxc or a second lemondx.
+        self._networks_lock = threading.Lock()
 
     # -- readiness ---------------------------------------------------------
 
@@ -348,11 +373,14 @@ class ContainerService:
         root_pool = next(
             (p for p in pool_summaries if p["name"] == root_pool_name), None)
 
+        _, nic = self._profile_nic(["default"])
+
         return {
             "connected": True,
             "ready": not issues,
             "issues": issues,
             "root_pool": root_pool,
+            "default_network": _nic_network(nic),
             "flavor": self.lxd.flavor,
             "product": self.lxd.product_name,
             "client_binary": self.lxd.client_binary,
@@ -413,12 +441,15 @@ class ContainerService:
             bridge = managed[0]["name"]
             steps.append("Reusing existing bridge '%s'." % bridge)
         else:
-            self.lxd.create_network(bridge, {
-                "ipv4.address": "auto",
-                "ipv4.nat": "true",
-                "ipv6.address": "auto" if ipv6 else "none",
-                "ipv6.nat": "true" if ipv6 else "false",
-            })
+            # The daemon picks an auto block around what exists now, which
+            # could be the one a concurrent create_network() just found free.
+            with self._networks_lock:
+                self.lxd.create_network(bridge, {
+                    "ipv4.address": "auto",
+                    "ipv4.nat": "true",
+                    "ipv6.address": "auto" if ipv6 else "none",
+                    "ipv6.nat": "true" if ipv6 else "false",
+                })
             steps.append("Created bridge '%s' with NAT." % bridge)
 
         profile = self.lxd.get_profile("default")
@@ -471,9 +502,9 @@ class ContainerService:
 
     def create_container(self, name, image, instance_type="container",
                          profiles=None, cpu=None, memory=None, disk=None, pool=None,
-                         description=None, ephemeral=False, start=True,
+                         network=None, description=None, ephemeral=False, start=True,
                          config=None, wait=True, bootstrap=None,
-                         remember_params=True, background=False):
+                         remember_params=True, background=False, secureboot=True):
         """Create an instance, start it and run its bootstrap modules.
 
         With ``background`` everything that can be checked up front still is
@@ -500,6 +531,10 @@ class ContainerService:
             instance_config["limits.memory"] = normalize_size(memory, "memory limit")
         if description:
             instance_config.setdefault("user.description", description)
+        if not secureboot:
+            if instance_type != "virtual-machine":
+                raise ServiceError("Secure boot only applies to virtual machines.")
+            instance_config.update(NO_SECUREBOOT_CONFIG[self.lxd.flavor])
 
         payload = {
             "name": name,
@@ -527,6 +562,9 @@ class ContainerService:
             if disk:
                 root["size"] = normalize_size(disk, "disk size")
             payload["devices"] = {"root": root}
+        if network:
+            key, nic = self._instance_nic(payload["profiles"], str(network).strip())
+            payload.setdefault("devices", {})[key] = nic
 
         if bootstrap and bootstrap.get("modules") and not (start and wait):
             raise ServiceError(
@@ -1012,8 +1050,11 @@ class ContainerService:
 
     MAX_LAUNCH = 20
     # Each create pulls from the same image and each bootstrap runs a package
-    # manager; beyond a few at once the host is the bottleneck, not lemondx.
-    LAUNCH_WORKERS = 4
+    # manager, so the host's CPUs are the bottleneck, not lemondx: run one per
+    # core. sched_getaffinity honours taskset/cgroup cpusets (a systemd unit
+    # with CPUAffinity=) where cpu_count would report every core on the box.
+    LAUNCH_WORKERS = max(1, len(os.sched_getaffinity(0))
+                         if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1)
 
     def list_templates(self):
         available = discover_modules()
@@ -1023,9 +1064,9 @@ class ContainerService:
         ]
 
     def save_template(self, name, image, instance_type="container", cpu=None,
-                      memory=None, disk=None, pool=None, profiles=None,
+                      memory=None, disk=None, pool=None, network=None, profiles=None,
                       ephemeral=False, start=True, bootstrap=None, description="",
-                      name_prefix=None):
+                      name_prefix=None, secureboot=True):
         name = self._record_name(name, "template")
         image = str(image or "").strip()
         if not image:
@@ -1067,9 +1108,12 @@ class ContainerService:
             "memory": normalize_size(memory, "memory limit") or "",
             "disk": normalize_size(disk, "disk size") or "",
             "pool": str(pool).strip() if pool else "",
+            "network": str(network).strip() if network else "",
             "profiles": [str(p) for p in profiles or []],
             "ephemeral": bool(ephemeral),
             "start": bool(start),
+            # Meaningless for a container, so never stored as off for one.
+            "secureboot": bool(secureboot) or instance_type != "virtual-machine",
             "bootstrap": selection,
         })
 
@@ -1124,7 +1168,9 @@ class ContainerService:
                 profiles=template["profiles"] or None,
                 cpu=template["cpu"] or None, memory=template["memory"] or None,
                 disk=template["disk"] or None, pool=template["pool"] or None,
+                network=template["network"] or None,
                 ephemeral=template["ephemeral"], start=template["start"],
+                secureboot=template["secureboot"],
                 config={TEMPLATE_CONFIG_KEY: template["name"]}, bootstrap=bootstrap,
                 # A template launches its own values; it should not quietly
                 # rewrite the module settings the create form starts from.
@@ -1157,7 +1203,7 @@ class ContainerService:
         return {"name": instance_name, "ok": True, "error": None, "container": None}
 
     def _each(self, names, work, workers=None):
-        """Run ``work`` over instance names a few at a time, keeping order."""
+        """Run ``work`` over instance names one per CPU core, keeping order."""
         if not names:
             return []
         limit = min(len(names), workers or self.LAUNCH_WORKERS)
@@ -1358,7 +1404,8 @@ class ContainerService:
                 raise
             finally:
                 with self._runs_lock:
-                    run.update(finished_at=time.time(), result=result, error=error)
+                    run.update(finished_at=time.time(), result=_run_record(result),
+                               error=error)
 
         if background:
             self._in_background("%s-%s" % (action, name), execute)
@@ -1525,10 +1572,18 @@ class ContainerService:
     # -- networking --------------------------------------------------------
 
     def list_networks(self):
-        """All interfaces the daemon can see, managed ones first."""
+        """All interfaces the daemon can see, managed ones first.
+
+        ``attachable`` marks what ``create_container(network=...)`` accepts,
+        and ``default`` the one a new instance joins when it names none.
+        """
+        clustered = self._clustered()
+        _, nic = self._profile_nic(["default"])
+        default = _nic_network(nic)
         summaries = []
         for network in self.lxd.list_networks():
             config = network.get("config") or {}
+            reason = _network_read_only_reason(network, clustered)
             summaries.append({
                 "name": network.get("name"),
                 "type": network.get("type"),
@@ -1538,15 +1593,220 @@ class ContainerService:
                 "ipv4_address": config.get("ipv4.address") or "",
                 "ipv6_address": config.get("ipv6.address") or "",
                 "used_by": len(network.get("used_by") or []),
+                "default": network.get("name") == default,
+                "attachable": _attachable(network),
+                "manageable": not reason,
+                "read_only_reason": reason,
             })
         summaries.sort(key=lambda n: (not n["managed"], n["name"]))
         return summaries
+
+    def create_network(self, name, description="", config=None):
+        """Create a managed bridge.
+
+        Unset addresses follow ``BRIDGE_DEFAULTS``, so a bare name gets what
+        ``lemondx init`` would have made: a free IPv4 subnet behind NAT.
+        """
+        if not VALID_NETWORK_NAME.match(name or ""):
+            raise ServiceError(
+                "Invalid network name '%s'. Use letters, digits and dashes, starting "
+                "with a letter (max 15 chars, the kernel's limit for an interface)."
+                % name)
+        self._network_mutation_context()
+        values = dict(BRIDGE_DEFAULTS)
+        values.update(self._network_config(config))
+        # An IPv6 subnet with NAT left unsaid would be unreachable from outside
+        # and have no way out, which nobody asks for by leaving a box unticked.
+        if values.get("ipv6.address", "none") != "none":
+            values.setdefault("ipv6.nat", "true")
+        values = {k: v for k, v in values.items() if v != ""}
+        with self._networks_lock:
+            if any(n.get("name") == name for n in self.lxd.list_networks()):
+                raise ServiceError(
+                    "An interface called '%s' already exists on this host." % name, 409)
+            self._check_subnets_free(name, values)
+            self.lxd.create_network(name, values, str(description or "")[:200])
+        return self.get_network(name)
+
+    def update_network(self, name, description=None, config=None):
+        """Change a managed bridge's settings; an empty value unsets a key."""
+        clustered = self._network_mutation_context()
+        changes = self._network_config(config)
+        with self._networks_lock:
+            # Read under the lock so the merge below starts from what the
+            # previous update left, not from before it.
+            current = self.lxd.get_network(name)
+            reason = _network_read_only_reason(current, clustered)
+            if reason:
+                raise ServiceError("Network '%s' is read-only: %s" % (name, reason), 409)
+            values = dict(current.get("config") or {})
+            self._check_subnets_free(name, {
+                key: value for key, value in changes.items()
+                if key.endswith(".address") and value != values.get(key)})
+            for key, value in changes.items():
+                if value == "":
+                    values.pop(key, None)
+                else:
+                    values[key] = value
+            if description is None:
+                description = current.get("description") or ""
+            self.lxd.update_network(name, str(description)[:200], values)
+        return self.get_network(name)
+
+    def delete_network(self, name):
+        """Delete a managed bridge nothing is attached to.
+
+        There is deliberately no cascade: detaching a NIC cuts an instance off
+        without it being deleted, which is easy to miss and hard to notice.
+        """
+        clustered = self._network_mutation_context()
+        current = self.lxd.get_network(name)
+        reason = _network_read_only_reason(current, clustered)
+        if reason:
+            raise ServiceError("Network '%s' is read-only: %s" % (name, reason), 409)
+        instances, profiles = _network_users(current)
+        if instances or profiles or current.get("used_by"):
+            parts = []
+            if instances:
+                parts.append("instance%s %s" % (
+                    "s" if len(instances) > 1 else "", ", ".join(instances)))
+            if profiles:
+                parts.append("profile%s %s" % (
+                    "s" if len(profiles) > 1 else "", ", ".join(profiles)))
+            raise ServiceError(
+                "Network '%s' is still used by %s. Detach %s first."
+                % (name, " and ".join(parts) or "other resources",
+                   "them" if len(instances) + len(profiles) != 1 else "it"), 409)
+        self.lxd.delete_network(name)
+        return {"deleted": name}
+
+    def _clustered(self):
+        environment = (self.lxd.server_info() or {}).get("environment") or {}
+        return bool(environment.get("server_clustered"))
+
+    def _network_mutation_context(self):
+        clustered = self._clustered()
+        if clustered:
+            raise ServiceError("Network changes are not supported on clustered servers.", 409)
+        return clustered
+
+    def subnets(self):
+        """Every subnet on the host the daemon can see, so a block can be picked around them."""
+        return [{"interface": other, "subnet": str(subnet), "family": subnet.version}
+                for other, subnet in self._subnets_in_use()]
+
+    def _check_subnets_free(self, name, config):
+        """Refuse a chosen subnet that overlaps one already on the host.
+
+        The daemon checks this for ``auto`` but not for an explicit block, and
+        a bridge on a subnet the host already routes elsewhere (the LAN,
+        docker0, another bridge) quietly breaks traffic to both.
+        """
+        wanted = []
+        for key in ("ipv4.address", "ipv6.address"):
+            value = config.get(key) or ""
+            if value not in ("", "auto", "none"):
+                wanted.append(ipaddress.ip_interface(value).network)
+        if not wanted:
+            return
+        for other, subnet in self._subnets_in_use(exclude=name):
+            for block in wanted:
+                if block.version == subnet.version and block.overlaps(subnet):
+                    raise ServiceError(
+                        "%s overlaps %s on %s, which is already on this host. Pick "
+                        "another block, or let the daemon pick a free one."
+                        % (block, subnet, other), 409)
+
+    def _subnets_in_use(self, exclude=None):
+        """(interface, subnet) for every address the daemon can see on the host."""
+        found = set()
+        for record in self.lxd.list_networks():
+            other = record.get("name")
+            if other == exclude:
+                continue
+            config = record.get("config") or {}
+            addresses = [config.get("ipv4.address"), config.get("ipv6.address")]
+            for entry in (self.lxd.get_network_state(other) or {}).get("addresses") or []:
+                if entry.get("scope") == "global" and entry.get("netmask"):
+                    addresses.append("%s/%s" % (entry.get("address"), entry["netmask"]))
+            for address in addresses:
+                if not address or address in ("auto", "none"):
+                    continue
+                try:
+                    found.add((other, ipaddress.ip_interface(address).network))
+                except ValueError:
+                    continue
+        return sorted(found, key=lambda pair: (pair[0], str(pair[1])))
+
+    def _network_config(self, config):
+        values = self._storage_config(config, BRIDGE_CONFIG, what="Network")
+        for key, value in values.items():
+            if value == "":
+                continue
+            if key in _BRIDGE_BOOLEANS:
+                if value.lower() not in ("true", "false"):
+                    raise ServiceError("'%s' must be true or false." % key)
+                values[key] = value.lower()
+            elif key in ("ipv4.address", "ipv6.address"):
+                values[key] = _bridge_address(key, value)
+            elif key == "bridge.mtu":
+                if not value.isdigit() or not 576 <= int(value) <= 65535:
+                    raise ServiceError("MTU must be a number between 576 and 65535.")
+            elif key == "dns.mode":
+                if value not in ("managed", "dynamic", "none"):
+                    raise ServiceError("dns.mode must be managed, dynamic or none.")
+            elif key == "dns.domain":
+                if not _DNS_DOMAIN.match(value) or len(value) > 253:
+                    raise ServiceError("'%s' is not a valid DNS domain." % value)
+        return values
+
+    def _profile_nic(self, profiles):
+        """The (device key, device) of the NIC the profiles give an instance.
+
+        Later profiles override earlier ones key by key, as the daemon applies
+        them. With several NICs, the one named eth0 is the primary.
+        """
+        devices = {}
+        for profile_name in profiles or ["default"]:
+            try:
+                profile = self.lxd.get_profile(profile_name)
+            except LXDError:
+                continue
+            devices.update(profile.get("devices") or {})
+        nics = sorted((k, d) for k, d in devices.items() if d.get("type") == "nic")
+        if not nics:
+            return None, None
+        return next(((k, d) for k, d in nics if d.get("name") == "eth0"), nics[0])
+
+    def _instance_nic(self, profiles, network):
+        """An instance-level NIC that replaces the profiles' one with ``network``.
+
+        Using the profile's device key is what makes it a replacement: a new
+        key would add a second NIC fighting the first for the same name.
+        """
+        record = next((n for n in self.lxd.list_networks()
+                       if n.get("name") == network), None)
+        if record is None:
+            raise ServiceError("No network called '%s'." % network, 404)
+        if not _attachable(record):
+            raise ServiceError(
+                "'%s' is an unmanaged %s interface. Instances can join a managed "
+                "network or a host bridge." % (network, record.get("type") or "unknown"))
+        if record.get("managed"):
+            device = {"type": "nic", "network": network}
+        else:
+            device = {"type": "nic", "nictype": "bridged", "parent": network}
+        key, current = self._profile_nic(profiles)
+        device["name"] = (current or {}).get("name") or "eth0"
+        return key or "eth0", device
 
     def get_network(self, name):
         """Everything about one network: config, live state, and who is on it."""
         network = self.lxd.get_network(name)
         config = network.get("config") or {}
         managed = bool(network.get("managed"))
+        reason = _network_read_only_reason(network, self._clustered())
+        _, nic = self._profile_nic(["default"])
 
         state = self.lxd.get_network_state(name) or {}
         counters = state.get("counters") or {}
@@ -1562,14 +1822,7 @@ class ContainerService:
                 })
             leases.sort(key=lambda l: (l["type"] != "gateway", _address_key(l["address"])))
 
-        # used_by entries are API paths; pull out the instance names.
-        instances = []
-        for path in network.get("used_by") or []:
-            marker = "/instances/"
-            if marker in path:
-                instances.append(path.split(marker, 1)[1].split("?", 1)[0])
-        profiles = [p.split("/profiles/", 1)[1].split("?", 1)[0]
-                    for p in (network.get("used_by") or []) if "/profiles/" in p]
+        instances, profiles = _network_users(network)
 
         return {
             "name": network.get("name"),
@@ -1577,6 +1830,10 @@ class ContainerService:
             "managed": managed,
             "status": network.get("status"),
             "description": network.get("description") or "",
+            "default": network.get("name") == _nic_network(nic),
+            "attachable": _attachable(network),
+            "manageable": not reason,
+            "read_only_reason": reason,
             "config": config,
             "ipv4": {
                 "address": config.get("ipv4.address") or "",
@@ -1606,8 +1863,8 @@ class ContainerService:
                 "tx": counters.get("bytes_sent") or 0,
             },
             "leases": leases,
-            "instances": sorted(set(instances)),
-            "profiles": sorted(set(profiles)),
+            "instances": instances,
+            "profiles": profiles,
             "forwards": self.lxd.network_forwards(name) if managed else [],
         }
 
@@ -1997,17 +2254,17 @@ class ContainerService:
                 % (record.get("name") or "", driver), 409)
         return driver
 
-    def _storage_config(self, config, allowed):
+    def _storage_config(self, config, allowed, what="Storage"):
         if config is None:
             return {}
         if not isinstance(config, dict):
-            raise ServiceError("Storage config must be an object of key/value strings.")
+            raise ServiceError("%s config must be an object of key/value strings." % what)
         result = {}
         for key, value in config.items():
             if key not in allowed:
-                raise ServiceError("Storage config key '%s' is not supported." % key)
+                raise ServiceError("%s config key '%s' is not supported." % (what, key))
             if not isinstance(value, (str, int, float, bool)):
-                raise ServiceError("Storage config value for '%s' must be a string." % key)
+                raise ServiceError("%s config value for '%s' must be a string." % (what, key))
             result[key] = str(value).lower() if isinstance(value, bool) else str(value)
         return result
 
@@ -2107,6 +2364,113 @@ def _safe_storage_config(config):
 
 def _is_true(value):
     return str(value).lower() in ("true", "yes", "1", "on")
+
+
+# A failed module keeps this much of its output in a run record, for the UI.
+RUN_OUTPUT_TAIL = 4 * 1024
+
+
+def _run_record(result):
+    """A run's result as kept for polling: what the Templates card shows.
+
+    Every open page re-fetches run records every few seconds for as long as
+    the server runs, and a full launch result carries each instance's detail
+    and every module's output -- megabytes for twenty instances installing
+    packages. The caller that waited for the run still gets all of it.
+    """
+    if not result:
+        return result
+    instances = []
+    for entry in result["instances"]:
+        container = entry.get("container")
+        if container is not None:
+            bootstrap = container.get("bootstrap")
+            container = {
+                "name": container.get("name"),
+                "status": container.get("status"),
+                "ipv4": container.get("ipv4") or [],
+                "bootstrap": bootstrap and {
+                    "container": bootstrap.get("container"),
+                    "ok": bootstrap["ok"],
+                    "modules": [dict(
+                        {k: m.get(k) for k in ("id", "name", "exit_code", "duration")},
+                        stdout=(m.get("stdout") or "")[-RUN_OUTPUT_TAIL:] if m["exit_code"] else "",
+                        stderr=(m.get("stderr") or "")[-RUN_OUTPUT_TAIL:] if m["exit_code"] else "",
+                    ) for m in bootstrap["modules"]],
+                },
+            }
+        instances.append(dict(entry, container=container))
+    return dict(result, instances=instances)
+
+
+def _network_read_only_reason(network, clustered):
+    """Why lemondx will not change a network, or "" if it will."""
+    if clustered:
+        return "clustered networks are shown read-only."
+    if not network.get("managed"):
+        return "not managed by the daemon."
+    if network.get("type") != "bridge":
+        return "only bridge networks are managed here."
+    return ""
+
+
+def _attachable(network):
+    # An unmanaged physical NIC would be moved into the instance, off the host.
+    return bool(network.get("managed")) or network.get("type") == "bridge"
+
+
+def _nic_network(device):
+    """The network a NIC device joins, managed (`network`) or not (`parent`)."""
+    if not device:
+        return None
+    return device.get("network") or device.get("parent")
+
+
+def _network_users(network):
+    """(instances, profiles) named by a network's used_by API paths."""
+    instances, profiles = set(), set()
+    for reference in network.get("used_by") or []:
+        parts = urllib.parse.urlsplit(str(reference)).path.rstrip("/").split("/")
+        if len(parts) >= 4 and parts[1] == "1.0":
+            value = urllib.parse.unquote(parts[3])
+            if parts[2] == "instances":
+                instances.add(value)
+            elif parts[2] == "profiles":
+                profiles.add(value)
+    return sorted(instances), sorted(profiles)
+
+
+def _bridge_address(key, value):
+    """``auto``, ``none``, or the bridge's own address with its prefix.
+
+    A CIDR block is accepted too, and means its first host: people pick a
+    block, while the daemon wants the gateway address it should hold.
+    """
+    if value in ("auto", "none"):
+        return value
+    family = 4 if key.startswith("ipv4") else 6
+    example = "10.10.0.0/24" if family == 4 else "fd42:1::/64"
+    if "/" not in value:
+        raise ServiceError(
+            "%s needs a CIDR block with a prefix length, e.g. %s (or 'auto' / 'none')."
+            % (key, example))
+    try:
+        interface = ipaddress.ip_interface(value)
+    except ValueError:
+        raise ServiceError(
+            "'%s' is not a valid %s, e.g. %s." % (value, key, example)) from None
+    if interface.version != family:
+        raise ServiceError("'%s' is not an IPv%d address, e.g. %s." % (value, family, example))
+    network = interface.network
+    if network.num_addresses < 4:
+        raise ServiceError("%s is too small a subnet to hand out addresses." % network)
+    if interface.ip == network.network_address:
+        return "%s/%d" % (next(network.hosts()).compressed, network.prefixlen)
+    if family == 4 and interface.ip == network.broadcast_address:
+        raise ServiceError(
+            "%s is the broadcast address of %s; the bridge needs a host address in it."
+            % (interface.ip, network))
+    return interface.with_prefixlen
 
 
 def _address_key(address):

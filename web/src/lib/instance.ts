@@ -16,9 +16,11 @@ export function blankSpec(): InstanceSpec {
     memory: '',
     disk: '',
     pool: '',
+    network: '',
     profiles: [],
     ephemeral: false,
     start: true,
+    secureboot: true,
     bootstrap: { modules: [], params: {}, ssh_keys: [] },
   }
 }
@@ -32,9 +34,11 @@ export function specOf(template: InstanceTemplate): InstanceSpec {
     memory: template.memory,
     disk: template.disk,
     pool: template.pool,
+    network: template.network,
     profiles: [...template.profiles],
     ephemeral: template.ephemeral,
     start: template.start,
+    secureboot: template.secureboot,
     bootstrap: {
       modules: [...template.bootstrap.modules],
       params: { ...template.bootstrap.params },
@@ -55,6 +59,8 @@ export function resolvedSpec(spec: InstanceSpec): InstanceSpec {
     memory: spec.memory.trim() || DEFAULT_MEMORY,
     disk: spec.disk.trim(),
     start: spec.start || spec.bootstrap.modules.length > 0,
+    // Unticking VM hides the checkbox, so it must not keep applying.
+    secureboot: spec.secureboot || spec.type !== 'virtual-machine',
   }
 }
 

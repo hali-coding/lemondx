@@ -29,8 +29,9 @@ with a matching HTTP status.
 | `GET`/`PATCH`/`DELETE` | `/api/storage/pools/{pool}/volumes/custom/{volume}` | manage an unattached custom volume |
 | `GET` | `/api/images` | cached images, suggested catalog, remotes |
 | `GET` | `/api/images/browse` | full remote catalogs, flagged with what is local |
-| `GET` | `/api/networks` | every interface the daemon can see |
-| `GET` | `/api/networks/{name}` | config, state, DHCP leases, attachments |
+| `GET`/`POST` | `/api/networks` | every interface the daemon can see / create a managed bridge |
+| `GET` | `/api/subnets` | every subnet already on the host, which a new bridge must not overlap |
+| `GET`/`PATCH`/`DELETE` | `/api/networks/{name}` | config, state, DHCP leases, attachments / change or delete a managed bridge |
 | `GET` | `/api/modules` | bootstrap modules with their parameters |
 | `GET` | `/api/ssh-keys` | public keys found in `~/.ssh` |
 | `POST` | `/api/ssh-keys/validate` | check one pasted public key |
@@ -63,6 +64,13 @@ curl -s -X POST localhost:8099/api/containers \
 curl -s -X POST localhost:8099/api/storage/pools \
   -H 'content-type: application/json' \
   -d '{"name":"fast","driver":"zfs","size":"30GiB"}'
+
+curl -s -X POST localhost:8099/api/networks \
+  -H 'content-type: application/json' \
+  -d '{"name":"labbr0","config":{"ipv4.address":"10.20.0.0/24"}}'
+curl -s -X POST localhost:8099/api/containers \
+  -H 'content-type: application/json' \
+  -d '{"name":"lab1","image":"images:alpine/3.21","network":"labbr0"}'
 ```
 
 Creating a container and template launch, recreate and destroy block until they

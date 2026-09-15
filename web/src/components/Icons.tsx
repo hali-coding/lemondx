@@ -96,6 +96,14 @@ export const CheckIcon = ({ size = 15 }: Props) => (
   <svg {...base(size)}><path d="M5 12.5l4.5 4.5L19 7" /></svg>
 )
 
+export const ChevronRightIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}><path d="M9 6l6 6-6 6" /></svg>
+)
+
+export const ChevronLeftIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}><path d="M15 6l-6 6 6 6" /></svg>
+)
+
 export const TerminalIcon = ({ size = 15 }: Props) => (
   <svg {...base(size)}>
     <path d="M5 8l4 4-4 4M12 17h7" />
