@@ -3,22 +3,34 @@
 from __future__ import annotations
 
 import errno
+import ipaddress
 import json
 import mimetypes
 import os
 import re
-import secrets
+import socket
+import ssl
+import sys
 import threading
 import time
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 
 from . import websocket
+from .auth import ADMIN, READ, SESSION_COOKIE, AuthConfig, AuthError, AuthService
 from .lxd import LXDError
 from .service import ContainerService, ServiceError
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8099
+TLS_HANDSHAKE_TIMEOUT = 10
+
+# The Vite dev server proxies /api with changeOrigin, which rewrites Host but
+# leaves the browser's Origin alone, so --dev has to accept that origin too.
+DEV_ORIGINS = ("localhost:5173", "127.0.0.1:5173")
+LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
+_TOKEN_IN_LOG = re.compile(r"(token=)[^&\s\"]*")
 
 def _find_web_dist():
     """Locate the built Vite output by walking up from this package."""
@@ -37,31 +49,41 @@ WEB_DIST = _find_web_dist()
 
 
 class Router:
-    """Tiny regex router: register handlers, then dispatch by method + path."""
+    """Tiny regex router: register handlers, then dispatch by method + path.
+
+    Every route has a role. Reads default to ``read`` and everything else to
+    ``admin``, so a new mutating route is admin-only unless someone decides
+    otherwise; pass ``role=`` only where the method gets it wrong. A route
+    with ``principal=True`` receives the caller after the query, for the few
+    handlers whose answer depends on who is asking.
+    """
 
     def __init__(self):
         self.routes = []
 
-    def add(self, method, pattern, handler):
-        self.routes.append((method, re.compile("^%s$" % pattern), handler))
+    def add(self, method, pattern, handler, role=None, principal=False):
+        role = role or (READ if method == "GET" else ADMIN)
+        self.routes.append((method, re.compile("^%s$" % pattern), handler, role, principal))
 
     def resolve(self, method, path):
+        """``(handler, args, role, wants_principal)``; handler is None for no match."""
         allowed = set()
-        for route_method, pattern, handler in self.routes:
+        for route_method, pattern, handler, role, wants in self.routes:
             match = pattern.match(path)
             if not match:
                 continue
             if route_method == method:
-                return handler, [unquote(g) for g in match.groups()]
+                return handler, [unquote(g) for g in match.groups()], role, wants
             allowed.add(route_method)
         if allowed:
             raise ServiceError("Method not allowed (try: %s)" % ", ".join(sorted(allowed)), 405)
-        return None, []
+        return None, [], ADMIN, False
 
 
-def build_router(service):
+def build_router(service, auth=None):
     r = Router()
     NAME = r"([^/]+)"
+    auth = auth or AuthService()
 
     r.add("GET", r"/api/status", lambda body, q: service.status())
     r.add("POST", r"/api/setup", lambda body, q: service.initialize(
@@ -125,6 +147,9 @@ def build_router(service):
           lambda body, q, name, snap: service.restore_snapshot(name, snap))
 
     r.add("GET", r"/api/resources", lambda body, q: service.resources())
+    # The monitor's latest results; there is deliberately no way to trigger a
+    # round from here, so checks stay at the configured interval.
+    r.add("GET", r"/api/health", lambda body, q: service.health())
 
     r.add("GET", r"/api/storage", lambda body, q: service.storage())
     r.add("GET", r"/api/storage/pools", lambda body, q: service.storage()["pools"])
@@ -236,8 +261,9 @@ def build_router(service):
               name, body.get("instances"), params=body.get("params"),
               background=bool(body.get("background", False))))
     r.add("GET", r"/api/ssh-keys", lambda body, q: service.list_ssh_keys())
+    # Parses a key the caller pasted; changes nothing.
     r.add("POST", r"/api/ssh-keys/validate",
-          lambda body, q: service.validate_ssh_key(body.get("key", "")))
+          lambda body, q: service.validate_ssh_key(body.get("key", "")), role=READ)
     r.add("POST", r"/api/containers/%s/bootstrap" % NAME,
           lambda body, q, name: service.bootstrap(
               name,
@@ -248,6 +274,24 @@ def build_router(service):
 
     r.add("GET", r"/api/images", lambda body, q: service.list_images())
     r.add("GET", r"/api/profiles", lambda body, q: service.list_profiles())
+
+    # GET /api/auth, login and logout are handled before routing: they must
+    # answer callers who are not authenticated yet, and they set cookies.
+    # Token routes are open to read-only users for their own tokens; the
+    # service enforces ownership.
+    r.add("GET", r"/api/auth/tokens", lambda body, q, who: auth.list_tokens(who),
+          principal=True)
+    r.add("POST", r"/api/auth/tokens", lambda body, q, who: auth.create_token(
+        who, body.get("name"), role=body.get("role"),
+        expires_days=body.get("expires_days"), owner=body.get("owner")),
+          role=READ, principal=True)
+    r.add("DELETE", r"/api/auth/tokens/%s" % NAME,
+          lambda body, q, who, token_id: auth.revoke_token(who, token_id),
+          role=READ, principal=True)
+    r.add("GET", r"/api/auth/users", lambda body, q: auth.list_users(), role=ADMIN)
+    r.add("PUT", r"/api/auth/users/%s" % NAME, lambda body, q, name: auth.set_user(
+        name, password=body.get("password"), role=body.get("role")))
+    r.add("DELETE", r"/api/auth/users/%s" % NAME, lambda body, q, name: auth.remove_user(name))
     return r
 
 
@@ -258,16 +302,39 @@ class LemondxHandler(BaseHTTPRequestHandler):
     # Injected by make_server().
     router = None
     service = None
-    token = None
+    auth = None
     web_root = None
     allow_origin = None
     quiet = False
+    tls = False
+    dev = False
+    bound_host = DEFAULT_HOST
+
+    # The caller of the request being handled, for the log line. A handler
+    # serves every request on a kept-alive connection, so _handle resets it.
+    principal = None
 
     # -- plumbing ----------------------------------------------------------
 
+    def setup(self):
+        # The listening socket is wrapped with do_handshake_on_connect=False,
+        # so the TLS handshake happens here on the request's own thread: done
+        # in accept(), one client that never finishes it would stall them all.
+        if self.tls:
+            self.request.settimeout(TLS_HANDSHAKE_TIMEOUT)
+            self.request.do_handshake()
+            self.request.settimeout(None)
+        super().setup()
+
     def log_message(self, fmt, *args):
-        if not self.quiet:
-            print("[lemondx] %s - %s" % (self.address_string(), fmt % args))
+        if self.quiet:
+            return
+        # A WebSocket client can only send its token in the query string, and
+        # the request line lands in this log -- which, under systemd, is the
+        # journal every admin on the host can read.
+        line = _TOKEN_IN_LOG.sub(r"\1***", fmt % args)
+        who = " %s" % self.principal.name if self.principal else ""
+        print("[lemondx] %s%s - %s" % (self.address_string(), who, line))
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -293,8 +360,13 @@ class LemondxHandler(BaseHTTPRequestHandler):
     def _handle(self, method):
         path = urlparse(self.path).path
         query = _parse_query(urlparse(self.path).query)
+        self.principal = None
+        self._body_read = False
 
-        if method == "GET" and websocket.is_upgrade(self.headers):
+        if not self._host_allowed():
+            self._send_json({"error": "Unexpected Host header. lemondx without auth only "
+                                      "answers to loopback names."}, 403)
+        elif method == "GET" and websocket.is_upgrade(self.headers):
             self._handle_upgrade(path, query)
         elif path.startswith("/api/"):
             self._handle_api(method, path, query)
@@ -304,18 +376,33 @@ class LemondxHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Not found"}, 404)
 
     def _handle_api(self, method, path, query):
-        if not self._authorized():
-            self._send_json({"error": "Unauthorized: missing or bad API token"}, 401)
-            return
         try:
-            handler, args = self.router.resolve(method, path)
+            if path in ("/api/auth", "/api/auth/login", "/api/auth/logout"):
+                self._handle_auth(method, path)
+                return
+            principal, explicit = self._principal()
+            if principal is None:
+                self._send_json({"error": "Unauthorized: log in or send a valid API token"}, 401)
+                return
+            self.principal = principal
+            if method not in ("GET", "HEAD") and not explicit and not self._same_origin():
+                self._send_json({"error": "Cross-origin request refused"}, 403)
+                return
+            handler, args, role, wants_principal = self.router.resolve(method, path)
             if handler is None:
                 self._send_json({"error": "No such endpoint: %s" % path}, 404)
                 return
+            if not principal.can(role):
+                self._send_json({"error": "Forbidden: %s access is read-only" % principal.name}, 403)
+                return
             body = self._read_body()
+            if wants_principal:
+                args = [principal] + list(args)
             result = handler(body, query, *args)
             self._send_json({"data": result}, 200)
         except ServiceError as exc:
+            self._send_json({"error": exc.message}, exc.code)
+        except AuthError as exc:
             self._send_json({"error": exc.message}, exc.code)
         except LXDError as exc:
             self._send_json({"error": exc.message}, _http_code(exc.code))
@@ -333,10 +420,20 @@ class LemondxHandler(BaseHTTPRequestHandler):
         if not match:
             self._send_json({"error": "Not a terminal endpoint: %s" % path}, 404)
             return
-        # A browser cannot put headers on a WebSocket, so the token arrives in
-        # the query string here rather than in Authorization.
-        if not self._authorized(query.get("token")):
-            self._send_json({"error": "Unauthorized: missing or bad API token"}, 401)
+        # A browser cannot put headers on a WebSocket, so a token arrives in
+        # the query string here rather than in Authorization. A session cookie
+        # does come along -- which is exactly why the Origin must be checked:
+        # otherwise any page the user visits could open a shell.
+        principal, explicit = self._principal(query.get("token"))
+        if principal is None:
+            self._send_json({"error": "Unauthorized: log in or send a valid API token"}, 401)
+            return
+        self.principal = principal
+        if not explicit and not self._same_origin():
+            self._send_json({"error": "Cross-origin WebSocket refused"}, 403)
+            return
+        if not principal.can(ADMIN):
+            self._send_json({"error": "Forbidden: terminals need admin access"}, 403)
             return
 
         name, kind = unquote(match.group(1)), match.group(2)
@@ -372,6 +469,7 @@ class LemondxHandler(BaseHTTPRequestHandler):
             session.close()
 
     def _read_body(self):
+        self._body_read = True
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
             return {}
@@ -384,15 +482,127 @@ class LemondxHandler(BaseHTTPRequestHandler):
             raise ServiceError("Request body must be a JSON object.")
         return parsed
 
-    def _authorized(self, query_token=None):
-        if not self.token:
-            return True
+    # -- authentication ----------------------------------------------------
+
+    def _principal(self, query_token=None):
+        """``(principal or None, explicit)`` for this request.
+
+        ``explicit`` means the caller presented a credential itself (a token
+        header or query value), which a cross-site page cannot make a browser
+        do. Cookies and proxy identity are ambient -- the browser attaches
+        them to any request -- so those need the Origin check.
+        """
+        if not self.auth.config.enabled:
+            return self.auth.anonymous(), False
         header = self.headers.get("Authorization") or ""
-        if header.startswith("Bearer "):
-            return secrets.compare_digest(header[7:], self.token)
+        if header[:7].lower() == "bearer ":
+            return self.auth.authenticate_token(header[7:]), True
+        if self.headers.get("X-Lemondx-Token") is not None:
+            return self.auth.authenticate_token(self.headers.get("X-Lemondx-Token")), True
         if query_token is not None:
-            return secrets.compare_digest(query_token, self.token)
-        return secrets.compare_digest(self.headers.get("X-Lemondx-Token") or "", self.token)
+            return self.auth.authenticate_token(query_token), True
+        principal = self.auth.session_principal(self._cookie(SESSION_COOKIE))
+        if principal:
+            return principal, False
+        return self.auth.proxy_principal(self.client_address[0], self.headers), False
+
+    def _handle_auth(self, method, path):
+        if path == "/api/auth" and method == "GET":
+            principal, _ = self._principal()
+            self._send_json({"data": self.auth.info(principal)})
+            return
+        if method != "POST":
+            raise ServiceError("Method not allowed (try: %s)"
+                               % ("GET" if path == "/api/auth" else "POST"), 405)
+        # Login CSRF is a thing too: a forged login plants the attacker's session.
+        if not self._same_origin():
+            self._send_json({"error": "Cross-origin request refused"}, 403)
+            return
+        if path == "/api/auth/logout":
+            self.auth.logout(self._cookie(SESSION_COOKIE))
+            self._send_json({"data": {"logged_out": True}},
+                            headers=[("Set-Cookie", self._session_cookie("", 0))])
+            return
+        body = self._read_body()
+        principal, session_id = self.auth.login(
+            body.get("username") if isinstance(body.get("username"), str) else "",
+            body.get("password") if isinstance(body.get("password"), str) else "",
+            client=self._client_ip(), secure_transport=self._secure_transport())
+        self.principal = principal
+        self.log_message("logged in as %s (%s) via %s", principal.name, principal.role, principal.via)
+        self._send_json({"data": self.auth.info(principal)}, headers=[
+            ("Set-Cookie", self._session_cookie(session_id, self.auth.config.session_seconds))])
+
+    def _cookie(self, name):
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        try:
+            morsel = SimpleCookie(raw).get(name)
+        except CookieError:
+            return None
+        return morsel.value if morsel else None
+
+    def _session_cookie(self, value, max_age):
+        parts = ["%s=%s" % (SESSION_COOKIE, value), "Path=/", "HttpOnly",
+                 "SameSite=Strict", "Max-Age=%d" % max_age]
+        if self._https():
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def _trusted_peer(self):
+        return self.auth.is_trusted_proxy(self.client_address[0])
+
+    def _https(self):
+        if self.tls:
+            return True
+        return self._trusted_peer() and \
+            (self.headers.get("X-Forwarded-Proto") or "").lower() == "https"
+
+    def _secure_transport(self):
+        """Whether a password in this request stayed off the network in the clear."""
+        return self.tls or self._trusted_peer() or _is_loopback(self.client_address[0])
+
+    def _client_ip(self):
+        # Behind a trusted proxy every login would otherwise share one throttle.
+        forwarded = self.headers.get("X-Forwarded-For")
+        if forwarded and self._trusted_peer():
+            return forwarded.split(",")[-1].strip()
+        return self.client_address[0]
+
+    def _request_host(self):
+        host = self.headers.get("Host") or ""
+        forwarded = self.headers.get("X-Forwarded-Host")
+        if forwarded and self._trusted_peer():
+            host = forwarded.split(",")[0].strip()
+        return host.lower()
+
+    def _same_origin(self):
+        """True unless the browser says this request comes from another site.
+
+        No Origin means not a browser (curl, scripts), which cannot carry the
+        user's cookies without the user's help.
+        """
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        netloc = urlparse(origin).netloc.lower()
+        if netloc and netloc == self._request_host():
+            return True
+        return self.dev and netloc in DEV_ORIGINS
+
+    def _host_allowed(self):
+        """Refuse DNS rebinding against an unauthenticated loopback server.
+
+        Without auth, anything that reaches the port is trusted, and a page
+        on evil.example that re-resolves to 127.0.0.1 reaches it with its own
+        Origin *and* Host -- so the Origin check alone would pass. Only
+        loopback names are answered in that configuration.
+        """
+        if self.auth.config.enabled or not _is_loopback(self.bound_host):
+            return True
+        host = _strip_port(self.headers.get("Host") or "")
+        return host in LOOPBACK_NAMES or host == ""
 
     # -- responses ---------------------------------------------------------
 
@@ -402,12 +612,19 @@ class LemondxHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 
-    def _send_json(self, payload, status=200):
+    def _send_json(self, payload, status=200, headers=()):
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in headers:
+            self.send_header(name, value)
+        # Refused before its body was read: on a kept-alive connection those
+        # bytes would be parsed as the next request, so hang up instead.
+        if not getattr(self, "_body_read", True) and (self.headers.get("Content-Length") or "0") != "0":
+            self.close_connection = True
+            self.send_header("Connection", "close")
         self._cors()
         self.end_headers()
         if self.command != "HEAD":
@@ -516,28 +733,83 @@ def _http_code(code):
     return code if isinstance(code, int) and 400 <= code < 600 else 500
 
 
+def _strip_port(host):
+    host = host.strip().lower()
+    if host.startswith("["):
+        return host[1:host.find("]")] if "]" in host else host
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+def _is_loopback(address):
+    address = (address or "").split("%", 1)[0]
+    if address == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback
+
+
+class LemondxHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # Port scanners, plain HTTP sent to a TLS port and clients that hang
+        # up mid-handshake are routine, not worth a traceback each.
+        if isinstance(sys.exc_info()[1], (ssl.SSLError, ConnectionError, socket.timeout)):
+            return
+        super().handle_error(request, client_address)
+
+
+def tls_context(cert, key):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(cert, key)
+    return context
+
+
 def make_server(host=DEFAULT_HOST, port=DEFAULT_PORT, service=None, token=None,
-                web_root=WEB_DIST, allow_origin=None, quiet=False):
+                web_root=WEB_DIST, allow_origin=None, quiet=False, auth=None,
+                tls=None, dev=False):
     service = service or ContainerService()
+    auth = auth or AuthService(AuthConfig(static_token=token))
     handler = type("BoundHandler", (LemondxHandler,), {
-        "router": build_router(service),
+        "router": build_router(service, auth),
         "service": service,
-        "token": token,
+        "auth": auth,
         "web_root": os.path.realpath(web_root) if web_root else None,
         "allow_origin": allow_origin,
         "quiet": quiet,
+        "tls": tls is not None,
+        "dev": dev,
+        "bound_host": host,
     })
-    httpd = ThreadingHTTPServer((host, port), handler)
-    httpd.daemon_threads = True
+    httpd = LemondxHTTPServer((host, port), handler)
+    if tls is not None:
+        httpd.socket = tls.wrap_socket(httpd.socket, server_side=True,
+                                       do_handshake_on_connect=False)
     return httpd
 
 
 def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=False,
-          open_browser=False):
+          open_browser=False, auth_config=None, tls_cert=None, tls_key=None, auth_source=None,
+          health_settings=None):
     allow_origin = "*" if dev else None
+    auth = AuthService(auth_config or AuthConfig(static_token=token))
+    tls = None
+    if tls_cert or tls_key:
+        if not (tls_cert and tls_key):
+            raise SystemExit("--tls-cert and --tls-key go together.")
+        try:
+            tls = tls_context(tls_cert, tls_key)
+        except (OSError, ssl.SSLError) as exc:
+            raise SystemExit("Cannot load the TLS certificate or key: %s" % exc)
     try:
-        httpd = make_server(host=host, port=port, token=token,
-                            allow_origin=allow_origin, quiet=quiet)
+        httpd = make_server(host=host, port=port, auth=auth, allow_origin=allow_origin,
+                            quiet=quiet, tls=tls, dev=dev)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
             raise SystemExit(
@@ -547,18 +819,38 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
             )
         raise SystemExit("Cannot listen on %s:%d: %s" % (host, port, exc))
 
-    url = "http://%s:%d" % ("localhost" if host in ("0.0.0.0", "127.0.0.1") else host, port)
+    url = "%s://%s:%d" % ("https" if tls else "http",
+                          "localhost" if host in ("0.0.0.0", "127.0.0.1") else host, port)
     print("lemondx API + UI listening on %s" % url)
-    if token:
-        print("API token: %s" % token)
-    if host not in ("127.0.0.1", "localhost", "::1") and not token:
-        print("WARNING: bound to %s with no --token. Anyone who can reach this port "
-              "can create and delete containers." % host)
+    config = auth.config
+    if config.enabled:
+        # Never the token itself: this output ends up in the journal.
+        print("Auth: %s%s" % (
+            ", ".join(config.methods + (["static token"] if config.static_token else [])),
+            " (sessions last %gh)" % (config.session_seconds / 3600.0)
+            if config.password_login else ""))
+    if auth_source:
+        print("Auth settings: %s (flags override)" % auth_source)
+    elif not _is_loopback(host):
+        print("WARNING: bound to %s with no authentication. Anyone who can reach this "
+              "port can create and delete containers. See docs/security.md." % host)
+    if config.password_login and not tls and not _is_loopback(host) \
+            and not config.allow_insecure_login and not config.trusted_proxies:
+        print("Note: password logins from other hosts are refused over plain HTTP; "
+              "use --tls-cert/--tls-key or a TLS proxy.")
+    for warning in auth.startup_warnings():
+        print("WARNING: %s" % warning)
     if dev:
         print("Dev mode: CORS is open for the Vite dev server (npm --prefix web run dev).")
     if not os.path.isdir(WEB_DIST) and not dev:
         print("Note: web/dist not found -- build the UI with "
               "`npm --prefix web install && npm --prefix web run build`.")
+
+    if health_settings is not None:
+        service = getattr(httpd.RequestHandlerClass, "service", None)
+        service.start_health_monitor(health_settings)
+        print("Health checks: %s" % ("every %gs" % health_settings["interval_seconds"]
+                                     if health_settings["enabled"] else "off"))
 
     if open_browser:
         threading.Timer(0.5, _open, args=(url,)).start()

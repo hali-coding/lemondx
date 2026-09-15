@@ -5,6 +5,12 @@
 All responses are `{"data": ...}` on success and `{"error": "..."}` on failure,
 with a matching HTTP status.
 
+When the server runs with `--auth` (see [Security](security.md)), requests need
+a session cookie from `/api/auth/login` or `Authorization: Bearer <token>`.
+Every `GET` needs `read` access and everything else `admin`, except where the
+auth table below says otherwise. Missing or bad credentials get `401`, too
+little access `403`, too many failed logins `429`.
+
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/status` | daemon flavor/version, readiness, pools, networks |
@@ -22,6 +28,7 @@ with a matching HTTP status.
 | `DELETE` | `/api/containers/{name}/snapshots/{snap}` | delete |
 | `POST` | `/api/containers/{name}/snapshots/{snap}/restore` | restore |
 | `GET` | `/api/resources` | host CPU/memory/disk against what instances have allocated |
+| `GET` | `/api/health` | latest health check per running instance (see [Web UI tour](web-ui.md#health-checks)) |
 | `GET` | `/api/storage` | pools, volumes, local-driver availability and management status |
 | `GET`/`POST` | `/api/storage/pools` | list pools / create a local pool |
 | `GET`/`PATCH`/`DELETE` | `/api/storage/pools/{pool}` | inspect, update or remove a local pool (`?force=true` cascades) |
@@ -55,8 +62,26 @@ with a matching HTTP status.
 | `DELETE` | `/api/template-runs/{name}` | dismiss a finished run |
 | `GET` | `/api/profiles` | available profiles |
 
+Authentication:
+
+| Method | Path | Access | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/api/auth` | none | `{enabled, methods, password_login, principal}` — who you are, what the server accepts |
+| `POST` | `/api/auth/login` | none | `{"username","password"}` → sets the session cookie |
+| `POST` | `/api/auth/logout` | none | ends the session |
+| `GET` | `/api/auth/tokens` | read | your API tokens (admins: all) |
+| `POST` | `/api/auth/tokens` | read | `{"name","role","expires_days"}` → the token, including its secret, once |
+| `DELETE` | `/api/auth/tokens/{id}` | read | revoke your token (admins: any) |
+| `GET` | `/api/auth/users` | admin | local users |
+| `PUT` | `/api/auth/users/{name}` | admin | `{"password","role"}` → create, or change either |
+| `DELETE` | `/api/auth/users/{name}` | admin | remove a local user |
+
+Token routes refuse callers who authenticated with a token. Cookie- and
+proxy-authenticated requests other than `GET` must not carry a foreign `Origin`.
+
 ```bash
 curl -s localhost:8099/api/containers | jq
+curl -s -H "Authorization: Bearer $LEMONDX_API_TOKEN" localhost:8099/api/containers   # with --auth
 curl -s -X POST localhost:8099/api/containers \
   -H 'content-type: application/json' \
   -d '{"name":"demo","image":"images:alpine/3.21","memory":"512MiB"}'

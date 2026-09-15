@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCanWrite } from '../hooks/useAuth'
 import type { FormEvent } from 'react'
 import { api } from '../lib/api'
 import { bytes } from '../lib/format'
@@ -20,6 +21,7 @@ type PendingDelete =
   | { kind: 'volume'; volume: StorageVolume }
 
 export function StorageView({ onNotify }: Props) {
+  const canWrite = useCanWrite()
   const [data, setData] = useState<StorageOverview | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [tab, setTab] = useState<'pools' | 'volumes'>('pools')
@@ -105,12 +107,12 @@ export function StorageView({ onNotify }: Props) {
             onClick={() => setTab('volumes')}>Volumes</button>
         </div>
         {tab === 'pools' ? (
-          <button className="btn btn-primary" disabled={busy || availableDrivers.length === 0}
+          <button className="btn btn-primary" disabled={busy || !canWrite || availableDrivers.length === 0}
             onClick={() => setPoolDialog('new')}>
             <PlusIcon /> New pool
           </button>
         ) : (
-          <button className="btn btn-primary" disabled={busy || manageablePools.length === 0}
+          <button className="btn btn-primary" disabled={busy || !canWrite || manageablePools.length === 0}
             onClick={() => setVolumeDialog('new')}>
             <PlusIcon /> New volume
           </button>
@@ -118,11 +120,11 @@ export function StorageView({ onNotify }: Props) {
       </div>
 
       {tab === 'pools' ? (
-        <PoolsTable pools={data.pools} busy={busy}
+        <PoolsTable pools={data.pools} busy={busy || !canWrite}
           onEdit={setPoolDialog}
           onDelete={(pool) => setPendingDelete({ kind: 'pool', pool })} />
       ) : (
-        <VolumesTable volumes={data.volumes} busy={busy}
+        <VolumesTable volumes={data.volumes} busy={busy || !canWrite}
           onEdit={setVolumeDialog}
           onDelete={(volume) => setPendingDelete({ kind: 'volume', volume })} />
       )}

@@ -20,12 +20,18 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 @LEMONDX_PATH@/lemondx serve --host 127.0.0.1 --port 8099
+# Authentication is off until configured: run `lemondx configure auth` as
+# this user and restart; serve reads the saved settings. Flags appended here
+# (--auth local, --token-file PATH, ...) override them. --auth pam also needs
+# the NoNewPrivileges change noted below; see docs/service.md#authentication.
 Restart=on-failure
 RestartSec=5
 
 # lemondx is stdlib-only and touches nothing outside its own state
 # directory, the daemon socket, and (for bootstrap) ~/.ssh/*.pub -- so it
 # costs little to also ask systemd to enforce that.
+# --auth pam: set this to "no". PAM's unix_chkpwd helper reads /etc/shadow
+# through a setgid bit, which this disables, and every login would fail.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only

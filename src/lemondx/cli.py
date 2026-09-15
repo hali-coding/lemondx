@@ -9,7 +9,13 @@ import os
 import shlex
 import shutil
 import sys
+import time
 
+from . import auth, configure, pam
+from . import health as health_checks
+from .auth import (METHODS, ROLES, AuthConfig, AuthError, AuthService, local_principal,
+                   parse_duration_days)
+from .configure import SECTIONS, ConfigureError, Prompter
 from .lxd import LXDError
 from .service import ContainerService, LOCAL_STORAGE_DRIVERS, ServiceError
 from .server import DEFAULT_HOST, DEFAULT_PORT, serve
@@ -27,6 +33,7 @@ BOLD = lambda s: _c(s, "1")
 GREEN = lambda s: _c(s, "32")
 RED = lambda s: _c(s, "31")
 YELLOW = lambda s: _c(s, "33")
+ORANGE = lambda s: _c(s, "38;5;208")
 CYAN = lambda s: _c(s, "36")
 
 STATUS_COLORS = {
@@ -107,9 +114,228 @@ def confirm(prompt, assume_yes=False):
 
 
 def cmd_serve(args, _service):
-    serve(host=args.host, port=args.port, token=args.token, dev=args.dev,
-          quiet=args.quiet, open_browser=args.open)
+    # Saved settings first, then each flag actually given on top: the auth
+    # flags all default to None so "not given" can be told from a value.
+    settings = None if args.ignore_config else auth.load_settings()
+    overrides = {
+        "methods": args.auth,
+        "token_file": args.token_file,
+        "session_hours": args.session_hours,
+        "allow_insecure_login": args.allow_insecure_login,
+        "pam_service": args.pam_service,
+        "pam_admin_groups": args.pam_admin_group,
+        "pam_read_groups": args.pam_read_group,
+        "trusted_proxies": args.trust_proxy,
+        "proxy_user_header": args.proxy_user_header,
+        "proxy_groups_header": args.proxy_groups_header,
+        "proxy_admin_group": args.proxy_admin_group,
+        "proxy_read_group": args.proxy_read_group,
+    }
+    token = args.token
+    if token is None and not args.token_file:
+        # From the environment rather than argv, where every local user can
+        # read it in `ps`.
+        token = os.environ.get("LEMONDX_TOKEN") or None
+    config = auth.build_config(settings, overrides, static_token=token)
+    health_settings, warning = health_checks.load_settings()
+    if warning:
+        print(YELLOW("WARNING: %s" % warning), file=sys.stderr)
+    if args.no_health:
+        health_settings = dict(health_settings, enabled=False)
+    serve(host=args.host, port=args.port, dev=args.dev, quiet=args.quiet,
+          open_browser=args.open, auth_config=config,
+          tls_cert=args.tls_cert, tls_key=args.tls_key,
+          auth_source=auth.settings_path() if settings is not None else None,
+          health_settings=health_settings)
     return 0
+
+
+# -- configure ---------------------------------------------------------------
+
+
+def _describe_rows(rows):
+    width = max(len(label) for label, _ in rows) if rows else 0
+    return "\n".join("  %s  %s" % (DIM(label.ljust(width)), value) for label, value in rows)
+
+
+def cmd_configure(args, _service):
+    if not args.section:
+        sections = [{"section": name, "help": section.help, "configured": section.configured(),
+                     "path": section.path()} for name, section in SECTIONS.items()]
+        emit(args, sections, lambda items: "%s\n\n%s" % (table(
+            [[BOLD(i["section"]), GREEN("yes") if i["configured"] else DIM("no"), i["help"]]
+             for i in items], ["section", "configured", "covers"]),
+            DIM("Run `lemondx configure <section>`; --show prints the saved settings.")))
+        return 0
+
+    section = SECTIONS[args.section]
+    if args.reset:
+        if not confirm("Delete the saved %s settings at %s?" % (section.name, section.path()),
+                       args.yes):
+            print("Nothing deleted." if sys.stdin.isatty() else
+                  "Refusing to delete without a terminal; pass --yes.", file=sys.stderr)
+            return 1
+        removed = section.reset()
+        emit(args, {"section": section.name, "path": section.path(), "removed": removed},
+             lambda r: "%s %s" % (GREEN("+") if r["removed"] else DIM("-"),
+                                  "removed %s" % r["path"] if r["removed"]
+                                  else "%s was not configured" % r["section"]))
+        return 0
+
+    if args.show:
+        current = section.load()
+        payload = {"section": section.name, "path": section.path(),
+                   "configured": current is not None,
+                   "settings": current if current is not None else section.defaults()}
+        emit(args, payload, lambda r: "%s %s\n%s" % (
+            BOLD(r["section"]), DIM(r["path"] if r["configured"] else "(not configured; defaults)"),
+            _describe_rows(section.describe(r["settings"]))))
+        return 0
+
+    if not sys.stdin.isatty():
+        raise ConfigureError("`lemondx configure %s` asks questions and needs a terminal. "
+                             "Edit %s instead, or see --show." % (section.name, section.path()))
+    prompter = Prompter()
+    try:
+        current = section.load()
+    except (AuthError, ConfigureError) as exc:
+        # Configuring is how a broken file gets fixed, so start over from defaults.
+        prompter.say(YELLOW("! %s" % exc.message))
+        prompter.say("Starting from defaults.")
+        current = None
+    settings = section.prompt(prompter, current)
+    prompter.say()
+    prompter.say(BOLD("Summary"))
+    prompter.say(_describe_rows(section.describe(settings)))
+    prompter.say()
+    if not prompter.yes_no("Save to %s?" % section.path(), True):
+        raise ConfigureError("Nothing was saved.", 1)
+    saved = section.save(settings)
+    prompter.say("%s saved %s" % (GREEN("+"), section.path()))
+    section.after_save(prompter, saved)
+    if getattr(args, "json", False):
+        emit(args, {"section": section.name, "path": section.path(), "settings": saved}, None)
+    return 0
+
+
+# -- access ------------------------------------------------------------------
+#
+# These edit the data directory directly rather than asking a running server:
+# whoever can write there already controls every credential in it, and the
+# server notices changed files on its next request.
+
+
+def _when(epoch):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch)) if epoch else "-"
+
+
+def cmd_tokens(args, _service):
+    tokens = AuthService().list_tokens(local_principal())
+    emit(args, tokens, lambda items: table(
+        [[t["id"], t["name"], t["owner"], t["role"], _when(t["created"]),
+          RED("expired") if t["expired"] else _when(t["expires"]) if t["expires"] else DIM("never"),
+          _when(t["last_used"])] for t in items],
+        ["id", "name", "owner", "role", "created", "expires", "last used"]))
+    return 0
+
+
+def cmd_token_create(args, _service):
+    token = AuthService().create_token(
+        local_principal(), args.name, role=args.role,
+        expires_days=parse_duration_days(args.expires), owner=args.owner)
+    emit(args, token, lambda t: "%s created token %s (%s, owner %s, %s)\n\n  %s\n\n%s" % (
+        GREEN("+"), BOLD(t["name"]), t["role"], t["owner"],
+        "expires %s" % _when(t["expires"]) if t["expires"] else "no expiry",
+        t["token"], DIM("Shown once. Send it as `Authorization: Bearer <token>`.")))
+    return 0
+
+
+def cmd_token_revoke(args, _service):
+    result = AuthService().revoke_token(local_principal(), args.id)
+    emit(args, result, lambda r: "%s revoked token %s" % (GREEN("+"), r["revoked"]))
+    return 0
+
+
+def cmd_users(args, _service):
+    users = AuthService().list_users()
+    emit(args, users, lambda items: table(
+        [[u["name"], u["role"], _when(u["created"]), _when(u["updated"])] for u in items],
+        ["name", "role", "created", "updated"]))
+    return 0
+
+
+def _new_password(name):
+    # Never from argv. An env var serves scripts, as it does for module secrets.
+    password = os.environ.get("LEMONDX_PASSWORD")
+    if password is not None:
+        return password
+    if not sys.stdin.isatty():
+        raise AuthError("No terminal to ask for a password on; set LEMONDX_PASSWORD.", 400)
+    password = getpass.getpass("Password for %s: " % name)
+    if getpass.getpass("Again: ") != password:
+        raise AuthError("Passwords do not match.", 400)
+    return password
+
+
+def cmd_user_add(args, _service):
+    service = AuthService()
+    if any(u["name"] == args.name for u in service.list_users()):
+        raise AuthError("User %s already exists; use `lemondx user-set`." % args.name, 409)
+    result = service.set_user(args.name, password=_new_password(args.name), role=args.role)
+    emit(args, result, lambda r: "%s added %s user %s" % (GREEN("+"), r["role"], BOLD(r["name"])))
+    return 0
+
+
+def cmd_user_set(args, _service):
+    service = AuthService()
+    if not any(u["name"] == args.name for u in service.list_users()):
+        raise AuthError("No such user: %s" % args.name, 404)
+    if not args.password and not args.role:
+        raise AuthError("Nothing to change: pass --password and/or --role.", 400)
+    result = service.set_user(
+        args.name, password=_new_password(args.name) if args.password else None, role=args.role)
+    emit(args, result, lambda r: "%s updated %s (%s)" % (GREEN("+"), BOLD(r["name"]), r["role"]))
+    return 0
+
+
+def cmd_user_remove(args, _service):
+    result = AuthService().remove_user(args.name)
+    emit(args, result, lambda r: "%s removed user %s" % (GREEN("+"), r["removed"]))
+    return 0
+
+
+def cmd_pam_test(args, _service):
+    """Run the same PAM check the server would, to debug a PAM stack."""
+    # The same service and groups `serve` would use, unless overridden here.
+    saved = auth.load_settings() or auth.DEFAULT_SETTINGS
+    args.service = args.service or saved["pam_service"]
+    config = AuthConfig(
+        methods=["pam"], pam_service=args.service,
+        pam_admin_groups=args.pam_admin_group if args.pam_admin_group is not None
+        else saved["pam_admin_groups"],
+        pam_read_groups=args.pam_read_group if args.pam_read_group is not None
+        else saved["pam_read_groups"])
+    service = AuthService(config)
+    for warning in service.startup_warnings():
+        print(YELLOW("! %s" % warning), file=sys.stderr)
+    password = os.environ.get("LEMONDX_PASSWORD")
+    if password is None:
+        password = getpass.getpass("Password for %s: " % args.user)
+    ok, reason = pam.authenticate(args.service, args.user, password)
+    role = service._pam_role(args.user)
+    result = {"user": args.user, "service": args.service, "authenticated": ok,
+              "reason": reason or None, "role": role}
+
+    def render(r):
+        if not r["authenticated"]:
+            return "%s PAM refused %s: %s" % (RED("x"), r["user"], r["reason"])
+        if not r["role"]:
+            return "%s password OK, but %s is in none of: %s" % (
+                YELLOW("!"), r["user"],
+                ", ".join(config.pam_admin_groups + config.pam_read_groups) or "(no groups)")
+        return "%s %s would log in as %s" % (GREEN("+"), r["user"], r["role"])
+    emit(args, result, render)
+    return 0 if ok and role else 1
 
 
 def cmd_status(args, service):
@@ -383,7 +609,7 @@ def cmd_modules(args, service):
                 out.append("    " + DIM(module["description"]))
             for param in module["params"]:
                 value = param.get("value", param["default"])
-                line = "    %s=%s" % (param["name"], value or DIM("(empty)"))
+                line = "    %s=%s" % (param["name"], short_value(value) or DIM("(empty)"))
                 if param.get("saved"):
                     line += "  " + GREEN("saved") + DIM(" (module default: %s)"
                                                         % (param["default"] or "empty"))
@@ -419,6 +645,13 @@ def collect_ssh_keys(paths, use_all):
         keys.extend(k["line"] for k in list_host_ssh_keys())
     # Preserve order, drop duplicates.
     return list(dict.fromkeys(keys))
+
+
+def short_value(value):
+    """A parameter value for a one-line listing; a config file is summarised."""
+    if "\n" not in value:
+        return value
+    return DIM("(%d lines)" % len(value.rstrip("\n").splitlines()))
 
 
 def parse_params(pairs):
@@ -483,7 +716,7 @@ def cmd_module_set(args, service):
         args.id, params=parse_params(args.param) or None, is_default=is_default)
     emit(args, module, lambda m: "%s %s: default=%s %s" % (
         GREEN("+"), BOLD(m["id"]), m["is_default"],
-        " ".join("%s=%s" % (p["name"], p["value"]) for p in m["params"])))
+        " ".join("%s=%s" % (p["name"], short_value(p["value"])) for p in m["params"])))
     return 0
 
 
@@ -491,7 +724,7 @@ def cmd_profiles(args, service):
     profiles = service.list_bootstrap_profiles()
     emit(args, profiles, lambda items: table(
         [[p["name"], " → ".join(p["modules"]),
-          " ".join("%s=%s" % kv for kv in p["params"].items()) or "-",
+          " ".join("%s=%s" % (k, short_value(v)) for k, v in p["params"].items()) or "-",
           len(p["ssh_keys"]) or "-",
           p["description"] or "-"] for p in items],
         ["name", "modules", "params", "keys", "description"]))
@@ -754,6 +987,53 @@ def meter(part, whole, width=20):
     bar = "[%s%s]" % ("#" * filled, "." * (width - filled))
     painted = RED(bar) if ratio > 1 else YELLOW(bar) if ratio >= 0.9 else bar
     return "%s %3d%%" % (painted, round(ratio * 100))
+
+
+HEALTH_COLORS = {
+    "healthy": GREEN, "degraded": ORANGE, "unhealthy": RED,
+    "starting": CYAN, "unknown": DIM, "paused": DIM,
+}
+
+
+def cmd_health(args, service):
+    settings, warning = health_checks.load_settings()
+    if warning:
+        print(YELLOW("! %s" % warning), file=sys.stderr)
+    records = service.check_health(names=args.name or None, window=args.window, settings=settings)
+
+    def render(items):
+        rows = []
+        for r in items:
+            cpu, memory, load, probe = r["cpu"], r["memory"], r["load"], r["probe"]
+            if load and load["scope"] == "instance":
+                # 1, 5 and 15 minute averages from serve; a one-off check has
+                # only its window's average.
+                load_text = " ".join("%.2f" % v for v in load["avg"] if v is not None)
+                if load["window"]:
+                    load_text += DIM(" (%gs)" % load["window"])
+                elif load["warming"]:
+                    load_text += DIM(" (warming)")
+            elif load:
+                load_text = DIM("host-wide")
+            else:
+                load_text = "-"
+            rows.append([
+                BOLD(r["name"]),
+                HEALTH_COLORS.get(r["status"], str)(r["status"]),
+                "%g%% of %d" % (cpu["percent"], cpu["cores"]) if cpu else "-",
+                "%g%%" % memory["percent"] if memory["percent"] is not None
+                else human_bytes(memory["usage"]),
+                load_text,
+                ("%dms" % probe["ms"]) if probe and probe["ok"] else (RED("failed") if probe else "-"),
+                "; ".join(r["reasons"]) or DIM("-"),
+            ])
+        return table(rows, ["name", "health", "cpu", "memory", "load", "probe", "reasons"])
+
+    emit(args, records, render)
+    statuses = {r["status"] for r in records}
+    if "unhealthy" in statuses:
+        return 2
+    return 1 if statuses & {"degraded", "unknown", "starting"} else 0
 
 
 def cmd_resources(args, service):
@@ -1139,11 +1419,95 @@ def build_parser():
     p = add("serve", help="run the web UI and REST API")
     p.add_argument("--host", default=DEFAULT_HOST)
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
-    p.add_argument("--token", help="require this bearer token on API calls")
     p.add_argument("--dev", action="store_true", help="allow cross-origin Vite dev server")
     p.add_argument("--open", action="store_true", help="open a browser window")
     p.add_argument("--quiet", action="store_true", help="do not log requests")
+    p.add_argument("--no-health", action="store_true",
+                   help="do not run health checks (see `lemondx configure health`)")
+    g = p.add_argument_group(
+        "authentication",
+        "Off unless configured. Settings saved by `lemondx configure auth` apply first; "
+        "each flag below overrides its setting.")
+    g.add_argument("--ignore-config", action="store_true",
+                   help="ignore settings saved by `lemondx configure`")
+    g.add_argument("--auth", action="append", choices=METHODS, metavar="METHOD",
+                   help="login method: %s (repeatable; order is the order passwords "
+                        "are tried; replaces the saved methods)" % ", ".join(METHODS))
+    g.add_argument("--token",
+                   help="also accept this static admin token (visible in `ps`; "
+                        "prefer --token-file or LEMONDX_TOKEN)")
+    g.add_argument("--token-file", metavar="PATH", help="read the static admin token from a file")
+    g.add_argument("--session-hours", type=float,
+                   help="how long a login lasts (default: 12)")
+    g.add_argument("--allow-insecure-login", action="store_true", default=None,
+                   help="accept passwords over plain HTTP from other hosts")
+    g.add_argument("--pam-service",
+                   help="PAM service name, i.e. /etc/pam.d/<name> (default: lemondx)")
+    g.add_argument("--pam-admin-group", action="append", metavar="GROUP",
+                   help="members get admin (repeatable; default: lxd / incus-admin)")
+    g.add_argument("--pam-read-group", action="append", metavar="GROUP",
+                   help="members get read-only access (repeatable)")
+    g.add_argument("--trust-proxy", action="append", metavar="CIDR",
+                   help="reverse proxy address(es) whose identity headers are believed")
+    g.add_argument("--proxy-user-header",
+                   help="header carrying the user name (default: X-Forwarded-User)")
+    g.add_argument("--proxy-groups-header", metavar="HEADER",
+                   help="header carrying the user's groups, comma separated")
+    g.add_argument("--proxy-admin-group", metavar="GROUP",
+                   help="with --proxy-groups-header: group granted admin")
+    g.add_argument("--proxy-read-group", metavar="GROUP",
+                   help="with --proxy-groups-header: group granted read-only access")
+    g = p.add_argument_group("TLS")
+    g.add_argument("--tls-cert", metavar="PATH", help="serve HTTPS with this certificate (PEM)")
+    g.add_argument("--tls-key", metavar="PATH", help="private key for --tls-cert (PEM)")
     p.set_defaults(func=cmd_serve, needs_service=False)
+
+    p = add("configure", help="interactively save settings for future launches")
+    p.add_argument("section", nargs="?", choices=list(SECTIONS), metavar="SECTION",
+                   help="what to configure: %s (omit to list)" % ", ".join(SECTIONS))
+    p.add_argument("--show", action="store_true", help="print the saved settings")
+    p.add_argument("--reset", action="store_true", help="delete the saved settings")
+    p.add_argument("-y", "--yes", action="store_true", help="with --reset: do not ask")
+    p.set_defaults(func=cmd_configure, needs_service=False)
+
+    p = add("tokens", help="list API tokens")
+    p.set_defaults(func=cmd_tokens, needs_service=False)
+
+    p = add("token-create", help="create an API token (shown once)")
+    p.add_argument("name")
+    p.add_argument("--role", choices=ROLES, default="admin", help="default: admin")
+    p.add_argument("--expires", metavar="DURATION", help="e.g. 12h, 30d, 2w (default: never)")
+    p.add_argument("--owner", help="user the token acts as (default: you)")
+    p.set_defaults(func=cmd_token_create, needs_service=False)
+
+    p = add("token-revoke", help="revoke an API token")
+    p.add_argument("id")
+    p.set_defaults(func=cmd_token_revoke, needs_service=False)
+
+    p = add("users", help="list local lemondx users (--auth local)")
+    p.set_defaults(func=cmd_users, needs_service=False)
+
+    p = add("user-add", help="add a local user; asks for the password")
+    p.add_argument("name")
+    p.add_argument("--role", choices=ROLES, default="read", help="default: read")
+    p.set_defaults(func=cmd_user_add, needs_service=False)
+
+    p = add("user-set", help="change a local user's password or role")
+    p.add_argument("name")
+    p.add_argument("--password", action="store_true", help="ask for a new password")
+    p.add_argument("--role", choices=ROLES)
+    p.set_defaults(func=cmd_user_set, needs_service=False)
+
+    p = add("user-remove", help="remove a local user and end their sessions")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_user_remove, needs_service=False)
+
+    p = add("pam-test", help="check a PAM login the way `serve --auth pam` would")
+    p.add_argument("user")
+    p.add_argument("--service", help="PAM service name (default: saved setting, or lemondx)")
+    p.add_argument("--pam-admin-group", action="append", metavar="GROUP")
+    p.add_argument("--pam-read-group", action="append", metavar="GROUP")
+    p.set_defaults(func=cmd_pam_test, needs_service=False)
 
     p = add("status", help="show daemon connection and readiness")
     p.set_defaults(func=cmd_status)
@@ -1156,6 +1520,12 @@ def build_parser():
     p.add_argument("--bridge", default="lxdbr0", help="bridge name")
     p.add_argument("--ipv6", action="store_true", help="also hand out IPv6")
     p.set_defaults(func=cmd_init)
+
+    p = add("health", help="check running instances now: responsiveness, CPU, memory, load")
+    p.add_argument("name", nargs="*", help="only these instances (default: all running)")
+    p.add_argument("--window", type=float, default=5,
+                   help="seconds between the two CPU samples (default: 5)")
+    p.set_defaults(func=cmd_health)
 
     p = add("resources", help="show allocated CPU/memory/disk against the host")
     p.set_defaults(func=cmd_resources)
@@ -1495,7 +1865,7 @@ def main(argv=None):
 
     try:
         return args.func(args, service)
-    except (ServiceError, LXDError) as exc:
+    except (ServiceError, LXDError, AuthError, ConfigureError) as exc:
         print(RED("! %s" % exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:

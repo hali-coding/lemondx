@@ -191,6 +191,8 @@ export interface ModuleParam {
   saved: boolean
   /** Never stored or pre-filled; must be entered on every run. */
   secret: boolean
+  /** Declared with `# text:`: a config file or similar, edited in a text area. */
+  multiline: boolean
 }
 
 export interface BootstrapModule {
@@ -584,4 +586,86 @@ export interface StorageVolumeRequest {
   size?: string
   description?: string
   config?: Record<string, string>
+}
+
+// -- authentication (auth.py) ------------------------------------------------
+
+export type Role = 'read' | 'admin'
+
+/** Who a request ran as. `via` is `none` when the server has auth off. */
+export interface Principal {
+  name: string
+  role: Role
+  via: string
+}
+
+export interface AuthInfo {
+  enabled: boolean
+  methods: ('local' | 'pam' | 'proxy' | 'token')[]
+  password_login: boolean
+  principal: Principal | null
+}
+
+export interface ApiToken {
+  id: string
+  name: string
+  owner: string
+  role: Role
+  created: number
+  expires: number | null
+  last_used: number | null
+  expired: boolean
+}
+
+/** Only the create response carries the secret, and only that once. */
+export interface CreatedApiToken extends ApiToken {
+  token: string
+}
+
+export interface LocalUser {
+  name: string
+  role: Role
+  created: number
+  updated: number
+}
+
+// -- health (health.py) ------------------------------------------------------
+
+export type HealthStatus = 'healthy' | 'degraded' | 'unhealthy' | 'starting' | 'unknown' | 'paused'
+
+/** One instance's latest check. Times are seconds since the epoch. */
+export interface HealthRecord {
+  name: string
+  type: string
+  status: HealthStatus
+  reasons: string[]
+  checked_at: number
+  /** When the status last changed. */
+  since: number
+  processes: number
+  cpu: { percent: number; cores_used: number; cores: number } | null
+  memory: { usage: number; limit: number | null; percent: number | null }
+  /**
+   * `source: cgroup` is counted by lemondx from the container's cgroup: 1, 5 and
+   * 15 minute averages from `serve` (`warming` for its first minute), or one
+   * average over `window` seconds from a one-off check. `guest` is a VM's own;
+   * `proc` is what a container reports, usually the host's (`scope: host`).
+   */
+  load: {
+    avg: [number, number | null, number | null]
+    scope: 'instance' | 'host' | 'unknown'
+    source: 'cgroup' | 'guest' | 'proc'
+    warming: boolean
+    window: number | null
+  } | null
+  probe: { ok: boolean; ms: number; error: string | null } | null
+  failures: number
+}
+
+export interface HealthReport {
+  enabled: boolean
+  interval: number | null
+  thresholds: Record<string, number> | null
+  checked_at: number | null
+  instances: HealthRecord[]
 }

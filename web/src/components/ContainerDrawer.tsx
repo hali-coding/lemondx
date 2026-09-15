@@ -1,16 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCanWrite } from '../hooks/useAuth'
 import { api } from '../lib/api'
-import { absoluteTime, bytes, cpuTime, relativeTime } from '../lib/format'
-import type { ContainerDetail, StateAction } from '../lib/types'
+import { absoluteTime, bytes, cpuTime, relativeTime, secondsAgo } from '../lib/format'
+import type { ContainerDetail, HealthRecord, StateAction } from '../lib/types'
 import { CameraIcon, CloseIcon, PauseIcon, PlayIcon, RestartIcon, StopIcon, TrashIcon } from './Icons'
 import { BootstrapPanel } from './BootstrapPanel'
 import { ExecConsole } from './ExecConsole'
+import { HealthLabel } from './HealthDot'
 import { StatusBadge } from './StatusBadge'
 
 type Tab = 'overview' | 'snapshots' | 'bootstrap' | 'console'
 
 interface Props {
   name: string
+  /** The server's latest check, or null when it has none (stopped, or checks off). */
+  health: HealthRecord | null
   busy: boolean
   onClose: () => void
   onAction: (name: string, action: StateAction) => void
@@ -20,8 +24,9 @@ interface Props {
 }
 
 export function ContainerDrawer({
-  name, busy, onClose, onAction, onDelete, onNotify, refreshToken,
+  name, health, busy, onClose, onAction, onDelete, onNotify, refreshToken,
 }: Props) {
+  const canWrite = useCanWrite()
   const [detail, setDetail] = useState<ContainerDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [tab, setTab] = useState<Tab>('overview')
@@ -169,6 +174,24 @@ export function ContainerDrawer({
 
           {detail && tab === 'overview' && (
             <>
+              {health && detail.status === 'Running' && (
+                <div className="panel">
+                  <h3>Health</h3>
+                  <div>
+                    <HealthLabel record={health} />
+                    <span className="faint" style={{ marginLeft: 8, fontSize: 12.5 }}>
+                      since {secondsAgo(health.since)} · checked {secondsAgo(health.checked_at)}
+                      {health.probe?.ok ? ` · answered in ${health.probe.ms} ms` : ''}
+                    </span>
+                  </div>
+                  {health.reasons.length > 0 && (
+                    <ul className="health-reasons">
+                      {health.reasons.map((reason) => <li key={reason}>{reason}</li>)}
+                    </ul>
+                  )}
+                </div>
+              )}
+
               <div className="panel">
                 <h3>Resources</h3>
                 <div className="stat-grid">
@@ -176,6 +199,23 @@ export function ContainerDrawer({
                     <div className="stat-label">Memory</div>
                     <div className="stat-value">{bytes(detail.memory_usage)}</div>
                   </div>
+                  {health?.cpu && (
+                    <div className="stat" title={`${health.cpu.cores_used} of ${health.cpu.cores} CPU(s), averaged since the previous check`}>
+                      <div className="stat-label">CPU</div>
+                      <div className="stat-value">{health.cpu.percent}%</div>
+                    </div>
+                  )}
+                  {health?.load && (
+                    <div className="stat" title={loadTitle(health.load)}>
+                      <div className="stat-label">Load</div>
+                      <div className={`stat-value${health.status === 'degraded'
+                        && health.load.scope === 'instance' ? ' health-warn' : ''}`}>
+                        {health.load.scope === 'instance'
+                          ? health.load.avg[0].toFixed(2)
+                          : <span className="faint" style={{ fontSize: 13 }}>host-wide</span>}
+                      </div>
+                    </div>
+                  )}
                   <div className="stat">
                     <div className="stat-label">CPU time</div>
                     <div className="stat-value">{cpuTime(detail.cpu_time_ns)}</div>
@@ -259,6 +299,7 @@ export function ContainerDrawer({
                         <button
                           className="btn btn-ghost btn-sm"
                           style={{ marginLeft: 8, padding: '1px 7px', fontSize: 11 }}
+                          disabled={!canWrite}
                           onClick={startEditLimits}
                         >
                           Edit
@@ -321,10 +362,10 @@ export function ContainerDrawer({
                   placeholder="snapshot name"
                   aria-label="New snapshot name"
                   autoComplete="off"
-                  disabled={snapBusy}
+                  disabled={snapBusy || !canWrite}
                 />
                 <button className="btn btn-primary" type="submit"
-                  disabled={snapBusy || !snapshotName.trim()}>
+                  disabled={snapBusy || !canWrite || !snapshotName.trim()}>
                   <CameraIcon /> Take
                 </button>
               </form>
@@ -344,11 +385,11 @@ export function ContainerDrawer({
                         {snapshot.stateful ? ' · stateful' : ''}
                       </div>
                     </div>
-                    <button className="btn btn-sm" disabled={snapBusy}
+                    <button className="btn btn-sm" disabled={snapBusy || !canWrite}
                       onClick={() => runSnapshotAction('restore', snapshot.name)}>
                       Restore
                     </button>
-                    <button className="btn btn-sm btn-icon btn-danger" disabled={snapBusy}
+                    <button className="btn btn-sm btn-icon btn-danger" disabled={snapBusy || !canWrite}
                       aria-label={`Delete snapshot ${snapshot.name}`}
                       onClick={() => runSnapshotAction('delete', snapshot.name)}>
                       <TrashIcon />
@@ -372,29 +413,39 @@ export function ContainerDrawer({
         <div className="drawer-actions">
           {running || frozen ? (
             <>
-              <button className="btn" disabled={busy} onClick={() => onAction(name, 'stop')}>
+              <button className="btn" disabled={busy || !canWrite} onClick={() => onAction(name, 'stop')}>
                 <StopIcon /> Stop
               </button>
-              <button className="btn" disabled={busy} onClick={() => onAction(name, 'restart')}>
+              <button className="btn" disabled={busy || !canWrite} onClick={() => onAction(name, 'restart')}>
                 <RestartIcon /> Restart
               </button>
-              <button className="btn" disabled={busy}
+              <button className="btn" disabled={busy || !canWrite}
                 onClick={() => onAction(name, frozen ? 'unfreeze' : 'freeze')}>
                 {frozen ? <PlayIcon /> : <PauseIcon />} {frozen ? 'Resume' : 'Pause'}
               </button>
             </>
           ) : (
-            <button className="btn btn-primary" disabled={busy}
+            <button className="btn btn-primary" disabled={busy || !canWrite}
               onClick={() => onAction(name, 'start')}>
               <PlayIcon /> Start
             </button>
           )}
           <div style={{ flex: 1 }} />
-          <button className="btn btn-danger" disabled={busy} onClick={() => onDelete(name)}>
+          <button className="btn btn-danger" disabled={busy || !canWrite} onClick={() => onDelete(name)}>
             <TrashIcon /> Delete
           </button>
         </div>
       </aside>
     </>
   )
+}
+
+function loadTitle(load: NonNullable<HealthRecord['load']>): string {
+  if (load.scope !== 'instance') {
+    return 'This container reports the host’s load average, and its cgroup could not be read to count its own.'
+  }
+  const [one, five, fifteen] = load.avg
+  if (load.warming) return `Load average ${one.toFixed(2)}; still gathering its first minute of samples`
+  if (five === null || fifteen === null) return `Load average ${one.toFixed(2)}`
+  return `Load average: ${one.toFixed(2)} (1 min), ${five.toFixed(2)} (5 min), ${fifteen.toFixed(2)} (15 min)`
 }

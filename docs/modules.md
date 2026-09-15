@@ -26,6 +26,7 @@ has a **Bootstrap** tab with the same picker and a live log.
 | `docker` | Docker plus the service | — |
 | `nodejs` | Node.js and npm | — |
 | `postgresql` | PostgreSQL, a role with a password, optional database | `POSTGRES_PASSWORD` (secret), `POSTGRES_USER`, `POSTGRES_DB`, `LISTEN_ADDRESSES` |
+| `apache2` | Apache httpd, optionally with a virtual host you paste in | `VHOST_CONFIG` (text), `VHOST_NAME`, `ENABLE_MODULES`, `DISABLE_DEFAULT_SITE` |
 
 Modules run in `order`, low to high, so `base` (10) precedes `ssh-access` (20)
 whatever sequence you tick them in. A failing module stops the run and its
@@ -208,6 +209,26 @@ catches most mistakes.
 Declared `param` values arrive as environment variables, with the declared
 default applied when you do not override it.
 
+## Multi-line parameters
+
+A parameter that holds a config file rather than a word is declared with
+`text:` -- same grammar as `param:`:
+
+```sh
+# text: VHOST_CONFIG=  Virtual host configuration
+```
+
+The UI edits it in a text area instead of a one-line input, and the CLI lists
+it as `(N lines)`. Otherwise it is an ordinary parameter: saved, stored in
+profiles and templates, and passed to the module as one environment variable,
+newlines intact. Write it out with `printf '%s\n' "$VAR" > file` rather than
+`echo`, which some shells let interpret backslashes. From the CLI, read the
+value from a file:
+
+```bash
+./lemondx bootstrap web -b apache2 --param "VHOST_CONFIG=$(cat site.conf)"
+```
+
 ## Secret parameters
 
 Declare a password, token or key with `secret:` instead of `param:` — same
@@ -257,6 +278,51 @@ be relied on for this: Alpine's initdb writes `trust`, which lets any password
 password logins fail. The block is regenerated on each run, so setting
 `LISTEN_ADDRESSES` back to `localhost` removes the remote rules. Rerunning the
 module is also how you change the password.
+
+## The Apache module
+
+`apache2` installs Apache httpd, starts it, and, when `VHOST_CONFIG` is not
+blank, installs that text as a virtual host. Verified on Debian 12, Alpine
+3.21, Rocky Linux 9 and Arch.
+
+```bash
+cat > site.conf <<'CONF'
+<VirtualHost *:80>
+    ServerName demo.test
+    DocumentRoot "/var/www/demo"
+    <Directory "/var/www/demo">
+        Require all granted
+    </Directory>
+</VirtualHost>
+CONF
+./lemondx create web -i images:debian/12 -b apache2 \
+    --param "VHOST_CONFIG=$(cat site.conf)" --param VHOST_NAME=demo --param ENABLE_MODULES=rewrite
+curl -H 'Host: demo.test' http://<container-ip>/
+```
+
+The config is written verbatim as `VHOST_NAME.conf` in the distro's own
+drop-in directory (`sites-available` plus `a2ensite` on Debian/Ubuntu,
+`conf.d` on Fedora/RHEL and Alpine, `vhosts.d` on openSUSE). Arch's
+`httpd.conf` includes no such directory, so the module adds an
+`IncludeOptional` for `/etc/httpd/conf/lemondx.d`. A `DocumentRoot` that does
+not exist yet is created with a placeholder `index.html`.
+
+The new config must pass Apache's config test before anything reloads. If it
+does not, the previous file is put back (or the new one removed), the test's
+error is shown, and the run fails, so a typo never takes down a server that
+was working. Rerunning with a changed config replaces the file and reloads;
+blanking `VHOST_CONFIG` leaves an installed vhost alone.
+
+`ENABLE_MODULES` uses `a2enmod` where it exists (Debian, openSUSE) and
+otherwise uncomments the `LoadModule` line, installing `mod_ssl`,
+`apache2-ssl` or `apache2-proxy` first where those are separate packages.
+On Debian/Ubuntu `000-default` is a catch-all on port 80 that sorts first and
+would answer instead of a vhost without a matching `ServerName`, so it is
+disabled when a vhost is installed; set `DISABLE_DEFAULT_SITE=no` to keep it.
+
+Write the config for the container's distro: `${APACHE_LOG_DIR}` is defined
+only on Debian/Ubuntu, and log directories are `/var/log/apache2` there and on
+Alpine, `/var/log/httpd` elsewhere.
 
 ## If modules cannot install anything
 
