@@ -74,6 +74,18 @@ export function BootstrapPicker({ modules, value, onChange, disabled, secretsAtL
                         {param.name}
                         {param.secret && <span className="badge badge-warn">secret</span>}
                       </label>
+                      {param.multiline && !param.secret ? (
+                        <textarea
+                          id={`p-${param.name}`}
+                          className="input mono param-text"
+                          rows={8}
+                          spellCheck={false}
+                          value={value.params[param.name] ?? param.value}
+                          placeholder={param.default}
+                          disabled={disabled}
+                          onChange={(event) => setParam(param.name, event.target.value)}
+                        />
+                      ) : (
                       <input
                         id={`p-${param.name}`}
                         className="input mono"
@@ -87,6 +99,7 @@ export function BootstrapPicker({ modules, value, onChange, disabled, secretsAtL
                         aria-invalid={param.secret && !value.params[param.name]}
                         onChange={(event) => setParam(param.name, event.target.value)}
                       />
+                      )}
                       {(param.description || param.secret) && (
                         <span className="hint">
                           {param.description}

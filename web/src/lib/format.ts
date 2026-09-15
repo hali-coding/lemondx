@@ -50,3 +50,12 @@ export function cpuTime(nanoseconds: number): string {
   if (minutes < 60) return `${minutes}m ${Math.floor(seconds % 60)}s`
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
 }
+
+/** "12s ago" for an epoch in seconds, as the health checks report times. */
+export function secondsAgo(epoch: number | null | undefined): string {
+  if (!epoch) return 'never'
+  const seconds = Math.max(0, Math.round(Date.now() / 1000 - epoch))
+  if (seconds < 60) return `${seconds}s ago`
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min ago`
+  return `${Math.round(seconds / 3600)} h ago`
+}

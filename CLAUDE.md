@@ -53,10 +53,16 @@ service.py      domain: ContainerService turns raw daemon records into lemondx s
 server.py       JSON API + static hosting      cli.py   argparse front end
 ```
 
+`auth.py` (`AuthService`) sits beside `service.py` with the same role for
+authentication: server and CLI both call it, so neither decides alone what a
+token or user is.
+
 `ContainerService` (`src/lemondx/service.py`) is the only place domain logic lives, so the
 API and the CLI cannot drift. **Adding a feature means: a method on `ContainerService`,
-then a route in `build_router()` (`server.py:60`) and a subcommand in `build_parser()`
-(`cli.py:551`).** A route handler is a one-line lambda that unpacks the JSON body and calls
+then a route in `build_router()` (`server.py:83`) and a subcommand in `build_parser()`
+(`cli.py:1249`).** A route's role defaults to `read` for `GET` and `admin` otherwise;
+pass `role=` to `Router.add()` only where that is wrong, and `principal=True` when
+the answer depends on the caller. A route handler is a one-line lambda that unpacks the JSON body and calls
 the service; a CLI command calls the same method and passes the result to `emit()` with a
 human renderer. Because `emit()` prints the service payload verbatim under `--json`, the
 service must return exactly what the API should serve — never reshape data in a route or a
@@ -69,10 +75,63 @@ runner), `simplestreams.py` (remote image catalogs, 15-minute in-process cache),
 ### Errors and the response envelope
 
 Every layer raises an exception carrying an HTTP-ish `.code`: `LXDError`, `ServiceError`,
-`BootstrapError`. `_handle_api()` turns those into `{"error": msg}` with that status and
+`BootstrapError`, `AuthError`. `_handle_api()` turns those into `{"error": msg}` with that status and
 everything else into a generic 500 — tracebacks never reach a client. Success is always
 `{"data": ...}`. `cli.main()` catches the same exception types and exits 1. So raising the
 right exception with the right code is all that either front end needs.
+
+### Authentication
+
+Opt-in: with no `--auth` method and no static token, `AuthConfig.enabled` is false
+and every request is an anonymous admin. `LemondxHandler._principal()` resolves the
+caller in a fixed order -- token header, `?token=` (WebSockets cannot send headers),
+session cookie, trusted-proxy header -- and reports whether the credential was
+*explicit*. Ambient credentials (cookies, proxy identity, or none at all) must pass
+`_same_origin()` on anything but `GET`, and on every WebSocket upgrade; that check is
+what stops a page on another site driving the API through the user's browser, so a
+new request path must not bypass it. With auth off and a loopback bind,
+`_host_allowed()` also refuses non-loopback `Host` headers against DNS rebinding.
+
+Users and token hashes live in `store.py`'s `auth/` directory. `AuthService` re-reads
+those files when their inode/mtime fingerprint changes, which is how a CLI revoke or
+password change reaches a running server without IPC -- keep auth state on disk, not
+only in the process. Sessions are the exception (in memory; a restart logs out).
+`pam.py` calls libpam through ctypes; non-root it can only verify the service's own
+account, and `NoNewPrivileges=yes` breaks it -- `pam.diagnose()` says so at startup.
+Never log a credential: `log_message()` masks `token=` and startup prints no token.
+
+`lemondx configure <section>` (`configure.py`) saves settings to
+`store.config_path(section)` for later launches. A section is a `Section` subclass
+decorated `@register`; the CLI builds its choices from `SECTIONS`, so a new section
+needs no parser change. Sections own prompts and presentation only -- validation
+lives with the consumer (`auth.clean_settings()`), so a hand-edited file and an
+answer meet the same rules. `serve` merges saved settings under its flags with
+`auth.build_config()`; every auth flag defaults to `None` so "not given" is
+distinguishable, and a new flag needs a `DEFAULT_SETTINGS` key to match. A saved
+file that fails validation must stop `serve` (`load_settings()` raises): skipping it
+would start the server with auth off. Keep it that way for any security section.
+
+### Health checks
+
+`serve` starts `ContainerService.start_health_monitor()`: a daemon thread that runs
+`check_health()` every `interval_seconds`, never overlapping, and keeps the records in
+memory on the service (one per `serve` process, like template runs). `health()` only
+reads that memory, so `/api/health` is safe in the UI's 3s poll; there is deliberately
+no route that triggers a round. The CLI has no previous round, so `check_health()`
+takes two samples `window` seconds apart for CPU. `health.py` judges samples and never
+calls the daemon; `service.py` gathers them (one `list_instances()` plus a
+`read_file("/proc/loadavg")` probe per instance on a small pool). A container's
+`/proc/loadavg` is the host's unless LXCFS runs with `-l`, so `health.LoadSampler` (a
+second `serve` thread, every 5s like the kernel's LOAD_FREQ) counts R and D threads in
+the container's cgroup on the host (`cgroup_dir()`, prefix from `CGROUP_PAYLOAD_PREFIX`
+in `lxd.py`) and keeps 1/5/15 minute averages; the CLI averages over its window with
+`measure_load()`. This is the one place lemondx reads host kernel state instead of the
+API, which relies on being on the daemon's host. VMs use the guest's load via the
+probe, and a container whose cgroup is missing falls back to the probe, judged only when
+`load_scope()` says it is the instance's own. The load threshold is absolute
+(`load_average`, strictly greater than). The file API's Content-Length for a `/proc`
+file can disagree with its body, which `read_file()` tolerates. Health settings are the `health` configure section; unlike auth, a broken
+file falls back to defaults with a warning.
 
 ### Two daemons
 
@@ -96,7 +155,7 @@ no TTY and no streaming anywhere — the browser console is non-interactive, and
 ### Bootstrap modules
 
 A module is a POSIX shell script with a `# key: value` metadata header (`name`,
-`description`, `order`, `uses`, `param`, `secret`). `BootstrapRunner` sorts by `order`, prepends
+`description`, `order`, `uses`, `param`, `secret`, `text`). `BootstrapRunner` sorts by `order`, prepends
 `modules/_prelude.sh` to each script, pushes it to `/tmp` in the container, runs it with
 declared params as environment variables, and deletes it. Modules run under `/bin/sh`
 (dash, busybox ash) because minimal images often have no bash — **keep them POSIX**, and
@@ -140,7 +199,9 @@ local disk).
 `LEMONDX_CONFIG_DIR` is still honoured as the name it had before the move):
 `settings.json` for default modules and remembered params, `profiles/` for one
 JSON file per bootstrap profile, `templates/` for one per instance template,
-`modules/` for uploads. Nothing else in the codebase builds those paths — go
+`modules/` for uploads, `auth/` (0700) for local users and API token hashes, `config/`
+for `lemondx configure` sections -- the one place where an unparseable file is an error,
+not a default. Nothing else in the codebase builds those paths — go
 through `store.py` so migration and atomic writes apply.
 
 Profiles and templates share one `_Records` implementation and are one file
@@ -178,8 +239,11 @@ Vite + React 19 + TypeScript, no UI framework or state library; plain CSS in
 `web/src/index.css` with theme variables. `web/src/lib/types.ts` hand-mirrors the payload
 shapes `service.py` returns — **change a service payload and update it in the same
 change.** `web/src/lib/api.ts` is the only place `fetch` is called; it throws `ApiError`
-with the status so `App.tsx` can treat 401 as "prompt for token" (`TokenGate`, kept in
-`sessionStorage` for that tab only).
+with the status so `App.tsx` can treat 401 as "ask `/api/auth` what the server accepts
+and show `LoginGate`" (a password login sets an HttpOnly cookie; a pasted token is kept
+in `sessionStorage` for that tab only). `hooks/useAuth.ts` exposes the principal;
+`useCanWrite()` disables mutating controls for read-only users -- a convenience only,
+the server's route roles are the enforcement -- so gate any new mutating button with it.
 
 `App.tsx` polls `/api/status`, `/api/containers` and `/api/creates` every 3s and holds a
 `mutating` ref that pauses polling while a mutation is in flight, so a poll cannot clobber

@@ -25,4 +25,39 @@ journalctl --user -u lemondx -f
 A user service only starts after you log in; for it to survive to boot with no
 session open, `sudo loginctl enable-linger $USER` (the installer prints this
 when it applies). The unit files are in `systemd/` if you want to edit the
-host/port or add `--token` by hand before installing.
+host/port or turn on authentication before installing.
+
+## Authentication
+
+Run `lemondx configure auth` as the account the service runs as, then restart
+it; the unit's `serve` picks the saved settings up with no change to the unit
+file (see [Security](security.md)):
+
+```bash
+lemondx configure auth && systemctl --user restart lemondx
+# --system: the account's data directory is under /var/lib/lemondx
+sudo -u lemondx env HOME=/var/lib/lemondx /path/to/lemondx configure auth
+sudo systemctl restart lemondx
+```
+
+Flags still work, and override the saved settings one by one, if you prefer
+them in the unit: `systemctl --user edit lemondx`, then clear `ExecStart=` and
+add your own with `--auth ...`.
+
+Local users and API tokens live in the state directory the units already make
+writable, so `--auth local` and `--auth token` need nothing else. Create them
+with the CLI as the account the service runs as (for `--system`,
+`sudo -u lemondx env HOME=/var/lib/lemondx ./lemondx user-add NAME`).
+
+`--auth pam` needs more, because both units set `NoNewPrivileges=yes`, which
+stops PAM's `unix_chkpwd` helper from reading `/etc/shadow`:
+
+- **User unit:** add `NoNewPrivileges=no` to the drop-in. PAM will then accept
+  only your own account — the one the service runs as.
+- **System unit:** add `SupplementaryGroups=shadow` instead (Debian/Ubuntu,
+  where `/etc/shadow` is group-readable), which lets `pam_unix` read it
+  directly and log in any member of `--pam-admin-group`. On distributions whose
+  `/etc/shadow` is root-only, prefer `--auth local` or `--auth proxy`.
+
+`serve` prints a warning at startup when PAM cannot work as configured, so
+check `journalctl` after the change.

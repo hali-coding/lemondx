@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useCanWrite } from '../hooks/useAuth'
 import { api } from '../lib/api'
 import { missingSecrets } from '../lib/bootstrap'
 import { useBootstrapData } from '../hooks/useBootstrapData'
@@ -15,6 +16,7 @@ interface Props {
 
 /** Run bootstrap modules against a container that already exists. */
 export function BootstrapPanel({ name, running, onFinished }: Props) {
+  const canWrite = useCanWrite()
   const { modules, hostKeys, loading } = useBootstrapData()
   const [selection, setSelection] = useState<BootstrapSelection>(
     { modules: [], params: {}, ssh_keys: [] })
@@ -89,7 +91,7 @@ export function BootstrapPanel({ name, running, onFinished }: Props) {
         className="btn btn-primary"
         style={{ marginTop: 12 }}
         onClick={run}
-        disabled={busy || selection.modules.length === 0 || keysMissing
+        disabled={busy || !canWrite || selection.modules.length === 0 || keysMissing
           || secretsMissing.length > 0}
       >
         {busy && <span className="spinner" />}

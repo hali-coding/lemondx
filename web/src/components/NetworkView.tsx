@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCanWrite } from '../hooks/useAuth'
 import type { FormEvent, ReactNode } from 'react'
 import { api } from '../lib/api'
 import { bytes } from '../lib/format'
@@ -17,6 +18,7 @@ interface Props {
 
 /** How the daemon's networking is wired up, and the bridges lemondx manages. */
 export function NetworkView({ onNotify }: Props) {
+  const canWrite = useCanWrite()
   const [summaries, setSummaries] = useState<NetworkSummary[] | null>(null)
   const [details, setDetails] = useState<Record<string, NetworkDetail>>({})
   const [error, setError] = useState<string | null>(null)
@@ -102,7 +104,7 @@ export function NetworkView({ onNotify }: Props) {
         <span className="faint" style={{ fontSize: 12.5 }}>
           {managed.length} managed · {others.length} host interface{others.length === 1 ? '' : 's'}
         </span>
-        <button className="btn btn-primary" disabled={busy}
+        <button className="btn btn-primary" disabled={busy || !canWrite}
           onClick={() => setDialog('new')}>
           <PlusIcon /> New network
         </button>
@@ -140,9 +142,9 @@ export function NetworkView({ onNotify }: Props) {
                 )}
                 {detail?.manageable ? (
                   <>
-                    <button className="btn btn-sm" disabled={busy}
+                    <button className="btn btn-sm" disabled={busy || !canWrite}
                       onClick={() => setDialog(detail)}>Edit</button>
-                    <button className="btn btn-sm btn-danger" disabled={busy}
+                    <button className="btn btn-sm btn-danger" disabled={busy || !canWrite}
                       onClick={() => setPendingDelete(detail)}>Delete</button>
                   </>
                 ) : detail && (
