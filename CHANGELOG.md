@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.0](https://github.com/hali-coding/lemondx/compare/v0.2.0...v0.3.0) (2026-09-16)
+
+
+### Features
+
+* bug fixes for copilot findings ([18535a8](https://github.com/hali-coding/lemondx/commit/18535a8b510109760ea83e386b58afa4766e5f90))
+* introduces cluster support ([25818f0](https://github.com/hali-coding/lemondx/commit/25818f02bfc99ae3f8d69be2afe3dbf74babc050))
+* introduces cluster support ([773f60f](https://github.com/hali-coding/lemondx/commit/773f60fb27fde2143808a23436a074701edf8b23))
+
 ## [0.2.0](https://github.com/hali-coding/lemondx/compare/v0.1.0...v0.2.0) (2026-09-16)
 
 
