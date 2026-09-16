@@ -415,6 +415,8 @@ export type TemplateRequest = Partial<InstanceSpec> & {
 
 export interface LaunchedInstance {
   name: string
+  /** Which node it was created on; absent for a launch that never left this one. */
+  node?: string
   /** False if it failed to delete or create, or a module failed. */
   ok: boolean
   error: string | null
@@ -448,6 +450,12 @@ export interface TemplateRunResult {
   template: string
   ok: boolean
   instances: LaunchedInstance[]
+  /**
+   * Things a node substituted rather than failing on -- a storage pool or
+   * network the template names that the node does not have. Prefixed with the
+   * node they came from when the run spanned several.
+   */
+  notes: string[]
 }
 
 /**
@@ -467,6 +475,10 @@ export interface TemplateRun {
   result: TemplateRunResult | null
   /** Set when the run as a whole failed, rather than one instance in it. */
   error: string | null
+  /** Substitutions made for this run; readable while it is still going. */
+  notes: string[]
+  /** The nodes it is spread over; empty for a launch on this node alone. */
+  nodes: string[]
 }
 
 export interface ModuleSource {
@@ -686,4 +698,180 @@ export interface HealthReport {
   thresholds: Record<string, number> | null
   checked_at: number | null
   instances: HealthRecord[]
+}
+
+
+/* -- federation ---------------------------------------------------------- */
+
+/** How a node is doing right now, as the node asking sees it. */
+export interface NodeState {
+  reachable: boolean
+  error: string | null
+  product: string | null
+  server_version: string | null
+  /** Its daemon is set up enough to hold instances. */
+  ready: boolean
+  containers: number
+  running: number
+}
+
+export interface ClusterNode {
+  name: string
+  url: string
+  /** SHA-256 of the TLS certificate it must present, lowercase hex. */
+  fingerprint: string
+  description: string
+  /** Unix seconds; 0 for this node, which was never "added". */
+  added: number
+  self: boolean
+  groups: string[]
+  /** Null when the listing was asked not to contact anyone. */
+  state: NodeState | null
+}
+
+export interface ClusterNodeDetail extends ClusterNode {
+  instances: Container[]
+}
+
+export interface NodeGroup {
+  name: string
+  description: string
+  members: string[]
+  /** Members that are not nodes here -- removed, or not enrolled yet. */
+  unknown_members: string[]
+}
+
+/** This node's own place in a cluster. */
+export interface ClusterInfo {
+  node: ClusterNode
+  /** Whether this node holds a cluster credential at all. */
+  in_cluster: boolean
+  allow_enrollment: boolean
+  auth_enabled: boolean
+  /**
+   * A member with authentication off still demands an API token from callers
+   * on other hosts; loopback stays anonymous, so nobody is locked out locally.
+   */
+  remote_requires_token: boolean
+  /** Why a peer could not reach this node as it advertises itself, or ''. */
+  reachable_because: string
+  fingerprint_pretty: string
+  peers: number
+  /** Set only when an address was configured by hand rather than worked out. */
+  configured_url: string
+  settings_path: string
+}
+
+/** A one-time code another node redeems to federate with this one. */
+export interface JoinCode {
+  id: string
+  /** Shown once, here: it is a credential. */
+  code: string
+  expires: number
+  expires_in_minutes: number
+  node: ClusterNode
+  fingerprint_pretty: string
+  /** How many nodes the redeemer would be joining. */
+  members: number
+  /** Set when peers would not actually reach this node at the address in the code. */
+  warning: string
+}
+
+export interface PendingInvite {
+  id: string
+  created: number
+  expires: number
+  note: string
+  expired: boolean
+}
+
+export interface JoinResult {
+  /** The node whose code was redeemed. */
+  node: ClusterNode
+  /** Everyone this node now knows, itself included. */
+  members: ClusterNode[]
+  /** Members that could not be told about this node; they catch up on refresh. */
+  unreachable: string[]
+  /** Set when peers would not actually be able to reach this node. */
+  warning: string
+}
+
+export interface MemberSync {
+  ok: boolean
+  results: { node: string; ok: boolean; error: string | null }[]
+  members: ClusterNode[]
+}
+
+export interface RotateResult {
+  ok: boolean
+  nodes: string[]
+  /** Members that missed the new credential and are now cut off. */
+  stranded: string[]
+  results: { node: string; ok: boolean; error: string | null }[]
+}
+
+export type SyncKind = 'templates' | 'modules' | 'profiles' | 'groups'
+
+export interface SyncOutcome {
+  node: string
+  kind: SyncKind
+  /** Not in the union below when a record kind gains one; treated as opaque. */
+  name: string
+  ok: boolean
+  error: string | null
+}
+
+/**
+ * What the rest of the cluster made of a save or a delete that was propagated
+ * automatically. Null on a lemondx that is not federated, which is most.
+ */
+export interface AutoSync {
+  ok: boolean
+  nodes: string[]
+  results: SyncOutcome[]
+  /** True when this was a removal rather than a push. */
+  deleted: boolean
+}
+
+/** Anything the cluster keeps level carries this back from a save or delete. */
+export type Synced<T> = T & { synced?: AutoSync | null }
+
+export interface SyncResult {
+  ok: boolean
+  nodes: string[]
+  items: number
+  results: SyncOutcome[]
+}
+
+/** Instances gathered from several nodes, each tagged with the one it is on. */
+export interface ClusterContainers {
+  nodes: string[]
+  instances: (Container & { node: string })[]
+  errors: { node: string; error: string }[]
+}
+
+/**
+ * Where the Containers and Templates tabs are looking. `local` is this node
+ * alone, which is what an unfederated lemondx always shows; the others widen
+ * it, and both tabs read the same value so a template's instances and the
+ * container list never disagree about which hosts are in view.
+ */
+export type Scope =
+  | { kind: 'local' }
+  | { kind: 'cluster' }
+  | { kind: 'node'; name: string }
+  | { kind: 'group'; name: string }
+
+/** An instance with the node it lives on; `node` is absent in local scope. */
+export type ScopedContainer = Container & { node?: string }
+
+/** One instance named together with its node, for an action that may cross hosts. */
+export interface InstanceRef {
+  node: string
+  name: string
+}
+
+export interface ScopedStateResult {
+  ok: boolean
+  instances: { node: string; name: string; ok: boolean; error: string | null }[]
 }

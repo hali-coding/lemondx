@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError, api, hasToken, setToken } from './lib/api'
 import type {
-  AuthInfo, Container, CreateProgress, CreateRequest, HealthRecord, HealthStatus, StateAction,
-  Status, TemplateRun,
+  AuthInfo, CreateProgress, CreateRequest, HealthRecord, HealthStatus, InstanceRef,
+  ScopedContainer, StateAction, Status, TemplateRun,
 } from './lib/types'
+import { keyOf } from './lib/instance'
 import { AuthContext } from './hooks/useAuth'
+import { useScope, scopeTargets } from './hooks/useScope'
 import { useTheme } from './hooks/useTheme'
 import { useToasts } from './hooks/useToasts'
 import type { ToastKind } from './hooks/useToasts'
@@ -16,7 +18,9 @@ import { CreateDialog } from './components/CreateDialog'
 import { MoonIcon, PlusIcon, RefreshIcon, SunIcon } from './components/Icons'
 import { ModulesView } from './components/ModulesView'
 import { NetworkView } from './components/NetworkView'
+import { NodesView } from './components/NodesView'
 import { ResourcesView } from './components/ResourcesView'
+import { ScopePicker } from './components/ScopePicker'
 import { SetupBanner } from './components/SetupBanner'
 import { StorageView } from './components/StorageView'
 import { LoginGate } from './components/LoginGate'
@@ -25,7 +29,7 @@ import { Toasts } from './components/Toasts'
 
 const POLL_INTERVAL = 3000
 
-const VIEWS = ['containers', 'templates', 'resources', 'storage', 'network', 'modules', 'access'] as const
+const VIEWS = ['containers', 'templates', 'nodes', 'resources', 'storage', 'network', 'modules', 'access'] as const
 
 const STATE_VERB: Record<StateAction, string> = {
   start: 'Started', stop: 'Stopped', restart: 'Restarted',
@@ -34,18 +38,27 @@ const STATE_VERB: Record<StateAction, string> = {
 
 export default function App() {
   const { theme, toggle } = useTheme()
+  const { scope, choose: chooseScope, nodes, groups, federated } = useScope()
+  // Where this lemondx sits, so a row here can be told apart from one elsewhere.
+  const localNode = nodes.find((n) => n.self)?.name ?? ''
+  const nodeUrls = Object.fromEntries(nodes.map((n) => [n.name, n.url]))
   const { toasts, push, dismiss } = useToasts()
 
   const [status, setStatus] = useState<Status | null>(null)
-  const [containers, setContainers] = useState<Container[] | null>(null)
+  const [containers, setContainers] = useState<ScopedContainer[] | null>(null)
+  // Nodes that could not be reached for the current scope, so the table can say
+  // it is showing less than was asked for rather than quietly showing less.
+  const [scopeErrors, setScopeErrors] = useState<{ node: string; error: string }[]>([])
   const [creates, setCreates] = useState<CreateProgress[]>([])
   const [templateRuns, setTemplateRuns] = useState<TemplateRun[]>([])
   const [health, setHealth] = useState<Record<string, HealthRecord>>({})
   const [connectionError, setConnectionError] = useState<string | null>(null)
   const [busy, setBusy] = useState<Record<string, boolean>>({})
-  const [selected, setSelected] = useState<string | null>(null)
+  // The whole record, not a name: the drawer needs the name, the busy map and
+  // the table need the node-qualified key, and in a cluster those differ.
+  const [selected, setSelected] = useState<ScopedContainer | null>(null)
   const [showCreate, setShowCreate] = useState(false)
-  const [pendingDelete, setPendingDelete] = useState<string | null>(null)
+  const [pendingDelete, setPendingDelete] = useState<ScopedContainer | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [refreshToken, setRefreshToken] = useState(0)
   const [authInfo, setAuthInfo] = useState<AuthInfo | null>(null)
@@ -155,7 +168,11 @@ export default function App() {
     try {
       const [nextStatus, nextContainers, nextCreates, nextRuns, nextHealth] = await Promise.all([
         api.status(signal),
-        api.listContainers(signal),
+        // One fetch drives both the Containers and Templates tabs, so they can
+        // never disagree about which hosts are in view.
+        scope.kind === 'local'
+          ? api.listContainers(signal).then((list) => ({ instances: list, errors: [] }))
+          : api.clusterContainers(scopeTargets(scope), signal),
         // Progress is extra; a failure here must not look like losing the server.
         api.creates(signal).catch(() => null),
         api.templateRuns(signal).catch(() => null),
@@ -165,7 +182,8 @@ export default function App() {
       ])
       if (sequence !== refreshSequence.current) return
       setStatus(nextStatus)
-      setContainers(nextContainers)
+      setContainers(nextContainers.instances)
+      setScopeErrors(nextContainers.errors)
       if (nextCreates) {
         setCreates(nextCreates)
         reportCreates(nextCreates)
@@ -193,7 +211,7 @@ export default function App() {
       }
       setConnectionError((cause as Error).message)
     }
-  }, [reportCreates, reportRuns, reportHealth])
+  }, [reportCreates, reportRuns, reportHealth, scope])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -258,14 +276,20 @@ export default function App() {
     }
   }, [refresh])
 
-  const changeState = useCallback((name: string, action: StateAction) => {
+  const changeState = useCallback((container: ScopedContainer, action: StateAction) => {
+    const { name, node } = container
+    const where = node && node !== localNode ? ` on ${node}` : ''
     return mutate(
-      name,
-      () => api.setState(name, action).then(() => {}),
-      () => notify('success', `${STATE_VERB[action]} ${name}`),
-      (message) => notify('error', `Could not ${action} ${name}`, message),
+      keyOf(container),
+      // A row on this node takes the plain call it always did; only one
+      // elsewhere goes through the cluster, which needs the node to route it.
+      () => (node && node !== localNode
+        ? api.setStateAcross([{ node, name }], action).then(() => {})
+        : api.setState(name, action).then(() => {})),
+      () => notify('success', `${STATE_VERB[action]} ${name}${where}`),
+      (message) => notify('error', `Could not ${action} ${name}${where}`, message),
     )
-  }, [mutate, notify])
+  }, [mutate, notify, localNode])
 
   /**
    * One action over the containers the user ticked and confirmed. The server
@@ -273,11 +297,16 @@ export default function App() {
    * does not hide what happened to the rest; resolves false only when the
    * request itself never landed, which leaves the selection to try again.
    */
-  const bulkState = useCallback(async (names: string[], action: StateAction) => {
+  const bulkState = useCallback(async (instances: InstanceRef[], action: StateAction) => {
+    const keys = instances.map((i) => (i.node === localNode ? i.name : `${i.node}/${i.name}`))
+    const names = instances.map((i) => i.name)
+    const spread = instances.some((i) => i.node !== localNode)
     mutating.current += 1
-    setBusy((current) => ({ ...current, ...Object.fromEntries(names.map((n) => [n, true])) }))
+    setBusy((current) => ({ ...current, ...Object.fromEntries(keys.map((k) => [k, true])) }))
     try {
-      const result = await api.setStateMany(names, action)
+      const result = spread
+        ? await api.setStateAcross(instances, action)
+        : await api.setStateMany(names, action)
       const failed = result.instances.filter((i) => !i.ok)
       if (failed.length === 0) {
         notify('success', `${STATE_VERB[action]} ${names.length} container${names.length === 1 ? '' : 's'}`,
@@ -295,13 +324,13 @@ export default function App() {
       mutating.current -= 1
       setBusy((current) => {
         const next = { ...current }
-        for (const name of names) delete next[name]
+        for (const key of keys) delete next[key]
         return next
       })
       await refresh()
       setRefreshToken((token) => token + 1)
     }
-  }, [notify, refresh])
+  }, [notify, refresh, localNode])
 
   const create = useCallback(async (request: CreateRequest) => {
     // Returns once the server has accepted the create -- anything it can
@@ -324,22 +353,34 @@ export default function App() {
   }, [refresh])
 
   const confirmDelete = useCallback(async () => {
-    const name = pendingDelete
-    if (!name) return
+    const target = pendingDelete
+    if (!target) return
+    const { name, node } = target
+    const key = keyOf(target)
+    const where = node && node !== localNode ? ` on ${node}` : ''
     setDeleting(true)
     // force also stops a running container first.
     await mutate(
-      name,
-      () => api.deleteContainer(name, true).then(() => {}),
+      key,
+      () => (node && node !== localNode
+        ? api.deleteAcross([{ node, name }], true).then(() => {})
+        : api.deleteContainer(name, true).then(() => {})),
       () => {
-        notify('success', `Deleted ${name}`)
-        setSelected((current) => (current === name ? null : current))
+        notify('success', `Deleted ${name}${where}`)
+        setSelected((current) => (current && keyOf(current) === key ? null : current))
       },
-      (message) => notify('error', `Could not delete ${name}`, message),
+      (message) => notify('error', `Could not delete ${name}${where}`, message),
     )
     setDeleting(false)
     setPendingDelete(null)
-  }, [mutate, notify, pendingDelete])
+  }, [mutate, notify, pendingDelete, localNode])
+
+  /** Open an instance's drawer by name, for the Templates tab's member lists. */
+  const openInstance = useCallback((name: string, node?: string) => {
+    const found = (containers ?? []).find(
+      (c) => c.name === name && (node === undefined || (c.node ?? localNode) === node))
+    if (found) setSelected(found)
+  }, [containers, localNode])
 
   const runSetup = useCallback(async (storageDriver: string) => {
     try {
@@ -451,22 +492,27 @@ export default function App() {
 
         {view === 'access' ? (
           <AccessView onNotify={notify} />
+        ) : view === 'nodes' ? (
+          <NodesView onNotify={notify} />
         ) : view === 'modules' ? (
           <ModulesView onNotify={notify} />
         ) : view === 'templates' ? (
           <TemplatesView
             containers={containers}
+            localNode={localNode}
+            scope={scope}
             runs={templateRuns}
             onRunStarted={templateRunStarted}
             ready={ready}
             onNotify={notify}
-            onOpen={setSelected}
+            onOpen={openInstance}
             // These add and remove instances but change none the table shows
             // optimistically, so polling carries on and the table follows along.
             onChanged={(removed) => {
               // A recreated instance comes back under the same name, but the
               // drawer would be showing the old one.
-              setSelected((current) => (current && removed.includes(current) ? null : current))
+              setSelected((current) => (
+                current && removed.includes(current.name) ? null : current))
               refresh()
             }}
           />
@@ -504,14 +550,34 @@ export default function App() {
         <>
         <div className="section-head">
           <h2>Containers</h2>
-          {status?.storage_pools.length ? (
+          {status?.storage_pools.length && scope.kind === 'local' ? (
             <span className="faint" style={{ fontSize: 12.5 }}>
               pool {(status.root_pool ?? status.storage_pools[0]).name}{' '}
               ({(status.root_pool ?? status.storage_pools[0]).driver})
               {status.default_network ? ` · ${status.default_network}` : ''}
             </span>
           ) : null}
+          {federated && (
+            <>
+              <div className="topbar-spacer" />
+              <ScopePicker scope={scope} nodes={nodes} groups={groups}
+                onChange={chooseScope} />
+            </>
+          )}
         </div>
+
+        {/* A node that did not answer means the table is showing less than was
+            asked for, which it should say rather than quietly shrink. */}
+        {scopeErrors.length > 0 && (
+          <div className="banner banner-warn">
+            <div className="banner-body">
+              <h3>{scopeErrors.length} node(s) did not answer</h3>
+              <p style={{ margin: 0 }}>
+                {scopeErrors.map((e) => `${e.node}: ${e.error}`).join('; ')}
+              </p>
+            </div>
+          </div>
+        )}
 
         {containers === null && !connectionError ? (
           <div className="card">
@@ -522,9 +588,12 @@ export default function App() {
             containers={containers ?? []}
             creates={creates}
             health={health}
-            selected={selected}
+            selected={selected ? keyOf(selected) : null}
             busy={busy}
             canCreate={ready}
+            localNode={localNode}
+            nodeUrls={nodeUrls}
+            showNodes={scope.kind !== 'local'}
             onSelect={setSelected}
             onAction={changeState}
             onBulkAction={bulkState}
@@ -541,14 +610,20 @@ export default function App() {
           // Remounts on every switch, so per-container UI state (the active
           // tab, an in-progress limits edit, a half-typed snapshot name)
           // never leaks from one container into another.
-          key={selected}
-          name={selected}
-          health={health[selected] ?? null}
-          busy={!!busy[selected]}
+          key={keyOf(selected)}
+          name={selected.name}
+          // Undefined for this node, so its calls take the plain path; any
+          // other name routes every one of them through that node.
+          node={selected.node && selected.node !== localNode ? selected.node : undefined}
+          health={selected.node && selected.node !== localNode
+            ? null : health[selected.name] ?? null}
+          busy={!!busy[keyOf(selected)]}
           refreshToken={refreshToken}
           onClose={() => setSelected(null)}
-          onAction={changeState}
-          onDelete={setPendingDelete}
+          // The drawer speaks in names; the record it acts on is the selected
+          // one, which carries the node its calls have to reach.
+          onAction={(_, action) => changeState(selected, action)}
+          onDelete={() => setPendingDelete(selected)}
           onNotify={notify}
         />
       )}
@@ -562,7 +637,9 @@ export default function App() {
 
       {pendingDelete && (
         <ConfirmDialog
-          title={`Delete ${pendingDelete}?`}
+          title={`Delete ${pendingDelete.name}${
+            pendingDelete.node && pendingDelete.node !== localNode
+              ? ` on ${pendingDelete.node}` : ''}?`}
           message={`This permanently removes the container, its filesystem and all of its snapshots. If it is running it will be stopped first. This cannot be undone.`}
           confirmLabel="Delete"
           danger

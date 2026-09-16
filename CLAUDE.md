@@ -2,7 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-lemondx is a web UI and CLI for local LXD/Incus containers. `README.md` and `docs/*.md`
+lemondx is a web UI and CLI for local LXD/Incus containers, optionally federated
+with other lemondx nodes. `README.md` and `docs/*.md`
 are the user-facing reference (CLI commands, REST endpoints, module authoring, socket
 discovery) and are kept current — read them for behaviour; this file covers how the code
 is put together. README.md is deliberately short: it links out to docs/ for anything more
@@ -23,6 +24,7 @@ npm --prefix web run lint           # oxlint
 python3 -m compileall -q src/lemondx # syntax check; there is no Python linter configured
 sh -n modules/foo.sh                # modules must parse as POSIX sh
 LEMONDX_FLAVOR=incus ./lemondx status  # force the other daemon
+LEMONDX_DATA_DIR=/tmp/n1 ./lemondx cluster status   # a second node's state, for testing federation
 ./systemd/install-service.sh        # install as a systemd --user unit (see systemd/)
 ```
 
@@ -60,12 +62,17 @@ server.py       JSON API + static hosting      cli.py   argparse front end
 
 `auth.py` (`AuthService`) sits beside `service.py` with the same role for
 authentication: server and CLI both call it, so neither decides alone what a
-token or user is.
+token or user is. `cluster.py` (`ClusterService`) is the same again for
+federation, one layer up: it holds a `ContainerService` for this host and an
+`AuthService`, where the cluster credential is kept as an ordinary token, and
+calls other nodes through `nodeclient.py` -- which is to a peer what `lxd.py` is
+to the daemon, transport and nothing else. The dependency only goes one way:
+`service.py` knows nothing about nodes.
 
 `ContainerService` (`src/lemondx/service.py`) is the only place domain logic lives, so the
 API and the CLI cannot drift. **Adding a feature means: a method on `ContainerService`,
-then a route in `build_router()` (`server.py:83`) and a subcommand in `build_parser()`
-(`cli.py:1249`).** A route's role defaults to `read` for `GET` and `admin` otherwise;
+then a route in `build_router()` (`server.py:85`) and a subcommand in `build_parser()`
+(`cli.py:1653`).** A route's role defaults to `read` for `GET` and `admin` otherwise;
 pass `role=` to `Router.add()` only where that is wrong, and `principal=True` when
 the answer depends on the caller. A route handler is a one-line lambda that unpacks the JSON body and calls
 the service; a CLI command calls the same method and passes the result to `emit()` with a
@@ -115,6 +122,108 @@ answer meet the same rules. `serve` merges saved settings under its flags with
 distinguishable, and a new flag needs a `DEFAULT_SETTINGS` key to match. A saved
 file that fails validation must stop `serve` (`load_settings()` raises): skipping it
 would start the server with auth off. Keep it that way for any security section.
+
+### Federation
+
+Flat by design: no leader, no quorum, no shared state. A node is a complete
+lemondx; a cluster means each one knows how to call the others, so losing one
+costs that node alone and `cluster.py` never has to reconcile anything. Template
+sync is a one-way push -- the node pushed from wins -- because there is no
+shared clock to do better with.
+
+**Joining is one way and then it spreads.** `join()` redeems a code against any
+one member and gets back the cluster credential *and* the whole member list,
+then announces itself to each member (`sync_members()`). There is deliberately
+no reciprocal handshake: a per-pair token exchange would need every node up at
+the moment a new one joined. Membership converges through `sync_members()`,
+which pulls each peer's list and pushes ours, rather than a broadcast that would
+miss whoever was down.
+
+The cluster credential is one shared secret held by every member, stored twice
+on purpose: plaintext in `auth/cluster.json` for calling out, and its hash as an
+ordinary token record for calls coming in -- so `AuthService.authenticate_token`
+authenticates a peer with no new code path, and `lemondx tokens` lists it. The
+consequences are in the design, not accidents: removing a node does not cut it
+off until `rotate_secret()` runs, and any member is an admin of every other.
+
+**Nothing needs configuring to federate.** `ensure_identity()` works out a name
+(hostname), an address (`guess_local_address()` plus the port from
+`store.read_runtime()`, which `serve` writes) and a certificate (generated), and
+saves what it chose so peers keep pinning the same thing. `configure cluster` is
+override-only. `self_check()` connects to this node's own advertised URL and
+compares what is served with what would be handed out, because every mismatch
+there is otherwise discovered hours later as another node failing to call back.
+
+A cluster member requires a credential from non-loopback callers even when
+`AuthConfig.enabled` is false (`requires_remote_token()`, applied in
+`_principal()`): accepting API calls from other hosts is incompatible with
+treating whoever reaches the port as an admin, and the loopback exception is
+what keeps that from locking the user out of their own UI with no way back in.
+
+Trust between nodes is pinned certificates. `NodeClient._connect()` checks the
+pin after the handshake and **before writing the request**, so a wrong
+certificate never sees the credential -- keep any new call path going through
+`_connect()`. `/api/cluster/enroll` is the one unauthenticated endpoint, handled
+in `_handle_enroll()` before routing like login, because the one-time code in
+the body *is* the credential; invite hashes live in `auth/` on disk, so a code
+issued by the CLI is redeemable against a running `serve`.
+
+`/api/nodes/{node}/{path}` forwards one call to a member (`_forward()` in
+server.py, `ClusterService.proxy()` for the transport), which is what lets the
+container drawer manage an instance anywhere: snapshots, limits, the console
+and a bootstrap run are all ordinary per-container endpoints, and forwarding
+them whole is far less to get wrong than mirroring each. **The role enforced is
+the target route's**, resolved against the same router, so proxying can never
+widen what a caller may do -- an unknown path resolves to admin and fails
+closed. Naming the local node dispatches through the router here rather than
+looping back over HTTP, so the front end never special-cases itself. Timeouts
+come from `PROXY_TIMEOUTS`, since a bootstrap genuinely takes minutes and
+nothing else does.
+
+The Containers tab's scope (`hooks/useScope.ts`) is the one setting both it and
+the Templates tab read, so the instances a template lists and the table's rows
+always cover the same hosts; it lives in `localStorage` because it is how one
+person is looking right now, not cluster state. Widened, an instance's identity
+becomes `keyOf()` -- node plus name -- since two nodes may each hold a `web-1`
+unless a cluster-wide launch named them, and `_share_names()` allocates against
+*every* member for that reason, not just the targets. Health dots stay local because each node's monitor judges its own instances;
+the drawer does not -- it takes the owning node and routes every call there,
+including the bootstrap pickers, since a module runs on that host and a key is
+installed from what that host can see.
+
+Templates, modules, bootstrap profiles and node groups are pushed to every
+member the moment they are saved, and removed from every member when deleted --
+`ClusterService.save_template()` and friends wrap the `ContainerService` call
+and then `_propagate()`. Two things keep that from going wrong: `from_peer()`
+(a member relaying a push never re-broadcasts, so nothing echoes round the
+cluster) and the push being best-effort with a short timeout, since the local
+save has already happened and must not be undone because another host is off.
+What each node made of it rides back on the record as `synced`, which is also
+why those routes take `principal=True`. Deleting propagates because sync only
+ever pushes -- it cannot clear a copy the target has and this node does not.
+
+`ClusterService.change_state()` / `delete_containers()` / `template_action()`
+take `[{node, name}]`, group by node and fan out. Each takes the plain local
+path when the only node named is this one, so an unfederated lemondx never
+touches cluster code. The `*_instances` methods on `ContainerService`
+(`launch_`, `destroy_`, `recreate_`, `exec_`) are the untracked halves these
+call: tracking twice under one template name would deadlock a run against
+itself.
+
+A cluster launch is tracked as an ordinary template run
+(`ContainerService.track_run`, public for exactly this) with each instance
+tagged `node`, so the UI's existing 3s poll follows it with no second mechanism.
+The local share calls `launch_instances()` rather than `launch_template()`,
+which would start a second run on the same template. Remote shares are started
+with `background: true` and polled (`_await_run`), never held open for the
+minutes an image pull takes.
+
+`place_template()` is why a template written for one host launches on another: a
+pool, network or profile the node lacks falls back to the default profile's, and
+the substitution is returned as run notes *and* logged, since a launch started
+from another node's UI is only visible here in the log. It says "this node"
+rather than naming one -- naming is the coordinator's job, and it knows where
+each set of notes came from.
 
 ### Health checks
 
@@ -204,7 +313,9 @@ local disk).
 `LEMONDX_CONFIG_DIR` is still honoured as the name it had before the move):
 `settings.json` for default modules and remembered params, `profiles/` for one
 JSON file per bootstrap profile, `templates/` for one per instance template,
-`modules/` for uploads, `auth/` (0700) for local users and API token hashes, `config/`
+`nodes/` and `node-groups/` for federation, `modules/` for uploads, `auth/`
+(0700) for local users, API token hashes, the cluster credential and join-code
+hashes, `runtime.json` for what `serve` is listening on, `config/`
 for `lemondx configure` sections -- the one place where an unparseable file is an error,
 not a default. Nothing else in the codebase builds those paths — go
 through `store.py` so migration and atomic writes apply.
@@ -218,6 +329,11 @@ normalise every record on read. A file that no longer parses is skipped rather
 than failing the listing. The service then drops secrets and re-parses SSH keys
 on every listing (`_public_selection()`), and on save completes the selection
 with every non-secret parameter its modules declare (`_stored_selection()`).
+
+Node records and groups (`nodes/`, `node-groups/`) are two more `_Records`
+directories held to exactly those rules, and copyability is the point of them
+too -- which is why the token for calling a peer is not in its record but in
+`auth/`.
 
 A template is a create request minus the name. `launch_template()` refuses
 anything that would fail for every instance before creating one, then creates
@@ -241,7 +357,10 @@ layout change.
 ### Frontend
 
 Vite + React 19 + TypeScript, no UI framework or state library; plain CSS in
-`web/src/index.css` with theme variables. `web/src/lib/types.ts` hand-mirrors the payload
+`web/src/index.css` with theme variables. The Nodes tab (`NodesView.tsx`) polls on its own 10s interval rather than App's
+3s one, because every listing probes each peer; the server caches those probes
+for a few seconds so an open tab is not a load generator.
+`web/src/lib/types.ts` hand-mirrors the payload
 shapes `service.py` returns — **change a service payload and update it in the same
 change.** `web/src/lib/api.ts` is the only place `fetch` is called; it throws `ApiError`
 with the status so `App.tsx` can treat 401 as "ask `/api/auth` what the server accepts

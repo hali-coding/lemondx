@@ -1,10 +1,11 @@
 import { useRef, useState } from 'react'
 import { api } from '../lib/api'
+import type { AutoSync } from '../lib/types'
 import { Modal } from './Modal'
 
 interface Props {
   onCancel: () => void
-  onUploaded: (id: string) => void
+  onUploaded: (id: string, synced?: AutoSync | null) => void
 }
 
 const EXAMPLE = `#!/bin/sh
@@ -46,7 +47,7 @@ export function ModuleUploadDialog({ onCancel, onUploaded }: Props) {
     setError(null)
     try {
       const module = await api.uploadModule(name.trim(), content, overwrite)
-      onUploaded(module.id)
+      onUploaded(module.id, module.synced)
     } catch (cause) {
       const message = (cause as Error).message
       setError(message)

@@ -6,6 +6,8 @@ Everything lemondx keeps between runs lives under one data directory,
     settings.json     pre-selected modules and remembered parameter values
     profiles/         one JSON file per bootstrap profile
     templates/        one JSON file per instance template
+    nodes/            one JSON file per federated lemondx node
+    node-groups/      one JSON file per node group
     modules/          uploaded modules
     auth/             local users and API tokens (0700; only hashes, never secrets)
     config/           one JSON file per `lemondx configure` section, e.g. auth.json
@@ -77,6 +79,14 @@ def profiles_dir():
 
 def templates_dir():
     return os.path.join(data_dir(), "templates")
+
+
+def nodes_dir():
+    return os.path.join(data_dir(), "nodes")
+
+
+def node_groups_dir():
+    return os.path.join(data_dir(), "node-groups")
 
 
 def auth_dir():
@@ -386,8 +396,61 @@ class _Records:
         return True
 
 
+# -- federated nodes and node groups ---------------------------------------
+#
+# A node record says how to reach another lemondx and how to recognise it: its
+# URL and the SHA-256 of the TLS certificate it must present. The API token
+# used to call it is *not* here -- it is a credential, so it lives in auth/
+# alongside the other secrets. That split is what lets a nodes/ file be copied
+# between machines or kept in a repo the way profiles and templates are.
+#
+# A group is a named list of node names. Membership is kept here rather than on
+# the node so there is one place to read it from, and so a group can be made
+# before its members are enrolled.
+
+_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _clean_node(stored, name):
+    """Normalise one node record. Like every record here, it is untrusted input."""
+    fingerprint = _text(stored.get("fingerprint"), 95).lower().replace(":", "")
+    return {
+        "name": name,
+        "url": _text(stored.get("url"), 300).rstrip("/"),
+        # Empty means "verify against the system CA store" instead of a pin.
+        "fingerprint": fingerprint if _FINGERPRINT.match(fingerprint) else "",
+        "description": _text(stored.get("description"), 200),
+        "added": _epoch(stored.get("added")),
+    }
+
+
+def _clean_node_group(stored, name):
+    return {
+        "name": name,
+        "description": _text(stored.get("description"), 200),
+        "members": _strings(stored.get("members")),
+    }
+
+
+def _epoch(value):
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 _profiles = _Records(profiles_dir, _clean_profile)
 _templates = _Records(templates_dir, _clean_template)
+_nodes = _Records(nodes_dir, _clean_node)
+_node_groups = _Records(node_groups_dir, _clean_node_group)
+
+load_nodes = _nodes.load
+save_node = _nodes.save
+delete_node = _nodes.delete
+
+load_node_groups = _node_groups.load
+save_node_group = _node_groups.save
+delete_node_group = _node_groups.delete
 
 load_profiles = _profiles.load
 save_profile = _profiles.save
@@ -440,7 +503,11 @@ def prune_module(module_id):
 # opaque here: auth.py validates them on read, since these files are as
 # hand-editable as everything else under the data directory.
 
-AUTH_KINDS = ("users", "tokens")
+# "cluster" holds the credential this lemondx calls its peers with, and
+# "invites" the hashed one-time codes it will accept for enrolment. Both are
+# secrets, and both have to be on disk rather than in one process: `lemondx
+# cluster invite` runs in the CLI and the code is redeemed against `serve`.
+AUTH_KINDS = ("users", "tokens", "cluster", "invites")
 
 
 def _auth_path(kind):
@@ -491,6 +558,42 @@ def update_auth(kind, mutate):
             pass
         _write_json(_auth_path(kind), {"version": 1, kind: records})
     return result
+
+
+# -- what `serve` is doing right now ---------------------------------------
+#
+# Written by the running server and read by the CLI in another process, which
+# otherwise has no way to know which port to advertise to a peer -- and a join
+# code naming the wrong port is a failure the operator only discovers later,
+# from the other node. Best-effort in both directions: a stale file is no worse
+# than no file, since anything that matters is verified by connecting.
+
+
+def runtime_path():
+    return os.path.join(data_dir(), "runtime.json")
+
+
+def write_runtime(payload):
+    try:
+        _write_json(runtime_path(), dict(payload, pid=os.getpid()))
+    except OSError:
+        pass                      # a read-only data dir must not stop `serve`
+
+
+def read_runtime():
+    try:
+        with open(runtime_path(), encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return stored if isinstance(stored, dict) else {}
+
+
+def clear_runtime():
+    try:
+        os.unlink(runtime_path())
+    except OSError:
+        pass
 
 
 # -- configuration sections ------------------------------------------------

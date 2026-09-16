@@ -62,6 +62,58 @@ Only the `serve` process's own creates are tracked: one started with
 `lemondx create` in a terminal appears in the list once the daemon has it,
 without a stage.
 
+## Showing one node or the whole cluster
+
+A lemondx joined to a cluster puts a **Showing** picker on the Containers tab:
+this node, the whole cluster, a single node, or a node group. The Templates tab
+follows the same setting, so the instances a template lists and the containers
+in the table always cover the same hosts, and Launch opens on the nodes you are
+already looking at.
+
+Widened, the table gains a Node column, and start/stop/restart/delete are routed
+to whichever node owns each row — a selection may span hosts. Clicking any row
+opens the full detail drawer, wherever the instance lives: overview and limits,
+snapshots, bootstrap and the console all act on its own node. The bootstrap
+picker's modules and keys come from that node too.
+
+Health dots stay local, since each node's monitor judges its own instances. The
+link on a remote row opens that node's own UI, for what is about the host rather
+than the instance.
+
+The choice is remembered in your browser. Without a cluster the picker is not
+shown at all.
+
+## Shared definitions sync themselves
+
+Saving a template, a module, a bootstrap profile or a node group on a clustered
+node pushes it to every other member as part of the save, and the toast says
+where it went — or names the node that missed it and points at Sync. Deleting
+one offers to remove it from the others too, ticked by default; untick it to
+leave their copies alone.
+
+## Nodes view
+
+Only interesting once this lemondx is federated with another; on its own it
+shows this host and not much else. It has three parts:
+
+- **This node** — the name, address and certificate fingerprint peers know it
+  by, and a warning naming whatever is stopping another node from joining it.
+- **Nodes** — a card per node with its daemon, instance counts and groups, and
+  a dot for reachable / not set up / unreachable. *Show instances* lists what is
+  on a node without leaving the page. **Invite** issues a one-time join code
+  (shown once — it is a credential), **Add node** redeems one from another host,
+  and **Sync** copies this node's templates, modules or bootstrap profiles over
+  another's.
+- **Node groups** — a name for a set of nodes, so a launch or a sync can say
+  "everywhere" once. A member that is not a node here is marked in red.
+
+The listing contacts every node, so this view polls every 10 seconds rather than
+the 3 the rest of the UI uses, and the server caches each probe for a few seconds
+so several open tabs do not multiply the traffic.
+
+See [Nodes and federation](cluster.md) for how joining works and what it rests
+on.
+
 ## Health checks
 
 While `lemondx serve` runs, it checks every running instance once a minute.

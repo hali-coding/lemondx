@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react'
 import { Modal } from './Modal'
 
 interface Props {
@@ -8,10 +9,12 @@ interface Props {
   busy?: boolean
   onConfirm: () => void
   onCancel: () => void
+  /** An extra choice the confirmation itself offers, under the message. */
+  children?: ReactNode
 }
 
 export function ConfirmDialog({
-  title, message, confirmLabel, danger, busy, onConfirm, onCancel,
+  title, message, confirmLabel, danger, busy, onConfirm, onCancel, children,
 }: Props) {
   return (
     <Modal
@@ -32,6 +35,7 @@ export function ConfirmDialog({
       }
     >
       <p style={{ margin: 0, fontSize: 13.5, lineHeight: 1.6 }}>{message}</p>
+      {children && <div style={{ marginTop: 14 }}>{children}</div>}
     </Modal>
   )
 }

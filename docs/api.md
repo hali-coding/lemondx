@@ -40,6 +40,28 @@ little access `403`, too many failed logins `429`.
 | `GET`/`POST` | `/api/networks` | every interface the daemon can see / create a managed bridge |
 | `GET` | `/api/subnets` | every subnet already on the host, which a new bridge must not overlap |
 | `GET`/`PATCH`/`DELETE` | `/api/networks/{name}` | config, state, DHCP leases, attachments / change or delete a managed bridge |
+| `GET` | `/api/cluster` | this node's name, address and certificate fingerprint |
+| `GET` | `/api/cluster/nodes` | federated nodes and their state (`?probe=false` skips contacting them) |
+| `GET` | `/api/cluster/nodes/{name}` | one node, with the instances on it |
+| `POST` | `/api/cluster/nodes` | `{"code":"lemondx-join.…"}` → join that node's cluster |
+| `DELETE` | `/api/cluster/nodes/{name}` | remove a node, here and on every member |
+| `POST` | `/api/cluster/leave` | give up membership of the cluster |
+| `GET`/`POST` | `/api/cluster/members` | the member list / announce a member (node to node) |
+| `DELETE` | `/api/cluster/members/{name}` | a peer saying a node has left |
+| `POST` | `/api/cluster/refresh` | pull every peer's member list and push ours |
+| `POST` | `/api/cluster/rotate` | replace the cluster credential on every member |
+| `PUT` | `/api/cluster/secret` | take a rotated credential (node to node) |
+| `GET` | `/api/cluster/containers` | instances across nodes (`?all=true`, `?nodes=`, `?groups=`) |
+| `POST` | `/api/cluster/containers/state` | `{"instances":[{"node","name"}],"action":...}` over several nodes |
+| `POST` | `/api/cluster/containers/delete` | delete instances that sit on several nodes |
+| *any* | `/api/nodes/{node}/{path}` | make that call against one node's own API and return its answer |
+| `GET` | `/api/cluster/groups` | node groups |
+| `PUT`/`DELETE` | `/api/cluster/groups/{name}` | create or replace / delete a group |
+| `GET`/`POST` | `/api/cluster/invites` | unredeemed join codes / issue one |
+| `DELETE` | `/api/cluster/invites/{id}` | withdraw a join code |
+| `POST` | `/api/cluster/sync` | push templates, modules or profiles to other nodes |
+| `POST` | `/api/cluster/fingerprint` | what certificate an address presents right now |
+| `POST` | `/api/cluster/enroll` | redeem a join code — node to node, no token (see [Nodes](cluster.md)) |
 | `GET` | `/api/modules` | bootstrap modules with their parameters |
 | `GET` | `/api/ssh-keys` | public keys found in `~/.ssh` |
 | `POST` | `/api/ssh-keys/validate` | check one pasted public key |
@@ -54,9 +76,10 @@ little access `403`, too many failed logins `429`.
 | `GET` | `/api/templates` | saved instance templates |
 | `PUT` | `/api/templates/{name}` | create or replace one |
 | `DELETE` | `/api/templates/{name}` | delete one |
-| `POST` | `/api/templates/{name}/launch` | `{"count":3}` → create instances from it |
+| `POST` | `/api/templates/{name}/launch` | `{"count":3}` → create instances from it; `nodes`/`groups` spread it across a cluster |
 | `GET` | `/api/templates/{name}/instances` | names of the instances launched from it |
 | `POST` | `/api/templates/{name}/exec` | `{"command":"uptime","instances":[...]}` → run on each, with output |
+| | | `instances` entries may be `{"node","name"}`, spreading destroy/recreate/exec over a cluster |
 | `POST` | `/api/templates/{name}/recreate` | `{"instances":[...]}` → delete and recreate each, same names |
 | `POST` | `/api/templates/{name}/destroy` | `{"instances":[...]}` → stop and delete each |
 | `GET` | `/api/template-runs` | launches/recreates/destroys in progress, or last finished, per template |
@@ -122,7 +145,30 @@ registration without destroying the zpool. A successful response includes
 `"detached": true`; other drivers return `"detached": false` and retain their
 normal destructive pool-delete behavior.
 
-See also [Bootstrap modules](modules.md) for `/api/modules`,
+`/api/nodes/{node}/{path}` forwards any call to one member —
+`/api/nodes/prdev2/containers/web-1/exec` runs a command on `web-1` over there.
+The access checked is the target endpoint's, resolved against the same route
+table, so forwarding grants nothing extra; an unrecognised path is treated as
+admin-only, and a proxied call cannot be proxied again. Naming this node runs
+the call locally.
+
+In a cluster, `PUT /api/templates/{name}`, `POST /api/modules`,
+`PUT /api/bootstrap-profiles/{name}` and `PUT /api/cluster/groups/{name}` push
+the saved record to every other member, and the `DELETE` of each removes it from
+them (`?everywhere=false` keeps a delete local). The answer carries `synced`:
+`{ok, nodes, results, deleted}`, or null when the node is not federated. A
+member relaying one of these never re-broadcasts it.
+
+`/api/cluster/enroll` is the one endpoint that answers without a credential of
+the usual kind, because it is how a node obtains its first one. The single-use
+join code in its body *is* the credential, and what comes back is the cluster's
+shared credential plus its whole member list — so joining any member joins the
+cluster. A node that is in a cluster requires a token from callers on other
+hosts even when authentication is otherwise off; loopback is unaffected. See
+[Nodes and federation](cluster.md).
+
+See also [Nodes and federation](cluster.md) for `/api/cluster`,
+[Bootstrap modules](modules.md) for `/api/modules`,
 `/api/bootstrap-profiles` and `/api/containers/{name}/bootstrap`,
 [Instance templates](templates.md) for `/api/templates`, and
 [Web UI tour](web-ui.md) for `/api/resources`, `/api/networks` and

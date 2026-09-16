@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useCanWrite } from '../hooks/useAuth'
 import { api } from '../lib/api'
+import { syncDetail, syncKind } from '../lib/sync'
 import type {
-  BootstrapModule, Container, InstanceTemplate, LaunchedInstance, TemplateRun,
+  BootstrapModule, ClusterNode, InstanceRef, InstanceTemplate, LaunchedInstance, NodeGroup,
+  Scope, ScopedContainer, TemplateRun,
 } from '../lib/types'
 import { ConfirmDialog } from './ConfirmDialog'
 import { CloseIcon, PencilIcon, PlusIcon, RestartIcon, TerminalIcon, TrashIcon } from './Icons'
@@ -11,14 +13,18 @@ import { StatusBadge } from './StatusBadge'
 import { TemplateDialog } from './TemplateDialog'
 
 interface Props {
-  containers: Container[] | null
+  containers: ScopedContainer[] | null
+  /** Which node this lemondx is, for telling local instances from the rest. */
+  localNode: string
+  /** How wide the view is; a template's members follow the same scope. */
+  scope: Scope
   /** Whether the daemon can create instances yet; saving works regardless. */
   ready: boolean
   onNotify: (kind: 'success' | 'error' | 'info', title: string, detail?: string) => void
   /** What the server is running or last ran per template, from App's poll. */
   runs: TemplateRun[]
   onRunStarted: (run: TemplateRun) => void
-  onOpen: (name: string) => void
+  onOpen: (name: string, node?: string) => void
   /** Refresh now, and let go of any of these instances the drawer shows. */
   onChanged: (removed: string[]) => void
 }
@@ -27,12 +33,15 @@ const MAX_LAUNCH = 20
 
 type Action = 'launch' | 'recreate' | 'destroy' | 'exec'
 
+/** Where a launch should go. Empty means this node, as it always did. */
+type Targets = { nodes?: string[]; groups?: string[] }
+
 
 /**
  * The names a launch would use: the lowest free `<prefix>-<n>`. Only a
  * preview -- the server picks the real names when the launch starts.
  */
-function previewNames(prefix: string, count: number, containers: Container[]) {
+function previewNames(prefix: string, count: number, containers: ScopedContainer[]) {
   const taken = new Set(containers.map((c) => c.name))
   const names: string[] = []
   for (let index = 1; names.length < count; index += 1) {
@@ -51,7 +60,8 @@ function secretParams(template: InstanceTemplate, modules: BootstrapModule[]) {
 
 /** Saved instance setups, each launchable as one or many identical instances. */
 export function TemplatesView({
-  containers, ready, runs: runList, onRunStarted, onNotify, onOpen, onChanged,
+  containers, localNode, scope, ready, runs: runList, onRunStarted, onNotify, onOpen,
+  onChanged,
 }: Props) {
   const canWrite = useCanWrite()
   const [templates, setTemplates] = useState<InstanceTemplate[] | null>(null)
@@ -59,11 +69,18 @@ export function TemplatesView({
   const [error, setError] = useState<string | null>(null)
   const [editing, setEditing] = useState<InstanceTemplate | 'new' | null>(null)
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
+  // These are kept level across a cluster, so removing one removes it
+  // everywhere by default; unticking keeps this node's copy the only one gone.
+  const [deleteEverywhere, setDeleteEverywhere] = useState(true)
   const [counts, setCounts] = useState<Record<string, string>>({})
   // Only while the request that starts a run is out, which is brief: the
   // server answers once it has accepted the run, not when the run is done.
   const [starting, setStarting] = useState<Record<string, { action: Action; count: number }>>({})
   const [confirming, setConfirming] = useState<{ template: InstanceTemplate; action: Action } | null>(null)
+  // Where a launch may go. Unprobed: only the names matter here, and probing
+  // every node to draw a picker would make opening this tab a fan-out.
+  const [nodes, setNodes] = useState<ClusterNode[]>([])
+  const [groups, setGroups] = useState<NodeGroup[]>([])
 
   const load = useCallback((signal?: AbortSignal) => {
     Promise.all([api.templates(signal), api.modules(signal)])
@@ -75,6 +92,14 @@ export function TemplatesView({
       .catch((cause) => {
         if ((cause as Error).name !== 'AbortError') setError((cause as Error).message)
       })
+    // A lemondx federated with nobody answers with one node, and the launch
+    // dialog leaves the picker out -- so a failure here is not worth showing.
+    Promise.all([api.nodes(signal, false), api.nodeGroups(signal)])
+      .then(([loadedNodes, loadedGroups]) => {
+        setNodes(loadedNodes)
+        setGroups(loadedGroups)
+      })
+      .catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -107,26 +132,42 @@ export function TemplatesView({
     (containers ?? []).filter((c) => c.template === template.name)
 
   function requestLaunch(template: InstanceTemplate) {
-    // Secrets are the one thing a template cannot keep, so only a template
-    // that needs one costs a second click.
-    if (secretParams(template, modules).length > 0) setConfirming({ template, action: 'launch' })
-    else run(template, 'launch', [], {})
+    // Secrets are the one thing a template cannot keep, so a template that
+    // needs one costs a second click -- and so does a launch with somewhere
+    // else it could go, since "where" is worth confirming even though the
+    // dialog starts on whatever the view is already scoped to.
+    if (secretParams(template, modules).length > 0 || nodes.length > 1) {
+      setConfirming({ template, action: 'launch' })
+    } else {
+      run(template, 'launch', [], {})
+    }
+  }
+
+  /**
+   * What to send as `instances`: plain names while the view is this node, and
+   * {node, name} once it is wider, so the server can hand each node its share.
+   */
+  function refs(names: string[]): (string | InstanceRef)[] {
+    if (scope.kind === 'local') return names
+    const byName = new Map((containers ?? []).map((c) => [c.name, c.node ?? localNode]))
+    return names.map((name) => ({ node: byName.get(name) ?? localNode, name }))
   }
 
   async function run(template: InstanceTemplate, action: Action, instances: string[],
-                     params: Record<string, string>, command = '', timeout?: number) {
+                     params: Record<string, string>, command = '', timeout?: number,
+                     targets: Targets = {}) {
     const count = action === 'launch' ? countFor(template.name) : instances.length
     setStarting((current) => ({ ...current, [template.name]: { action, count } }))
     try {
       // Returns as soon as the server has accepted the run; the run itself
       // goes on there, and App reports how it ended from its poll.
       const started = action === 'launch'
-        ? await api.launchTemplate(template.name, { count, params })
+        ? await api.launchTemplate(template.name, { count, params, ...targets })
         : action === 'recreate'
-          ? await api.recreateTemplateInstances(template.name, instances, params)
+          ? await api.recreateTemplateInstances(template.name, refs(instances), params)
           : action === 'exec'
-            ? await api.execTemplateInstances(template.name, command, instances, timeout)
-            : await api.destroyTemplateInstances(template.name, instances)
+            ? await api.execTemplateInstances(template.name, command, refs(instances), timeout)
+            : await api.destroyTemplateInstances(template.name, refs(instances))
       onRunStarted(started)
       // The drawer would be showing an instance about to be deleted.
       onChanged(action === 'exec' ? [] : instances)
@@ -145,8 +186,9 @@ export function TemplatesView({
     const name = pendingDelete
     if (!name) return
     try {
-      await api.deleteTemplate(name)
-      onNotify('success', `Deleted template “${name}”`)
+      const result = await api.deleteTemplate(name, deleteEverywhere)
+      onNotify(syncKind(result.synced), `Deleted template “${name}”`,
+        syncDetail(result.synced))
       load()
     } catch (cause) {
       onNotify('error', 'Could not delete the template', (cause as Error).message)
@@ -269,10 +311,19 @@ export function TemplatesView({
                       ) : (
                         <span className="template-members">
                           {members.map((c) => (
-                            <button key={c.name} type="button" className="template-member"
-                              onClick={() => onOpen(c.name)} title={c.status}>
+                            <button key={`${c.node ?? ''}/${c.name}`} type="button"
+                              className="template-member"
+                              onClick={() => onOpen(c.name, c.node)}
+                              title={c.node && c.node !== localNode
+                                ? `${c.status} on ${c.node} -- open it there`
+                                : c.status}>
                               <span className={`dot${c.status === 'Running' ? ' dot-ok' : ''}`} />
                               {c.name}
+                              {/* Which host it is on, once the view spans more
+                                  than one and the name alone is ambiguous. */}
+                              {c.node && c.node !== localNode && (
+                                <span className="badge badge-dim">{c.node}</span>
+                              )}
                             </button>
                           ))}
                           <span className="faint">{running} running</span>
@@ -374,6 +425,11 @@ export function TemplatesView({
                   {finished?.error && (
                     <p className="hint" style={{ color: 'var(--danger)' }}>{finished.error}</p>
                   )}
+                  {/* Substitutions a node made rather than failing the launch --
+                      a storage pool or network it does not have. */}
+                  {(run?.notes ?? []).map((note) => (
+                    <p key={note} className="hint" style={{ color: 'var(--warn)' }}>{note}</p>
+                  ))}
                   {result && finished?.action === 'exec' && (
                     <ExecResults instances={result.instances} onOpen={onOpen} />
                   )}
@@ -394,6 +450,10 @@ export function TemplatesView({
                               </button>
                             ) : (
                               <span className="mono">{instance.name}</span>
+                            )}
+                            {instance.node && result.instances.some(
+                              (other) => other.node !== instance.node) && (
+                              <span className="badge badge-dim">{instance.node}</span>
                             )}
                             {instance.error && <span className="faint">{instance.error}</span>}
                             {failedModule && (
@@ -416,7 +476,8 @@ export function TemplatesView({
           template={editing === 'new' ? undefined : editing}
           onCancel={() => setEditing(null)}
           onSaved={(saved) => {
-            onNotify('success', `Saved template “${saved.name}”`)
+            onNotify(syncKind(saved.synced), `Saved template “${saved.name}”`,
+              syncDetail(saved.synced))
             setEditing(null)
             load()
           }}
@@ -447,11 +508,15 @@ export function TemplatesView({
           secrets={confirming.action === 'destroy' ? []
             : secretParams(confirming.template, modules)}
           count={countFor(confirming.template.name)}
+          nodes={nodes}
+          groups={groups}
+          scope={scope}
+          localNode={localNode}
           onCancel={() => setConfirming(null)}
-          onConfirm={(instances, params) => {
+          onConfirm={(instances, params, targets) => {
             const { template, action } = confirming
             setConfirming(null)
-            run(template, action, instances, params)
+            run(template, action, instances, params, '', undefined, targets)
           }}
         />
       )}
@@ -463,8 +528,19 @@ export function TemplatesView({
           confirmLabel="Delete"
           danger
           onConfirm={remove}
-          onCancel={() => setPendingDelete(null)}
-        />
+          onCancel={() => { setPendingDelete(null); setDeleteEverywhere(true) }}
+        >
+          {nodes.length > 1 && (
+            <label className="check">
+              <input type="checkbox" checked={deleteEverywhere}
+                onChange={(event) => setDeleteEverywhere(event.target.checked)} />
+              <span>
+                Also remove it from the other {nodes.length - 1} node(s)
+                <span className="dim"> — templates are kept level across the cluster</span>
+              </span>
+            </label>
+          )}
+        </ConfirmDialog>
       )}
     </>
   )
@@ -473,11 +549,17 @@ export function TemplatesView({
 interface ActionProps {
   template: InstanceTemplate
   action: Action
-  members: Container[]
+  members: ScopedContainer[]
   secrets: BootstrapModule['params']
   count: number
+  /** Every node this one knows, including itself. One means no picker. */
+  nodes: ClusterNode[]
+  groups: NodeGroup[]
+  /** What the Containers tab is scoped to; a launch starts from the same. */
+  scope: Scope
+  localNode: string
   onCancel: () => void
-  onConfirm: (instances: string[], params: Record<string, string>) => void
+  onConfirm: (instances: string[], params: Record<string, string>, targets: Targets) => void
 }
 
 /**
@@ -485,18 +567,42 @@ interface ActionProps {
  * and collects any secrets a launch or recreate needs -- those go to this run
  * and nowhere else.
  */
-function ActionDialog({ template, action, members, secrets, count, onCancel, onConfirm }: ActionProps) {
+function ActionDialog({ template, action, members, secrets, count, nodes, groups,
+                       scope, localNode, onCancel, onConfirm }: ActionProps) {
   const [values, setValues] = useState<Record<string, string>>({})
+  // This node by default: a launch that names nowhere else behaves exactly as
+  // it did before there was anywhere else.
+  const here = nodes.find((n) => n.self)?.name ?? localNode
+  // Opens on whatever the view is scoped to, so launching does the obvious
+  // thing after switching the Containers tab to a group or the whole cluster.
+  const [chosen, setChosen] = useState<string[]>(
+    scope.kind === 'cluster' ? nodes.map((n) => n.name)
+      : scope.kind === 'node' ? [scope.name]
+        : here ? [here] : [])
+  const [group, setGroup] = useState(scope.kind === 'group' ? scope.name : '')
   const complete = secrets.every((p) => values[p.name])
   const names = members.map((c) => c.name)
   const launch = action === 'launch'
-  const canConfirm = complete && (launch || names.length > 0)
+  const federated = launch && nodes.length > 1
+  const somewhere = !federated || !!group || chosen.length > 0
+  const canConfirm = complete && somewhere && (launch || names.length > 0)
 
+  const targets: Targets = !federated ? {}
+    : group ? { groups: [group] }
+      // Only this node is the same as naming nothing, and naming nothing is
+      // the path that never touches the cluster code at all.
+      : chosen.length === 1 && chosen[0] === here ? {}
+        : { nodes: chosen }
+
+  const spread = group ? `the “${group}” group`
+    : chosen.length > 1 ? `${chosen.length} nodes` : chosen[0] || 'this node'
   const title = launch ? `Launch ${count} from “${template.name}”`
     : action === 'recreate' ? `Recreate ${names.length} from “${template.name}”?`
     : `Destroy ${names.length} from “${template.name}”?`
   const subtitle = launch
-    ? 'Secrets are never saved, so they are entered for each launch. Every instance in this launch gets the same values.'
+    ? (federated
+      ? `Spread over ${spread}, round robin, with one run of names across them all. A node without the template's storage pool or network uses its own default and says so.`
+      : 'Secrets are never saved, so they are entered for each launch. Every instance in this launch gets the same values.')
     : action === 'recreate'
       ? 'Each instance is stopped, deleted and created again with the same name, from the template as it is now. Everything inside them, including snapshots, is lost.'
       : 'Each instance is stopped and deleted, with its filesystem and snapshots. This cannot be undone. The template itself is kept.'
@@ -520,17 +626,58 @@ function ActionDialog({ template, action, members, secrets, count, onCancel, onC
       <form id="template-action-form" style={{ display: 'contents' }}
         onSubmit={(event) => {
           event.preventDefault()
-          if (canConfirm) onConfirm(names, values)
+          if (canConfirm) onConfirm(names, values, targets)
         }}>
+        {federated && (
+          <>
+            <div className="field">
+              <label htmlFor="launch-group">Launch on a group</label>
+              <select id="launch-group" className="select" value={group}
+                onChange={(event) => setGroup(event.target.value)}>
+                <option value="">Pick nodes instead</option>
+                {groups.map((item) => (
+                  <option key={item.name} value={item.name}>
+                    {item.name} ({item.members.length})
+                  </option>
+                ))}
+              </select>
+            </div>
+            {!group && (
+              <div className="field">
+                <label>Nodes</label>
+                <div className="check-list">
+                  {nodes.map((node) => (
+                    <label key={node.name} className="check">
+                      <input type="checkbox" checked={chosen.includes(node.name)}
+                        onChange={() => setChosen((current) => current.includes(node.name)
+                          ? current.filter((n) => n !== node.name)
+                          : [...current, node.name])} />
+                      <span>{node.name}{node.self ? ' (this node)' : ''}</span>
+                    </label>
+                  ))}
+                </div>
+                {chosen.length === 0 && (
+                  <span className="field-error">Pick at least one node.</span>
+                )}
+              </div>
+            )}
+          </>
+        )}
         {!launch && (
           names.length === 0 ? (
             <p className="hint">No instances from this template remain.</p>
           ) : (
             <ul className="template-results">
               {members.map((c) => (
-                <li key={c.name}>
+                <li key={`${c.node ?? ''}/${c.name}`}>
                   <StatusBadge status={c.status} />
                   <span className="mono">{c.name}</span>
+                  {c.node && c.node !== localNode && (
+                    <span className="badge badge-dim">{c.node}</span>
+                  )}
+                  {c.node && c.node !== localNode && (
+                    <span className="badge badge-dim">{c.node}</span>
+                  )}
                   {c.ipv4[0] && <span className="faint mono">{c.ipv4[0]}</span>}
                 </li>
               ))}
@@ -566,7 +713,7 @@ function ActionDialog({ template, action, members, secrets, count, onCancel, onC
 /** Each instance's exit code and output from a command run across a template. */
 function ExecResults({ instances, onOpen }: {
   instances: LaunchedInstance[]
-  onOpen: (name: string) => void
+  onOpen: (name: string, node?: string) => void
 }) {
   return (
     <div className="template-exec">
@@ -607,7 +754,7 @@ function ExecResults({ instances, onOpen }: {
 
 interface ExecProps {
   template: InstanceTemplate
-  members: Container[]
+  members: ScopedContainer[]
   lastCommand: string
   onCancel: () => void
   onConfirm: (instances: string[], command: string, timeout: number) => void

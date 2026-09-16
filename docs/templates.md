@@ -115,6 +115,25 @@ launch. Every launched instance carries `user.lemondx.template` in its config,
 which is how the UI groups them; renaming a template does not relabel
 instances launched before the rename.
 
+## Launching across nodes
+
+A launch stays on this host unless it is told otherwise. If this lemondx is
+federated with others (see [Nodes and federation](cluster.md)), `launch` takes
+`--node` and `--group`, and the UI's Launch button opens a node picker:
+
+```bash
+lemondx launch web -n 6 --group edge
+```
+
+Instances go round robin, and the `<prefix>-<n>` numbering is allocated across
+every chosen node at once, so a name means one instance in the cluster rather
+than one per host. The template is pushed to each node first, so a node that has
+never seen it can still run the launch.
+
+A node that lacks the template's storage pool, network or profile substitutes
+its own default rather than failing every instance, and the run says so, per
+node. A node that fails outright fails only its own share.
+
 ## Parameters, keys and secrets
 
 Saving fills in every non-secret parameter the selected modules declare — from
@@ -150,8 +169,10 @@ curl -s -X POST localhost:8099/api/templates/Web%20server/destroy \
   -H 'content-type: application/json' -d '{"instances":["web-1","web-2","web-3"]}'
 ```
 
-Launch, recreate and destroy all respond with `{"template", "ok", "instances":
-[{"name", "ok", "error", "container"}]}`. `POST /api/templates/{name}/exec`
+Launch, recreate and destroy all respond with `{"template", "ok", "notes",
+"instances": [{"name", "ok", "error", "container"}]}`. `notes` lists what a node
+substituted rather than failing on — a storage pool or network it does not have
+— and each instance carries `"node"` when the launch spanned more than this one. `POST /api/templates/{name}/exec`
 takes `{"command", "instances": [...], "timeout"}` — every named instance must
 be from the template, or nothing runs — and each entry also carries `"exec":
 {"exit_code", "stdout", "stderr", "truncated"}`. `container` is the same detail
@@ -163,9 +184,14 @@ Launch, recreate and destroy block until done by default. Add `"background":
 true` to the body and they return the run record at once instead, which is how
 the web UI calls them.
 
+`POST /api/templates/{name}/launch` also takes `nodes` and `groups` to spread a
+launch over a cluster, and `names` to ask for particular instance names — which
+is how a coordinating node keeps numbering unique across one.
+
 `GET /api/template-runs` lists what the server is running or last ran for each
 template — `{"template", "action", "count", "started_at", "finished_at",
-"result", "error"}`, with `finished_at` null while in progress — and
+"result", "error", "notes", "nodes"}`, with `finished_at` null while in
+progress — and
 `DELETE /api/template-runs/{name}` forgets a finished one. This is held by the
 `serve` process, so the CLI in a separate process neither sees these runs nor
 is blocked by them.

@@ -109,3 +109,32 @@ export const TerminalIcon = ({ size = 15 }: Props) => (
     <path d="M5 8l4 4-4 4M12 17h7" />
   </svg>
 )
+
+export const ServerIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <rect x="3" y="4" width="18" height="7" rx="1.5" />
+    <rect x="3" y="13" width="18" height="7" rx="1.5" />
+    <path d="M7 7.5h.01M7 16.5h.01" />
+  </svg>
+)
+
+export const UploadIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5" />
+    <path d="M4 17v2.5A1.5 1.5 0 0 0 5.5 21h13a1.5 1.5 0 0 0 1.5-1.5V17" />
+  </svg>
+)
+
+export const KeyIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <circle cx="8" cy="15" r="4" />
+    <path d="M10.85 12.15 20 3m-3 3 2.5 2.5M14 9l2.5 2.5" />
+  </svg>
+)
+
+export const ExternalIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M14 4h6v6M20 4l-8.5 8.5" />
+    <path d="M18 14.5V19a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 19V8a1.5 1.5 0 0 1 1.5-1.5H10" />
+  </svg>
+)

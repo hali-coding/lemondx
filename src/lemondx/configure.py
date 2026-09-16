@@ -18,7 +18,7 @@ import os
 import secrets
 import sys
 
-from . import auth, pam, store
+from . import auth, cluster, pam, store
 from . import health as health_checks
 
 
@@ -458,11 +458,159 @@ class HealthSection(Section):
               "straight away.")
 
 
+@register
+class ClusterSection(Section):
+    name = "cluster"
+    help = "this node's name, address and TLS certificate for federating with others"
+
+    def load(self):
+        try:
+            raw = store.load_config(self.name)
+            return None if raw is None else cluster.clean_settings(raw)
+        except (ValueError, cluster.ClusterError) as exc:
+            raise ConfigureError(getattr(exc, "message", str(exc)))
+
+    def defaults(self):
+        return dict(cluster.DEFAULT_SETTINGS)
+
+    def save(self, settings):
+        try:
+            return cluster.save_settings(settings)
+        except cluster.ClusterError as exc:
+            raise ConfigureError("Not saved: %s" % exc.message, exc.code)
+
+    def reset(self):
+        return cluster.reset_settings()
+
+    def prompt(self, p, current):
+        s = self.defaults()
+        s.update(current or {})
+        p.say("Federation settings. None of these is required: joining a cluster "
+              "works them out and saves what it chose. Set them to override that "
+              "-- a DNS name, an address behind NAT, a certificate of your own.")
+        p.say()
+
+        s["name"] = p.ask("What other nodes should call this one",
+                          default=s["name"] or cluster.default_node_name(),
+                          validate=_node_name)
+        s["url"] = p.ask("Address peers reach it on (blank: work it out each time)",
+                         default=s["url"] or _default_node_url(),
+                         allow_empty=True, validate=_node_url) or ""
+
+        p.say()
+        p.say("A node is recognised by the TLS certificate it serves, which peers pin "
+              "when they join -- so it has to serve HTTPS. One is generated on first "
+              "use if you have none.")
+        s["tls_cert"], s["tls_key"] = self._prompt_tls(p, s)
+
+        p.say()
+        s["allow_enrollment"] = p.yes_no(
+            "Let nodes join this cluster through this node, with a valid join code?",
+            s["allow_enrollment"])
+        return s
+
+    def _prompt_tls(self, p, s):
+        if s["tls_cert"] and os.path.exists(s["tls_cert"]):
+            p.say("  Currently %s" % s["tls_cert"])
+            if not p.yes_no("Replace it?", False):
+                return s["tls_cert"], s["tls_key"]
+        elif s["tls_cert"]:
+            p.say("  ! %s no longer exists." % s["tls_cert"])
+
+        choice = p.choose_one("Certificate", [
+            ("generate", "generate a self-signed one now (needs openssl)"),
+            ("existing", "use a certificate I already have"),
+            ("none", "decide later -- one is generated when this node federates"),
+        ], default="none")
+        if choice == "none":
+            return None, None
+        if choice == "existing":
+            cert = p.ask("Certificate file (PEM)", default=s["tls_cert"],
+                         validate=_readable_file)
+            key = p.ask("Private key file (PEM)", default=s["tls_key"],
+                        validate=_readable_file)
+            try:
+                p.say("  Fingerprint %s"
+                      % cluster.pretty_fingerprint(cluster.certificate_fingerprint(cert)))
+            except cluster.ClusterError as exc:
+                p.say("  ! %s" % exc.message)
+            return cert, key
+
+        host = _host_of(s["url"]) or cluster.guess_local_address() or "localhost"
+        host = p.ask("Address to name in the certificate", default=host)
+        try:
+            made = cluster.generate_certificate(host)
+        except cluster.ClusterError as exc:
+            raise ConfigureError(exc.message, exc.code)
+        p.say("  + wrote %s" % made["cert"])
+        p.say("  Fingerprint %s" % cluster.pretty_fingerprint(made["fingerprint"]))
+        return made["cert"], made["key"]
+
+    def describe(self, s):
+        rows = [("node name", s["name"] or "%s (this host)" % cluster.default_node_name()),
+                ("address", s["url"] or "worked out when federating")]
+        if s["tls_cert"]:
+            try:
+                rows.append(("fingerprint", cluster.pretty_fingerprint(
+                    cluster.certificate_fingerprint(s["tls_cert"]))))
+            except cluster.ClusterError as exc:
+                rows.append(("fingerprint", "! %s" % exc.message))
+            rows.append(("certificate", s["tls_cert"]))
+        else:
+            rows.append(("certificate", "generated when federating"))
+        rows.append(("joining through this node",
+                     "allowed" if s["allow_enrollment"] else "refused"))
+        return rows
+
+    def after_save(self, p, s):
+        p.say()
+        if s["tls_cert"]:
+            p.say("`lemondx serve` uses this certificate unless --tls-cert or --no-tls "
+                  "says otherwise.")
+        p.say("`lemondx cluster invite` starts a cluster here and prints a code; "
+              "`lemondx cluster add <code>` joins one. Neither needs anything else "
+              "set up first.")
+
+
 # -- validators ------------------------------------------------------------
 
 
 def _number(value):
     return ("%g" % value) if isinstance(value, (int, float)) else str(value)
+
+
+def _node_name(answer):
+    if not cluster.NODE_NAME.match(answer):
+        raise ValueError("Use letters, digits and . _ -, up to 64 characters.")
+    return answer
+
+
+def _node_url(answer):
+    try:
+        return cluster.normalize_url(answer)
+    except cluster.NodeError as exc:
+        raise ValueError(exc.message)
+
+
+def _default_node_url():
+    address = cluster.guess_local_address()
+    return "https://%s:8099" % address if address else ""
+
+
+def _host_of(url):
+    try:
+        return cluster.parse_url(url)[1]
+    except cluster.NodeError:
+        return ""
+
+
+def _readable_file(answer):
+    path = os.path.abspath(os.path.expanduser(answer))
+    if not os.path.isfile(path):
+        raise ValueError("No such file: %s" % path)
+    if not os.access(path, os.R_OK):
+        raise ValueError("Cannot read %s." % path)
+    return path
 
 
 def _positive_hours(answer):

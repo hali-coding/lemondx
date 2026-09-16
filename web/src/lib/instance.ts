@@ -1,5 +1,7 @@
 import { keyModules, missingSecrets } from './bootstrap'
-import type { BootstrapModule, InstanceSpec, InstanceTemplate } from './types'
+import type {
+  BootstrapModule, InstanceSpec, InstanceTemplate, ScopedContainer,
+} from './types'
 
 // What a blank CPU or memory field means in the UI. Only the forms apply
 // these: the API and `lemondx create` still treat an omitted limit as none, so
@@ -76,4 +78,14 @@ export function specProblems(
     secretsMissing,
     blocked: !spec.image.trim() || keysMissing || secretsMissing.length > 0,
   }
+}
+
+/**
+ * A row's identity across a cluster. Two nodes can each hold a `web-1` --
+ * nothing stops them, unless a cluster-wide launch named them -- so anything
+ * that remembers an instance has to remember its node too. Without a node (a
+ * view scoped to this host) the name alone is already unique.
+ */
+export function keyOf(container: ScopedContainer) {
+  return container.node ? `${container.node}/${container.name}` : container.name
 }
