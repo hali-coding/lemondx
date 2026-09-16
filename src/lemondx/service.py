@@ -10,6 +10,7 @@ import ipaddress
 import json
 import os
 import re
+import sys
 import threading
 import time
 import urllib.parse
@@ -320,7 +321,7 @@ class ContainerService:
     def __init__(self, client=None, **kwargs):
         self.lxd = client or LXDClient(**kwargs)
         # Template launches, recreates and destroys in progress or last
-        # finished, by template name. See _tracked().
+        # finished, by template name. See track_run().
         self._runs = {}
         self._runs_lock = threading.Lock()
         # Creates in progress, and recently finished, by instance name. See
@@ -1361,6 +1362,64 @@ class ContainerService:
         return {"modules": selection["modules"], "params": values,
                 "ssh_keys": selection["ssh_keys"]}
 
+    def place_template(self, template):
+        """The template as this host can actually run it, plus what had to change.
+
+        A template is written once and launched anywhere -- on this host, or on
+        any node it is synced to -- but a storage pool, a network and a profile
+        are all local names. A node that has never heard of "fast-nvme" would
+        otherwise fail every instance in the launch, which is the worst of both
+        outcomes: nothing runs, and the user finds out one instance at a time.
+
+        So a placement this host cannot honour falls back to its own default --
+        the root pool and NIC of the default profile -- and the substitution is
+        reported: returned as notes for the run record and the UI, and printed,
+        because a launch started from another node's UI is only visible here in
+        the log. The notes say "this node" rather than naming it -- a node has
+        no name of its own at this layer, and the coordinator that collects them
+        knows which node each set came back from.
+        """
+        notes = []
+        placed = dict(template)
+
+        if template["pool"]:
+            pools = {p.get("name") for p in self.lxd.list_storage_pools()}
+            if template["pool"] not in pools:
+                fallback = self._root_pool(template["profiles"] or ["default"])
+                placed["pool"] = ""          # empty: take the profile's root disk
+                notes.append(
+                    "No storage pool '%s' on this node; used %s instead."
+                    % (template["pool"],
+                       "the default profile's pool (%s)" % fallback if fallback
+                       else "the default profile's root disk"))
+
+        if template["network"]:
+            networks = {n.get("name") for n in self.lxd.list_networks() if n.get("managed")}
+            if template["network"] not in networks:
+                _, nic = self._profile_nic(template["profiles"] or ["default"])
+                placed["network"] = ""       # empty: take the profile's NIC
+                notes.append(
+                    "No network '%s' on this node; used %s instead."
+                    % (template["network"],
+                       "the default profile's network (%s)" % _nic_network(nic)
+                       if _nic_network(nic) else "the default profile's NIC"))
+
+        wanted = [p for p in (template["profiles"] or []) if p != "default"]
+        if wanted:
+            known = {p.get("name") for p in self.lxd.list_profiles()}
+            missing = [p for p in wanted if p not in known]
+            if missing:
+                placed["profiles"] = [p for p in (template["profiles"] or [])
+                                      if p not in missing] or ["default"]
+                notes.append(
+                    "No profile %s on this node; used %s instead."
+                    % (", ".join("'%s'" % m for m in missing),
+                       ", ".join(placed["profiles"])))
+
+        for note in notes:
+            _log(note)
+        return placed, notes
+
     def _create_from_template(self, template, bootstrap, instance_name):
         """One instance, reported rather than raised so its siblings carry on."""
         try:
@@ -1412,15 +1471,38 @@ class ContainerService:
         with ThreadPoolExecutor(max_workers=limit) as pool:
             return list(pool.map(work, names))
 
-    def launch_template(self, name, count=1, prefix=None, params=None, background=False):
-        """Create ``count`` instances from a template, several at a time.
+    def prepare_launch(self, name, count=1, prefix=None, params=None, names=None,
+                       place=True):
+        """Everything a launch needs, checked, before anything is created.
 
-        Anything that would fail for every instance -- a missing secret or
-        module, a bad count -- is refused before one is created. After that,
-        each instance reports its own outcome: one failing to create or to
-        bootstrap does not stop the others, and the ones that exist stay.
+        Returns ``(template, bootstrap, names, count, prefix, notes)``, where
+        ``names`` is None unless the caller chose them. The template comes back
+        with its placement already adjusted to this host -- see
+        ``place_template()`` -- and ``notes`` says where that differed from
+        what was asked for.
+
+        ``names`` names the instances explicitly instead of taking the next
+        free ``<prefix>-<n>``. A cluster launch uses it so numbering is unique
+        across every node it spreads over, not just within each one; on its own
+        a node picks its own names, inside the run, so two launches racing
+        cannot pick alike.
+
+        ``place=False`` validates without adjusting placement, for a cluster
+        launch that is only checking a template it will run somewhere else:
+        substituting this host's pool would be noise in the log about a node
+        that is not taking part.
         """
         template = self._template(name)
+        if names is not None:
+            if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                raise ServiceError("'names' must be a list of instance names.")
+            names = list(dict.fromkeys(n.strip() for n in names))
+            for candidate in names:
+                if not VALID_NAME.match(candidate):
+                    raise ServiceError(
+                        "Invalid name '%s'. Use letters, digits and dashes, "
+                        "starting with a letter (max 62 chars)." % candidate)
+            count = len(names)
         try:
             count = int(count)
         except (TypeError, ValueError):
@@ -1435,13 +1517,39 @@ class ContainerService:
                 "Invalid name prefix '%s'. Use letters, digits and dashes, "
                 "starting with a letter (max 50 chars)." % prefix)
         bootstrap = self._launch_bootstrap(template, params)
+        notes = []
+        if place:
+            template, notes = self.place_template(template)
+        return template, bootstrap, names, count, prefix, notes
+
+    def launch_instances(self, template, bootstrap, names):
+        """Create the named instances from an already-prepared template.
+
+        Separate from ``launch_template`` because a cluster-wide launch tracks
+        the run itself, across every node, and must not start a second run on
+        this one; see ``cluster.py``.
+        """
+        return self._each(names, lambda n: self._create_from_template(template, bootstrap, n))
+
+    def launch_template(self, name, count=1, prefix=None, params=None, background=False,
+                        names=None):
+        """Create ``count`` instances from a template, several at a time.
+
+        Anything that would fail for every instance -- a missing secret or
+        module, a bad count -- is refused before one is created. After that,
+        each instance reports its own outcome: one failing to create or to
+        bootstrap does not stop the others, and the ones that exist stay.
+        """
+        template, bootstrap, chosen, count, prefix, notes = self.prepare_launch(
+            name, count=count, prefix=prefix, params=params, names=names)
 
         def work():
-            # Names are picked inside the run, so two launches cannot pick alike.
-            return self._each(
-                self._free_names(prefix, count),
-                lambda n: self._create_from_template(template, bootstrap, n))
-        return self._tracked(template["name"], "launch", count, work, background)
+            # Names the caller did not choose are picked inside the run, so two
+            # launches racing here cannot pick alike.
+            return self.launch_instances(
+                template, bootstrap, chosen or self._free_names(prefix, count))
+        return self.track_run(template["name"], "launch", count, work, background,
+                              notes=notes)
 
     def template_instances(self, name):
         """Names of the instances launched from template ``name``, sorted."""
@@ -1467,6 +1575,17 @@ class ContainerService:
             raise ServiceError("No instances were launched from template '%s'." % name, 404)
         return current
 
+    # The three below come in pairs, like launch: an ``*_instances`` method that
+    # does the work and returns per-instance results, and a wrapper that records
+    # it as this template's one run. A cluster-wide run tracks itself, across
+    # every node, and calls the untracked half here -- tracking twice under the
+    # same template name would deadlock it against itself.
+
+    def destroy_instances(self, name, instances):
+        """Stop and delete a template's instances. No run tracking."""
+        names = self._confirmed_instances(name, instances)
+        return self._each(names, self._remove_instance)
+
     def destroy_template_instances(self, name, instances, background=False):
         """Stop and delete every instance launched from a template.
 
@@ -1474,8 +1593,24 @@ class ContainerService:
         the instances is all it needs.
         """
         names = self._confirmed_instances(name, instances)
-        return self._tracked(name, "destroy", len(names),
-                             lambda: self._each(names, self._remove_instance), background)
+        return self.track_run(name, "destroy", len(names),
+                              lambda: self.destroy_instances(name, names), background)
+
+    def recreate_instances(self, name, instances, params=None):
+        """Replace a template's instances with fresh ones. ``(results, notes)``."""
+        template = self._template(name)
+        names = self._confirmed_instances(name, instances)
+        bootstrap = self._launch_bootstrap(template, params)
+        template, notes = self.place_template(template)
+
+        def replace(instance_name):
+            removed = self._remove_instance(instance_name)
+            if not removed["ok"]:
+                return dict(removed, error="Not recreated: could not delete it: %s"
+                            % removed["error"])
+            return self._create_from_template(template, bootstrap, instance_name)
+
+        return self._each(names, replace), notes
 
     def recreate_template_instances(self, name, instances, params=None, background=False):
         """Replace each of a template's instances with a fresh one of the same name.
@@ -1486,19 +1621,13 @@ class ContainerService:
         after that, an instance that fails to delete is left alone rather than
         recreated alongside itself.
         """
-        template = self._template(name)
+        # Validated before the run is recorded, so a bad request is refused
+        # rather than filed as a run that failed.
         names = self._confirmed_instances(name, instances)
-        bootstrap = self._launch_bootstrap(template, params)
-
-        def replace(instance_name):
-            removed = self._remove_instance(instance_name)
-            if not removed["ok"]:
-                return dict(removed, error="Not recreated: could not delete it: %s"
-                            % removed["error"])
-            return self._create_from_template(template, bootstrap, instance_name)
-
-        return self._tracked(name, "recreate", len(names),
-                             lambda: self._each(names, replace), background)
+        self._launch_bootstrap(self._template(name), params)
+        return self.track_run(name, "recreate", len(names),
+                              lambda: self.recreate_instances(name, names, params),
+                              background)
 
     # A command is mostly waiting on the guest, not on the host, so it can
     # fan out wider than a create.
@@ -1530,6 +1659,14 @@ class ContainerService:
             raise ServiceError("Timeout must be between 1 and %d seconds."
                                % self.MAX_EXEC_TIMEOUT)
         names = self._members_among(name, instances)
+        return self.track_run(
+            name, "exec", len(names),
+            lambda: self.exec_instances(name, command, names, timeout),
+            background, command=command)
+
+    def exec_instances(self, name, command, instances, timeout=300):
+        """Run one command on a template's instances. No run tracking."""
+        names = self._members_among(name, instances)
         limit = self.EXEC_OUTPUT_LIMIT
 
         def tail(text):
@@ -1550,10 +1687,7 @@ class ContainerService:
                     "exec": {"exit_code": exit_code, "stdout": stdout, "stderr": stderr,
                              "truncated": cut_out or cut_err}}
 
-        return self._tracked(
-            name, "exec", len(names),
-            lambda: self._each(names, run_one, workers=self.EXEC_WORKERS),
-            background, command=command)
+        return self._each(names, run_one, workers=self.EXEC_WORKERS)
 
     def _members_among(self, name, instances):
         """The named instances, provided every one still belongs to the template."""
@@ -1568,7 +1702,8 @@ class ContainerService:
                 % (", ".join(strangers), "is" if len(strangers) == 1 else "are", name), 409)
         return sorted(set(instances))
 
-    def _tracked(self, name, action, count, work, background=False, command=None):
+    def track_run(self, name, action, count, work, background=False, command=None,
+                  notes=(), nodes=()):
         """Run ``work`` as the one operation on a template's instances.
 
         The run is recorded so any client can follow it and find its result.
@@ -1578,6 +1713,13 @@ class ContainerService:
         which is what the CLI wants. Only one runs per template, since a second
         recreate or destroy would be deleting instances the first is in the
         middle of bootstrapping.
+
+        ``notes`` are things the user should know that did not stop the run --
+        a template asking for a storage pool this host does not have, say.
+        ``cluster.py`` calls this for a launch spread over several nodes, which
+        is why it is not private: the run belongs to the template either way,
+        and one lock must cover both kinds or a cluster launch and a local one
+        could work on the same instances.
         """
         with self._runs_lock:
             current = self._runs.get(name)
@@ -1588,15 +1730,27 @@ class ContainerService:
                         name, current["action"], current["count"]), 409)
             run = {"template": name, "action": action, "count": count,
                    "command": command, "started_at": time.time(), "finished_at": None,
-                   "result": None, "error": None}
+                   "result": None, "error": None, "notes": list(notes),
+                   "nodes": list(nodes)}
             self._runs[name] = run
 
         def execute():
             result = error = None
             try:
                 instances = work()
+                # A run whose work returns notes of its own -- a cluster launch
+                # collecting each node's -- adds them to the ones found up front.
+                if isinstance(instances, tuple):
+                    instances, extra = instances
+                    with self._runs_lock:
+                        run["notes"] = list(run["notes"]) + list(extra)
+                with self._runs_lock:
+                    notes = list(run["notes"])
+                # Carried on the result as well as the run record, so a caller
+                # that waited for the run is told what was substituted without
+                # having to go and read the record it never needed.
                 result = {"template": name, "ok": all(i["ok"] for i in instances),
-                          "instances": instances}
+                          "instances": instances, "notes": notes}
                 return result
             except (ServiceError, LXDError, BootstrapError) as exc:
                 error = str(exc)
@@ -2566,6 +2720,15 @@ def _safe_storage_config(config):
 
 def _is_true(value):
     return str(value).lower() in ("true", "yes", "1", "on")
+
+
+def _log(message):
+    """Say something worth keeping. Under systemd this is the journal.
+
+    stderr rather than stdout: a launch runs from the CLI as well as the
+    server, and there stdout may be a --json payload a script is reading.
+    """
+    print("[lemondx] %s" % message, file=sys.stderr, flush=True)
 
 
 # A failed module keeps this much of its output in a run record, for the UI.

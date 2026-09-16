@@ -1,28 +1,43 @@
 import { useState } from 'react'
-import type { Container, CreateProgress, HealthRecord, StateAction } from '../lib/types'
+import type {
+  CreateProgress, HealthRecord, InstanceRef, ScopedContainer, StateAction,
+} from '../lib/types'
 import { useCanWrite } from '../hooks/useAuth'
 import { bytes } from '../lib/format'
+import { keyOf } from '../lib/instance'
 import { ConfirmDialog } from './ConfirmDialog'
 import { CopyButton } from './CopyButton'
 import { HealthDot } from './HealthDot'
 import { StatusBadge } from './StatusBadge'
-import { PlayIcon, PlusIcon, RestartIcon, StopIcon, TrashIcon } from './Icons'
+import { ExternalIcon, PlayIcon, PlusIcon, RestartIcon, StopIcon, TrashIcon } from './Icons'
 
 interface Props {
-  containers: Container[]
+  containers: ScopedContainer[]
   /** Creates the server is running or recently finished, including other tabs'. */
   creates: CreateProgress[]
-  /** Latest health check per instance name; absent when never checked. */
+  /** Latest health check per instance name; this node's only. */
   health: Record<string, HealthRecord>
+  /** The selected row's key, from `keyOf`. */
   selected: string | null
+  /** Busy rows, keyed by `keyOf`. */
   busy: Record<string, boolean>
-  onSelect: (name: string) => void
-  onAction: (name: string, action: StateAction) => void
+  onSelect: (container: ScopedContainer) => void
+  onAction: (container: ScopedContainer, action: StateAction) => void
   /** Runs one action over several; resolves false if the request never landed. */
-  onBulkAction: (names: string[], action: StateAction) => Promise<boolean>
-  onDelete: (name: string) => void
+  onBulkAction: (instances: InstanceRef[], action: StateAction) => Promise<boolean>
+  onDelete: (container: ScopedContainer) => void
   onCreate: () => void
   canCreate: boolean
+  /** Which node this lemondx is; rows on any other are read-only here. */
+  localNode: string
+  /** Node name -> its own UI address, for opening a remote instance where it lives. */
+  nodeUrls: Record<string, string>
+  /** Whether the view spans more than this node, so rows say where they are. */
+  showNodes: boolean
+}
+
+function refOf(container: ScopedContainer, localNode: string): InstanceRef {
+  return { node: container.node ?? localNode, name: container.name }
 }
 
 const STAGE_LABEL: Record<CreateProgress['stage'], string> = {
@@ -40,6 +55,11 @@ function stageText(progress: CreateProgress) {
 
 const BULK_LABEL: Record<'start' | 'stop', string> = { start: 'Start', stop: 'Stop' }
 
+/** How an instance is named in a confirmation: with its node, once that matters. */
+function describe(instance: InstanceRef) {
+  return `${instance.name} on ${instance.node}`
+}
+
 /** Name the containers an action is about, without an unbounded wall of text. */
 function nameList(names: string[], limit = 8) {
   return names.length <= limit
@@ -49,7 +69,7 @@ function nameList(names: string[], limit = 8) {
 
 export function ContainerTable({
   containers, creates, health, selected, busy, onSelect, onAction, onBulkAction, onDelete,
-  onCreate, canCreate,
+  onCreate, canCreate, localNode, nodeUrls, showNodes,
 }: Props) {
   const canWrite = useCanWrite()
   // Ticked names, not containers: the list is replaced by every poll, and a
@@ -60,19 +80,23 @@ export function ContainerTable({
   // dialog is up would empty them the moment the request marks those rows busy,
   // and what the user confirmed is exactly what should be acted on.
   const [confirming, setConfirming] =
-    useState<{ action: 'start' | 'stop'; names: string[] } | null>(null)
+    useState<{ action: 'start' | 'stop'; instances: InstanceRef[] } | null>(null)
   const [applying, setApplying] = useState(false)
   const inProgress = new Map(
     creates.filter((c) => c.finished_at === null).map((c) => [c.name, c]))
   // The daemon lists an instance only once its image is unpacked, so a create
   // still downloading gets a row of its own until then.
-  const known = new Set(containers.map((c) => c.name))
+  // Creates are this node's own, so a placeholder only belongs on a view that
+  // includes it; another node's creates show once its daemon lists them.
+  const local = (c: ScopedContainer) => (c.node ?? localNode) === localNode
+  const known = new Set(containers.filter(local).map((c) => c.name))
   const placeholders = [...inProgress.values()].filter((c) => !known.has(c.name))
 
   // Acting on a container mid-create would pull the rug out from under its
   // bootstrap, so those cannot be ticked -- same rule as the row's own buttons.
-  const selectable = containers.filter((c) => !busy[c.name] && !inProgress.has(c.name))
-  const chosen = selectable.filter((c) => ticked.has(c.name)).map((c) => c.name)
+  const selectable = containers.filter(
+    (c) => !busy[keyOf(c)] && !(local(c) && inProgress.has(c.name)))
+  const chosen = selectable.filter((c) => ticked.has(keyOf(c)))
   const allTicked = selectable.length > 0 && chosen.length === selectable.length
 
   const tick = (name: string, on: boolean) => {
@@ -87,7 +111,7 @@ export function ContainerTable({
   const applyBulk = async () => {
     if (!confirming) return
     setApplying(true)
-    const landed = await onBulkAction(confirming.names, confirming.action)
+    const landed = await onBulkAction(confirming.instances, confirming.action)
     setApplying(false)
     setConfirming(null)
     // Per-container failures are reported by the caller; the request either
@@ -121,14 +145,18 @@ export function ContainerTable({
           <span className="bulk-count">
             {chosen.length} selected
           </span>
-          <span className="faint truncate bulk-names">{nameList(chosen, 4)}</span>
+          <span className="faint truncate bulk-names">
+            {nameList(chosen.map((c) => c.name), 4)}
+          </span>
           <div className="bulk-actions">
             <button className="btn btn-sm" disabled={!canWrite || applying}
-              onClick={() => setConfirming({ action: 'start', names: chosen })}>
+              onClick={() => setConfirming({
+                action: 'start', instances: chosen.map((c) => refOf(c, localNode)) })}>
               <PlayIcon /> Start
             </button>
             <button className="btn btn-sm" disabled={!canWrite || applying}
-              onClick={() => setConfirming({ action: 'stop', names: chosen })}>
+              onClick={() => setConfirming({
+                action: 'stop', instances: chosen.map((c) => refOf(c, localNode)) })}>
               <StopIcon /> Stop
             </button>
             <button className="btn btn-sm btn-ghost" disabled={applying}
@@ -152,10 +180,11 @@ export function ContainerTable({
                 disabled={selectable.length === 0 || !canWrite}
                 aria-label={allTicked ? 'Clear selection' : 'Select all containers'}
                 onChange={(event) => setTicked(
-                  event.target.checked ? new Set(selectable.map((c) => c.name)) : new Set())}
+                  event.target.checked ? new Set(selectable.map(keyOf)) : new Set())}
               />
             </th>
             <th>Name</th>
+            {showNodes && <th>Node</th>}
             <th>State</th>
             <th className="optional">Image</th>
             <th className="optional">IPv4</th>
@@ -176,6 +205,7 @@ export function ContainerTable({
                   <div className="cdesc truncate">from {progress.template}</div>
                 )}
               </td>
+              {showNodes && <td className="dim">{localNode}</td>}
               <td>
                 <span className="badge badge-warn">
                   <span className="spinner" />{stageText(progress)}
@@ -190,33 +220,35 @@ export function ContainerTable({
             </tr>
           ))}
           {containers.map((container) => {
-            const progress = inProgress.get(container.name)
+            const here = local(container)
+            const rowKey = keyOf(container)
+            const progress = here ? inProgress.get(container.name) : undefined
             // Starting or stopping it mid-create would pull the rug out from
             // under the bootstrap; deleting stays possible, to abandon one.
-            const isBusy = busy[container.name] || !!progress
+            const isBusy = busy[rowKey] || !!progress
             const running = container.status === 'Running'
             const frozen = container.status === 'Frozen'
             return (
               <tr
-                key={container.name}
-                aria-selected={selected === container.name}
-                onClick={() => onSelect(container.name)}
+                key={rowKey}
+                aria-selected={selected === rowKey}
+                onClick={() => onSelect(container)}
                 tabIndex={0}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' || event.key === ' ') {
                     event.preventDefault()
-                    onSelect(container.name)
+                    onSelect(container)
                   }
                 }}
               >
                 <td className="tick" onClick={(event) => event.stopPropagation()}>
                   <input
                     type="checkbox"
-                    checked={ticked.has(container.name)}
-disabled={isBusy || !canWrite}
+                    checked={ticked.has(rowKey)}
+                    disabled={isBusy || !canWrite}
                     aria-label={`Select ${container.name}`}
                     onKeyDown={(event) => event.stopPropagation()}
-                    onChange={(event) => tick(container.name, event.target.checked)}
+                    onChange={(event) => tick(rowKey, event.target.checked)}
                   />
                 </td>
                 <td>
@@ -228,15 +260,26 @@ disabled={isBusy || !canWrite}
                   {container.description && (
                     <div className="cdesc truncate">{container.description}</div>
                   )}
+                  {container.template && (
+                    <div className="cdesc truncate">from {container.template}</div>
+                  )}
                 </td>
+                {showNodes && (
+                  <td className="dim">
+                    {container.node ?? localNode}
+                    {here && <span className="badge badge-dim">here</span>}
+                  </td>
+                )}
                 <td>
                   {progress
                     ? <span className="badge badge-warn"><span className="spinner" />{stageText(progress)}</span>
-                    : busy[container.name]
+                    : busy[rowKey]
                       ? <span className="badge badge-warn"><span className="spinner" />working</span>
                       : <>
                         <StatusBadge status={container.status} />
-                        {container.status === 'Running' && health[container.name] && (
+                        {/* Health is this node's own monitor; another node
+                            judges its instances on its own schedule. */}
+                        {here && container.status === 'Running' && health[container.name] && (
                           <HealthDot record={health[container.name]} />
                         )}
                       </>}
@@ -263,7 +306,7 @@ disabled={isBusy || !canWrite}
                           title="Restart"
                           aria-label={`Restart ${container.name}`}
                           disabled={isBusy || !canWrite}
-                          onClick={() => onAction(container.name, 'restart')}
+                          onClick={() => onAction(container, 'restart')}
                         >
                           <RestartIcon />
                         </button>
@@ -272,7 +315,7 @@ disabled={isBusy || !canWrite}
                           title="Stop"
                           aria-label={`Stop ${container.name}`}
                           disabled={isBusy || !canWrite}
-                          onClick={() => onAction(container.name, 'stop')}
+                          onClick={() => onAction(container, 'stop')}
                         >
                           <StopIcon />
                         </button>
@@ -283,7 +326,7 @@ disabled={isBusy || !canWrite}
                         title="Start"
                         aria-label={`Start ${container.name}`}
                         disabled={isBusy || !canWrite}
-                        onClick={() => onAction(container.name, 'start')}
+                        onClick={() => onAction(container, 'start')}
                       >
                         <PlayIcon />
                       </button>
@@ -292,11 +335,26 @@ disabled={isBusy || !canWrite}
                       className="btn btn-sm btn-icon btn-danger"
                       title="Delete"
                       aria-label={`Delete ${container.name}`}
-                      disabled={busy[container.name] || !canWrite}
-                      onClick={() => onDelete(container.name)}
+                      disabled={busy[rowKey] || !canWrite}
+                      onClick={() => onDelete(container)}
                     >
                       <TrashIcon />
                     </button>
+                    {/* Managing it here is the normal path; this is for when
+                        you want that node's own UI -- its storage, its logs. */}
+                    {!here && nodeUrls[container.node ?? ''] && (
+                      <a
+                        className="btn btn-sm btn-icon"
+                        href={`${nodeUrls[container.node ?? '']}/`}
+                        target="_blank"
+                        rel="noreferrer"
+                        title={`Open ${container.node}'s own UI`}
+                        aria-label={`Open ${container.node}'s own UI`}
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <ExternalIcon />
+                      </a>
+                    )}
                   </div>
                 </td>
               </tr>
@@ -307,13 +365,13 @@ disabled={isBusy || !canWrite}
 
       {confirming && (
         <ConfirmDialog
-          title={`${BULK_LABEL[confirming.action]} ${confirming.names.length} `
-            + `container${confirming.names.length === 1 ? '' : 's'}?`}
+          title={`${BULK_LABEL[confirming.action]} ${confirming.instances.length} `
+            + `container${confirming.instances.length === 1 ? '' : 's'}?`}
           message={confirming.action === 'stop'
-            ? `${nameList(confirming.names)} will be shut down. Anything running inside `
-              + 'them stops, and unsaved work in them is lost.'
-            : `${nameList(confirming.names)} will be started. One that is already running `
-              + 'is reported as such and left alone.'}
+            ? `${nameList(confirming.instances.map(describe))} will be shut down. Anything `
+              + 'running inside them stops, and unsaved work in them is lost.'
+            : `${nameList(confirming.instances.map(describe))} will be started. One that is `
+              + 'already running is reported as such and left alone.'}
           confirmLabel={BULK_LABEL[confirming.action]}
           danger={confirming.action === 'stop'}
           busy={applying}

@@ -10,14 +10,16 @@ import { SshKeyPicker } from './SshKeyPicker'
 
 interface Props {
   name: string
+  /** The node it is on, when that is not this one. */
+  node?: string
   running: boolean
   onFinished: () => void
 }
 
 /** Run bootstrap modules against a container that already exists. */
-export function BootstrapPanel({ name, running, onFinished }: Props) {
+export function BootstrapPanel({ name, node, running, onFinished }: Props) {
   const canWrite = useCanWrite()
-  const { modules, hostKeys, loading } = useBootstrapData()
+  const { modules, hostKeys, loading } = useBootstrapData(node)
   const [selection, setSelection] = useState<BootstrapSelection>(
     { modules: [], params: {}, ssh_keys: [] })
   const [busy, setBusy] = useState(false)
@@ -34,7 +36,7 @@ export function BootstrapPanel({ name, running, onFinished }: Props) {
     setError(null)
     setResult(null)
     try {
-      setResult(await api.bootstrap(name, selection))
+      setResult(await api.bootstrap(name, selection, node))
       onFinished()
     } catch (cause) {
       setError((cause as Error).message)

@@ -11,12 +11,14 @@ import shutil
 import sys
 import time
 
-from . import auth, configure, pam
+from . import auth, cluster as cluster_mod, configure, pam
 from . import health as health_checks
 from .auth import (METHODS, ROLES, AuthConfig, AuthError, AuthService, local_principal,
                    parse_duration_days)
+from .cluster import ClusterError, ClusterService
 from .configure import SECTIONS, ConfigureError, Prompter
 from .lxd import LXDError
+from .nodeclient import NodeError
 from .service import ContainerService, LOCAL_STORAGE_DRIVERS, ServiceError
 from .server import DEFAULT_HOST, DEFAULT_PORT, serve
 
@@ -131,6 +133,14 @@ def cmd_serve(args, _service):
         "proxy_admin_group": args.proxy_admin_group,
         "proxy_read_group": args.proxy_read_group,
     }
+    # The cluster section names the certificate that identifies this node to its
+    # peers, so `serve` uses it unless told otherwise -- a node whose peers pin
+    # one certificate and which serves another is federated with nobody.
+    tls_cert, tls_key = args.tls_cert, args.tls_key
+    cluster_settings = None if args.ignore_config else cluster_mod.load_settings()
+    if not tls_cert and not args.no_tls and cluster_settings and cluster_settings["tls_cert"]:
+        tls_cert, tls_key = cluster_settings["tls_cert"], cluster_settings["tls_key"]
+
     token = args.token
     if token is None and not args.token_file:
         # From the environment rather than argv, where every local user can
@@ -144,9 +154,9 @@ def cmd_serve(args, _service):
         health_settings = dict(health_settings, enabled=False)
     serve(host=args.host, port=args.port, dev=args.dev, quiet=args.quiet,
           open_browser=args.open, auth_config=config,
-          tls_cert=args.tls_cert, tls_key=args.tls_key,
+          tls_cert=tls_cert, tls_key=tls_key,
           auth_source=auth.settings_path() if settings is not None else None,
-          health_settings=health_settings)
+          health_settings=health_settings, cluster_settings=cluster_settings)
     return 0
 
 
@@ -686,6 +696,24 @@ def render_bootstrap(result):
     return "\n".join(lines)
 
 
+def sync_note(record):
+    """A line about what the rest of the cluster made of a save or a delete.
+
+    Nothing at all on a lemondx that is not federated, which is most of them.
+    """
+    outcome = (record or {}).get("synced") if isinstance(record, dict) else None
+    if not outcome:
+        return ""
+    failed = [r for r in outcome["results"] if not r["ok"]]
+    verb = "removed from" if outcome["deleted"] else "synced to"
+    if not failed:
+        return "\n  %s %s %d node(s): %s" % (
+            GREEN("+"), verb, len(outcome["nodes"]), ", ".join(outcome["nodes"]))
+    return "\n  %s not %s %s -- run `lemondx cluster sync` when they are back" % (
+        YELLOW("!"), verb,
+        "; ".join("%s (%s)" % (r["node"], r["error"] or "failed") for r in failed))
+
+
 def cmd_module_add(args, service):
     path = os.path.expanduser(args.path)
     try:
@@ -693,21 +721,23 @@ def cmd_module_add(args, service):
             content = handle.read()
     except OSError as exc:
         raise ServiceError("Cannot read '%s': %s" % (args.path, exc))
-    module = service.upload_module(args.name or os.path.basename(path), content,
-                                   overwrite=args.force)
+    module = cluster_service(service).upload_module(
+        args.name or os.path.basename(path), content, overwrite=args.force)
     if args.default:
         service.update_module_settings(module["id"], is_default=True)
-    emit(args, module, lambda m: "%s installed module %s%s" % (
+    emit(args, module, lambda m: "%s installed module %s%s%s" % (
         GREEN("+"), BOLD(m["id"]),
-        " (default for new containers)" if args.default else ""))
+        " (default for new containers)" if args.default else "", sync_note(m)))
     return 0
 
 
 def cmd_module_remove(args, service):
-    result = service.remove_module(args.id)
-    emit(args, result, lambda r: "%s removed module %s%s" % (
+    result = cluster_service(service).remove_module(
+        args.id, everywhere=not args.local_only)
+    emit(args, result, lambda r: "%s removed module %s%s%s" % (
         GREEN("+"), BOLD(r["deleted"]),
-        " -- the built-in module is back" if r["restored_builtin"] else ""))
+        " -- the built-in module is back" if r["restored_builtin"] else "",
+        sync_note(r)))
     return 0
 
 
@@ -738,17 +768,20 @@ def cmd_profiles(args, service):
 
 def cmd_profile_save(args, service):
     modules, params, ssh_keys = resolve_selection(args, service)
-    profile = service.save_bootstrap_profile(
-        args.name, modules, params, args.description or "", ssh_keys)
-    emit(args, profile, lambda p: "%s saved profile %s (%s%s)" % (
+    profile = cluster_service(service).save_bootstrap_profile(
+        name=args.name, modules=modules, params=params,
+        description=args.description or "", ssh_keys=ssh_keys)
+    emit(args, profile, lambda p: "%s saved profile %s (%s%s)%s" % (
         GREEN("+"), BOLD(p["name"]), " → ".join(p["modules"]),
-        ", %d key(s)" % len(p["ssh_keys"]) if p["ssh_keys"] else ""))
+        ", %d key(s)" % len(p["ssh_keys"]) if p["ssh_keys"] else "", sync_note(p)))
     return 0
 
 
 def cmd_profile_delete(args, service):
-    result = service.delete_bootstrap_profile(args.name)
-    emit(args, result, lambda r: "%s deleted profile %s" % (GREEN("+"), r["deleted"]))
+    result = cluster_service(service).delete_bootstrap_profile(
+        args.name, everywhere=not args.local_only)
+    emit(args, result, lambda r: "%s deleted profile %s%s" % (
+        GREEN("+"), r["deleted"], sync_note(r)))
     return 0
 
 
@@ -805,8 +838,8 @@ def cmd_templates(args, service):
 
 def cmd_template_save(args, service):
     modules, params, ssh_keys = resolve_selection(args, service)
-    template = service.save_template(
-        args.name, args.image or service.default_image(),
+    template = cluster_service(service).save_template(
+        name=args.name, image=args.image or service.default_image(),
         instance_type="virtual-machine" if args.vm else "container",
         cpu=args.cpu, memory=args.memory, disk=args.disk, pool=args.pool,
         network=args.network, profiles=args.profile, ephemeral=args.ephemeral,
@@ -814,31 +847,40 @@ def cmd_template_save(args, service):
         bootstrap={"modules": modules, "params": params, "ssh_keys": ssh_keys},
         description=args.description or "", name_prefix=args.prefix,
     )
-    emit(args, template, lambda t: "%s saved template %s: %s%s" % (
+    emit(args, template, lambda t: "%s saved template %s: %s%s%s" % (
         GREEN("+"), BOLD(t["name"]), describe_template(t),
         (" · " + " → ".join(t["bootstrap"]["modules"]))
-        if t["bootstrap"]["modules"] else ""))
+        if t["bootstrap"]["modules"] else "", sync_note(t)))
     return 0
 
 
 def cmd_template_delete(args, service):
-    result = service.delete_template(args.name)
-    emit(args, result, lambda r: "%s deleted template %s" % (GREEN("+"), r["deleted"]))
+    result = cluster_service(service).delete_template(
+        args.name, everywhere=not args.local_only)
+    emit(args, result, lambda r: "%s deleted template %s%s" % (
+        GREEN("+"), r["deleted"], sync_note(r)))
     return 0
 
 
 def render_template_run(result):
     """Per-instance outcome of a launch, recreate or destroy."""
     lines = []
+    if "instances" not in result:
+        # A run record rather than a result: what a background launch returns.
+        result = result.get("result") or {"instances": [], "notes": result.get("notes")}
+    for note in result.get("notes") or []:
+        lines.append(YELLOW("! %s" % note))
     for instance in result["instances"]:
         container = instance["container"]
+        where = CYAN(" on %s" % instance["node"]) if instance.get("node") else ""
         if instance["error"]:
-            lines.append("%s %s: %s" % (RED("!"), BOLD(instance["name"]), instance["error"]))
+            lines.append("%s %s%s: %s" % (RED("!"), BOLD(instance["name"]), where,
+                                          instance["error"]))
         elif container is None:
-            lines.append("%s deleted %s" % (GREEN("+"), BOLD(instance["name"])))
+            lines.append("%s deleted %s%s" % (GREEN("+"), BOLD(instance["name"]), where))
         else:
-            lines.append("%s %s is %s%s" % (
-                GREEN("+") if instance["ok"] else RED("!"), BOLD(instance["name"]),
+            lines.append("%s %s%s is %s%s" % (
+                GREEN("+") if instance["ok"] else RED("!"), BOLD(instance["name"]), where,
                 container["status"].lower(),
                 (" at " + ", ".join(container["ipv4"])) if container["ipv4"] else ""))
             if container.get("bootstrap") and not container["bootstrap"]["ok"]:
@@ -933,11 +975,18 @@ def cmd_launch(args, service):
     template = find_template(service, args.template)
     params = parse_params(args.param)
     fill_secrets(template["bootstrap"]["modules"], params, service)
+    cluster = cluster_service(service)
+    targets = cluster.resolve_targets(args.node, args.group)
     if not args.json:
-        print(DIM("Launching %d instance(s) from %s (this pulls the image on first "
-                  "use)..." % (args.count, template["name"])), flush=True)
-    result = service.launch_template(template["name"], count=args.count,
-                                     prefix=args.prefix, params=params)
+        # Where only matters once there is more than one: on a host that has
+        # never been federated, naming it would be noise about a feature the
+        # user is not using.
+        where = "" if targets == [cluster.local_name()] else " on %s" % ", ".join(targets)
+        print(DIM("Launching %d instance(s) from %s%s (this pulls the image on "
+                  "first use)..." % (args.count, template["name"], where)), flush=True)
+    result = cluster.launch_template(template["name"], count=args.count,
+                                     prefix=args.prefix, params=params,
+                                     nodes=args.node, groups=args.group)
     emit(args, result, render_template_run)
     return 0 if result["ok"] else 1
 
@@ -1362,6 +1411,351 @@ def cmd_network_delete(args, service):
     return 0
 
 
+# -- cluster ---------------------------------------------------------------
+
+
+def cluster_service(service):
+    """A ClusterService configured the way `serve` on this host would be.
+
+    The same auth settings matter here: issuing a join code hands a peer an API
+    token, and whether a token means anything is exactly what those settings
+    decide.
+    """
+    return ClusterService(service, AuthService(auth.build_config(auth.load_settings())))
+
+
+def _node_state(node):
+    state = node.get("state") or {}
+    if not state:
+        return DIM("-")
+    if not state["reachable"]:
+        return RED("unreachable")
+    if not state["ready"]:
+        return YELLOW("not set up")
+    return GREEN("ok")
+
+
+def _render_nodes(nodes):
+    return table([[
+        BOLD(n["name"]) + (DIM(" (this node)") if n["self"] else ""),
+        n["url"] or DIM("-"),
+        _node_state(n),
+        "%s %s" % ((n["state"] or {}).get("product") or "-",
+                   (n["state"] or {}).get("server_version") or ""),
+        str((n["state"] or {}).get("containers", "-")),
+        ", ".join(n["groups"]) or DIM("-"),
+        (n["state"] or {}).get("error") or "",
+    ] for n in nodes], ["node", "url", "state", "daemon", "instances", "groups", "note"])
+
+
+def cmd_cluster_refresh(args, service):
+    result = cluster_service(service).sync_members()
+
+    def render(r):
+        lines = ["%s %s %s" % (GREEN("+") if row["ok"] else RED("!"), BOLD(row["node"]),
+                               "" if row["ok"] else row["error"] or "unreachable")
+                 for row in r["results"]]
+        lines.append(DIM("%d member(s) known here" % len(r["members"])))
+        return "\n".join(lines)
+
+    emit(args, result, render)
+    return 0 if result["ok"] else 1
+
+
+def cmd_cluster_leave(args, service):
+    cluster = cluster_service(service)
+    if not confirm("Leave the cluster? This node keeps its instances and templates.",
+                   args.yes):
+        print(DIM("still a member"))
+        return 1
+    result = cluster.leave()
+
+    def render(r):
+        lines = ["%s left the cluster (forgot %s)"
+                 % (GREEN("+"), ", ".join(r["left"]) or "nobody")]
+        if r["note"]:
+            lines.append(YELLOW("! %s" % r["note"]))
+        return "\n".join(lines)
+
+    emit(args, result, render)
+    return 0
+
+
+def cmd_cluster_rotate(args, service):
+    result = cluster_service(service).rotate_secret()
+
+    def render(r):
+        lines = ["%s %s %s" % (GREEN("+") if row["ok"] else RED("!"), BOLD(row["node"]),
+                               "took the new credential" if row["ok"]
+                               else row["error"] or "unreachable")
+                 for row in r["results"]]
+        if r["stranded"]:
+            lines.append(YELLOW(
+                "! %s did not get it and is now cut off; it has to rejoin."
+                % ", ".join(r["stranded"])))
+        else:
+            lines.append("%s every member holds the new credential" % GREEN("+"))
+        return "\n".join(lines)
+
+    emit(args, result, render)
+    return 0 if result["ok"] else 1
+
+
+def cmd_cluster_nodes(args, service):
+    nodes = cluster_service(service).list_nodes(probe=not args.no_probe)
+    emit(args, nodes, _render_nodes)
+    return 0
+
+
+def cmd_cluster_status(args, service):
+    cluster = cluster_service(service)
+    info = cluster.info()
+    payload = dict(info, nodes=cluster.list_nodes(probe=not args.no_probe))
+
+    def render(p):
+        node = p["node"]
+        rows = [("name", BOLD(node["name"])),
+                ("address", node["url"] or DIM("none -- no route off this host")),
+                ("fingerprint", p["fingerprint_pretty"] or DIM("no certificate yet")),
+                ("cluster", GREEN("member of %d node(s)" % len(p["nodes"]))
+                 if p["in_cluster"] else DIM("not in a cluster")),
+                ("new members", "accepted" if p["allow_enrollment"] else "refused")]
+        if p["remote_requires_token"]:
+            rows.append(("authentication", "off for this host, API token required "
+                                           "from others"))
+        else:
+            rows.append(("authentication", GREEN("on") if p["auth_enabled"] else RED("off")))
+        out = [BOLD("This node"), _describe_rows(rows)]
+        if p["reachable_because"]:
+            out.append(YELLOW("! %s" % p["reachable_because"]))
+        if not p["in_cluster"]:
+            out.append(DIM("  `lemondx cluster invite` starts a cluster here; "
+                           "`lemondx cluster join <code>` joins one."))
+        out += ["", BOLD("Nodes"), _render_nodes(p["nodes"])]
+        return "\n".join(out)
+
+    emit(args, payload, render)
+    return 0
+
+
+def cmd_cluster_show(args, service):
+    node = cluster_service(service).describe_node(args.name)
+
+    def render(n):
+        state = n["state"] or {}
+        rows = [("address", n["url"] or DIM("-")),
+                ("fingerprint", cluster_mod.pretty_fingerprint(n["fingerprint"])
+                 or DIM("none")),
+                ("state", _node_state(n)),
+                ("groups", ", ".join(n["groups"]) or DIM("-"))]
+        if state.get("error"):
+            rows.append(("error", RED(state["error"])))
+        out = [BOLD(n["name"]), _describe_rows(rows), "", BOLD("Instances")]
+        out.append(table([[c["name"], STATUS_COLORS.get(c["status"], str)(c["status"]),
+                           ", ".join(c.get("ipv4") or []) or DIM("-"),
+                           c.get("template") or DIM("-")]
+                          for c in n["instances"]],
+                         ["name", "status", "ipv4", "template"]))
+        return "\n".join(out)
+
+    emit(args, node, render)
+    return 0
+
+
+def cmd_cluster_invite(args, service):
+    minutes = args.expires
+    result = cluster_service(service).create_invite(expires_minutes=minutes, note=args.note or "")
+
+    def render(r):
+        lines = [
+            "%s join code for the cluster around %s (%d member(s)), valid for "
+            "%g minutes:" % (GREEN("+"), BOLD(r["node"]["name"]), r["members"],
+                             r["expires_in_minutes"]),
+            "",
+            "    %s" % r["code"],
+            "",
+            DIM("Run `lemondx cluster join '<code>'` on the node that should join -- "
+                "it needs no setup of its own."),
+            DIM("Single use, and it carries this node's address and certificate:"),
+            DIM("    %s" % r["node"]["url"]),
+            DIM("    %s" % r["fingerprint_pretty"]),
+        ]
+        if r["warning"]:
+            lines += ["", YELLOW("! %s" % r["warning"])]
+        return "\n".join(lines)
+
+    emit(args, result, render)
+    return 0
+
+
+def cmd_cluster_invites(args, service):
+    invites = cluster_service(service).list_invites()
+    emit(args, invites, lambda items: table(
+        [[i["id"], _when(i["created"]),
+          RED("expired") if i["expired"] else _when(i["expires"]), i["note"] or DIM("-")]
+         for i in items], ["id", "created", "expires", "note"]))
+    return 0
+
+
+def cmd_cluster_revoke_invite(args, service):
+    result = cluster_service(service).revoke_invite(args.id)
+    emit(args, result, lambda r: "%s revoked join code %s" % (GREEN("+"), r["revoked"]))
+    return 0
+
+
+def cmd_cluster_join(args, service):
+    code = args.code
+    if code == "-":
+        code = sys.stdin.read().strip()
+    cluster = cluster_service(service)
+    result = cluster.join(code, description=args.description or "")
+    local, local_url = cluster.local_name(), cluster.local_url()
+
+    def render(r):
+        others = [m["name"] for m in r["members"] if m["name"] != local]
+        lines = ["%s joined the cluster through %s -- now a member alongside %s"
+                 % (GREEN("+"), BOLD(r["node"]["name"]), ", ".join(others) or "nobody")]
+        lines.append(DIM("  this node is %s at %s" % (local, local_url)))
+        if r["unreachable"]:
+            lines.append(YELLOW(
+                "! %s could not be told about this node; they will pick it up from "
+                "another member, or run `lemondx cluster refresh` when they are back."
+                % ", ".join(r["unreachable"])))
+        if r["warning"]:
+            lines.append(YELLOW("! %s" % r["warning"]))
+        return "\n".join(lines)
+
+    emit(args, result, render)
+    return 0
+
+
+def cmd_cluster_remove(args, service):
+    if not confirm("Remove node %s from the cluster?" % args.name, args.yes):
+        print(DIM("nothing removed"))
+        return 1
+    cluster = cluster_service(service)
+    result = cluster.forget_node(args.name)
+    if args.rotate:
+        result["rotated"] = cluster.rotate_secret()
+
+    def render(r):
+        lines = ["%s removed node %s" % (GREEN("+"), r["removed"])]
+        for row in r["told"]:
+            if not row["ok"]:
+                lines.append(YELLOW("! %s still lists it: %s"
+                                    % (row["node"], row["error"] or "unreachable")))
+        rotated = r.get("rotated")
+        if rotated:
+            lines.append("%s rotated the cluster credential%s" % (
+                GREEN("+"), "" if rotated["ok"]
+                else ", but %s missed it and is cut off" % ", ".join(rotated["stranded"])))
+        elif r["still_holds_credential"]:
+            # Worth saying plainly: the credential is shared, so removal alone
+            # does not stop the node calling in.
+            lines.append(YELLOW(
+                "! %s still holds the cluster credential. Run `lemondx cluster "
+                "rotate` to cut it off." % r["removed"]))
+        return "\n".join(lines)
+
+    emit(args, result, render)
+    return 0
+
+
+def cmd_cluster_groups(args, service):
+    groups = cluster_service(service).list_groups()
+    emit(args, groups, lambda items: table(
+        [[BOLD(g["name"]), str(len(g["members"])),
+          ", ".join(GREEN(m) if m not in g["unknown_members"] else RED(m)
+                    for m in g["members"]) or DIM("-"),
+          g["description"] or DIM("-")] for g in items],
+        ["group", "nodes", "members", "description"]))
+    return 0
+
+
+def cmd_cluster_group_set(args, service):
+    group = cluster_service(service).save_group(
+        args.name, members=args.node, description=args.description or "")
+    emit(args, group, lambda g: "%s saved group %s: %s%s" % (
+        GREEN("+"), BOLD(g["name"]), ", ".join(g["members"]) or "no members",
+        sync_note(g)))
+    return 0
+
+
+def cmd_cluster_group_delete(args, service):
+    result = cluster_service(service).delete_group(
+        args.name, everywhere=not args.local_only)
+    emit(args, result, lambda r: "%s deleted group %s%s" % (
+        GREEN("+"), r["deleted"], sync_note(r)))
+    return 0
+
+
+def cmd_cluster_sync(args, service):
+    result = cluster_service(service).sync(
+        kinds=args.kind or ["templates"], names=args.name or None,
+        nodes=args.node or None, groups=args.group or None)
+
+    def render(r):
+        lines = []
+        for row in r["results"]:
+            lines.append("%s %s %s %s%s" % (
+                GREEN("+") if row["ok"] else RED("!"), BOLD(row["node"]),
+                DIM(row["kind"][:-1] if row["kind"].endswith("s") else row["kind"]),
+                row["name"], "" if row["ok"] else ": " + (row["error"] or "failed")))
+        lines.append("")
+        lines.append("%d item(s) to %d node(s)" % (r["items"], len(r["nodes"])))
+        return "\n".join(lines)
+
+    emit(args, result, render)
+    return 0 if result["ok"] else 1
+
+
+def cmd_cluster_containers(args, service):
+    # No flags means the whole cluster: a command called `cluster containers`
+    # that showed only this host would have nothing to do with a cluster.
+    result = cluster_service(service).containers(
+        nodes=args.node or None, groups=args.group or None,
+        everything=not (args.node or args.group))
+
+    def render(r):
+        out = [table([[BOLD(c["node"]), c["name"],
+                       STATUS_COLORS.get(c["status"], str)(c["status"]),
+                       ", ".join(c.get("ipv4") or []) or DIM("-"),
+                       c.get("template") or DIM("-")]
+                      for c in r["instances"]],
+                     ["node", "name", "status", "ipv4", "template"])]
+        for failure in r["errors"]:
+            out.append(RED("! %s: %s" % (failure["node"], failure["error"])))
+        return "\n".join(out)
+
+    emit(args, result, render)
+    return 0 if not result["errors"] else 1
+
+
+def cmd_cluster_cert(args, _service):
+    host = args.host or cluster_mod.guess_local_address() or "localhost"
+    made = cluster_mod.generate_certificate(host, days=args.days)
+
+    def render(m):
+        return "\n".join([
+            "%s wrote a self-signed certificate for %s" % (GREEN("+"), BOLD(m["host"])),
+            DIM("  %s" % m["cert"]),
+            DIM("  %s" % m["key"]),
+            "  fingerprint %s" % cluster_mod.pretty_fingerprint(m["fingerprint"]),
+            "",
+            DIM("Run `lemondx configure cluster` to use it, or serve with "
+                "--tls-cert/--tls-key."),
+        ])
+
+    emit(args, made, render)
+    return 0
+
+
+def cmd_cluster_fingerprint(args, _service):
+    result = ClusterService(None, None).probe_fingerprint(args.url)
+    emit(args, result, lambda r: "%s presents %s" % (r["url"], r["fingerprint_pretty"]))
+    return 0
+
+
 def cmd_images(args, service):
     images = service.list_images()
 
@@ -1404,6 +1798,13 @@ def build_parser():
     def add(name, **kwargs):
         kwargs.setdefault("parents", [common])
         return sub.add_parser(name, **kwargs)
+
+    # Templates, modules, profiles and node groups are kept level across a
+    # cluster, so removing one removes it everywhere unless this says otherwise.
+    only_here = argparse.ArgumentParser(add_help=False)
+    only_here.add_argument("--local-only", action="store_true",
+                           help="delete only on this node, leaving other members' "
+                                "copies in place")
 
     # Bootstrap selection, shared by `create` and `bootstrap`.
     boot = argparse.ArgumentParser(add_help=False)
@@ -1465,6 +1866,9 @@ def build_parser():
     g = p.add_argument_group("TLS")
     g.add_argument("--tls-cert", metavar="PATH", help="serve HTTPS with this certificate (PEM)")
     g.add_argument("--tls-key", metavar="PATH", help="private key for --tls-cert (PEM)")
+    g.add_argument("--no-tls", action="store_true",
+                   help="serve plain HTTP even though `configure cluster` saved a "
+                        "certificate, e.g. behind a proxy that terminates TLS")
     p.set_defaults(func=cmd_serve, needs_service=False)
 
     p = add("configure", help="interactively save settings for future launches")
@@ -1769,7 +2173,8 @@ def build_parser():
                    help="replace an existing module of the same name")
     p.set_defaults(func=cmd_module_add)
 
-    p = add("module-remove", help="remove an uploaded module")
+    p = add("module-remove", parents=[common, only_here],
+            help="remove an uploaded module")
     p.add_argument("id")
     p.set_defaults(func=cmd_module_remove)
 
@@ -1792,7 +2197,8 @@ def build_parser():
     p.add_argument("--description", default="")
     p.set_defaults(func=cmd_profile_save)
 
-    p = add("profile-delete", help="delete a bootstrap profile")
+    p = add("profile-delete", parents=[common, only_here],
+            help="delete a bootstrap profile")
     p.add_argument("name")
     p.set_defaults(func=cmd_profile_delete)
 
@@ -1806,7 +2212,8 @@ def build_parser():
     p.add_argument("--prefix", help="instance name prefix (default: from the name)")
     p.set_defaults(func=cmd_template_save)
 
-    p = add("template-delete", help="delete an instance template")
+    p = add("template-delete", parents=[common, only_here],
+            help="delete an instance template")
     p.add_argument("name")
     p.set_defaults(func=cmd_template_delete)
 
@@ -1834,6 +2241,121 @@ def build_parser():
                    help="seconds allowed per instance (default: 300)")
     p.set_defaults(func=cmd_template_exec)
 
+    # -- cluster -----------------------------------------------------------
+    cluster_p = add("cluster", help="federate with other lemondx nodes")
+    cluster_sub = cluster_p.add_subparsers(dest="cluster_command", metavar="<command>")
+    cluster_p.set_defaults(func=cmd_cluster_status, no_probe=False)
+
+    probe = argparse.ArgumentParser(add_help=False)
+    probe.add_argument("--no-probe", action="store_true",
+                       help="do not contact the nodes, just list what is registered")
+
+    p = cluster_sub.add_parser("status", parents=[common, probe],
+                               help="this node and the cluster it is part of")
+    p.set_defaults(func=cmd_cluster_status)
+
+    p = cluster_sub.add_parser("nodes", aliases=["ls"], parents=[common, probe],
+                               help="list the cluster's nodes")
+    p.set_defaults(func=cmd_cluster_nodes)
+
+    p = cluster_sub.add_parser("show", parents=[common],
+                               help="one node, with the instances on it")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_cluster_show)
+
+    p = cluster_sub.add_parser("invite", parents=[common],
+                               help="print a one-time code for a node to join this "
+                                    "cluster with (starts one if there is none)")
+    p.add_argument("--expires", type=float, default=cluster_mod.DEFAULT_INVITE_MINUTES,
+                   metavar="MINUTES", help="how long the code stays valid (default: %d)"
+                   % cluster_mod.DEFAULT_INVITE_MINUTES)
+    p.add_argument("--note", help="a reminder of who the code was for")
+    p.set_defaults(func=cmd_cluster_invite)
+
+    p = cluster_sub.add_parser("invites", parents=[common],
+                               help="join codes issued here that nobody has redeemed")
+    p.set_defaults(func=cmd_cluster_invites)
+
+    p = cluster_sub.add_parser("revoke-invite", parents=[common],
+                               help="withdraw an unredeemed join code")
+    p.add_argument("id")
+    p.set_defaults(func=cmd_cluster_revoke_invite)
+
+    p = cluster_sub.add_parser("join", parents=[common],
+                               help="join a cluster with a code from any of its nodes")
+    p.add_argument("code", help="the code `lemondx cluster invite` printed there, "
+                                "or - to read it from stdin")
+    p.add_argument("--description", help="a note about this node")
+    p.set_defaults(func=cmd_cluster_join)
+
+    p = cluster_sub.add_parser("remove", aliases=["rm"], parents=[common],
+                               help="remove a node from the cluster, here and elsewhere")
+    p.add_argument("name")
+    p.add_argument("--rotate", action="store_true",
+                   help="also replace the cluster credential, which is what "
+                        "actually stops the removed node calling in")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_cluster_remove)
+
+    p = cluster_sub.add_parser("refresh", parents=[common],
+                               help="level the member list with every other node")
+    p.set_defaults(func=cmd_cluster_refresh)
+
+    p = cluster_sub.add_parser("leave", parents=[common],
+                               help="give up membership of the cluster")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_cluster_leave)
+
+    p = cluster_sub.add_parser("rotate", parents=[common],
+                               help="replace the cluster credential on every member")
+    p.set_defaults(func=cmd_cluster_rotate)
+
+    p = cluster_sub.add_parser("groups", parents=[common], help="list node groups")
+    p.set_defaults(func=cmd_cluster_groups)
+
+    group_p = cluster_sub.add_parser("group", help="manage a node group")
+    group_sub = group_p.add_subparsers(dest="group_command", metavar="<command>")
+
+    p = group_sub.add_parser("set", parents=[common],
+                             help="create a group or replace its members")
+    p.add_argument("name")
+    p.add_argument("--node", action="append", metavar="NAME",
+                   help="a member (repeatable; replaces the current members)")
+    p.add_argument("--description")
+    p.set_defaults(func=cmd_cluster_group_set)
+
+    p = group_sub.add_parser("delete", aliases=["rm"], parents=[common, only_here],
+                             help="delete a group; its nodes stay")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_cluster_group_delete)
+
+    p = cluster_sub.add_parser("sync", parents=[common],
+                               help="copy templates, modules or profiles to other nodes")
+    p.add_argument("--kind", action="append", choices=list(cluster_mod.SYNC_KINDS),
+                   help="what to copy (repeatable; default: templates)")
+    p.add_argument("--name", action="append", metavar="NAME",
+                   help="only this template/module/profile (repeatable; default: all)")
+    p.add_argument("--node", action="append", metavar="NAME", help="send to this node")
+    p.add_argument("--group", action="append", metavar="NAME", help="send to this group")
+    p.set_defaults(func=cmd_cluster_sync)
+
+    p = cluster_sub.add_parser("containers", aliases=["instances"], parents=[common],
+                               help="every instance across the chosen nodes")
+    p.add_argument("--node", action="append", metavar="NAME")
+    p.add_argument("--group", action="append", metavar="NAME")
+    p.set_defaults(func=cmd_cluster_containers)
+
+    p = cluster_sub.add_parser("cert", parents=[common],
+                               help="write a self-signed TLS certificate for this node")
+    p.add_argument("--host", help="address peers will use (default: this host's)")
+    p.add_argument("--days", type=int, default=3650)
+    p.set_defaults(func=cmd_cluster_cert, needs_service=False)
+
+    p = cluster_sub.add_parser("fingerprint", parents=[common],
+                               help="show the certificate an address presents right now")
+    p.add_argument("url")
+    p.set_defaults(func=cmd_cluster_fingerprint, needs_service=False)
+
     p = add("launch", help="create one or more instances from a template")
     p.add_argument("template")
     p.add_argument("-n", "--count", type=int, default=1,
@@ -1841,6 +2363,11 @@ def build_parser():
     p.add_argument("--prefix", help="name them <prefix>-N instead of the template's")
     p.add_argument("--param", action="append", metavar="KEY=VALUE",
                    help="override a saved parameter or supply a secret (repeatable)")
+    p.add_argument("--node", action="append", metavar="NAME",
+                   help="launch on this node instead of here (repeatable; see "
+                        "`lemondx cluster nodes`)")
+    p.add_argument("--group", action="append", metavar="NAME",
+                   help="launch across every node in this group (repeatable)")
     p.set_defaults(func=cmd_launch)
 
     p = add("bootstrap", parents=[common, boot],
@@ -1870,7 +2397,8 @@ def main(argv=None):
 
     try:
         return args.func(args, service)
-    except (ServiceError, LXDError, AuthError, ConfigureError) as exc:
+    except (ServiceError, LXDError, AuthError, ConfigureError, ClusterError,
+            NodeError) as exc:
         print(RED("! %s" % exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:

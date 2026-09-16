@@ -107,8 +107,14 @@ Want it running all the time? See [Running as a service](docs/service.md).
 ./lemondx profile-save NAME -b base -b docker
 ./lemondx template-save NAME -i images:debian/12 -c 2 -b base   # a whole instance setup
 ./lemondx launch NAME -n 3       # create NAME's instances: prefix-1..3
+                                 # --node/--group spread them over a cluster
 ./lemondx template-recreate|template-destroy NAME   # every instance from NAME
 ./lemondx template-exec NAME -- uptime              # on every running one
+./lemondx cluster status         # this node and the lemondx nodes it federates with
+./lemondx cluster invite         # start a cluster here and print a one-time join code
+./lemondx cluster join CODE      # join that cluster -- needs no setup on this host
+./lemondx cluster refresh        # level the member list with every other node
+./lemondx cluster sync --group edge  # copy templates and modules to other nodes
 ./lemondx serve                  # web UI + API
 ```
 
@@ -131,6 +137,7 @@ pass to `-i`.
 | --- | --- |
 | [Bootstrap modules](docs/modules.md) | writing and uploading modules, defaults, saved settings, profiles, secrets, the shipped modules |
 | [Instance templates](docs/templates.md) | saving a full instance setup and launching one or many from it |
+| [Nodes and federation](docs/cluster.md) | joining nodes securely, node groups, launching and syncing across them |
 | [REST API](docs/api.md) | every endpoint, request/response shapes, curl examples |
 | [Daemons, images and storage](docs/daemons-and-storage.md) | LXD vs Incus, socket discovery, image remotes, disk quotas, units |
 | [Web UI tour](docs/web-ui.md) | the Resources and Network views, the full image browser |
@@ -162,6 +169,11 @@ use `--tls-cert`/`--tls-key` or a TLS proxy before exposing it; see
   VM-capable image.
 - Incus support is implemented from its published API and socket layout but
   has not been exercised against a live Incus daemon; LXD 6.9 has.
+- Federating nodes is not LXD clustering. Each node runs its own lemondx against
+  its own daemon and they only learn how to call each other, so there is no
+  shared state, no leader and no live migration. Members share one credential,
+  so every node in a cluster is an admin of every other — federate hosts you
+  administer. See [Nodes and federation](docs/cluster.md).
 
 ## Layout
 
@@ -173,6 +185,8 @@ src/lemondx/
   server.py        # HTTP routing, JSON API, static hosting
   cli.py           # argparse front end
   bootstrap.py     # module discovery, SSH key validation, the runner
+  cluster.py       # federated nodes: enrolment, groups, sync, cluster launches
+  nodeclient.py    # REST client for another node, over pinned TLS
   simplestreams.py # reads remote image catalogs, with caching
   store.py         # persistent state under ~/.local/share/lemondx
 modules/           # bootstrap modules (POSIX sh)

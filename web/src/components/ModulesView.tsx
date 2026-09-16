@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useCanWrite } from '../hooks/useAuth'
 import { api } from '../lib/api'
+import { syncDetail, syncKind } from '../lib/sync'
 import type { BootstrapModule, BootstrapProfile, InstanceTemplate } from '../lib/types'
 import { ConfirmDialog } from './ConfirmDialog'
 import { ModuleDetail, ModuleOrigin, type ModuleUsage } from './ModuleDetail'
@@ -77,8 +78,9 @@ export function ModulesView({ onNotify }: Props) {
     const name = pendingProfile
     if (!name) return
     try {
-      await api.deleteBootstrapProfile(name)
-      onNotify('success', `Deleted profile “${name}”`)
+      const result = await api.deleteBootstrapProfile(name)
+      onNotify(syncKind(result.synced), `Deleted profile “${name}”`,
+        syncDetail(result.synced))
       load()
     } catch (cause) {
       onNotify('error', 'Could not delete the profile', (cause as Error).message)
@@ -347,9 +349,9 @@ export function ModulesView({ onNotify }: Props) {
       {showUpload && (
         <ModuleUploadDialog
           onCancel={() => setShowUpload(false)}
-          onUploaded={(id) => {
+          onUploaded={(id, synced) => {
             setShowUpload(false)
-            onNotify('success', `Uploaded ${id}`)
+            onNotify(syncKind(synced), `Uploaded ${id}`, syncDetail(synced))
             load().then(() => openModule(id))
           }}
         />

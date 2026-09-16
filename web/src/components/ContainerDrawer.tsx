@@ -13,6 +13,12 @@ type Tab = 'overview' | 'snapshots' | 'bootstrap' | 'console'
 
 interface Props {
   name: string
+  /**
+   * The node it lives on, when that is not this one. Every call the drawer
+   * makes is routed there, so an instance is managed from wherever you are
+   * looking rather than only from its own host.
+   */
+  node?: string
   /** The server's latest check, or null when it has none (stopped, or checks off). */
   health: HealthRecord | null
   busy: boolean
@@ -24,7 +30,7 @@ interface Props {
 }
 
 export function ContainerDrawer({
-  name, health, busy, onClose, onAction, onDelete, onNotify, refreshToken,
+  name, node, health, busy, onClose, onAction, onDelete, onNotify, refreshToken,
 }: Props) {
   const canWrite = useCanWrite()
   const [detail, setDetail] = useState<ContainerDetail | null>(null)
@@ -38,12 +44,12 @@ export function ContainerDrawer({
   const [savingLimits, setSavingLimits] = useState(false)
 
   const load = useCallback((signal?: AbortSignal) => {
-    api.getContainer(name, signal)
+    api.getContainer(name, signal, node)
       .then((data) => { setDetail(data); setError(null) })
       .catch((cause) => {
         if ((cause as Error).name !== 'AbortError') setError((cause as Error).message)
       })
-  }, [name])
+  }, [name, node])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -72,7 +78,7 @@ export function ContainerDrawer({
     if (!trimmed) return
     setSnapBusy(true)
     try {
-      await api.createSnapshot(name, trimmed)
+      await api.createSnapshot(name, trimmed, false, node)
       setSnapshotName('')
       onNotify('success', `Snapshot “${trimmed}” created`)
       load()
@@ -97,7 +103,7 @@ export function ContainerDrawer({
       // Sending "" (not omitting the key) is how the API clears a limit, so
       // both fields go over every time, blank or not -- see update_limits()
       // in service.py.
-      await api.updateLimits(name, { cpu: limitCpu.trim(), memory: limitMemory.trim() })
+      await api.updateLimits(name, { cpu: limitCpu.trim(), memory: limitMemory.trim() }, node)
       onNotify('success', `Updated limits for ${name}`)
       setEditingLimits(false)
       load()
@@ -114,10 +120,10 @@ export function ContainerDrawer({
     setSnapBusy(true)
     try {
       if (action === 'restore') {
-        await api.restoreSnapshot(name, snapshot)
+        await api.restoreSnapshot(name, snapshot, node)
         onNotify('success', `Restored “${snapshot}”`)
       } else {
-        await api.deleteSnapshot(name, snapshot)
+        await api.deleteSnapshot(name, snapshot, node)
         onNotify('success', `Deleted snapshot “${snapshot}”`)
       }
       load()
@@ -401,12 +407,13 @@ export function ContainerDrawer({
           )}
 
           {detail && tab === 'bootstrap' && (
-            <BootstrapPanel key={name} name={name} running={running} onFinished={load} />
+            <BootstrapPanel key={name} name={name} node={node} running={running}
+              onFinished={load} />
           )}
 
           {detail && tab === 'console' && (
             /* key: remount per container so output never leaks across them */
-            <ExecConsole key={name} name={name} running={running} />
+            <ExecConsole key={name} name={name} node={node} running={running} />
           )}
         </div>
 

@@ -9,7 +9,12 @@ interface Entry {
   exitCode: number
 }
 
-export function ExecConsole({ name, running }: { name: string; running: boolean }) {
+export function ExecConsole({ name, node, running }: {
+  name: string
+  /** The node it is on, when that is not this one; its calls are routed there. */
+  node?: string
+  running: boolean
+}) {
   const canWrite = useCanWrite()
   const [entries, setEntries] = useState<Entry[]>([])
   const [command, setCommand] = useState('')
@@ -32,7 +37,7 @@ export function ExecConsole({ name, running }: { name: string; running: boolean 
     setHistoryIndex(-1)
     setCommand('')
     try {
-      const result = await api.exec(name, trimmed)
+      const result = await api.exec(name, trimmed, node)
       setEntries((current) => [...current, {
         command: trimmed,
         stdout: result.stdout,

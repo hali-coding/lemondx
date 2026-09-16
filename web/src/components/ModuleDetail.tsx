@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useCanWrite } from '../hooks/useAuth'
 import { api } from '../lib/api'
+import { syncDetail, syncKind } from '../lib/sync'
 import type { BootstrapModule, ModuleSource } from '../lib/types'
 import { ConfirmDialog } from './ConfirmDialog'
 import { ChevronLeftIcon, PencilIcon, TrashIcon } from './Icons'
@@ -116,14 +117,18 @@ export function ModuleDetail({ module, usage, onBack, onChanged, onDeleted, onNo
     try {
       // Saving over a built-in writes a copy that shadows it; the server
       // refuses that without overwrite, and this button is the confirmation.
-      await api.uploadModule(module.id, script, true)
+      const saved = await api.uploadModule(module.id, script, true)
       setSourceVersion((version) => version + 1)
       setScript(null)
       await onChanged()
-      onNotify('success', module.editable
+      const shadow = module.editable
+        ? undefined : 'It replaces the built-in until you revert it.'
+      onNotify(syncKind(saved.synced), module.editable
         ? `Saved ${module.id}`
         : `Saved your copy of ${module.id}`,
-        module.editable ? undefined : 'It replaces the built-in until you revert it.')
+        // Where it went matters more than the shadowing note once there is a
+        // cluster, and the two never both apply to a fresh upload.
+        syncDetail(saved.synced) ?? shadow)
     } catch (cause) {
       setScriptError((cause as Error).message)
     } finally {
@@ -136,12 +141,13 @@ export function ModuleDetail({ module, usage, onBack, onChanged, onDeleted, onNo
     try {
       const result = await api.deleteModule(module.id)
       if (result.restored_builtin) {
-        onNotify('success', `Reverted ${module.id} to the built-in module`)
+        onNotify(syncKind(result.synced), `Reverted ${module.id} to the built-in module`,
+          syncDetail(result.synced))
         setConfirm(null)
         setScript(null)
         await onChanged()
       } else {
-        onNotify('success', `Deleted ${module.id}`)
+        onNotify(syncKind(result.synced), `Deleted ${module.id}`, syncDetail(result.synced))
         onDeleted()
       }
     } catch (cause) {

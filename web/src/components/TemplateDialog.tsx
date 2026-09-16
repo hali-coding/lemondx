@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { api } from '../lib/api'
 import { savableSelection } from '../lib/bootstrap'
-import type { InstanceSpec, InstanceTemplate } from '../lib/types'
+import type { InstanceSpec, InstanceTemplate, Synced } from '../lib/types'
 import { useBootstrapData } from '../hooks/useBootstrapData'
 import { blankSpec, resolvedSpec, specOf, specProblems } from '../lib/instance'
 import { InstanceForm } from './InstanceForm'
@@ -11,7 +11,7 @@ interface Props {
   /** The template being edited; absent when creating one. */
   template?: InstanceTemplate
   onCancel: () => void
-  onSaved: (saved: InstanceTemplate) => void
+  onSaved: (saved: Synced<InstanceTemplate>) => void
 }
 
 const TEMPLATE_NAME_RULE = /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$/

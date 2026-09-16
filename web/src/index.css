@@ -1388,3 +1388,110 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .health-dim { color: var(--text-faint); }
 .health-dot.health-danger { animation: pulse 1.6s ease-in-out infinite; }
 .health-reasons { margin: 4px 0 0; padding-left: 18px; color: var(--text-dim); font-size: 12.5px; }
+
+/* ------------------------------------------------------------------- nodes */
+
+.banner-warn { border-color: color-mix(in srgb, var(--warn) 32%, transparent); background: var(--warn-bg); }
+
+.node-self { padding: 14px; margin-bottom: 16px; }
+.node-self-main h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  margin-bottom: 10px;
+}
+.node-self-note { margin: 14px 0 0; }
+
+/* Facts as a definition list rather than a table: a node has a handful of
+   them, and they wrap instead of forcing a horizontal scroll on a phone. */
+.node-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 22px;
+  margin: 0;
+  font-size: 12.5px;
+}
+.node-facts > div { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+.node-facts dt { color: var(--text-faint); }
+.node-facts dd { margin: 0; display: flex; align-items: center; gap: 4px; min-width: 0; }
+
+.node-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  padding: 14px;
+}
+.node-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--surface);
+}
+.node-card-down { border-color: color-mix(in srgb, var(--danger) 30%, var(--border)); }
+.node-card > header { display: flex; align-items: center; gap: 8px; }
+.node-card h4 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13.5px;
+  min-width: 0;
+}
+.node-card > header > .btn { margin-left: auto; }
+.node-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.node-dot-ok { background: var(--ok); }
+.node-dot-warn { background: var(--warn); }
+.node-dot-down { background: var(--danger); }
+.node-url { margin: 0; font-size: 12px; color: var(--text-dim); word-break: break-all; }
+.node-error { margin: 0; font-size: 12px; color: var(--danger); }
+.node-groups { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; }
+.node-expand { align-self: flex-start; }
+.node-instances {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 5px;
+  font-size: 12.5px;
+}
+.node-instances li { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.node-instances strong { font-weight: 550; }
+
+/* A column of checkboxes, for picking nodes or what to sync. */
+.check-list {
+  display: grid;
+  gap: 6px;
+  max-height: 210px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.check { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+.check input { accent-color: var(--accent); }
+
+.sync-results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 5px;
+  max-height: 240px;
+  overflow-y: auto;
+  font-size: 12.5px;
+}
+.sync-results li { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.sync-failed strong { color: var(--danger); }
+
+/* ---------------------------------------------------------------- scope */
+
+.scope-picker { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.scope-picker .select { width: auto; }
+
+/* A row on another node: the drawer is this node's, so it does not open. */
+.ctable tr.row-elsewhere { cursor: default; }
+.ctable tr.row-elsewhere:hover { background: transparent; }
+.ctable td .badge { margin-left: 6px; }

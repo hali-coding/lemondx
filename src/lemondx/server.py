@@ -17,9 +17,11 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 
-from . import websocket
+from . import store, websocket
 from .auth import ADMIN, READ, SESSION_COOKIE, AuthConfig, AuthError, AuthService
+from .cluster import ClusterError, ClusterService, from_peer
 from .lxd import LXDError
+from .nodeclient import NodeError
 from .service import ContainerService, ServiceError
 
 DEFAULT_HOST = "127.0.0.1"
@@ -80,10 +82,11 @@ class Router:
         return None, [], ADMIN, False
 
 
-def build_router(service, auth=None):
+def build_router(service, auth=None, cluster=None):
     r = Router()
     NAME = r"([^/]+)"
     auth = auth or AuthService()
+    cluster = cluster or ClusterService(service, auth)
 
     r.add("GET", r"/api/status", lambda body, q: service.status())
     r.add("POST", r"/api/setup", lambda body, q: service.initialize(
@@ -211,29 +214,38 @@ def build_router(service, auth=None):
           lambda body, q, name: service.delete_network(name))
 
     r.add("GET", r"/api/modules", lambda body, q: service.list_modules())
-    r.add("POST", r"/api/modules", lambda body, q: service.upload_module(
-        body.get("name"), body.get("content"), bool(body.get("overwrite"))))
+    # Saving anything the cluster shares pushes it to every member, unless the
+    # caller *is* a member pushing it here -- see cluster.from_peer(). A node
+    # that is not in a cluster takes the plain local path.
+    r.add("POST", r"/api/modules", lambda body, q, who: cluster.upload_module(
+        body.get("name"), body.get("content"), bool(body.get("overwrite")),
+        propagate=not from_peer(who)), principal=True)
     r.add("GET", r"/api/modules/%s/source" % NAME,
           lambda body, q, mid: service.get_module_source(mid))
     r.add("PUT", r"/api/modules/%s/settings" % NAME,
           lambda body, q, mid: service.update_module_settings(
               mid, params=body.get("params"), is_default=body.get("is_default")))
     r.add("DELETE", r"/api/modules/%s" % NAME,
-          lambda body, q, mid: service.remove_module(mid))
+          lambda body, q, who, mid: cluster.remove_module(
+              mid, everywhere=_everywhere(body, q, who)), principal=True)
 
     r.add("GET", r"/api/bootstrap-profiles",
           lambda body, q: service.list_bootstrap_profiles())
     r.add("PUT", r"/api/bootstrap-profiles/%s" % NAME,
-          lambda body, q, name: service.save_bootstrap_profile(
-              name, body.get("modules") or [], body.get("params"),
-              body.get("description", ""), body.get("ssh_keys")))
+          lambda body, q, who, name: cluster.save_bootstrap_profile(
+              propagate=not from_peer(who), name=name,
+              modules=body.get("modules") or [], params=body.get("params"),
+              description=body.get("description", ""), ssh_keys=body.get("ssh_keys")),
+          principal=True)
     r.add("DELETE", r"/api/bootstrap-profiles/%s" % NAME,
-          lambda body, q, name: service.delete_bootstrap_profile(name))
+          lambda body, q, who, name: cluster.delete_bootstrap_profile(
+              name, everywhere=_everywhere(body, q, who)), principal=True)
 
     r.add("GET", r"/api/templates", lambda body, q: service.list_templates())
     r.add("PUT", r"/api/templates/%s" % NAME,
-          lambda body, q, name: service.save_template(
-              name, body.get("image"),
+          lambda body, q, who, name: cluster.save_template(
+              propagate=not from_peer(who),
+              name=name, image=body.get("image"),
               instance_type=body.get("type", "container"),
               cpu=body.get("cpu"), memory=body.get("memory"), disk=body.get("disk"),
               pool=body.get("pool"), network=body.get("network"),
@@ -243,30 +255,43 @@ def build_router(service, auth=None):
               secureboot=bool(body.get("secureboot", True)),
               bootstrap=body.get("bootstrap"),
               description=body.get("description", ""),
-              name_prefix=body.get("name_prefix")))
+              name_prefix=body.get("name_prefix")), principal=True)
     r.add("DELETE", r"/api/templates/%s" % NAME,
-          lambda body, q, name: service.delete_template(name))
+          lambda body, q, who, name: cluster.delete_template(
+              name, everywhere=_everywhere(body, q, who)), principal=True)
+    # Launching names nodes or groups; with neither it is this node alone, so
+    # an older client -- or a script that has never heard of federation -- gets
+    # exactly the behaviour it had before. `names` is how a coordinating node
+    # asks for particular instance names, so numbering stays unique across a
+    # cluster; on its own this node picks them.
     r.add("POST", r"/api/templates/%s/launch" % NAME,
-          lambda body, q, name: service.launch_template(
+          lambda body, q, name: cluster.launch_template(
               name, count=body.get("count", 1), prefix=body.get("prefix"),
-              params=body.get("params"), background=bool(body.get("background", False))))
+              params=body.get("params"), nodes=body.get("nodes"),
+              groups=body.get("groups"), names=body.get("names"),
+              background=bool(body.get("background", False))))
     r.add("GET", r"/api/template-runs", lambda body, q: service.template_runs())
     r.add("DELETE", r"/api/template-runs/%s" % NAME,
           lambda body, q, name: service.dismiss_template_run(name))
     r.add("GET", r"/api/templates/%s/instances" % NAME,
           lambda body, q, name: service.template_instances(name))
+    # `instances` is either plain names (this node, as always) or
+    # {"node": ..., "name": ...} entries, which is what the UI sends when the
+    # Containers tab is scoped to the cluster. cluster.template_action() hands
+    # each node its own share and falls through to the local call when the only
+    # node named is this one.
     r.add("POST", r"/api/templates/%s/destroy" % NAME,
-          lambda body, q, name: service.destroy_template_instances(
-              name, body.get("instances"),
+          lambda body, q, name: cluster.template_action(
+              name, "destroy", body.get("instances"),
               background=bool(body.get("background", False))))
     r.add("POST", r"/api/templates/%s/exec" % NAME,
-          lambda body, q, name: service.exec_template_instances(
-              name, body.get("command"), body.get("instances"),
+          lambda body, q, name: cluster.template_action(
+              name, "exec", body.get("instances"), command=body.get("command"),
               timeout=body.get("timeout", 300),
               background=bool(body.get("background", False))))
     r.add("POST", r"/api/templates/%s/recreate" % NAME,
-          lambda body, q, name: service.recreate_template_instances(
-              name, body.get("instances"), params=body.get("params"),
+          lambda body, q, name: cluster.template_action(
+              name, "recreate", body.get("instances"), params=body.get("params"),
               background=bool(body.get("background", False))))
     r.add("GET", r"/api/ssh-keys", lambda body, q: service.list_ssh_keys())
     # Parses a key the caller pasted; changes nothing.
@@ -282,6 +307,90 @@ def build_router(service, auth=None):
 
     r.add("GET", r"/api/images", lambda body, q: service.list_images())
     r.add("GET", r"/api/profiles", lambda body, q: service.list_profiles())
+
+    # -- federation --------------------------------------------------------
+    # /api/cluster/enroll is handled before routing, like login: it is how a
+    # node that has no credential yet gets one, so it authenticates itself with
+    # the one-time join code in its body instead.
+    r.add("GET", r"/api/cluster", lambda body, q: cluster.info())
+    r.add("GET", r"/api/cluster/nodes", lambda body, q: cluster.list_nodes(
+        probe=_flag(q.get("probe")) if "probe" in q else True))
+    r.add("GET", r"/api/cluster/nodes/%s" % NAME,
+          lambda body, q, name: cluster.describe_node(name))
+    r.add("POST", r"/api/cluster/nodes", lambda body, q: cluster.join(
+        body.get("code"), description=body.get("description", "")))
+    r.add("DELETE", r"/api/cluster/nodes/%s" % NAME,
+          lambda body, q, name: cluster.forget_node(name))
+    r.add("POST", r"/api/cluster/leave", lambda body, q: cluster.leave())
+
+    # Membership, spoken between nodes as well as to the UI. A joining node
+    # announces itself here with the cluster credential, which is how one-way
+    # joining reaches every member rather than only the one that invited it.
+    r.add("GET", r"/api/cluster/members", lambda body, q: cluster.members())
+    r.add("POST", r"/api/cluster/members",
+          lambda body, q: cluster.announce(body))
+    r.add("DELETE", r"/api/cluster/members/%s" % NAME,
+          lambda body, q, name: cluster.drop_member(name))
+    r.add("POST", r"/api/cluster/refresh", lambda body, q: cluster.sync_members())
+    # Rotating replaces the credential everywhere; accepting one is a member
+    # being told by whoever ran the rotation.
+    r.add("POST", r"/api/cluster/rotate", lambda body, q: cluster.rotate_secret())
+    r.add("PUT", r"/api/cluster/secret",
+          lambda body, q: cluster.accept_secret(body.get("secret")))
+    r.add("GET", r"/api/cluster/containers", lambda body, q: cluster.containers(
+        nodes=_list(q.get("nodes")), groups=_list(q.get("groups")),
+        everything=_flag(q.get("all")) if "all" in q else False))
+    # One action over instances that may sit on different nodes, for the
+    # Containers tab while it is scoped wider than this host.
+    r.add("POST", r"/api/cluster/containers/state", lambda body, q: cluster.change_state(
+        body.get("instances"), body.get("action", ""), force=bool(body.get("force")),
+        timeout=int(body.get("timeout", 60))))
+    r.add("POST", r"/api/cluster/containers/delete",
+          lambda body, q: cluster.delete_containers(
+              body.get("instances"), force=bool(body.get("force"))))
+
+    r.add("GET", r"/api/cluster/groups", lambda body, q: cluster.list_groups())
+    r.add("PUT", r"/api/cluster/groups/%s" % NAME,
+          lambda body, q, who, name: cluster.save_group(
+              name, members=body.get("members"),
+              description=body.get("description", ""),
+              propagate=not from_peer(who)), principal=True)
+    r.add("DELETE", r"/api/cluster/groups/%s" % NAME,
+          lambda body, q, who, name: cluster.delete_group(
+              name, everywhere=_everywhere(body, q, who)), principal=True)
+
+    # Issuing a join code is handing out the right to federate with this node,
+    # so it is admin-only like every other mutation -- and a read-only user
+    # cannot see the codes either, since the id is all a listing shows.
+    r.add("GET", r"/api/cluster/invites", lambda body, q: cluster.list_invites(),
+          role=ADMIN)
+    r.add("POST", r"/api/cluster/invites", lambda body, q: cluster.create_invite(
+        expires_minutes=body.get("expires_minutes", 30), note=body.get("note", "")))
+    r.add("DELETE", r"/api/cluster/invites/%s" % NAME,
+          lambda body, q, invite_id: cluster.revoke_invite(invite_id))
+
+    r.add("POST", r"/api/cluster/sync", lambda body, q: cluster.sync(
+        kinds=body.get("kinds") or ["templates"], names=body.get("names"),
+        nodes=body.get("nodes"), groups=body.get("groups")))
+    # Looks, changes nothing: what certificate an address presents right now.
+    r.add("POST", r"/api/cluster/fingerprint",
+          lambda body, q: cluster.probe_fingerprint(body.get("url")), role=ADMIN)
+
+    # Any one node's own API, reached through this one:
+    #   /api/nodes/<node>/containers/web-1/exec  ->  <node>/api/containers/web-1/exec
+    # which is what lets the container drawer manage an instance wherever it
+    # lives. The role enforced is the *target* route's, resolved against this
+    # router below, so forwarding can never grant more than calling the same
+    # endpoint here would -- and the route's own role has to be the looser of
+    # the two, or a read-only caller could not reach a read endpoint at all.
+    def _proxy(method):
+        def handler(body, q, who, node, rest):
+            return _forward(r, cluster, method, who, node, rest, body, q)
+        return handler
+
+    for _method in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+        r.add(_method, r"/api/nodes/%s/(.+)" % NAME, _proxy(_method),
+              role=READ, principal=True)
 
     # GET /api/auth, login and logout are handled before routing: they must
     # answer callers who are not authenticated yet, and they set cookies.
@@ -311,6 +420,7 @@ class LemondxHandler(BaseHTTPRequestHandler):
     router = None
     service = None
     auth = None
+    cluster = None
     web_root = None
     allow_origin = None
     quiet = False
@@ -388,6 +498,9 @@ class LemondxHandler(BaseHTTPRequestHandler):
             if path in ("/api/auth", "/api/auth/login", "/api/auth/logout"):
                 self._handle_auth(method, path)
                 return
+            if path == "/api/cluster/enroll":
+                self._handle_enroll(method)
+                return
             principal, explicit = self._principal()
             if principal is None:
                 self._send_json({"error": "Unauthorized: log in or send a valid API token"}, 401)
@@ -412,7 +525,7 @@ class LemondxHandler(BaseHTTPRequestHandler):
             self._send_json({"error": exc.message}, exc.code)
         except AuthError as exc:
             self._send_json({"error": exc.message}, exc.code)
-        except LXDError as exc:
+        except (LXDError, ClusterError, NodeError) as exc:
             self._send_json({"error": exc.message}, _http_code(exc.code))
         except Exception as exc:  # noqa: BLE001 - never leak a traceback to the client
             self.log_message("unhandled error: %r", exc)
@@ -500,7 +613,7 @@ class LemondxHandler(BaseHTTPRequestHandler):
         do. Cookies and proxy identity are ambient -- the browser attaches
         them to any request -- so those need the Origin check.
         """
-        if not self.auth.config.enabled:
+        if not self.auth.config.enabled and not self._remote_needs_token():
             return self.auth.anonymous(), False
         header = self.headers.get("Authorization") or ""
         if header[:7].lower() == "bearer ":
@@ -512,12 +625,26 @@ class LemondxHandler(BaseHTTPRequestHandler):
         principal = self.auth.session_principal(self._cookie(SESSION_COOKIE))
         if principal:
             return principal, False
-        return self.auth.proxy_principal(self.client_address[0], self.headers), False
+        proxied = self.auth.proxy_principal(self.client_address[0], self.headers)
+        if proxied or self.auth.config.enabled:
+            return proxied, False
+        # Only here because membership, not configuration, is asking for a
+        # credential: on this host there is still nothing to log in with, so
+        # anyone local stays the anonymous admin they were before joining.
+        return (self.auth.anonymous(), False) if _is_loopback(self.client_address[0]) \
+            else (None, False)
 
     def _handle_auth(self, method, path):
         if path == "/api/auth" and method == "GET":
             principal, _ = self._principal()
-            self._send_json({"data": self.auth.info(principal)})
+            info = self.auth.info(principal)
+            # A member with auth off still refuses remote callers without a
+            # token, so say tokens are accepted -- otherwise the login gate a
+            # remote browser gets would offer it no way in.
+            if self.cluster is not None and self.cluster.requires_remote_token() \
+                    and "token" not in info["methods"]:
+                info["methods"] = info["methods"] + ["token"]
+            self._send_json({"data": info})
             return
         if method != "POST":
             raise ServiceError("Method not allowed (try: %s)"
@@ -540,6 +667,37 @@ class LemondxHandler(BaseHTTPRequestHandler):
         self.log_message("logged in as %s (%s) via %s", principal.name, principal.role, principal.via)
         self._send_json({"data": self.auth.info(principal)}, headers=[
             ("Set-Cookie", self._session_cookie(session_id, self.auth.config.session_seconds))])
+
+    def _remote_needs_token(self):
+        """Whether this caller must present a credential although auth is off.
+
+        Being in a cluster means accepting API calls from other hosts, which a
+        node cannot do while treating whoever reaches the port as an admin. So
+        membership alone requires a credential from anyone who is not on this
+        machine -- joining needs no auth setup, and does not quietly open the
+        node up either. Loopback is untouched, so nobody is shut out of the UI
+        on their own host.
+        """
+        return self.cluster is not None and self.cluster.requires_remote_token() \
+            and not _is_loopback(self.client_address[0])
+
+    def _handle_enroll(self, method):
+        """Redeem a join code: the one API call a node makes before it has a token.
+
+        The code in the body *is* the credential, and a strong one -- 32 random
+        bytes, single use, expiring -- so no session or token is required here.
+        It is an explicit credential in the sense _principal() means: a browser
+        on another site cannot make the user's browser produce one, so the
+        same-origin check that guards ambient credentials has nothing to add.
+        The connection is already pinned to this node's certificate by the
+        caller, which is what makes the code safe to send at all.
+        """
+        if method != "POST":
+            raise ServiceError("Method not allowed (try: POST)", 405)
+        body = self._read_body()
+        result = self.cluster.enroll(body, peer_address=self._client_ip())
+        self.log_message("cluster enrolment from %s accepted", self._client_ip())
+        self._send_json({"data": result})
 
     def _cookie(self, name):
         raw = self.headers.get("Cookie")
@@ -737,6 +895,50 @@ def _flag(value):
     return str(value).lower() in ("1", "true", "yes", "on", "")
 
 
+def _forward(router, cluster, method, principal, node, rest, body, query):
+    """Send one call on to a member's own API, after checking the caller may.
+
+    The target path is resolved against this node's routes purely to find what
+    access it needs. An unknown path resolves to admin, so a route this node
+    has never heard of fails closed rather than open.
+    """
+    path = "/api/%s" % rest.lstrip("/")
+    if rest.lstrip("/").startswith("nodes/"):
+        raise ClusterError("A proxied call cannot be proxied again.", 400)
+    handler, args, role, wants = router.resolve(method, path)
+    if not principal.can(role):
+        raise AuthError("Forbidden: %s access is read-only" % principal.name, 403)
+    if node == cluster.local_name():
+        # Addressing this node by name is the same request without the prefix;
+        # answering it here keeps the front end from having to special-case it.
+        if handler is None:
+            raise ServiceError("No such endpoint: %s" % path, 404)
+        return handler(body, query, *([principal] + args if wants else args))
+    return cluster.proxy(method, node, path, body=body, params=query)
+
+
+def _everywhere(body, query, principal):
+    """Whether a delete should also remove the thing from every other member.
+
+    On by default, because these definitions are kept level automatically and a
+    copy left behind on one node is drift a push-only sync can never clear. A
+    peer relaying the delete never re-broadcasts it, and `?everywhere=false`
+    (or `"everywhere": false`) keeps one deliberately local.
+    """
+    if from_peer(principal):
+        return False
+    if "everywhere" in query:
+        return _flag(query.get("everywhere"))
+    return body.get("everywhere", True) is not False
+
+
+def _list(value):
+    """A comma-separated query value as a list; None stays None."""
+    if value is None:
+        return None
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
 def _http_code(code):
     return code if isinstance(code, int) and 400 <= code < 600 else 500
 
@@ -781,13 +983,15 @@ def tls_context(cert, key):
 
 def make_server(host=DEFAULT_HOST, port=DEFAULT_PORT, service=None, token=None,
                 web_root=WEB_DIST, allow_origin=None, quiet=False, auth=None,
-                tls=None, dev=False):
+                tls=None, dev=False, cluster=None):
     service = service or ContainerService()
     auth = auth or AuthService(AuthConfig(static_token=token))
+    cluster = cluster or ClusterService(service, auth)
     handler = type("BoundHandler", (LemondxHandler,), {
-        "router": build_router(service, auth),
+        "router": build_router(service, auth, cluster),
         "service": service,
         "auth": auth,
+        "cluster": cluster,
         "web_root": os.path.realpath(web_root) if web_root else None,
         "allow_origin": allow_origin,
         "quiet": quiet,
@@ -804,7 +1008,7 @@ def make_server(host=DEFAULT_HOST, port=DEFAULT_PORT, service=None, token=None,
 
 def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=False,
           open_browser=False, auth_config=None, tls_cert=None, tls_key=None, auth_source=None,
-          health_settings=None):
+          health_settings=None, cluster_settings=None):
     allow_origin = "*" if dev else None
     auth = AuthService(auth_config or AuthConfig(static_token=token))
     tls = None
@@ -815,9 +1019,12 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
             tls = tls_context(tls_cert, tls_key)
         except (OSError, ssl.SSLError) as exc:
             raise SystemExit("Cannot load the TLS certificate or key: %s" % exc)
+    service = ContainerService()
+    cluster = ClusterService(service, auth, settings=cluster_settings)
     try:
-        httpd = make_server(host=host, port=port, auth=auth, allow_origin=allow_origin,
-                            quiet=quiet, tls=tls, dev=dev)
+        httpd = make_server(host=host, port=port, service=service, auth=auth,
+                            allow_origin=allow_origin, quiet=quiet, tls=tls, dev=dev,
+                            cluster=cluster)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
             raise SystemExit(
@@ -830,6 +1037,9 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
     url = "%s://%s:%d" % ("https" if tls else "http",
                           "localhost" if host in ("0.0.0.0", "127.0.0.1") else host, port)
     print("lemondx API + UI listening on %s" % url)
+    # So `lemondx cluster invite` in another process can advertise the port and
+    # scheme actually being served, rather than guessing at the default.
+    store.write_runtime({"host": host, "port": port, "tls": tls is not None})
     config = auth.config
     if config.enabled:
         # Never the token itself: this output ends up in the journal.
@@ -848,6 +1058,16 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
               "use --tls-cert/--tls-key or a TLS proxy.")
     for warning in auth.startup_warnings():
         print("WARNING: %s" % warning)
+
+    if cluster.in_cluster():
+        peers = len(store.load_nodes())
+        print("Cluster: this node is '%s' at %s, with %d other member(s)"
+              % (cluster.local_name(), cluster.local_url(), peers))
+        if cluster.requires_remote_token():
+            # Worth saying: it is the one place lemondx enforces a credential
+            # that nobody configured, and it changes what a remote browser sees.
+            print("         authentication is off, so requests from other hosts "
+                  "need an API token; loopback is unchanged.")
     if dev:
         print("Dev mode: CORS is open for the Vite dev server (npm --prefix web run dev).")
     if not os.path.isdir(WEB_DIST) and not dev:
@@ -855,7 +1075,6 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
               "or use a release archive, which ships it built.")
 
     if health_settings is not None:
-        service = getattr(httpd.RequestHandlerClass, "service", None)
         service.start_health_monitor(health_settings)
         print("Health checks: %s" % ("every %gs" % health_settings["interval_seconds"]
                                      if health_settings["enabled"] else "off"))
@@ -869,6 +1088,7 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
         _wait_for_background_work(getattr(httpd.RequestHandlerClass, "service", None))
         print("Shutting down.")
     finally:
+        store.clear_runtime()
         httpd.server_close()
 
 

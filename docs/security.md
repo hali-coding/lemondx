@@ -173,5 +173,66 @@ TLS 1.2 or newer, with the handshake done per connection so a client that
 stalls cannot block others. A TLS-terminating reverse proxy works just as well;
 either way, do not send passwords or tokens across a network in the clear.
 
+`lemondx configure cluster` saves a certificate for federation, and `serve` then
+uses it without being told to; `--tls-cert` overrides it and `--no-tls` declines
+it, for a node behind a proxy that terminates TLS.
+
 The static UI files are served without authentication — they contain no data.
 Only `/api/*` is gated.
+
+## Federation
+
+Federating nodes is opt-in and hand-carried: nothing is trusted for being on the
+same network. See [Nodes and federation](cluster.md) for the workflow; this is
+what it rests on.
+
+**Nodes recognise each other by certificate, not by CA.** A peer's record holds
+the SHA-256 of the certificate it must present, taken when it joined. The pin is
+checked after the TLS handshake and *before* the request is written, so a node
+answering with the wrong certificate never sees the credential. A self-signed
+certificate is expected and fine — pinning is the stronger claim anyway: this
+exact key, rather than "someone a CA vouched for". Rotating a node's certificate
+changes its fingerprint, and its peers will refuse it, saying so, until it
+re-joins.
+
+**Every call between nodes is HTTPS.** A node URL is rejected unless it is
+`https://`, or `http://` to a loopback address where the traffic never reaches a
+network.
+
+**Joining is the only unauthenticated call**, and only because it is how a node
+gets its first credential. `lemondx cluster invite` mints a 32-byte single-use
+code that expires (30 minutes by default) and stores only its hash, in the `0700`
+auth directory — so a code issued from the CLI is honoured by an already-running
+`serve`, and redeeming it consumes it. The code carries the issuing node's
+fingerprint, so the joiner pins the connection before sending the secret: the
+secret proves the joiner was given permission, the fingerprint proves it reached
+the right node.
+
+**The cluster shares one credential.** It is an ordinary lemondx API token,
+stored like any other and listed by `lemondx tokens` as `cluster`, and every
+member holds the same one. That is what makes joining one-way: a node that has
+redeemed a code can immediately call every member and be called by them, with no
+per-pair exchange needing every host up at once. Two consequences worth being
+clear about:
+
+- **Any member is an admin of every other.** Federate hosts you administer.
+  Anyone who can create a container on a node can become root on it.
+- **Removing a node does not by itself cut it off**, because it still holds the
+  credential. `lemondx cluster rotate` replaces the credential on every remaining
+  member and is what actually excludes it; `lemondx cluster remove --rotate`
+  does both, and the CLI says so when you skip it. A member that is down during a
+  rotation is left behind and has to re-join — reported, not silent.
+
+**A member demands a credential from other hosts even with authentication off.**
+Joining a cluster means accepting API calls from elsewhere, and a node cannot do
+that while treating whoever reaches its port as an admin. So membership alone
+turns on "callers from other hosts must present a token", which is why joining
+needs no auth setup and does not quietly open the node up either. Loopback is
+deliberately untouched: the person at that host keeps the anonymous-admin UI they
+had. Configure real authentication if anyone else uses that node directly.
+
+**Secrets stay out of copyable records.** `nodes/*.json` holds only a name, URL
+and fingerprint, so it can be copied between machines the way profiles and
+templates are; the cluster credential lives in `auth/cluster.json` with the other
+credentials. A synced template carries no module secret — a template never stores
+one — though public SSH keys in it do travel.
