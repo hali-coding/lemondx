@@ -100,8 +100,8 @@ shows this host and not much else. It has three parts:
   by, and a warning naming whatever is stopping another node from joining it.
 - **Nodes** — a card per node with its daemon, instance counts and groups, and
   a dot for reachable / not set up / unreachable. *Show instances* lists what is
-  on a node without leaving the page. **Invite** issues a one-time join code
-  (shown once — it is a credential), **Add node** redeems one from another host,
+  on a node without leaving the page. **Invite new node** issues a one-time join
+  code (shown once — it is a credential), **Join cluster** redeems one issued elsewhere,
   and **Sync** copies this node's templates, modules or bootstrap profiles over
   another's.
 - **Node groups** — a name for a set of nodes, so a launch or a sync can say

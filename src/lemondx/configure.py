@@ -568,7 +568,7 @@ class ClusterSection(Section):
             p.say("`lemondx serve` uses this certificate unless --tls-cert or --no-tls "
                   "says otherwise.")
         p.say("`lemondx cluster invite` starts a cluster here and prints a code; "
-              "`lemondx cluster add <code>` joins one. Neither needs anything else "
+              "`lemondx cluster join <code>` joins one. Neither needs anything else "
               "set up first.")
 
 

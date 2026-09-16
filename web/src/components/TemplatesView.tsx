@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useCanWrite } from '../hooks/useAuth'
 import { api } from '../lib/api'
+import { keyOf } from '../lib/instance'
 import { syncDetail, syncKind } from '../lib/sync'
 import type {
   BootstrapModule, ClusterNode, InstanceRef, InstanceTemplate, LaunchedInstance, NodeGroup,
@@ -25,7 +26,7 @@ interface Props {
   runs: TemplateRun[]
   onRunStarted: (run: TemplateRun) => void
   onOpen: (name: string, node?: string) => void
-  /** Refresh now, and let go of any of these instances the drawer shows. */
+  /** Refresh now, and let go of any of these instances (`keyOf`) the drawer shows. */
   onChanged: (removed: string[]) => void
 }
 
@@ -146,14 +147,20 @@ export function TemplatesView({
   /**
    * What to send as `instances`: plain names while the view is this node, and
    * {node, name} once it is wider, so the server can hand each node its share.
+   *
+   * It takes the records the dialog listed rather than their names, because
+   * once the scope is wider than one host a name is not an identity: two nodes
+   * can each hold a `web-1`, and looking a name back up would send both copies
+   * of the row to whichever node the lookup happened to find -- acting twice on
+   * one instance and never on the other.
    */
-  function refs(names: string[]): (string | InstanceRef)[] {
-    if (scope.kind === 'local') return names
-    const byName = new Map((containers ?? []).map((c) => [c.name, c.node ?? localNode]))
-    return names.map((name) => ({ node: byName.get(name) ?? localNode, name }))
+  function refs(instances: ScopedContainer[]): (string | InstanceRef)[] {
+    if (scope.kind === 'local') return instances.map((c) => c.name)
+    return instances.map((c) => ({ node: c.node ?? localNode, name: c.name }))
   }
 
-  async function run(template: InstanceTemplate, action: Action, instances: string[],
+  async function run(template: InstanceTemplate, action: Action,
+                     instances: ScopedContainer[],
                      params: Record<string, string>, command = '', timeout?: number,
                      targets: Targets = {}) {
     const count = action === 'launch' ? countFor(template.name) : instances.length
@@ -170,7 +177,7 @@ export function TemplatesView({
             : await api.destroyTemplateInstances(template.name, refs(instances))
       onRunStarted(started)
       // The drawer would be showing an instance about to be deleted.
-      onChanged(action === 'exec' ? [] : instances)
+      onChanged(action === 'exec' ? [] : instances.map(keyOf))
     } catch (cause) {
       onNotify('error', `Could not ${action} from “${template.name}”`, (cause as Error).message)
     } finally {
@@ -488,6 +495,7 @@ export function TemplatesView({
         <ExecDialog
           template={confirming.template}
           members={membersOf(confirming.template)}
+          localNode={localNode}
           lastCommand={runs[confirming.template.name]?.command ?? ''}
           onCancel={() => setConfirming(null)}
           onConfirm={(instances, command, timeout) => {
@@ -559,7 +567,8 @@ interface ActionProps {
   scope: Scope
   localNode: string
   onCancel: () => void
-  onConfirm: (instances: string[], params: Record<string, string>, targets: Targets) => void
+  onConfirm: (instances: ScopedContainer[], params: Record<string, string>,
+              targets: Targets) => void
 }
 
 /**
@@ -581,11 +590,10 @@ function ActionDialog({ template, action, members, secrets, count, nodes, groups
         : here ? [here] : [])
   const [group, setGroup] = useState(scope.kind === 'group' ? scope.name : '')
   const complete = secrets.every((p) => values[p.name])
-  const names = members.map((c) => c.name)
   const launch = action === 'launch'
   const federated = launch && nodes.length > 1
   const somewhere = !federated || !!group || chosen.length > 0
-  const canConfirm = complete && somewhere && (launch || names.length > 0)
+  const canConfirm = complete && somewhere && (launch || members.length > 0)
 
   const targets: Targets = !federated ? {}
     : group ? { groups: [group] }
@@ -597,8 +605,8 @@ function ActionDialog({ template, action, members, secrets, count, nodes, groups
   const spread = group ? `the “${group}” group`
     : chosen.length > 1 ? `${chosen.length} nodes` : chosen[0] || 'this node'
   const title = launch ? `Launch ${count} from “${template.name}”`
-    : action === 'recreate' ? `Recreate ${names.length} from “${template.name}”?`
-    : `Destroy ${names.length} from “${template.name}”?`
+    : action === 'recreate' ? `Recreate ${members.length} from “${template.name}”?`
+    : `Destroy ${members.length} from “${template.name}”?`
   const subtitle = launch
     ? (federated
       ? `Spread over ${spread}, round robin, with one run of names across them all. A node without the template's storage pool or network uses its own default and says so.`
@@ -618,7 +626,8 @@ function ActionDialog({ template, action, members, secrets, count, nodes, groups
           <button type="submit" form="template-action-form"
             className={`btn ${launch ? 'btn-primary' : 'btn-danger'}`}
             disabled={!canConfirm}>
-            {launch ? 'Launch' : action === 'recreate' ? `Recreate ${names.length}` : `Destroy ${names.length}`}
+            {launch ? 'Launch' : action === 'recreate'
+              ? `Recreate ${members.length}` : `Destroy ${members.length}`}
           </button>
         </>
       }
@@ -626,7 +635,7 @@ function ActionDialog({ template, action, members, secrets, count, nodes, groups
       <form id="template-action-form" style={{ display: 'contents' }}
         onSubmit={(event) => {
           event.preventDefault()
-          if (canConfirm) onConfirm(names, values, targets)
+          if (canConfirm) onConfirm(members, values, targets)
         }}>
         {federated && (
           <>
@@ -664,17 +673,14 @@ function ActionDialog({ template, action, members, secrets, count, nodes, groups
           </>
         )}
         {!launch && (
-          names.length === 0 ? (
+          members.length === 0 ? (
             <p className="hint">No instances from this template remain.</p>
           ) : (
             <ul className="template-results">
               {members.map((c) => (
-                <li key={`${c.node ?? ''}/${c.name}`}>
+                <li key={keyOf(c)}>
                   <StatusBadge status={c.status} />
                   <span className="mono">{c.name}</span>
-                  {c.node && c.node !== localNode && (
-                    <span className="badge badge-dim">{c.node}</span>
-                  )}
                   {c.node && c.node !== localNode && (
                     <span className="badge badge-dim">{c.node}</span>
                   )}
@@ -755,30 +761,34 @@ function ExecResults({ instances, onOpen }: {
 interface ExecProps {
   template: InstanceTemplate
   members: ScopedContainer[]
+  localNode: string
   lastCommand: string
   onCancel: () => void
-  onConfirm: (instances: string[], command: string, timeout: number) => void
+  onConfirm: (instances: ScopedContainer[], command: string, timeout: number) => void
 }
 
 /** Pick a command and which of a template's running instances it runs on. */
-function ExecDialog({ template, members, lastCommand, onCancel, onConfirm }: ExecProps) {
+function ExecDialog({ template, members, localNode, lastCommand, onCancel,
+                     onConfirm }: ExecProps) {
   const [command, setCommand] = useState(lastCommand)
   const [timeout, setTimeoutSeconds] = useState('300')
   // Unticked rather than ticked, so an instance that starts while the dialog
-  // is open is included without anyone having to notice it.
+  // is open is included without anyone having to notice it. Held by `keyOf`
+  // and not by name: across a cluster one name can be two instances, and
+  // unticking one of them would quietly drop the other from the run too.
   const [excluded, setExcluded] = useState<Set<string>>(new Set())
 
   const running = members.filter((c) => c.status === 'Running')
-  const targets = running.map((c) => c.name).filter((name) => !excluded.has(name))
+  const targets = running.filter((c) => !excluded.has(keyOf(c)))
   const seconds = Number.parseInt(timeout, 10)
   const timeoutValid = Number.isFinite(seconds) && seconds >= 1 && seconds <= 3600
   const canRun = command.trim().length > 0 && targets.length > 0 && timeoutValid
 
-  function toggle(name: string) {
+  function toggle(key: string) {
     setExcluded((current) => {
       const next = new Set(current)
-      if (next.has(name)) next.delete(name)
-      else next.add(name)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
       return next
     })
   }
@@ -837,12 +847,15 @@ function ExecDialog({ template, members, lastCommand, onCancel, onConfirm }: Exe
               {members.map((c) => {
                 const up = c.status === 'Running'
                 return (
-                  <li key={c.name}>
+                  <li key={keyOf(c)}>
                     <label className="checkbox">
                       <input type="checkbox" disabled={!up}
-                        checked={up && !excluded.has(c.name)}
-                        onChange={() => toggle(c.name)} />
+                        checked={up && !excluded.has(keyOf(c))}
+                        onChange={() => toggle(keyOf(c))} />
                       <span className="mono">{c.name}</span>
+                      {c.node && c.node !== localNode && (
+                        <span className="badge badge-dim">{c.node}</span>
+                      )}
                     </label>
                     {up ? (
                       c.ipv4[0] && <span className="faint mono">{c.ipv4[0]}</span>

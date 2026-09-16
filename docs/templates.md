@@ -127,8 +127,11 @@ lemondx launch web -n 6 --group edge
 
 Instances go round robin, and the `<prefix>-<n>` numbering is allocated across
 every chosen node at once, so a name means one instance in the cluster rather
-than one per host. The template is pushed to each node first, so a node that has
-never seen it can still run the launch.
+than one per host. The numbering is a scan of what every member holds, not a
+reservation, so two launches started at the same moment from two different nodes
+can still land on the same name — nothing addresses an instance by name alone,
+so the result is untidy rather than ambiguous. The template is pushed to each
+node first, so a node that has never seen it can still run the launch.
 
 A node that lacks the template's storage pool, network or profile substitutes
 its own default rather than failing every instance, and the run says so, per

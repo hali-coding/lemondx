@@ -20,7 +20,10 @@ invite` is the setup. A node's name, the address peers reach it on and its TLS
 certificate are all worked out and provisioned the first time it federates —
 its hostname, the address on its default route, and a self-signed certificate.
 `lemondx configure cluster` exists to *override* those, not to make federation
-work.
+work. The one thing it is needed for is a **name clash**: a name is how calls
+are routed to a node, so two hosts that share a hostname cannot both be members
+— a join under a name the cluster already uses is refused, and renaming either
+side with `lemondx configure cluster` and issuing a fresh code settles it.
 
 The local host is the default everywhere. A lemondx joined to nothing behaves
 exactly as it did before this existed, and a launch that names no node still
@@ -54,7 +57,7 @@ and prints a code:
 
     lemondx-join.eyJjb2RlIjoibG1keGpvaW5fMDQ4ZDc3NTg4N2M5X19…
 
-Run `lemondx cluster add '<code>'` on the node that should join -- it needs no
+Run `lemondx cluster join '<code>'` on the node that should join -- it needs no
 setup of its own.
 ```
 
@@ -94,10 +97,11 @@ On the joining node — which needs **no** setup, no certificate and no
 configuration:
 
 ```bash
-lemondx cluster add 'lemondx-join.eyJjb2RlIjoibG1keGpvaW5f…'
+lemondx cluster join 'lemondx-join.eyJjb2RlIjoibG1keGpvaW5f…'
 ```
 
-In the web UI the same pair is **Invite** and **Add node** on the Nodes tab.
+In the web UI the same pair is **Invite new node** and **Join cluster** on the
+Nodes tab.
 
 ```
 + joined the cluster through nodeA -- now a member alongside nodeA, nodeB
@@ -110,7 +114,9 @@ What happens:
    has none.
 2. It connects to the address in the code and checks the certificate against the
    fingerprint in it **before sending anything**. A mismatch aborts with nothing
-   transmitted.
+   transmitted, and so does a code that carries no fingerprint for an `https://`
+   address — there would be nothing to recognise that node by, and CA-signed is
+   not the same as the node you were invited to.
 3. It presents the code along with its own name, address and fingerprint. The
    other node redeems it — constant-time, single use, expiring — and answers with
    the cluster credential and the full member list.

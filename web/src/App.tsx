@@ -510,9 +510,11 @@ export default function App() {
             // optimistically, so polling carries on and the table follows along.
             onChanged={(removed) => {
               // A recreated instance comes back under the same name, but the
-              // drawer would be showing the old one.
+              // drawer would be showing the old one. Matched by `keyOf`, so
+              // destroying one node's `web-1` does not shut the drawer on
+              // another node's.
               setSelected((current) => (
-                current && removed.includes(current.name) ? null : current))
+                current && removed.includes(keyOf(current)) ? null : current))
               refresh()
             }}
           />

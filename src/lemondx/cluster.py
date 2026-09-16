@@ -668,7 +668,7 @@ class ClusterService:
         peer = self._peers().get(name)
         if not peer:
             raise ClusterError("No node called '%s'. Join a cluster with "
-                               "`lemondx cluster add`." % name, 404)
+                               "`lemondx cluster join`." % name, 404)
         return peer
 
     def client(self, name, timeout=DEFAULT_TIMEOUT):
@@ -678,7 +678,7 @@ class ClusterService:
         if not secret:
             raise ClusterError(
                 "This node is not in a cluster, so it has no credential to call "
-                "'%s' with. Join with `lemondx cluster add`." % name, 403)
+                "'%s' with. Join with `lemondx cluster join`." % name, 403)
         return NodeClient(peer["url"], token=secret, fingerprint=peer["fingerprint"],
                           timeout=timeout)
 
@@ -706,7 +706,7 @@ class ClusterService:
         # twice -- a join gets the inviter both on its own and inside the member
         # list -- and re-reading the directory per record would be worse.
         known = dict(self._peers())
-        added, updated = [], []
+        added, updated, notes = [], [], []
         for raw in records or []:
             member = clean_member(raw)
             if member is None or member["name"] == self.local_name():
@@ -718,13 +718,16 @@ class ClusterService:
             saved = store.save_node(member["name"], dict(member, added=int(
                 (current or {}).get("added") or time.time())))
             (updated if current else added).append(member["name"])
+            # An address change is spelled out: it is where calls start going to
+            # another host, and the log is the only record of who repointed what.
+            notes.append("~%s %s -> %s" % (member["name"], current["url"], member["url"])
+                         if current and current["url"] != member["url"]
+                         else "%s%s" % ("~" if current else "+", member["name"]))
             known[member["name"]] = saved
             with self._lock:
                 self._probes.pop(member["name"], None)
-        if added or updated:
-            _log("membership from %s: %s" % (
-                source or "a peer",
-                ", ".join(["+%s" % n for n in added] + ["~%s" % n for n in updated])))
+        if notes:
+            _log("membership from %s: %s" % (source or "a peer", ", ".join(notes)))
         return {"added": added, "updated": updated}
 
     def announce(self, body, peer_address=None):
@@ -1138,6 +1141,20 @@ class ClusterService:
                 "That node calls itself '%s', which is this node's own name. Give "
                 "one of them a different name with `lemondx configure cluster`."
                 % joiner["name"], 409)
+        # A name is the routing key, so admitting a second node under one that is
+        # taken would repoint the first node's traffic -- here and, once the
+        # joiner announces itself, on every other member. Two hosts default to
+        # the same name easily enough (`ensure_identity()` uses the hostname),
+        # and only the collision with *this* node's name is caught above, so the
+        # one with a peer has to be refused rather than merged.
+        clash = self._peers().get(joiner["name"])
+        if clash and (clash["url"], clash["fingerprint"]) != \
+                (joiner["url"], joiner["fingerprint"]):
+            raise ClusterError(
+                "'%s' is already a member of this cluster at %s. Names are how "
+                "calls are routed between nodes, so a second one cannot take it: "
+                "rename the joining node with `lemondx configure cluster` and "
+                "issue a fresh code." % (joiner["name"], clash["url"]), 409)
 
         # Recorded before answering, so this node knows the joiner even if the
         # joiner's own announcements never arrive.
@@ -1168,6 +1185,21 @@ class ClusterService:
         fingerprint = str(payload.get("fp") or "").strip().lower().replace(":", "")
         if not NODE_NAME.match(name):
             raise ClusterError("That join code names an unusable node: %r." % name)
+        try:
+            url = normalize_url(url)
+        except NodeError as exc:
+            raise ClusterError("That join code names an unusable address: %s" % exc.message)
+        # The rule `clean_member()` holds every member record to, applied here
+        # too because this call is the one that carries a credential to a node
+        # nothing has vouched for yet: over HTTPS the pinned fingerprint is the
+        # only thing identifying it, and without one NodeClient falls back to CA
+        # verification -- which any host with a certificate some CA signed would
+        # pass, and it would be handed the code and given the cluster back.
+        if parse_url(url)[0] == "https" and not FINGERPRINT.match(fingerprint):
+            raise ClusterError(
+                "That join code carries no certificate fingerprint for %s, so "
+                "there would be nothing to recognise that node by. Issue a fresh "
+                "code with `lemondx cluster invite`." % url)
 
         mine = self.ensure_identity()
         if name == mine["name"]:
@@ -1189,6 +1221,18 @@ class ClusterService:
         if not isinstance(answer, dict) or not answer.get("secret"):
             raise ClusterError("%s answered the join without a cluster credential."
                                % url, 502)
+
+        # Checked before the credential is installed: a member already using this
+        # node's name means every call routed to that name would end up at one of
+        # them arbitrarily, and remember_members() drops a record with our own
+        # name rather than reporting it. Better to stay out of the cluster.
+        taken = [m.get("name") for m in (answer.get("members") or [])
+                 if isinstance(m, dict) and m.get("name") == mine["name"]]
+        if taken:
+            raise ClusterError(
+                "That cluster already has a node called '%s'. Rename this one "
+                "with `lemondx configure cluster` and join with a fresh code."
+                % mine["name"], 409)
 
         self._install_secret(str(answer["secret"]))
         remote = answer.get("node") or {}
@@ -1470,8 +1514,9 @@ class ClusterService:
         The run is recorded on this node's template exactly as a local launch
         is, so every client follows it the same way -- with each instance saying
         which node it landed on. Instance names are allocated across all the
-        chosen nodes at once, so no two instances in a cluster share a name even
-        though nothing stops them from doing so.
+        chosen nodes at once, so a name means one instance in the cluster rather
+        than one per host -- as far as one coordinator can tell; see
+        ``_share_names()`` for what that is and is not worth.
 
         A node that cannot honour the template's storage pool or network
         substitutes its own default rather than failing; the run's notes say so,
@@ -1523,6 +1568,17 @@ class ClusterService:
         two nodes out of five must not reuse a name the other three have. Names
         for a node that cannot be reached are allocated anyway -- its share
         fails, and taking the numbers out would renumber everyone else's.
+
+        **Deliberately best-effort.** This is a snapshot, then a fan-out: two
+        launches started at the same moment -- from two nodes, or here with one
+        `--prefix` given to two templates -- can both see `web-3` free and each
+        create it, on different hosts. Closing that needs a lock or a leader to
+        allocate from, which is the one thing federation here refuses to have,
+        and the cost of losing the race is small: an instance's identity is node
+        plus name everywhere (`keyOf()` in the UI, `{node, name}` in the API), so
+        a duplicate across two hosts is untidy rather than ambiguous, and two
+        instances of one name on the *same* host is refused by the daemon and
+        reported against that share.
         """
         taken = set()
         for names in self._fanout(self.all_nodes(), self._instance_names):

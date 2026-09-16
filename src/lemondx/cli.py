@@ -1530,7 +1530,7 @@ def cmd_cluster_status(args, service):
             out.append(YELLOW("! %s" % p["reachable_because"]))
         if not p["in_cluster"]:
             out.append(DIM("  `lemondx cluster invite` starts a cluster here; "
-                           "`lemondx cluster add <code>` joins one."))
+                           "`lemondx cluster join <code>` joins one."))
         out += ["", BOLD("Nodes"), _render_nodes(p["nodes"])]
         return "\n".join(out)
 
@@ -1574,7 +1574,7 @@ def cmd_cluster_invite(args, service):
             "",
             "    %s" % r["code"],
             "",
-            DIM("Run `lemondx cluster add '<code>'` on the node that should join -- "
+            DIM("Run `lemondx cluster join '<code>'` on the node that should join -- "
                 "it needs no setup of its own."),
             DIM("Single use, and it carries this node's address and certificate:"),
             DIM("    %s" % r["node"]["url"]),
@@ -1603,7 +1603,7 @@ def cmd_cluster_revoke_invite(args, service):
     return 0
 
 
-def cmd_cluster_add(args, service):
+def cmd_cluster_join(args, service):
     code = args.code
     if code == "-":
         code = sys.stdin.read().strip()
@@ -2281,12 +2281,12 @@ def build_parser():
     p.add_argument("id")
     p.set_defaults(func=cmd_cluster_revoke_invite)
 
-    p = cluster_sub.add_parser("add", parents=[common],
+    p = cluster_sub.add_parser("join", parents=[common],
                                help="join a cluster with a code from any of its nodes")
     p.add_argument("code", help="the code `lemondx cluster invite` printed there, "
                                 "or - to read it from stdin")
-    p.add_argument("--description", help="a note about the node being added")
-    p.set_defaults(func=cmd_cluster_add)
+    p.add_argument("--description", help="a note about this node")
+    p.set_defaults(func=cmd_cluster_join)
 
     p = cluster_sub.add_parser("remove", aliases=["rm"], parents=[common],
                                help="remove a node from the cluster, here and elsewhere")

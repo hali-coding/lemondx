@@ -112,7 +112,7 @@ Want it running all the time? See [Running as a service](docs/service.md).
 ./lemondx template-exec NAME -- uptime              # on every running one
 ./lemondx cluster status         # this node and the lemondx nodes it federates with
 ./lemondx cluster invite         # start a cluster here and print a one-time join code
-./lemondx cluster add CODE       # join that cluster -- needs no setup on this host
+./lemondx cluster join CODE      # join that cluster -- needs no setup on this host
 ./lemondx cluster refresh        # level the member list with every other node
 ./lemondx cluster sync --group edge  # copy templates and modules to other nodes
 ./lemondx serve                  # web UI + API

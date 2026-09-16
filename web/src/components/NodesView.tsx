@@ -132,12 +132,14 @@ export function NodesView({ onNotify }: Props) {
               <UploadIcon /> Sync
             </button>
             <button className="btn btn-sm" disabled={!canWrite}
-              onClick={() => setDialog('invite')}>
-              <KeyIcon /> Invite
+              onClick={() => setDialog('invite')}
+              title="Make a code for another host to join this cluster with">
+              <KeyIcon /> Invite new node
             </button>
             <button className="btn btn-sm btn-primary" disabled={!canWrite}
-              onClick={() => setDialog('join')}>
-              <PlusIcon /> Add node
+              onClick={() => setDialog('join')}
+              title="Paste a code from another node to make this host a member">
+              <PlusIcon /> Join cluster
             </button>
           </div>
         </header>
@@ -157,9 +159,10 @@ export function NodesView({ onNotify }: Props) {
           <div className="empty">
             <h3>No other nodes yet</h3>
             <p>
-              Run <code>lemondx cluster invite</code> on the node you want to add — or press
-              Invite here — then redeem the code it prints with Add node on the other side.
-              Everything already works on this host alone.
+              Press <strong>Invite new node</strong> here (or run <code>lemondx cluster
+              invite</code>) and redeem the code it prints with <strong>Join
+              cluster</strong> on the other host. Everything already works on this host
+              alone.
             </p>
           </div>
         )}
@@ -446,8 +449,8 @@ function JoinDialog({ onCancel, onDone }: {
             onChange={(event) => setCode(event.target.value)} />
           <span className="hint">
             From <code>lemondx cluster invite</code> on any node already in the cluster,
-            or its Invite button. A code works once and expires. Joining one node makes
-            this host a member of the whole cluster.
+            or its <strong>Invite new node</strong> button. A code works once and expires.
+            Joining one node makes this host a member of the whole cluster.
           </span>
         </div>
         <div className="field">
@@ -492,7 +495,7 @@ function InviteDialog({ info, onClose }: { info: ClusterInfo | null; onClose: ()
   if (code) {
     return (
       <Modal title="Join code"
-        subtitle="Copy it now — it is a credential and is never shown again. Run Add node on the joining host and paste it there; that host needs no setup of its own."
+        subtitle="Copy it now — it is a credential and is never shown again. Press Join cluster on the joining host and paste it there; that host needs no setup of its own."
         onClose={onClose}
         footer={<button className="btn btn-primary" onClick={onClose}>Done</button>}>
         <div className="access-secret">
@@ -519,7 +522,7 @@ function InviteDialog({ info, onClose }: { info: ClusterInfo | null; onClose: ()
   }
 
   return (
-    <Modal title="Invite a node"
+    <Modal title="Invite a new node"
       subtitle="Makes a one-time code another lemondx redeems to federate with this one."
       onClose={busy ? () => {} : onClose}
       footer={<>
