@@ -503,19 +503,24 @@ def cmd_limits(args, service):
 
 def cmd_state(action):
     def run(args, service):
-        code = 0
-        for name in args.name:
-            try:
-                container = service.change_state(name, action, force=getattr(args, "force", False))
-                if not args.json:
-                    print("%s %s is now %s" % (GREEN("+"), BOLD(name),
-                                               container["status"].lower()))
-                elif args.json:
-                    print(json.dumps(container, indent=2, default=str))
-            except (ServiceError, LXDError) as exc:
-                print("%s %s: %s" % (RED("!"), name, exc), file=sys.stderr)
-                code = 1
-        return code
+        # One call for every name, so several containers change together and
+        # --json prints one document rather than one per name concatenated.
+        result = service.change_state_many(
+            args.name, action, force=getattr(args, "force", False))
+
+        def render(payload):
+            lines = []
+            for item in payload["instances"]:
+                if item["ok"]:
+                    lines.append("%s %s is now %s" % (
+                        GREEN("+"), BOLD(item["name"]),
+                        item["container"]["status"].lower()))
+                else:
+                    lines.append("%s %s: %s" % (RED("!"), item["name"], item["error"]))
+            return "\n".join(lines)
+
+        emit(args, result, render)
+        return 0 if result["ok"] else 1
     return run
 
 

@@ -180,6 +180,24 @@ export interface SetupResult {
 
 export type StateAction = 'start' | 'stop' | 'restart' | 'freeze' | 'unfreeze'
 
+/** What one state action did to one container, for a bulk request. */
+export interface BulkStateInstance {
+  name: string
+  ok: boolean
+  /** Why it was refused; null when it worked. */
+  error: string | null
+  /** The container as it is now; null when the action failed. */
+  container: ContainerDetail | null
+}
+
+/** The result of applying one action to several containers at once. */
+export interface BulkStateResult {
+  action: StateAction
+  /** True only when every container did as asked. */
+  ok: boolean
+  instances: BulkStateInstance[]
+}
+
 export interface ModuleParam {
   name: string
   /** The value declared in the module header. */

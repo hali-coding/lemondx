@@ -322,6 +322,24 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .ctable tbody tr.row-pending { cursor: default; }
 .ctable tbody tr.row-pending:hover { background: transparent; }
 
+/* Just wide enough for the box: the name column is what should grow. */
+.ctable th.tick, .ctable td.tick { width: 1px; padding-right: 0; }
+.ctable td.tick input, .ctable th.tick input { cursor: pointer; margin: 0; display: block; }
+.ctable td.tick input:disabled { cursor: default; opacity: 0.4; }
+
+/* Sits above the header row, so the actions stay in view while ticking. */
+.bulk-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  background: var(--accent-bg);
+  border-bottom: 1px solid var(--border);
+}
+.bulk-count { font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+.bulk-names { font-size: 12.5px; min-width: 0; }
+.bulk-actions { display: flex; gap: 6px; margin-left: auto; flex: none; }
+
 /* Wide enough for any IPv4 address, so the copy icons line up in a column. */
 .ip-cell { display: inline-flex; align-items: center; justify-content: space-between; gap: 6px; min-width: 18ch; }
 .copy-btn {
@@ -599,6 +617,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
   .topbar-actions { margin-left: auto; flex: none; }
   .grid-2, .grid-3 { grid-template-columns: 1fr; }
   .ctable th.optional, .ctable td.optional { display: none; }
+  /* The count and the buttons are what matter when there is no room. */
+  .bulk-names { display: none; }
   .drawer { width: 100vw; }
 }
 

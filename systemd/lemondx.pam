@@ -1,0 +1,36 @@
+# PAM service for `lemondx serve --auth pam`, i.e. the stack looked up as
+# --pam-service (default: lemondx). Install it as root:
+#
+#   install -m 644 systemd/lemondx.pam /etc/pam.d/lemondx
+#
+# Without it PAM falls back to its `other` stack, which on most distributions
+# is pam_deny and refuses every login with no explanation -- `serve` warns at
+# startup when /etc/pam.d/<service> is missing for that reason.
+#
+# This file is written for Debian/Ubuntu, whose system stack lives in
+# common-auth/common-account. On Fedora/RHEL/Arch (and anything else with a
+# single system-auth) comment the two @include lines out and uncomment the
+# pair below them instead -- there is no spelling that works on both.
+#
+# Delegating to the host's own stack is the point: whatever the distribution
+# already does for console and SSH logins -- pam_unix, faillock, SSSD, an MFA
+# module -- applies here too, and stays applied when the host's policy changes.
+
+@include common-auth
+@include common-account
+
+# auth     include  system-auth
+# account  include  system-auth
+
+# lemondx never opens a session or changes a password: pam.py calls only
+# pam_authenticate() and pam_acct_mgmt(). These two make that explicit, so a
+# future caller gets a clear refusal rather than silently picking up `other`.
+password required pam_deny.so
+session  required pam_deny.so
+
+# Who may log in is decided by lemondx, not here: --pam-admin-group (default
+# lxd / incus-admin) and --pam-read-group map group membership to a role, and
+# anyone in neither is refused even with a correct password. Adding a
+# pam_succeed_if here would only duplicate that in a second place that the
+# configure UI cannot see -- but it is the right spot for a rule that should
+# also cover other services, such as denying remote accounts.

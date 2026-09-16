@@ -49,8 +49,10 @@ writable, so `--auth local` and `--auth token` need nothing else. Create them
 with the CLI as the account the service runs as (for `--system`,
 `sudo -u lemondx env HOME=/var/lib/lemondx ./lemondx user-add NAME`).
 
-`--auth pam` needs more, because both units set `NoNewPrivileges=yes`, which
-stops PAM's `unix_chkpwd` helper from reading `/etc/shadow`:
+`--auth pam` needs more. Install the PAM service first
+(`sudo install -m 644 systemd/lemondx.pam /etc/pam.d/lemondx`), then work
+around `NoNewPrivileges=yes`, which both units set and which stops PAM's
+`unix_chkpwd` helper from reading `/etc/shadow`:
 
 - **User unit:** add `NoNewPrivileges=no` to the drop-in. PAM will then accept
   only your own account — the one the service runs as.

@@ -22,6 +22,7 @@ little access `403`, too many failed logins `429`.
 | `PATCH` | `/api/containers/{name}` | update cpu/memory limits, description |
 | `DELETE` | `/api/containers/{name}` | delete (`?force=true` stops it first) |
 | `POST` | `/api/containers/{name}/state` | `{"action":"start\|stop\|restart\|freeze\|unfreeze"}` |
+| `POST` | `/api/containers/state` | `{"names":[...],"action":"start\|stop\|..."}` → each container's outcome, applied in parallel |
 | `POST` | `/api/containers/{name}/rename` | `{"name":"new-name"}` |
 | `POST` | `/api/containers/{name}/exec` | `{"command":"uname -a"}` → stdout/stderr/exit_code |
 | `GET`/`POST` | `/api/containers/{name}/snapshots` | list / create |
