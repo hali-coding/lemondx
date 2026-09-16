@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { useCanWrite } from '../hooks/useAuth'
 import { api } from '../lib/api'
 import type { BootstrapModule, BootstrapProfile, InstanceTemplate } from '../lib/types'
 import { ConfirmDialog } from './ConfirmDialog'
@@ -21,6 +22,7 @@ function usageOf(
 
 /** Bootstrap modules and the profiles built from them: a list, and a page per module. */
 export function ModulesView({ onNotify }: Props) {
+  const canWrite = useCanWrite()
   const [modules, setModules] = useState<BootstrapModule[] | null>(null)
   const [profiles, setProfiles] = useState<BootstrapProfile[]>([])
   const [templates, setTemplates] = useState<InstanceTemplate[]>([])
@@ -148,7 +150,7 @@ export function ModulesView({ onNotify }: Props) {
           </button>
         </div>
         {tab === 'modules' ? (
-          <button className="btn btn-primary" onClick={() => setShowUpload(true)}>
+          <button className="btn btn-primary" disabled={!canWrite} onClick={() => setShowUpload(true)}>
             <PlusIcon /> Upload module
           </button>
         ) : (
@@ -220,7 +222,7 @@ export function ModulesView({ onNotify }: Props) {
                     <td onClick={(event) => event.stopPropagation()}>
                       <label className="checkbox module-default">
                         <input type="checkbox" checked={module.is_default}
-                          disabled={busy === module.id}
+                          disabled={busy === module.id || !canWrite}
                           aria-label={`Pre-select ${module.name} for new instances`}
                           onChange={() => toggleDefault(module)} />
                       </label>
@@ -302,7 +304,7 @@ export function ModulesView({ onNotify }: Props) {
                     <td onClick={(event) => event.stopPropagation()}>
                       <div className="row-actions">
                         <button className="btn btn-sm btn-icon btn-danger"
-                          aria-label={`Delete profile ${profile.name}`}
+                          aria-label={`Delete profile ${profile.name}`} disabled={!canWrite}
                           onClick={() => setPendingProfile(profile.name)}>
                           <TrashIcon />
                         </button>
@@ -319,7 +321,7 @@ export function ModulesView({ onNotify }: Props) {
                             {params.map(([key, value]) => (
                               <div key={key} style={{ display: 'contents' }}>
                                 <dt className="mono">{key}</dt>
-                                <dd className="mono">{value || <span className="faint">(empty)</span>}</dd>
+                                <dd className={`mono${value.includes('\n') ? ' param-value-text' : ''}`}>{value || <span className="faint">(empty)</span>}</dd>
                               </div>
                             ))}
                             {profile.ssh_keys.map((key, index) => (

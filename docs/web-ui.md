@@ -3,8 +3,24 @@
 [← back to README](../README.md)
 
 Parts of the web UI that are easy to miss because they are not on the
-Containers tab: the Resources, Storage and Network views, and the full image
-browser.
+Containers tab: health checks, the Resources, Storage, Network and Access views,
+and the full image browser.
+
+## Logging in and the Access view
+
+With `--auth` on, the UI asks for a username and password (or an API token,
+when the server accepts tokens) the first time the API answers `401`. The
+header then shows who you are and a **Log out** button. A read-only user gets a
+banner and disabled controls for anything that would change state; the server
+refuses those requests anyway. Views remount on login, so nothing loaded as one
+user stays on screen for the next.
+
+**Access** lists your API tokens — create one with a name, access level and
+expiry, copy the secret from the dialog (it is not shown again), or revoke one.
+Admins see every user's tokens and manage local users there too: add, change
+access, set a password (which ends that user's sessions) or remove. With auth
+off the tab still works, so tokens and users can be prepared before turning it
+on. See [Security](security.md) for the methods and what each needs.
 
 ## Creating in the background
 
@@ -30,6 +46,75 @@ the systemd unit, or killing the process, abandons it straight away.
 Only the `serve` process's own creates are tracked: one started with
 `lemondx create` in a terminal appears in the list once the daemon has it,
 without a stage.
+
+## Health checks
+
+While `lemondx serve` runs, it checks every running instance once a minute.
+Each check reads the instance's `/proc/loadavg` through the daemon's file API,
+which proves it responds, and compares its CPU and memory with its limits:
+
+| Status | When |
+| --- | --- |
+| healthy | answered, and under every threshold |
+| degraded | load average over 3, CPU ≥ 90% of its CPUs over the minute, memory ≥ 90% of its limit, or one missed probe |
+| unhealthy | missed two probes in a row, or a running container with no processes |
+| starting | within two minutes of starting and not answering yet |
+| unknown | a VM whose agent is not running, so it cannot be probed |
+| paused | frozen; not checked |
+
+The container list shows a coloured dot beside **Running** — green when
+healthy, orange when degraded, red when unhealthy (hover for the reasons); the detail panel shows the status, how long it has held, the reasons,
+CPU as a percentage of the instance's CPUs, and load. The page raises a toast
+once when an instance becomes unhealthy and once when it recovers. Degraded
+changes only show in the list, as they come and go with ordinary work.
+
+CPU comes from the daemon's per-instance counter, averaged between two checks,
+so it appears from the second check on. Its denominator is `limits.cpu`, or the
+host's CPUs for a container without one. Memory is only judged against a
+`limits.memory`.
+
+**Load average.** A container's own `/proc/loadavg` is the host's (unless
+LXCFS virtualises it, which is off by default), so lemondx counts each
+container's load itself, the way the kernel does for the host: every five
+seconds it counts the container's threads that are running, waiting for a CPU
+or in uninterruptible sleep — read from the container's cgroup on the host —
+and keeps 1, 5 and 15 minute averages. A container pinned to one CPU with four
+busy processes has a load of about 4 even though its CPU reads 100% or less,
+which is exactly what CPU percentage alone hides. The 1 minute average is
+judged once it has a minute of samples. It is an absolute count of tasks, not
+divided by CPUs.
+
+A VM reports its own load average through its agent. If a container's cgroup
+cannot be found or read, lemondx falls back to the container's `/proc/loadavg`;
+when that is the host's, it shows "host-wide" and does not judge it.
+
+Tune any of it with `lemondx configure health` (interval of 15 seconds or more,
+each threshold including `load_average`, probe timeout, missed probes before unhealthy, start grace);
+`serve --no-health` turns checks off for one run. A saved file that does not
+validate is ignored with a warning. The same checks run on demand from the
+CLI, which measures CPU and load over a short window since it has no previous
+check (its load is that window's average, shown as e.g. `4.00 (5s)`):
+
+```bash
+lemondx health                  # every running instance
+lemondx health web-1 --window 10 --json
+```
+
+It exits 0 when everything is healthy, 1 when anything is degraded, starting or
+unknown, and 2 when anything is unhealthy, so it can drive a cron job or a
+monitoring check. `GET /api/health` returns the server's latest results
+without running a check:
+
+```json
+{"enabled": true, "interval": 60, "thresholds": {"cpu_percent": 90, ...},
+ "checked_at": 1789482783.3,
+ "instances": [{"name": "web-1", "status": "degraded",
+   "reasons": ["CPU at 99.6% of 1 core"], "checked_at": 1789482783.3, "since": 1789482723.1,
+   "cpu": {"percent": 99.6, "cores_used": 0.996, "cores": 1},
+   "memory": {"usage": 22446080, "limit": 134217728, "percent": 16.7},
+   "load": {"avg": [4.02, 3.61, 2.10], "scope": "instance", "source": "cgroup", "warming": false, "window": null},
+   "probe": {"ok": true, "ms": 18, "error": null}, "processes": 7, "failures": 0}]}
+```
 
 ## Resources view
 

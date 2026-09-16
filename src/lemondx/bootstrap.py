@@ -126,8 +126,9 @@ def parse_module(path):
         if not match:
             continue
         key, value = match.group(1).lower(), match.group(2).strip()
-        if key in ("param", "secret"):
-            parsed = _parse_param(value, secret=key == "secret")
+        if key in ("param", "secret", "text"):
+            parsed = _parse_param(value, secret=key == "secret",
+                                  multiline=key == "text")
             if parsed:
                 meta["param"].append(parsed)
         elif key == "uses":
@@ -162,7 +163,7 @@ def parse_module(path):
     }
 
 
-def _parse_param(value, secret=False):
+def _parse_param(value, secret=False, multiline=False):
     match = _PARAM.match(value)
     if not match:
         return None
@@ -173,6 +174,9 @@ def _parse_param(value, secret=False):
         "default": "" if secret else match.group(2),
         "description": match.group(3).strip(),
         "secret": secret,
+        # A config file rather than a word: front ends offer a text area. The
+        # value reaches the module the same way, newlines and all.
+        "multiline": multiline,
     }
 
 

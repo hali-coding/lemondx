@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ApiError, api } from './lib/api'
+import { ApiError, api, hasToken, setToken } from './lib/api'
 import type {
-  Container, CreateProgress, CreateRequest, StateAction, Status, TemplateRun,
+  AuthInfo, Container, CreateProgress, CreateRequest, HealthRecord, HealthStatus, StateAction,
+  Status, TemplateRun,
 } from './lib/types'
+import { AuthContext } from './hooks/useAuth'
 import { useTheme } from './hooks/useTheme'
 import { useToasts } from './hooks/useToasts'
 import type { ToastKind } from './hooks/useToasts'
+import { AccessView } from './components/AccessView'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { ContainerDrawer } from './components/ContainerDrawer'
 import { ContainerTable } from './components/ContainerTable'
@@ -16,11 +19,13 @@ import { NetworkView } from './components/NetworkView'
 import { ResourcesView } from './components/ResourcesView'
 import { SetupBanner } from './components/SetupBanner'
 import { StorageView } from './components/StorageView'
+import { LoginGate } from './components/LoginGate'
 import { TemplatesView } from './components/TemplatesView'
-import { TokenGate } from './components/TokenGate'
 import { Toasts } from './components/Toasts'
 
 const POLL_INTERVAL = 3000
+
+const VIEWS = ['containers', 'templates', 'resources', 'storage', 'network', 'modules', 'access'] as const
 
 export default function App() {
   const { theme, toggle } = useTheme()
@@ -30,6 +35,7 @@ export default function App() {
   const [containers, setContainers] = useState<Container[] | null>(null)
   const [creates, setCreates] = useState<CreateProgress[]>([])
   const [templateRuns, setTemplateRuns] = useState<TemplateRun[]>([])
+  const [health, setHealth] = useState<Record<string, HealthRecord>>({})
   const [connectionError, setConnectionError] = useState<string | null>(null)
   const [busy, setBusy] = useState<Record<string, boolean>>({})
   const [selected, setSelected] = useState<string | null>(null)
@@ -37,10 +43,10 @@ export default function App() {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [refreshToken, setRefreshToken] = useState(0)
-  const [needsToken, setNeedsToken] = useState(false)
-  const [view, setView] = useState<
-    'containers' | 'templates' | 'resources' | 'storage' | 'network' | 'modules'
-  >('containers')
+  const [authInfo, setAuthInfo] = useState<AuthInfo | null>(null)
+  // Set while the server refuses us; holds what it accepts instead.
+  const [gate, setGate] = useState<AuthInfo | null>(null)
+  const [view, setView] = useState<(typeof VIEWS)[number]>('containers')
 
   // Any in-flight mutation pauses polling so it cannot clobber optimistic state.
   // That stops new polls only; refreshSequence drops a response once a newer
@@ -56,6 +62,10 @@ export default function App() {
   // poll finding one finished reports it, exactly once.
   const watchedCreates = useRef(new Set<string>())
   const watchedRuns = useRef(new Set<string>())
+  // The health status each instance had at this page's previous poll, so a
+  // change is reported once, by the page that saw it happen -- and a page
+  // opened on an instance that is already unhealthy says nothing.
+  const seenHealth = useRef<Map<string, HealthStatus> | null>(null)
 
   const notify = useCallback(
     (kind: ToastKind, title: string, detail?: string) => push(kind, title, detail),
@@ -119,15 +129,34 @@ export default function App() {
     }
   }, [notify])
 
+  const reportHealth = useCallback((records: HealthRecord[]) => {
+    const previous = seenHealth.current
+    const next = new Map(records.map((r) => [r.name, r.status] as [string, HealthStatus]))
+    seenHealth.current = next
+    if (previous === null) return
+    for (const record of records) {
+      const before = previous.get(record.name)
+      if (before === undefined || before === record.status) continue
+      if (record.status === 'unhealthy') {
+        notify('error', `${record.name} is unhealthy`, record.reasons.join('; ') || undefined)
+      } else if (before === 'unhealthy' && record.status === 'healthy') {
+        notify('success', `${record.name} recovered`)
+      }
+    }
+  }, [notify])
+
   const refresh = useCallback(async (signal?: AbortSignal) => {
     const sequence = ++refreshSequence.current
     try {
-      const [nextStatus, nextContainers, nextCreates, nextRuns] = await Promise.all([
+      const [nextStatus, nextContainers, nextCreates, nextRuns, nextHealth] = await Promise.all([
         api.status(signal),
         api.listContainers(signal),
         // Progress is extra; a failure here must not look like losing the server.
         api.creates(signal).catch(() => null),
         api.templateRuns(signal).catch(() => null),
+        // Read from the server's memory, so polling it this often is free; the
+        // checks themselves run on the server's own interval.
+        api.health(signal).catch(() => null),
       ])
       if (sequence !== refreshSequence.current) return
       setStatus(nextStatus)
@@ -140,16 +169,47 @@ export default function App() {
         setTemplateRuns(nextRuns)
         reportRuns(nextRuns)
       }
+      if (nextHealth) {
+        setHealth(Object.fromEntries(nextHealth.instances.map((r) => [r.name, r])))
+        reportHealth(nextHealth.instances)
+      }
       setConnectionError(null)
     } catch (cause) {
       if ((cause as Error).name === 'AbortError' || sequence !== refreshSequence.current) return
       if (cause instanceof ApiError && cause.status === 401) {
-        setNeedsToken(true)
+        // A pasted token that stopped working (revoked, expired, mistyped)
+        // would otherwise be sent forever, shadowing a fresh login.
+        if (hasToken()) setToken(null)
+        api.authInfo().then((info) => {
+          setAuthInfo(info)
+          setGate(info)
+        }).catch(() => {})
         return
       }
       setConnectionError((cause as Error).message)
     }
-  }, [reportCreates, reportRuns])
+  }, [reportCreates, reportRuns, reportHealth])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    api.authInfo(controller.signal).then(setAuthInfo).catch(() => {})
+    return () => controller.abort()
+  }, [])
+
+  const signedIn = useCallback(async (info: AuthInfo | null) => {
+    setGate(null)
+    // A pasted token passes null: ask who it makes us.
+    setAuthInfo(info ?? await api.authInfo().catch(() => null))
+    refresh()
+  }, [refresh])
+
+  const logout = useCallback(async () => {
+    setToken(null)
+    await api.logout().catch(() => {})
+    const info = await api.authInfo().catch(() => null)
+    setAuthInfo(info)
+    if (info?.enabled && !info.principal) setGate(info)
+  }, [])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -254,9 +314,12 @@ export default function App() {
   }, [notify, refresh])
 
   const ready = status?.ready ?? false
+  const principal = authInfo?.enabled ? authInfo.principal : null
+  const canWrite = !principal || principal.role === 'admin'
   const running = containers?.filter((c) => c.status === 'Running').length ?? 0
 
   return (
+    <AuthContext.Provider value={authInfo}>
     <div className="app">
       <header className="topbar">
         <div className="brand">
@@ -277,7 +340,7 @@ export default function App() {
           </div>
         )}
         <nav className="topbar-nav" aria-label="Views">
-          {(['containers', 'templates', 'resources', 'storage', 'network', 'modules'] as const)
+          {VIEWS
             .map((id) => (
               <button
                 key={id}
@@ -301,16 +364,28 @@ export default function App() {
             aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}>
             {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
           </button>
+          {principal && (
+            <span className="topbar-user" title={`Signed in via ${principal.via}`}>
+              <span>{principal.name}</span>
+              {principal.role !== 'admin' && <span className="badge badge-dim">read-only</span>}
+              {/* Proxy identity is not ours to end; the proxy owns that session. */}
+              {principal.via !== 'proxy' && (
+                <button className="btn btn-ghost btn-sm" onClick={logout}>Log out</button>
+              )}
+            </span>
+          )}
           {view === 'containers' && (
             <button className="btn btn-primary" onClick={() => setShowCreate(true)}
-              disabled={!ready}>
+              disabled={!ready || !canWrite}>
               <PlusIcon /> New
             </button>
           )}
         </div>
       </header>
 
-      <main className="main">
+      {/* Keyed by identity: views load their data on mount, and nothing loaded
+          as one user should still be on screen after logging in as another. */}
+      <main className="main" key={principal ? `${principal.name}/${principal.role}` : '-'}>
         {connectionError && (
           <div className="banner banner-error">
             <div className="banner-body">
@@ -320,11 +395,24 @@ export default function App() {
           </div>
         )}
 
-        {status && !status.ready && (
+        {principal && !canWrite && (
+          <div className="banner">
+            <div className="banner-body">
+              <h3>Read-only access</h3>
+              <p style={{ margin: 0 }}>
+                You can look around, but {principal.name} cannot make changes here.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {status && !status.ready && canWrite && (
           <SetupBanner status={status} onSetup={runSetup} />
         )}
 
-        {view === 'modules' ? (
+        {view === 'access' ? (
+          <AccessView onNotify={notify} />
+        ) : view === 'modules' ? (
           <ModulesView onNotify={notify} />
         ) : view === 'templates' ? (
           <TemplatesView
@@ -394,6 +482,7 @@ export default function App() {
           <ContainerTable
             containers={containers ?? []}
             creates={creates}
+            health={health}
             selected={selected}
             busy={busy}
             canCreate={ready}
@@ -414,6 +503,7 @@ export default function App() {
           // never leaks from one container into another.
           key={selected}
           name={selected}
+          health={health[selected] ?? null}
           busy={!!busy[selected]}
           refreshToken={refreshToken}
           onClose={() => setSelected(null)}
@@ -423,9 +513,7 @@ export default function App() {
         />
       )}
 
-      {needsToken && (
-        <TokenGate onSubmit={() => { setNeedsToken(false); refresh() }} />
-      )}
+      {gate && <LoginGate info={gate} onDone={signedIn} />}
 
       {showCreate && (
         <CreateDialog onCancel={() => setShowCreate(false)} onCreate={create}
@@ -446,5 +534,6 @@ export default function App() {
 
       <Toasts toasts={toasts} onDismiss={dismiss} />
     </div>
+    </AuthContext.Provider>
   )
 }

@@ -14,13 +14,15 @@ import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
+from . import health as health_checks
 from . import store
 from .bootstrap import (BootstrapError, BootstrapRunner, delete_module,
                         discover_modules, effective_params,
                         list_host_ssh_keys, module_source,
                         normalise_module_id, parse_public_key,
                         public_modules, save_module, secret_param_names)
-from .lxd import INCUS, NO_SECUREBOOT_CONFIG, LXDClient, LXDError, window_resize_message
+from .lxd import (CGROUP_PAYLOAD_PREFIX, INCUS, NO_SECUREBOOT_CONFIG, LXDClient, LXDError,
+                  window_resize_message)
 from .simplestreams import CatalogError, fetch_catalog
 
 VALID_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,61}$")
@@ -329,6 +331,18 @@ class ContainerService:
         # the daemon does not reject an explicit block that overlaps another.
         # It only covers this process, not lxc or a second lemondx.
         self._networks_lock = threading.Lock()
+        # Health rounds: baselines and streaks in the tracker, the latest
+        # records here. Only `serve` fills these continuously; see
+        # start_health_monitor().
+        self._health_tracker = health_checks.Tracker()
+        self._health_lock = threading.Lock()
+        self._health_records = {}
+        self._health_checked_at = None
+        self._health_settings = None
+        self._host_cpu = None               # (threads, memory bytes), fetched once
+        # Per-container load averages, sampled every few seconds; only `serve`
+        # runs one, and a one-off check measures over its window instead.
+        self._load_sampler = None
 
     # -- readiness ---------------------------------------------------------
 
@@ -694,6 +708,157 @@ class ContainerService:
                        for r in self._creates.values()
                        if r["finished_at"] is None and not r["template"]]
         return runs + creates
+
+    # -- health ------------------------------------------------------------
+
+    def check_health(self, names=None, window=5, settings=None):
+        """Run one round of health checks now and return a record per instance.
+
+        CPU needs two samples of the daemon's usage counter. The server's
+        rounds are a minute apart and use the previous one; a caller with no
+        previous sample (the CLI) waits ``window`` seconds between two.
+        Instances not running or frozen get no record.
+        """
+        settings = settings or self._health_settings or health_checks.load_settings()[0]
+        samples = self._health_samples(names)
+        wanted = [s["name"] for s in samples if s["status"] == "Running"]
+        cgroups = {s["name"]: s["cgroup"] for s in samples
+                   if s["status"] == "Running" and s["cgroup"]}
+        sampler = self._load_sampler
+        if sampler is not None and names is None:
+            sampler.set_targets(cgroups)
+
+        measured = None
+        if window and wanted and not self._health_tracker.has_baseline(wanted):
+            self._health_tracker.baseline(samples)
+            if sampler is None and cgroups:
+                # The CPU window doubles as the load window: counted while we wait.
+                measured = health_checks.measure_load(cgroups, window)
+            else:
+                time.sleep(window)
+            samples = self._health_samples(names)
+
+        for sample in samples:
+            if sample["cgroup"]:
+                sample["cgroup_load"] = measured.get(sample["name"]) if measured is not None \
+                    else sampler.load(sample["name"]) if sampler is not None else None
+
+        running = [s for s in samples if s["status"] == "Running"]
+        timeout = settings["probe_timeout_seconds"]
+        probes = {}
+        if running:
+            # Each probe opens its own socket to the daemon, as template
+            # launches do, so a slow instance only holds up its own slot.
+            with ThreadPoolExecutor(max_workers=min(8, len(running))) as pool:
+                for sample, probe in zip(running, pool.map(
+                        lambda s: self._probe(s["name"], timeout), running)):
+                    probes[sample["name"]] = probe
+
+        host = health_checks.host_tasks()
+        records = [self._health_tracker.evaluate(s, probes.get(s["name"]), settings, host)
+                   for s in samples]
+        if names is None:
+            self._health_tracker.forget_except({s["name"] for s in samples})
+        with self._health_lock:
+            if names is None:
+                self._health_records = {r["name"]: r for r in records}
+            else:
+                self._health_records.update((r["name"], r) for r in records)
+            self._health_checked_at = time.time()
+        return sorted(records, key=lambda r: r["name"])
+
+    def health(self):
+        """The latest health records, from memory: never touches the daemon."""
+        settings = self._health_settings
+        with self._health_lock:
+            records = sorted(self._health_records.values(), key=lambda r: r["name"])
+            checked_at = self._health_checked_at
+        return {
+            "enabled": settings is not None and settings["enabled"],
+            "interval": settings["interval_seconds"] if settings else None,
+            "thresholds": health_checks.thresholds(settings) if settings else None,
+            "checked_at": checked_at,
+            "instances": records,
+        }
+
+    def start_health_monitor(self, settings):
+        """Check health every ``interval_seconds`` on a daemon thread, for `serve`."""
+        self._health_settings = settings
+        if not settings["enabled"]:
+            return
+        self._load_sampler = health_checks.LoadSampler()
+        self._load_sampler.start()
+
+        def loop():
+            # The first round establishes CPU baselines and probes at once, so
+            # liveness shows straight away and CPU from the second round on.
+            while True:
+                started = time.time()
+                try:
+                    self.check_health(window=0, settings=settings)
+                except Exception as exc:                    # noqa: BLE001
+                    print("[lemondx] health check failed: %s" % exc)
+                elapsed = time.time() - started
+                # Rounds never overlap: a slow one just starts the next later.
+                time.sleep(max(1.0, settings["interval_seconds"] - elapsed))
+
+        threading.Thread(target=loop, name="lemondx-health", daemon=True).start()
+
+    def _probe(self, name, timeout):
+        started = time.time()
+        try:
+            text = self.lxd.read_file(name, "/proc/loadavg", timeout=timeout)
+        except LXDError as exc:
+            return {"ok": False, "ms": int((time.time() - started) * 1000),
+                    "error": exc.message, "text": None}
+        return {"ok": True, "ms": int((time.time() - started) * 1000), "error": None,
+                "text": text.decode("ascii", "replace")}
+
+    def _health_samples(self, names=None):
+        if self._host_cpu is None:
+            host = self.lxd.resources() or {}
+            self._host_cpu = ((host.get("cpu") or {}).get("total") or 1,
+                              (host.get("memory") or {}).get("total") or 0)
+        threads, host_memory = self._host_cpu
+        wanted = set(names) if names else None
+        samples = []
+        for instance in self.lxd.list_instances():
+            name = instance.get("name")
+            status = instance.get("status") or ""
+            if status not in ACTIVE_STATUSES or (wanted is not None and name not in wanted):
+                continue
+            config = instance.get("expanded_config") or instance.get("config") or {}
+            state = instance.get("state") or {}
+            is_vm = instance.get("type") == "virtual-machine"
+            cores = cpu_count(config.get("limits.cpu")) or (VM_DEFAULTS["cpu"] if is_vm else threads)
+            memory_limit = parse_byte_size(
+                config.get("limits.memory") or (VM_DEFAULTS["memory"] if is_vm else ""),
+                host_memory)
+            usage = (state.get("cpu") or {}).get("usage")
+            samples.append({
+                "name": name,
+                # A VM's threads on the host are its emulator's, not its
+                # guest's tasks, so only a container's cgroup says anything.
+                "cgroup": None if is_vm else health_checks.cgroup_dir(
+                    CGROUP_PAYLOAD_PREFIX[self.lxd.flavor], name, self.lxd.project),
+                "cgroup_load": None,
+                "type": instance.get("type") or "container",
+                "status": status,
+                # A VM without its agent reports -1 or nothing: no counter.
+                "cpu_usage": usage if isinstance(usage, int) and usage > 0 else None,
+                "pid": state.get("pid") or 0,
+                "processes": state.get("processes") or 0,
+                "memory_usage": (state.get("memory") or {}).get("usage") or 0,
+                "memory_limit": memory_limit,
+                "cores": cores,
+                "started_at": health_checks.iso_epoch(instance.get("last_used_at")),
+                "at": time.time(),
+            })
+        if wanted:
+            missing = wanted - {s["name"] for s in samples}
+            if missing:
+                raise ServiceError("Not running: %s" % ", ".join(sorted(missing)), 404)
+        return samples
 
     def root_pool_info(self, profiles=None, pool=None):
         """The pool a new container lands on, and whether it enforces quotas."""

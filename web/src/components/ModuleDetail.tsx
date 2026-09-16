@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useCanWrite } from '../hooks/useAuth'
 import { api } from '../lib/api'
 import type { BootstrapModule, ModuleSource } from '../lib/types'
 import { ConfirmDialog } from './ConfirmDialog'
@@ -33,6 +34,7 @@ const HEADER_LINE = /^#\s*(name|description|order|uses|param|secret|os)\s*:/i
 
 /** One module: its settings, its script, and where it is used. */
 export function ModuleDetail({ module, usage, onBack, onChanged, onDeleted, onNotify }: Props) {
+  const canWrite = useCanWrite()
   const [tab, setTab] = useState<'settings' | 'script'>('settings')
   // Only the fields typed into, so a reload (after toggling pre-select, say)
   // refreshes the rest without losing them.
@@ -175,7 +177,7 @@ export function ModuleDetail({ module, usage, onBack, onChanged, onDeleted, onNo
           </div>
           <div className="module-detail-actions">
             {module.editable && (
-              <button className="btn btn-sm btn-danger" onClick={() => setConfirm('delete')}>
+              <button className="btn btn-sm btn-danger" disabled={!canWrite} onClick={() => setConfirm('delete')}>
                 <TrashIcon size={13} />
                 {module.shadows_builtin ? 'Revert to built-in' : 'Delete'}
               </button>
@@ -211,7 +213,7 @@ export function ModuleDetail({ module, usage, onBack, onChanged, onDeleted, onNo
             <dt>New instances</dt>
             <dd>
               <label className="checkbox">
-                <input type="checkbox" checked={module.is_default} disabled={togglingDefault}
+                <input type="checkbox" checked={module.is_default} disabled={togglingDefault || !canWrite}
                   onChange={toggleDefault} />
                 Pre-select in the create dialog
               </label>
@@ -271,6 +273,13 @@ export function ModuleDetail({ module, usage, onBack, onChanged, onDeleted, onNo
                           </>
                         ) : (
                           <>
+                            {param.multiline ? (
+                              <textarea id={`p-${param.name}`} className="input mono param-text" rows={10}
+                                value={value} placeholder={param.default ? undefined : '(empty)'}
+                                disabled={saving} autoComplete="off" spellCheck={false}
+                                onChange={(event) =>
+                                  setDrafts({ ...drafts, [param.name]: event.target.value })} />
+                            ) : (
                             <input id={`p-${param.name}`} className="input mono" value={value}
                               placeholder={param.default ? undefined : '(empty)'}
                               disabled={saving} autoComplete="off" spellCheck={false}
@@ -279,6 +288,7 @@ export function ModuleDetail({ module, usage, onBack, onChanged, onDeleted, onNo
                               onKeyDown={(event) => {
                                 if (event.key === 'Enter' && changed.length > 0) saveSettings()
                               }} />
+                            )}
                             <span className="hint param-default">
                               {differs ? (
                                 <>
@@ -312,7 +322,7 @@ export function ModuleDetail({ module, usage, onBack, onChanged, onDeleted, onNo
                       Discard
                     </button>
                     <button className="btn btn-sm btn-primary"
-                      disabled={saving || changed.length === 0} onClick={saveSettings}>
+                      disabled={saving || !canWrite || changed.length === 0} onClick={saveSettings}>
                       {saving && <span className="spinner" />}
                       Save settings
                     </button>
@@ -341,7 +351,7 @@ export function ModuleDetail({ module, usage, onBack, onChanged, onDeleted, onNo
                   onClick={() => { setScript(null); setScriptError(null) }}>
                   Cancel
                 </button>
-                <button className="btn btn-sm btn-primary" disabled={savingScript || !scriptDirty}
+                <button className="btn btn-sm btn-primary" disabled={savingScript || !canWrite || !scriptDirty}
                   onClick={saveScript}>
                   {savingScript && <span className="spinner" />}
                   {module.editable ? 'Save script' : 'Save my copy'}
