@@ -13,11 +13,12 @@ web UI, service, security, frontend dev).
 ## Commands
 
 ```bash
-./lemondx serve --open              # run API + committed UI on :8099
+./lemondx serve --open              # run API + built UI on :8099
 ./lemondx serve --dev               # same, with CORS open for the Vite dev server
-npm --prefix web install            # once, only if changing the frontend
+./build.sh                          # check the Node toolchain, install, build -> web/dist
 npm --prefix web run dev            # Vite on :5173, proxies /api to :8099
-npm --prefix web run build          # tsc -b && vite build -> web/dist (commit the result)
+npm --prefix web run build          # the build step alone (web/dist is not committed)
+.github/scripts/bundle.sh 1.2.3     # the release archive, exactly as CI builds it
 npm --prefix web run lint           # oxlint
 python3 -m compileall -q src/lemondx # syntax check; there is no Python linter configured
 sh -n modules/foo.sh                # modules must parse as POSIX sh
@@ -35,11 +36,15 @@ resolved; `--json` on any CLI command prints the same payload the REST API retur
   dependencies by design — do not add any, and do not use syntax newer than 3.9
   (every module starts with `from __future__ import annotations`, so annotations
   themselves are free).
-- **`web/dist` is committed** so a clone runs without Node. Any change under `web/src`
-  must be followed by `npm --prefix web run build` and the rebuilt `dist` committed in the
-  same change.
-- **Node is not required to run lemondx**, only to change the UI. Nothing in the Python
-  side may depend on a build step having happened.
+- **`web/dist` is a build output, not source**, and is gitignored. The release workflow
+  builds it and ships it inside the release archive, which is how a user gets a runnable
+  tree; a clone runs `./build.sh` once. Nothing in the Python side may
+  depend on that build having happened -- `serve` prints a note and still serves the API
+  when `web/dist` is absent.
+- **Node is not required to run a release**, only to build from a clone or change the UI.
+- **Commit subjects are conventional commits** (`feat:`, `fix:`, `feat!:` ...): release-please
+  derives the next semantic version from them, so the subject line is a release decision.
+  The PR workflow rejects a PR title that does not parse. See docs/development.md.
 
 ## Architecture
 
@@ -264,5 +269,7 @@ state.
 
 Comments explain *why*, not what — the existing ones are the model: they record the
 trade-off or the daemon quirk that forced the code's shape. Keep that density rather than
-annotating obvious lines. Commit messages are a short imperative subject followed by
-prose paragraphs explaining the reasoning, wrapped at ~72 columns.
+annotating obvious lines. Commit messages are a conventional-commit subject
+(`feat:`, `fix:`, `docs:`, `feat!:` for a break) in the imperative, followed by prose
+paragraphs explaining the reasoning, wrapped at ~72 columns. The subject picks the next
+version number -- see docs/development.md.

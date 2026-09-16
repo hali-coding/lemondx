@@ -29,9 +29,10 @@ shelling out and no parsing of CLI output.
 - **Python 3.9+**. That is the whole dependency list — the backend is stdlib
   only, so there is no pip install, virtualenv or lockfile.
 
-Node is **not** required to run lemondx; the built UI is committed. You only
-need it if you want to change the frontend — see
-[Frontend development](docs/development.md).
+Node is **not** required to run a release: the archive on the
+[releases page](../../releases) already contains the built UI. You only need it
+to build from a clone or to change the frontend — see
+[Development](docs/development.md).
 
 Not to be confused with liblxc's `lxc-create` / `lxc-ls` tools, which are a
 different thing with no REST API. lemondx targets the LXD/Incus API — see
@@ -40,12 +41,26 @@ finds and adapts to whichever one is installed.
 
 ## Quick start
 
+Download the latest release — Python 3.9+ is all it needs, the UI is already
+built:
+
 ```bash
-git clone <repo> lemondx && cd lemondx
+curl -LO <repo>/releases/latest/download/lemondx-<version>.tar.gz
+tar xzf lemondx-<version>.tar.gz && cd lemondx-<version>
 ./lemondx serve --open
 ```
 
-That is it — no build step. Then open <http://127.0.0.1:8099>.
+Then open <http://127.0.0.1:8099>.
+
+From a clone instead — the UI is a build output and is not in git, so build it
+once. `./build.sh` checks for a usable Node toolchain, installs the frontend
+dependencies and builds; it is the only step that needs Node:
+
+```bash
+git clone <repo> lemondx && cd lemondx
+./build.sh
+./lemondx serve --open
+```
 
 Handy on PATH:
 
@@ -121,7 +136,7 @@ pass to `-i`.
 | [Web UI tour](docs/web-ui.md) | the Resources and Network views, the full image browser |
 | [Running as a service](docs/service.md) | systemd units, user vs system install |
 | [Security](docs/security.md) | logins (local users, PAM, proxy), roles, API tokens, TLS |
-| [Frontend development](docs/development.md) | Vite dev server, rebuilding `web/dist` |
+| [Development](docs/development.md) | Vite dev server, building `web/dist`, how releases are cut |
 
 ## Security
 

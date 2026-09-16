@@ -92,20 +92,40 @@ jobs:
         run: npm run lint
         working-directory: web
 
-      - name: Typecheck and build (tsc -b && vite build)
-        run: npm run build
-        working-directory: web
+      - name: Typecheck and build (./build.sh)
+        # Via build.sh rather than npm directly, so the script a clone is told
+        # to run is the one CI proves still works. npm ci above already
+        # populated node_modules, so it goes straight to the build.
+        run: ./build.sh
 
-      - name: web/dist must match this build
-        # Hard constraint from CLAUDE.md: web/dist is committed so a clone
-        # runs with no Node install, which means a PR that touches web/src
-        # must ship the rebuilt dist in the same change. `npm run build`
-        # above just regenerated it from source -- if that differs at all
-        # from what's committed (new content-hashed filenames included),
-        # the PR is missing that rebuild.
+      - name: Release archive assembles
+        # web/dist is no longer committed, so the release archive is the only
+        # thing that ships a runnable tree -- and the release workflow only
+        # ever runs after a merge, too late to find out it is broken. Build
+        # the same archive here, from the dist just built above.
         run: |
-          if [ -n "$(git status --porcelain -- web/dist)" ]; then
-            echo "::error::web/dist does not match a fresh build. Run 'npm --prefix web run build' and commit the result."
-            git status --porcelain -- web/dist
+          .github/scripts/bundle.sh 0.0.0-pr "$RUNNER_TEMP/bundle"
+          tar xzf "$RUNNER_TEMP/bundle/lemondx-0.0.0-pr.tar.gz" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/lemondx-0.0.0-pr"
+          test -f web/dist/index.html
+          ./lemondx --help > /dev/null
+
+  commit-style:
+    name: PR title is a conventional commit
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Check the title release-please will read
+        # A squash merge takes the PR title as the commit subject, and that
+        # subject is the entire input to the next version number -- an
+        # unparseable one silently releases nothing. See docs/development.md.
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if printf '%s' "$TITLE" | grep -Eq '^(feat|fix|perf|refactor|docs|deps|build|ci|chore|style|test|revert)(\([a-z0-9._/-]+\))?!?: .+'; then
+            echo "ok: $TITLE"
+          else
+            echo "::error::PR title must be a conventional commit, e.g. 'feat(web): add a bulk stop button'."
+            echo "::error::Got: $TITLE"
             exit 1
           fi
