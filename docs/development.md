@@ -72,3 +72,23 @@ Two repository settings this depends on: **Allow GitHub Actions to create and
 approve pull requests** (Settings → Actions → General), or release-please
 cannot open its PR; and squash merging enabled, so PR titles are what lands on
 `main`.
+
+### The `RELEASE_PLEASE_TOKEN` secret
+
+GitHub will not let one workflow run trigger another, so a release PR opened by
+`github-actions[bot]` cannot start the PR workflow: the run is created and dies
+immediately with *Actor is not allowed to trigger Actions workflows*. The
+effect is that the one PR nobody wrote by hand is the one that goes unchecked.
+
+Giving release-please a token that belongs to an account fixes it — the PR is
+opened by that account, and CI treats it like any other. Create a
+[fine-grained PAT](https://github.com/settings/personal-access-tokens) scoped to
+this repository with **Contents: read and write** and **Pull requests: read and
+write**, then store it as the repository secret `RELEASE_PLEASE_TOKEN`
+(Settings → Secrets and variables → Actions).
+
+It is optional: without the secret the workflow falls back to `GITHUB_TOKEN`,
+which still tags and releases correctly — only the checks on the release PR are
+lost, and they show as a startup failure rather than as nothing. Nothing else in
+the repository needs the token, and a fine-grained PAT expires, so the red X
+coming back on a release PR is the sign that it needs renewing.

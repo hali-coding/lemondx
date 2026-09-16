@@ -39,6 +39,16 @@ jobs:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
         id: release
         with:
+          # GITHUB_TOKEN would work, except that GitHub refuses to let one
+          # workflow run trigger another: a release PR opened by
+          # github-actions[bot] makes the PR workflow fail at startup with
+          # "Actor is not allowed to trigger Actions workflows", so the one PR
+          # whose contents nobody hand-wrote is the one that never gets
+          # checked. A PAT makes the PR come from a real account instead, and
+          # CI runs on it like any other. Falls back to GITHUB_TOKEN so a fork
+          # -- or this repo before the secret is set -- still releases, just
+          # without CI on the release PR. See docs/development.md.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
