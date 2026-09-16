@@ -213,8 +213,9 @@ export function ContainerTable({
                   <input
                     type="checkbox"
                     checked={ticked.has(container.name)}
-                    disabled={isBusy || !canWrite}
+disabled={isBusy || !canWrite}
                     aria-label={`Select ${container.name}`}
+                    onKeyDown={(event) => event.stopPropagation()}
                     onChange={(event) => tick(container.name, event.target.checked)}
                   />
                 </td>
