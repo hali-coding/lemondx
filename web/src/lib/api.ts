@@ -1,6 +1,6 @@
 import type {
   ApiToken, AuthInfo, CreatedApiToken, HealthReport, LocalUser, Role,
-  BootstrapModule, BootstrapProfile, BootstrapResult, BootstrapSelection,
+  BootstrapModule, BootstrapProfile, BootstrapResult, BootstrapSelection, BulkStateResult,
   Container, ModuleSource,
   ContainerDetail, CreateProgress, CreateRequest, ExecResult, ImageBrowse, Images, NetworkDetail,
   InstanceTemplate, NetworkRequest, NetworkSummary, SubnetInUse, Resources, SetupResult, Snapshot, SshKey,
@@ -113,6 +113,11 @@ export const api = {
   setState: (name: string, action: StateAction, force = false) =>
     request<ContainerDetail>(`/containers/${encodeURIComponent(name)}/state`,
       { method: 'POST', body: { action, force } }),
+
+  /** One action over several containers; each one's outcome comes back separately. */
+  setStateMany: (names: string[], action: StateAction, force = false) =>
+    request<BulkStateResult>('/containers/state',
+      { method: 'POST', body: { names, action, force } }),
 
   updateLimits: (name: string, body: { cpu?: string; memory?: string; description?: string }) =>
     request<ContainerDetail>(`/containers/${encodeURIComponent(name)}`,

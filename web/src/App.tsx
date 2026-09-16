@@ -27,6 +27,11 @@ const POLL_INTERVAL = 3000
 
 const VIEWS = ['containers', 'templates', 'resources', 'storage', 'network', 'modules', 'access'] as const
 
+const STATE_VERB: Record<StateAction, string> = {
+  start: 'Started', stop: 'Stopped', restart: 'Restarted',
+  freeze: 'Paused', unfreeze: 'Resumed',
+}
+
 export default function App() {
   const { theme, toggle } = useTheme()
   const { toasts, push, dismiss } = useToasts()
@@ -254,15 +259,49 @@ export default function App() {
   }, [refresh])
 
   const changeState = useCallback((name: string, action: StateAction) => {
-    const verb = { start: 'Started', stop: 'Stopped', restart: 'Restarted',
-      freeze: 'Paused', unfreeze: 'Resumed' }[action]
     return mutate(
       name,
       () => api.setState(name, action).then(() => {}),
-      () => notify('success', `${verb} ${name}`),
+      () => notify('success', `${STATE_VERB[action]} ${name}`),
       (message) => notify('error', `Could not ${action} ${name}`, message),
     )
   }, [mutate, notify])
+
+  /**
+   * One action over the containers the user ticked and confirmed. The server
+   * applies it to each and reports every outcome, so a container that refuses
+   * does not hide what happened to the rest; resolves false only when the
+   * request itself never landed, which leaves the selection to try again.
+   */
+  const bulkState = useCallback(async (names: string[], action: StateAction) => {
+    mutating.current += 1
+    setBusy((current) => ({ ...current, ...Object.fromEntries(names.map((n) => [n, true])) }))
+    try {
+      const result = await api.setStateMany(names, action)
+      const failed = result.instances.filter((i) => !i.ok)
+      if (failed.length === 0) {
+        notify('success', `${STATE_VERB[action]} ${names.length} container${names.length === 1 ? '' : 's'}`,
+          names.join(', '))
+      } else {
+        notify('error', `${failed.length} of ${result.instances.length} could not ${action}`,
+          failed.map((i) => `${i.name}: ${i.error}`).join('; '))
+      }
+      return true
+    } catch (cause) {
+      notify('error', `Could not ${action} the selected containers`,
+        cause instanceof ApiError ? cause.message : (cause as Error).message)
+      return false
+    } finally {
+      mutating.current -= 1
+      setBusy((current) => {
+        const next = { ...current }
+        for (const name of names) delete next[name]
+        return next
+      })
+      await refresh()
+      setRefreshToken((token) => token + 1)
+    }
+  }, [notify, refresh])
 
   const create = useCallback(async (request: CreateRequest) => {
     // Returns once the server has accepted the create -- anything it can
@@ -488,6 +527,7 @@ export default function App() {
             canCreate={ready}
             onSelect={setSelected}
             onAction={changeState}
+            onBulkAction={bulkState}
             onDelete={setPendingDelete}
             onCreate={() => setShowCreate(true)}
           />

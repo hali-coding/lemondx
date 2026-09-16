@@ -126,6 +126,14 @@ def build_router(service, auth=None):
           lambda body, q, name: service.delete_container(
               name, force=_flag(q.get("force")) or bool(body.get("force"))))
 
+    # One action over several containers at once. Distinct from the per-name
+    # route by path length, and POST /api/containers is the create, so nothing
+    # here shadows a container called "state".
+    r.add("POST", r"/api/containers/state",
+          lambda body, q: service.change_state_many(
+              body.get("names"), body.get("action", ""), force=bool(body.get("force")),
+              timeout=int(body.get("timeout", 60))))
+
     r.add("POST", r"/api/containers/%s/state" % NAME,
           lambda body, q, name: service.change_state(
               name, body.get("action", ""), force=bool(body.get("force")),

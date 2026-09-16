@@ -2,9 +2,24 @@
 
 [← back to README](../README.md)
 
-Parts of the web UI that are easy to miss because they are not on the
-Containers tab: health checks, the Resources, Storage, Network and Access views,
-and the full image browser.
+Parts of the web UI that are easy to miss: bulk start and stop, health checks,
+the Resources, Storage, Network and Access views, and the full image browser.
+
+## Starting and stopping several at once
+
+Each row on the Containers tab has a checkbox, and the one in the header ticks
+every container that is not already busy — a container mid-create is left out,
+since starting or stopping it would pull the rug out from under its bootstrap.
+Ticking any of them raises a bar above the table with **Start**, **Stop** and
+**Clear**, and either action asks for confirmation naming the containers it is
+about before anything happens.
+
+One request carries the whole list (`POST /api/containers/state`) and the server
+applies the action to each in parallel, reporting every outcome separately: a
+container the daemon refuses — one already stopped, say — is that container's
+result, not a failure for the rest. The notification afterwards says so,
+naming only the ones that did not do as asked. `lemondx start`/`stop` take
+several names for the same reason and go through the same code.
 
 ## Logging in and the Access view
 

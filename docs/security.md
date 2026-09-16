@@ -122,18 +122,12 @@ password.
 
 lemondx uses the PAM service named by `--pam-service` (default `lemondx`).
 Create it, or PAM falls back to `other`, which denies everything on some
-distributions:
+distributions. `systemd/lemondx.pam` is a ready one -- it delegates to the
+host's own stack, and carries the one-line swap for distributions with a
+single `system-auth` instead of Debian's `common-auth`:
 
-```text
-# /etc/pam.d/lemondx  (Debian/Ubuntu)
-@include common-auth
-@include common-account
-```
-
-```text
-# /etc/pam.d/lemondx  (Fedora/RHEL/Arch)
-auth     include  system-auth
-account  include  system-auth
+```bash
+sudo install -m 644 systemd/lemondx.pam /etc/pam.d/lemondx
 ```
 
 Two properties of `pam_unix` decide who can actually log in, and `serve` warns

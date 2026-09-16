@@ -897,6 +897,43 @@ class ContainerService:
         self.lxd.set_state(name, STATE_ACTIONS[action], force=force, timeout=timeout)
         return self.get_container(name)
 
+    # A state change is nearly all waiting on the daemon, and the client opens
+    # a socket per request, so a ticked list goes out together rather than one
+    # round trip after another. Same reasoning as EXEC_WORKERS.
+    BULK_STATE_WORKERS = 8
+
+    def change_state_many(self, names, action, force=False, timeout=60):
+        """Apply one state action to several containers at once.
+
+        Every instance goes through ``change_state``, so the bulk path
+        cannot drift from the single one. A container the daemon refuses --
+        already stopped, or wedged -- is that container's result rather than an
+        error for the whole request: the caller acted on a list it confirmed,
+        and giving up halfway would leave the rest in a state nobody chose.
+        Only a request that cannot be carried out at all raises.
+        """
+        if action not in STATE_ACTIONS:
+            raise ServiceError(
+                "Unknown action '%s'. Try: %s" % (action, ", ".join(sorted(STATE_ACTIONS)))
+            )
+        if (not isinstance(names, list) or not names
+                or not all(isinstance(n, str) and n.strip() for n in names)):
+            raise ServiceError("List the containers to act on in 'names'.")
+        # Deduplicated, but kept in the order given, so the CLI's output reads
+        # in the order the names were typed.
+        wanted = list(dict.fromkeys(name.strip() for name in names))
+
+        def run_one(name):
+            try:
+                container = self.change_state(name, action, force=force, timeout=timeout)
+            except (ServiceError, LXDError) as exc:
+                return {"name": name, "ok": False, "error": str(exc), "container": None}
+            return {"name": name, "ok": True, "error": None, "container": container}
+
+        instances = self._each(wanted, run_one, workers=self.BULK_STATE_WORKERS)
+        return {"action": action, "ok": all(i["ok"] for i in instances),
+                "instances": instances}
+
     def delete_container(self, name, force=False):
         state = self.lxd.get_state(name)
         if state.get("status") != "Stopped":
