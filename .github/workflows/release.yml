@@ -1,0 +1,113 @@
+# Releases lemondx. Two stages, both driven by a merge to main:
+#
+#   1. release-please reads the conventional-commit subjects since the last tag
+#      and keeps a release PR open with the next semantic version, the bumped
+#      pyproject.toml/__init__.py and the CHANGELOG entry. Merging that PR is
+#      the decision to release; nothing else here tags anything.
+#   2. Merging it makes release-please tag and create the GitHub release, and
+#      this run then builds the UI and attaches the archives -- which is the
+#      only place a user gets a ready-to-run tree now that web/dist is no
+#      longer committed. See docs/development.md.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never let two releases interleave; unlike the PR workflow, an in-flight run
+# must finish rather than be superseded -- it may already have tagged.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release PR / tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # tag and create the release
+      pull-requests: write   # open and update the release PR
+    outputs:
+      released: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  artifacts:
+    name: Build and attach artifacts
+    needs: release-please
+    if: needs.release-please.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # upload assets onto the release just created
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tag, not main: main may already have moved on, and the archive
+          # has to match the version stamped in the release.
+          ref: ${{ needs.release-please.outputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build the UI
+        # The same script a user runs in a clone -- one build path, so a
+        # release cannot be built differently from what anyone can reproduce.
+        run: ./build.sh
+
+      - name: Assemble archives
+        run: |
+          # Same commit in, same bytes out: timestamp the archive from the
+          # tagged commit rather than from when the runner happened to start.
+          SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
+          export SOURCE_DATE_EPOCH
+          .github/scripts/bundle.sh "${{ needs.release-please.outputs.version }}"
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.release-please.outputs.tag }}" \
+            dist/lemondx-*.tar.gz dist/lemondx-*.zip dist/SHA256SUMS \
+            --clobber
+
+      - name: Note how to use the archive in the release body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          # release-please writes the changelog; append the install snippet
+          # below it, since the archive is now the recommended way in.
+          {
+            gh release view "$TAG" --json body --jq .body
+            cat <<NOTE
+
+          ---
+
+          ### Install
+
+          \`\`\`bash
+          curl -LO https://github.com/${{ github.repository }}/releases/download/$TAG/lemondx-$VERSION.tar.gz
+          tar xzf lemondx-$VERSION.tar.gz && cd lemondx-$VERSION
+          ./lemondx serve --open
+          \`\`\`
+
+          Python 3.9+ and a running LXD or Incus daemon are the only
+          requirements -- the archive already contains the built web UI, so
+          no Node toolchain is needed. Checksums: \`SHA256SUMS\`.
+          NOTE
+          } > body.md
+          gh release edit "$TAG" --notes-file body.md

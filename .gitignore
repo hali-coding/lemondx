@@ -3,7 +3,11 @@ __pycache__/
 node_modules/
 .DS_Store
 
-
-# web/dist is deliberately committed: it lets `./lemondx serve` work straight
-# from a clone, with no Node toolchain. Rebuild it with:
+# web/dist is a build output, not source: it is rebuilt by the release
+# workflow and shipped in the release archive, so a clone builds it with
 #   npm --prefix web install && npm --prefix web run build
+# or downloads a release, which already contains it.
+web/dist/
+
+# Local output of .github/scripts/bundle.sh.
+/dist/

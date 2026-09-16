@@ -851,8 +851,8 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
     if dev:
         print("Dev mode: CORS is open for the Vite dev server (npm --prefix web run dev).")
     if not os.path.isdir(WEB_DIST) and not dev:
-        print("Note: web/dist not found -- build the UI with "
-              "`npm --prefix web install && npm --prefix web run build`.")
+        print("Note: web/dist not found -- build the UI with `./build.sh`, "
+              "or use a release archive, which ships it built.")
 
     if health_settings is not None:
         service = getattr(httpd.RequestHandlerClass, "service", None)
