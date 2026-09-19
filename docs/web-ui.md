@@ -76,7 +76,9 @@ opens the full detail drawer, wherever the instance lives: overview and limits,
 snapshots, bootstrap and the console all act on its own node. The bootstrap
 picker's modules and keys come from that node too.
 
-Health dots stay local, since each node's monitor judges its own instances. The
+Health dots and app-check diamonds show for every node's rows: each node's
+monitor judges its own instances, and the listing carries what the owner last
+concluded. The
 link on a remote row opens that node's own UI, for what is about the host rather
 than the instance.
 
@@ -129,6 +131,21 @@ which proves it responds, and compares its CPU and memory with its limits:
 | unknown | a VM whose agent is not running, so it cannot be probed |
 | paused | frozen; not checked |
 
+An instance launched from a template can also have an
+[app check](templates.md#app-health-checks) — a script of the template's own,
+Nagios-style — which adds its verdict to the same status: warning or unknown
+makes the instance degraded, critical does too and makes it unhealthy once it
+repeats. Every running instance reports an app status; with no check
+configured it is always `ok`. The container list shows it as a small diamond
+after the health dot — green ok, orange warning, red critical, grey unknown
+or pending. A running instance its node has not checked yet (up to one
+interval after it starts) shows both markers grey rather than none; a node
+with checks off shows none — and the detail panel's Health section has an App row
+with the first line of output and when it last ran. Click the diamond, or
+**Output** on that row, for everything the latest run printed — stdout, stderr,
+exit code and timing — and the script itself; it is fetched from the node the
+instance is on, where the check ran.
+
 The container list shows a coloured dot beside **Running** — green when
 healthy, orange when degraded, red when unhealthy (hover for the reasons); the detail panel shows the status, how long it has held, the reasons,
 CPU as a percentage of the instance's CPUs, and load. The page raises a toast
@@ -167,7 +184,8 @@ lemondx health                  # every running instance
 lemondx health web-1 --window 10 --json
 ```
 
-It exits 0 when everything is healthy, 1 when anything is degraded, starting or
+The CLI also runs each instance's app check once, and shows its status in the
+`app` column. It exits 0 when everything is healthy, 1 when anything is degraded, starting or
 unknown, and 2 when anything is unhealthy, so it can drive a cron job or a
 monitoring check. `GET /api/health` returns the server's latest results
 without running a check:
@@ -180,7 +198,11 @@ without running a check:
    "cpu": {"percent": 99.6, "cores_used": 0.996, "cores": 1},
    "memory": {"usage": 22446080, "limit": 134217728, "percent": 16.7},
    "load": {"avg": [4.02, 3.61, 2.10], "scope": "instance", "source": "cgroup", "warming": false, "window": null},
-   "probe": {"ok": true, "ms": 18, "error": null}, "processes": 7, "failures": 0}]}
+   "probe": {"ok": true, "ms": 18, "error": null},
+   "app": {"status": "ok", "configured": false, "template": "Web server", "code": null,
+           "output": "no app check configured", "ms": null, "checked_at": null,
+           "streak": 0, "interval": null},
+   "processes": 7, "failures": 0}]}
 ```
 
 ## Resources view

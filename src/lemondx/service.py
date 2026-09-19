@@ -21,7 +21,8 @@ from .bootstrap import (BootstrapError, BootstrapRunner, delete_module,
                         discover_modules, effective_params,
                         list_host_ssh_keys, module_source,
                         normalise_module_id, parse_public_key,
-                        public_modules, save_module, secret_param_names)
+                        public_modules, save_module, secret_param_names,
+                        check_shell_syntax)
 from .lxd import (CGROUP_PAYLOAD_PREFIX, INCUS, NO_SECUREBOOT_CONFIG, LXDClient, LXDError,
                   window_resize_message)
 from .simplestreams import CatalogError, fetch_catalog
@@ -338,12 +339,18 @@ class ContainerService:
         self._health_tracker = health_checks.Tracker()
         self._health_lock = threading.Lock()
         self._health_records = {}
+        # The same, judged as machines only: what an app check result that
+        # lands between rounds is folded into (health_checks.fold_app()).
+        self._health_base = {}
         self._health_checked_at = None
         self._health_settings = None
         self._host_cpu = None               # (threads, memory bytes), fetched once
         # Per-container load averages, sampled every few seconds; only `serve`
         # runs one, and a one-off check measures over its window instead.
         self._load_sampler = None
+        # Template app checks on their own intervals; `serve` only, like the
+        # sampler. Without it a round runs each check itself.
+        self._app_checker = None
 
     # -- readiness ---------------------------------------------------------
 
@@ -746,24 +753,56 @@ class ContainerService:
 
         running = [s for s in samples if s["status"] == "Running"]
         timeout = settings["probe_timeout_seconds"]
-        probes = {}
+        app_checks, configured = self._app_checks(running)
+        checker = self._app_checker
+        if checker is not None and names is None:
+            checker.set_targets(app_checks)
+        probes, apps = {}, {}
+
+        def check(sample):
+            name = sample["name"]
+            probe = self._probe(name, timeout)
+            if checker is not None:
+                # `serve` runs checks on their own intervals; a round reads.
+                return probe, checker.result(name) if name in app_checks else None
+            # A one-off check runs the script now. An instance that cannot
+            # even have a file read will not run one either; the failed probe
+            # already says so.
+            app = self._run_app_check(name, app_checks[name]) \
+                if name in app_checks and probe["ok"] else None
+            if app:
+                app.update(checked_at=time.time(), interval=None,
+                           streak=1 if app["status"] == health_checks.APP_CRITICAL else 0)
+            return probe, app
+
+        def app_status(sample):
+            if sample["status"] != "Running":
+                return None
+            return self._app_status(sample["name"], sample["template"],
+                                    apps.get(sample["name"]), sample["name"] in configured)
+
         if running:
             # Each probe opens its own socket to the daemon, as template
             # launches do, so a slow instance only holds up its own slot.
             with ThreadPoolExecutor(max_workers=min(8, len(running))) as pool:
-                for sample, probe in zip(running, pool.map(
-                        lambda s: self._probe(s["name"], timeout), running)):
+                for sample, (probe, app) in zip(running, pool.map(check, running)):
                     probes[sample["name"]] = probe
+                    apps[sample["name"]] = app
 
         host = health_checks.host_tasks()
-        records = [self._health_tracker.evaluate(s, probes.get(s["name"]), settings, host)
-                   for s in samples]
+        bases = [self._health_tracker.evaluate(s, probes.get(s["name"]), settings, host)
+                 for s in samples]
         if names is None:
             self._health_tracker.forget_except({s["name"] for s in samples})
         with self._health_lock:
+            records = [health_checks.fold_app(base, app_status(sample), settings,
+                                              self._health_records.get(base["name"]))
+                       for base, sample in zip(bases, samples)]
             if names is None:
+                self._health_base = {b["name"]: b for b in bases}
                 self._health_records = {r["name"]: r for r in records}
             else:
+                self._health_base.update((b["name"], b) for b in bases)
                 self._health_records.update((r["name"], r) for r in records)
             self._health_checked_at = time.time()
         return sorted(records, key=lambda r: r["name"])
@@ -789,6 +828,9 @@ class ContainerService:
             return
         self._load_sampler = health_checks.LoadSampler()
         self._load_sampler.start()
+        self._app_checker = health_checks.AppChecker(self._run_app_check,
+                                                     self._app_result_landed)
+        self._app_checker.start()
 
         def loop():
             # The first round establishes CPU baselines and probes at once, so
@@ -804,6 +846,167 @@ class ContainerService:
                 time.sleep(max(1.0, settings["interval_seconds"] - elapsed))
 
         threading.Thread(target=loop, name="lemondx-health", daemon=True).start()
+
+    # Runs the template's script inside the instance with its own watchdog, so
+    # a hung check is stopped where it runs: the daemon giving up on waiting
+    # stops nothing, and a hung script left running would be joined by another
+    # every interval. `timeout` is not used even where it exists -- it kills
+    # only its direct child (busybox's always; coreutils' unless the child
+    # makes its own group), and a check's hung `curl` is a grandchild. Without
+    # a tty there is no job control to give the script a process group, so at
+    # the limit the watchdog walks /proc for the script's tree, stopping each
+    # process as it is found so none is reparented out of reach, then kills
+    # them all, deepest first. The script itself goes last and the watchdog
+    # ignores TERM from then on: the script dying wakes the wrapper, whose
+    # `kill "$dog"` would otherwise cut the list short. It leaves a marker so a timeout is told apart from a script
+    # that was killed some other way (the OOM killer's 137 looks the same).
+    #
+    # The script goes to a file and its interpreter line is read and run by
+    # hand, the way the kernel would, so a check can be bash or python without
+    # the file needing to be executable -- /tmp is often mounted noexec.
+    # Minimal images may have no mktemp. The watchdog's fds go to /dev/null so
+    # that one left sleeping never holds the run's output open.
+    _APP_CHECK_WRAPPER = (
+        'f=$(mktemp 2>/dev/null) || f=/tmp/lemondx-app-check.$$\n'
+        'printf "%s" "$1" > "$f" || exit 3\n'
+        'limit=$2; interp=/bin/sh\n'
+        'case "$1" in "#!"*) IFS= read -r interp < "$f"; interp=${interp#??} ;; esac\n'
+        'set -- $interp "$f"\n'
+        '"$@" & pid=$!\n'
+        '(\n'
+        '  sleep "$limit"\n'
+        '  trap "" TERM\n'
+        '  : > "$f.timeout"\n'
+        '  kill -STOP "$pid"; all=$pid; new=$pid\n'
+        '  while [ -n "$new" ]; do\n'
+        '    next=\n'
+        '    for s in /proc/[0-9]*/status; do\n'
+        '      while IFS=: read -r k v; do\n'
+        '        [ "$k" = PPid ] || continue\n'
+        '        for p in $new; do\n'
+        '          if [ ${v:-x} = "$p" ]; then\n'
+        '            c=${s#/proc/}; c=${c%/status}; kill -STOP "$c"; next="$next $c"\n'
+        '          fi\n'
+        '        done\n'
+        '        break\n'
+        '      done < "$s"\n'
+        '    done\n'
+        '    all="$next $all"; new=$next\n'
+        '  done\n'
+        '  kill -9 $all\n'
+        ') >/dev/null 2>&1 </dev/null & dog=$!\n'
+        'wait "$pid"; rc=$?\n'
+        'kill "$dog" 2>/dev/null\n'
+        'if [ -e "$f.timeout" ]; then rc=124; fi\n'
+        'rm -f "$f" "$f.timeout"; exit $rc\n'
+    )
+
+    @staticmethod
+    def _app_status(name, template, result, configured):
+        """What a record says about the app: a result, pending, or ok for none."""
+        if result is None:
+            return dict(health_checks.app_placeholder(configured), template=template)
+        summary = {k: v for k, v in result.items() if k not in health_checks.APP_DETAIL_KEYS}
+        return dict(summary, configured=True, template=template)
+
+    def app_check_output(self, name):
+        """The latest run of an instance's app check, with everything it printed.
+
+        Kept apart from health(): records go out on every poll, and this is
+        what someone asks for when they want to know why a check said what it
+        said. ``result`` is None until the first run finishes.
+        """
+        checker = self._app_checker
+        if checker is None:
+            raise ServiceError("App checks run under `lemondx serve` with health checks on; "
+                               "this process keeps no results.", 409)
+        target = checker.target(name)
+        if target is None:
+            raise ServiceError(
+                "'%s' has no app check running: it is not running, its template has "
+                "none, or it is still being created." % name, 404)
+        result = checker.result(name)
+        return {
+            "name": name,
+            "template": target["template"],
+            "script": target["script"],
+            "interval_seconds": target["interval_seconds"],
+            "timeout_seconds": target["timeout_seconds"],
+            "result": result,
+        }
+
+    def _app_result_landed(self, name):
+        """Fold a check that finished between rounds into its instance's record."""
+        checker = self._app_checker
+        result = checker.result(name)
+        settings = self._health_settings
+        with self._health_lock:
+            base, previous = self._health_base.get(name), self._health_records.get(name)
+            if base is None or previous is None or previous["app"] is None:
+                return                  # not running at the last round; the next says
+            # No result: a check just swapped in (pending) or removed (ok).
+            self._health_records[name] = health_checks.fold_app(
+                base, self._app_status(name, previous["app"]["template"], result,
+                                       checker.has_target(name)),
+                settings, previous)
+
+    def _app_checks(self, samples):
+        """``(checks, configured)``: the app checks to run now, by instance name,
+        and the names of every instance whose template has one.
+
+        Read from the template on every round rather than copied onto the
+        instance, so editing a template's check reaches the instances already
+        launched from it. An instance still being created or bootstrapped is
+        left out: the application it checks is not there yet.
+        """
+        tagged = {s["name"]: s["template"] for s in samples if s.get("template")}
+        if not tagged:
+            return {}, set()
+        templates = store.load_templates()
+        with self._creates_lock:
+            busy = {n for n, r in self._creates.items() if r["finished_at"] is None}
+        checks, configured = {}, set()
+        for name, template in tagged.items():
+            app_check = (templates.get(template) or {}).get("app_check")
+            if app_check:
+                configured.add(name)
+                if name not in busy:
+                    # Tagged with its template so a save can find what to swap.
+                    checks[name] = dict(app_check, template=template)
+        return checks, configured
+
+    def _app_check_changed(self, template, app_check):
+        """Swap a saved (or deleted) check into the running scheduler at once.
+
+        Saving -- here, or a push from another member, which lands in the same
+        save -- would otherwise reach the scheduler only at the next round.
+        """
+        checker = self._app_checker
+        if checker is None:
+            return
+        for name in checker.update_template(template, app_check):
+            self._app_result_landed(name)
+
+    def _run_app_check(self, name, app_check):
+        """One run of an app check, or None if the instance is being (re)built."""
+        with self._creates_lock:
+            record = self._creates.get(name)
+            if record and record["finished_at"] is None:
+                return None
+        limit = app_check["timeout_seconds"]
+        started = time.time()
+        try:
+            outcome = self.lxd.exec_command(
+                name, ["/bin/sh", "-c", self._APP_CHECK_WRAPPER, "lemondx-app-check",
+                       app_check["script"], str(limit)],
+                # The daemon-side wait outlasts the in-instance timeout, so
+                # the script's own exit is what normally ends it.
+                timeout=limit + 5)
+        except LXDError as exc:
+            return health_checks.app_error(exc.message, int((time.time() - started) * 1000))
+        return health_checks.app_result(
+            outcome.get("exit_code"), outcome.get("stdout"), outcome.get("stderr"),
+            int((time.time() - started) * 1000), limit)
 
     def _probe(self, name, timeout):
         started = time.time()
@@ -853,6 +1056,7 @@ class ContainerService:
                 "memory_limit": memory_limit,
                 "cores": cores,
                 "started_at": health_checks.iso_epoch(instance.get("last_used_at")),
+                "template": config.get(TEMPLATE_CONFIG_KEY) or None,
                 "at": time.time(),
             })
         if wanted:
@@ -1269,7 +1473,7 @@ class ContainerService:
     def save_template(self, name, image, instance_type="container", cpu=None,
                       memory=None, disk=None, pool=None, network=None, profiles=None,
                       ephemeral=False, start=True, bootstrap=None, description="",
-                      name_prefix=None, secureboot=True):
+                      name_prefix=None, secureboot=True, app_check=None):
         name = self._record_name(name, "template")
         image = str(image or "").strip()
         if not image:
@@ -1300,8 +1504,12 @@ class ContainerService:
             raise ServiceError(
                 "%s installs SSH keys, so the template needs at least one."
                 % " and ".join(needs_keys))
+        app_check = self._clean_app_check(app_check)
+        if app_check and not start:
+            raise ServiceError("An app check needs the instance running, so 'start' "
+                               "cannot be disabled.")
 
-        return store.save_template(name, {
+        saved = store.save_template(name, {
             "description": str(description or "")[:200],
             "name_prefix": prefix,
             "image": image,
@@ -1318,11 +1526,63 @@ class ContainerService:
             # Meaningless for a container, so never stored as off for one.
             "secureboot": bool(secureboot) or instance_type != "virtual-machine",
             "bootstrap": selection,
+            "app_check": app_check,
         })
+        self._app_check_changed(saved["name"], saved["app_check"])
+        return saved
+
+    @staticmethod
+    def _clean_app_check(app_check):
+        """A template's app check as it is stored, None for none, or raise.
+
+        The store would quietly drop what it cannot keep, which is right for a
+        hand-edited file; a save is told instead.
+        """
+        if app_check is None or app_check == {}:
+            return None
+        if not isinstance(app_check, dict):
+            raise ServiceError("app_check must be an object with a 'script'.")
+        script = app_check.get("script")
+        if script is None or (isinstance(script, str) and not script.strip()):
+            return None                   # a cleared script is how one is removed
+        if not isinstance(script, str):
+            raise ServiceError("app_check.script must be text.")
+        script = script.replace("\r\n", "\n")
+        if len(script.encode("utf-8")) > store.APP_CHECK_SCRIPT_LIMIT:
+            raise ServiceError("The app check script is over %d KiB."
+                               % (store.APP_CHECK_SCRIPT_LIMIT // 1024))
+        def seconds(key, label, bounds):
+            low, high, default = bounds
+            value = app_check.get(key)
+            if value in (None, ""):
+                return default
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = None
+            if value is None or not value.is_integer() or not low <= value <= high:
+                raise ServiceError("The app check %s must be a whole number of seconds "
+                                   "from %d to %d." % (label, low, high))
+            return int(value)
+
+        interval = seconds("interval_seconds", "interval", store.APP_CHECK_INTERVAL)
+        timeout = seconds("timeout_seconds", "timeout", store.APP_CHECK_TIMEOUT)
+        if timeout >= interval:
+            raise ServiceError("The app check timeout must be shorter than its interval.")
+        # Only a script without an interpreter line is known to be sh; one
+        # naming bash or python is that program's to parse, in the instance.
+        if not script.startswith("#!") or script.split("\n", 1)[0].strip() in (
+                "#!/bin/sh", "#!/usr/bin/env sh"):
+            try:
+                check_shell_syntax(script)
+            except BootstrapError as exc:
+                raise ServiceError("App check: %s" % exc)
+        return {"script": script, "interval_seconds": interval, "timeout_seconds": timeout}
 
     def delete_template(self, name):
         if not store.delete_template(name):
             raise ServiceError("No such template '%s'." % name, 404)
+        self._app_check_changed(name, None)
         return {"deleted": name}
 
     def _template(self, name):

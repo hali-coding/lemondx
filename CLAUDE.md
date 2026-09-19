@@ -222,8 +222,10 @@ always cover the same hosts; it lives in `localStorage` because it is how one
 person is looking right now, not cluster state. Widened, an instance's identity
 becomes `keyOf()` -- node plus name -- since two nodes may each hold a `web-1`
 unless a cluster-wide launch named them, and `_share_names()` allocates against
-*every* member for that reason, not just the targets. Health dots stay local because each node's monitor judges its own instances;
-the drawer does not -- it takes the owning node and routes every call there,
+*every* member for that reason, not just the targets. Health is judged where the instance lives -- each node's monitor, its own
+schedule -- and `cluster.containers()` only carries each node's latest records
+(`health`, tagged `node`), so the UI keys them by `keyOf()` like the rows.
+The drawer takes the owning node and routes every call there,
 including the bootstrap pickers, since a module runs on that host and a key is
 installed from what that host can see.
 
@@ -282,6 +284,23 @@ probe, and a container whose cgroup is missing falls back to the probe, judged o
 (`load_average`, strictly greater than). The file API's Content-Length for a `/proc`
 file can disagree with its body, which `read_file()` tolerates. Health settings are the `health` configure section; unlike auth, a broken
 file falls back to defaults with a warning.
+
+A template may carry an `app_check` (a Nagios-style script: exit 0/1/2/3), run
+in each instance tagged with that template. Under `serve`, `health.AppChecker`
+runs checks on each template's own `interval_seconds`, not the round's, so the
+two are kept apart: `Tracker.evaluate()` judges the machine, `fold_app()` adds
+the latest app result, and the service keeps both (`_health_base`,
+`_health_records`) so a result landing between rounds refolds at once. The
+script goes through `_APP_CHECK_WRAPPER` (file in `/tmp`, interpreter from its
+`#!` line, a /proc-walking watchdog that kills the script's whole tree --
+not `timeout`, which kills only its child), and the check is read from the template every
+round, never copied onto the instance; a template save or delete (including a
+peer's push) also swaps it into the scheduler at once
+(`AppChecker.update_template()`). `_template_body()` must carry `app_check`:
+a push is a whole-record PUT, so a field it omits is deleted on the peer. A
+running instance with no check reports app `ok`, never null. A run's full
+stdout/stderr (`APP_DETAIL_KEYS`) stays in the checker and is stripped from
+records by `_app_status()`; `app_check_output()` serves it on request.
 
 ### Two daemons
 

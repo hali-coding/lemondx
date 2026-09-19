@@ -288,6 +288,31 @@ def _clean_profile(stored, name):
     return record
 
 
+# An app check's script travels as an exec argument every round, so it is kept
+# to what one argument comfortably carries.
+APP_CHECK_SCRIPT_LIMIT = 16 * 1024
+APP_CHECK_TIMEOUT = (1, 300, 10)          # lowest, highest, default seconds
+APP_CHECK_INTERVAL = (10, 86400, 60)
+
+
+def _clean_app_check(stored):
+    """A template's app check, or None for a template without one."""
+    if not isinstance(stored, dict):
+        return None
+    script = stored.get("script")
+    if not isinstance(script, str) or not script.strip() \
+            or len(script.encode("utf-8")) > APP_CHECK_SCRIPT_LIMIT:
+        return None
+    def seconds(value, bounds):
+        low, high, default = bounds
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return default
+        return int(min(high, max(low, value)))
+    return {"script": script,
+            "interval_seconds": seconds(stored.get("interval_seconds"), APP_CHECK_INTERVAL),
+            "timeout_seconds": seconds(stored.get("timeout_seconds"), APP_CHECK_TIMEOUT)}
+
+
 def _clean_template(stored, name):
     """Normalise one template record, with the same tolerance as a profile."""
     bootstrap = stored.get("bootstrap")
@@ -310,6 +335,7 @@ def _clean_template(stored, name):
         # Absent means on, and only a VM can have it off.
         "secureboot": not (kind == "virtual-machine" and stored.get("secureboot") is False),
         "bootstrap": _clean_selection(bootstrap if isinstance(bootstrap, dict) else {}),
+        "app_check": _clean_app_check(stored.get("app_check")),
     }
 
 

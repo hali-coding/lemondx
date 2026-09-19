@@ -106,6 +106,71 @@ destroying an instance someone launched after you looked, the request carries
 the list of instances you confirmed; if the template's instances no longer
 match it, nothing happens and the request fails with `409`.
 
+## App health checks
+
+The built-in [health check](web-ui.md#health-checks) judges an instance as a
+machine: does it answer, is it out of CPU, memory or load. A template can also
+say what "working" means for the application on it, with a script run inside
+each of its instances — optional, and set per template under **App health
+check** in the template editor, or with `--app-check` on `template-save`.
+
+The script answers the way a Nagios plugin does, by exit code, and the first
+line it prints (up to any `|`, where performance data would start) is shown as
+the status text:
+
+| Exit | App status | Instance becomes |
+| --- | --- | --- |
+| 0 | ok | no change |
+| 1 | warning | degraded |
+| 2 | critical | degraded; unhealthy once it repeats as many times in a row as the health settings' `failures_before_unhealthy` (2) |
+| 3, or anything else | unknown | degraded — a missing command (127) lands here |
+
+An instance whose template has no app check always reports its app as `ok`, so
+the app status is never blank. A configured check reads `pending` until it
+first answers, and is not judged while the instance is being created or
+bootstrapped, or within the start grace period.
+
+```sh
+# Exit 0 ok, 1 warning, 2 critical, 3 unknown.
+if curl -fsS -o /dev/null --max-time 5 http://localhost/; then
+  echo "OK - web server answering"; exit 0
+fi
+echo "CRITICAL - web server not answering"; exit 2
+```
+
+- **Interval** (`interval_seconds`, default 60, 10 to 86400): how often it
+  runs, on its own schedule rather than the health round's — a result shows
+  on the instance as soon as it is in.
+- **Timeout** (`timeout_seconds`, default 10, 1 to 300, shorter than the
+  interval): the script is stopped inside the instance — it and every process
+  it started, so a hung `curl` under it goes too — and the check counts as
+  **critical**, as Nagios treats a plugin that overran. The watchdog that does
+  it is plain `sh` reading `/proc`, so it needs nothing installed in the image,
+  and a hung check can never pile up copies of itself.
+
+It runs as root through the daemon's exec API, like
+[Run command](#running-a-command-on-every-instance). Without a `#!` line it is
+`/bin/sh` and must parse as POSIX sh, which is checked on save; with one
+(`#!/bin/bash`, `#!/usr/bin/env python3`) that interpreter runs it and must
+exist in the instance. At most 16 KiB. The check is read from the template on
+every run rather than copied onto instances, so editing it reaches instances
+already launched — and a template that is deleted takes its check with it.
+
+```bash
+./lemondx template-save "Web server" -i images:debian/12 -b base \
+    --app-check checks/web.sh --app-check-interval 30 --app-check-timeout 5
+./lemondx template-save "Web server" -i images:debian/12 -b base -m 4GiB  # keeps the check
+./lemondx template-save "Web server" -i images:debian/12 -b base --no-app-check
+```
+
+`--app-check -` reads the script from stdin.
+
+Health records carry only the first line of output, since they are re-sent on
+every poll. The latest run's full stdout and stderr (the last 16 KiB of each)
+stay on the node that ran it, in memory, and `GET
+/api/containers/{name}/app-check` returns them — which is what clicking the
+diamond in the web UI shows.
+
 ## Naming
 
 Instances are named `<prefix>-<n>` with the lowest numbers no instance is
@@ -164,13 +229,18 @@ curl -s localhost:8099/api/templates | jq
 curl -s -X PUT localhost:8099/api/templates/Web%20server \
   -H 'content-type: application/json' \
   -d '{"image":"images:debian/12","cpu":"2","memory":"2GiB","name_prefix":"web",
-       "bootstrap":{"modules":["base"],"params":{},"ssh_keys":[]}}'
+       "bootstrap":{"modules":["base"],"params":{},"ssh_keys":[]},
+       "app_check":{"script":"curl -fs localhost >/dev/null || exit 2",
+                    "interval_seconds":30,"timeout_seconds":5}}'
 curl -s -X POST localhost:8099/api/templates/Web%20server/launch \
   -H 'content-type: application/json' -d '{"count":3}'
 curl -s localhost:8099/api/templates/Web%20server/instances   # ["web-1","web-2","web-3"]
 curl -s -X POST localhost:8099/api/templates/Web%20server/destroy \
   -H 'content-type: application/json' -d '{"instances":["web-1","web-2","web-3"]}'
 ```
+
+`PUT` replaces the whole template, so `app_check` absent or `null` means no
+check.
 
 Launch, recreate and destroy all respond with `{"template", "ok", "notes",
 "instances": [{"name", "ok", "error", "container"}]}`. `notes` lists what a node
@@ -225,6 +295,11 @@ or check them into a project:
     "modules": ["base", "ssh-access"],
     "params": { "USERNAME": "hampus", "SHELL_PATH": "/bin/bash" },
     "ssh_keys": ["ssh-ed25519 AAAA… hampus@laptop"]
+  },
+  "app_check": {
+    "script": "curl -fs localhost >/dev/null || exit 2\necho OK\n",
+    "interval_seconds": 30,
+    "timeout_seconds": 5
   }
 }
 ```

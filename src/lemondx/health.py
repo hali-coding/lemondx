@@ -15,6 +15,12 @@ uninterruptible sleep, and folds that into 1, 5 and 15 minute averages. That
 reads host files, not the daemon, and needs lemondx on the daemon's host --
 which talking to it over a unix socket already implies. A VM's load comes
 from its own kernel, through the probe.
+
+An instance launched from a template whose record carries an ``app_check``
+also gets the template's own check each round: a script run inside it that
+answers the way a Nagios plugin does, by exit code (``APP_STATES``). That is
+the only part of a round that knows what the instance is *for*; everything
+else here judges it as a machine.
 """
 
 from __future__ import annotations
@@ -77,6 +83,24 @@ _LOAD_PERIODS = (60.0, 300.0, 900.0)
 # the v1 controllers that hold every task.
 CGROUP_ROOTS = ("/sys/fs/cgroup", "/sys/fs/cgroup/pids", "/sys/fs/cgroup/cpu,cpuacct",
                 "/sys/fs/cgroup/cpu", "/sys/fs/cgroup/unified")
+
+
+# Nagios plugin exit codes. Anything else -- 127 for a missing interpreter
+# among them -- is unknown, as Nagios itself treats it.
+APP_OK, APP_WARNING, APP_CRITICAL, APP_UNKNOWN = "ok", "warning", "critical", "unknown"
+# Configured, but with no result yet: not run, or the instance is being built.
+APP_PENDING = "pending"
+APP_STATES = {0: APP_OK, 1: APP_WARNING, 2: APP_CRITICAL, 3: APP_UNKNOWN}
+# What the wrapper exits with when its watchdog had to stop the script, as
+# coreutils' `timeout` would.
+APP_TIMEOUT_CODES = (124,)
+APP_OUTPUT_LIMIT = 500
+# The full output kept per stream for the latest run, for someone asking what
+# the script said. Never part of a health record: those are re-sent on every
+# poll, and a chatty check would make each one heavy.
+APP_DETAIL_LIMIT = 16 * 1024
+# Keys of a result that stay with the checker and out of health records.
+APP_DETAIL_KEYS = ("stdout", "stderr", "truncated")
 
 
 class HealthSettingsError(Exception):
@@ -355,6 +379,183 @@ def iso_epoch(value):
         return None
 
 
+# -- application checks -----------------------------------------------------
+
+
+def app_result(exit_code, stdout, stderr, ms, timeout):
+    """One app check's record from what its script did.
+
+    The first line of output is the status text and anything after a ``|``
+    on it is performance data, both as Nagios plugins print them; the
+    performance data is dropped because nothing here graphs it. A script that
+    printed nothing to stdout is described by its stderr, which is where a
+    shell puts "not found".
+    """
+    def tail(text):
+        text = text or ""
+        return (text[-APP_DETAIL_LIMIT:], True) if len(text) > APP_DETAIL_LIMIT else (text, False)
+
+    out, cut_out = tail(stdout)
+    err, cut_err = tail(stderr)
+    detail = {"stdout": out, "stderr": err, "truncated": cut_out or cut_err}
+    if exit_code in APP_TIMEOUT_CODES:
+        # Nagios reports a plugin that overran as critical by default: a check
+        # that hangs usually means the thing it checks does.
+        return dict(detail, status=APP_CRITICAL, code=exit_code, ms=ms,
+                    output="timed out after %gs" % timeout)
+    lines = [line for line in (stdout or "").splitlines() if line.strip()] \
+        or [line for line in (stderr or "").splitlines() if line.strip()]
+    output = lines[0].split("|", 1)[0].strip()[:APP_OUTPUT_LIMIT] if lines else ""
+    return dict(detail, status=APP_STATES.get(exit_code, APP_UNKNOWN), code=exit_code,
+                ms=ms, output=output)
+
+
+def app_placeholder(configured):
+    """The app status of an instance with no result to report.
+
+    With no check configured there is nothing application-level to be wrong,
+    so it reads as ok rather than as missing; a configured check that has not
+    answered yet is pending, and judged on nothing.
+    """
+    return {"status": APP_PENDING if configured else APP_OK, "code": None, "ms": None,
+            "output": "" if configured else "no app check configured",
+            "checked_at": None, "streak": 0, "interval": None, "configured": configured}
+
+
+def app_error(message, ms):
+    """An app check that could not be run at all: unknown, as Nagios would say."""
+    return {"status": APP_UNKNOWN, "code": None, "ms": ms,
+            "output": str(message)[:APP_OUTPUT_LIMIT],
+            "stdout": "", "stderr": str(message), "truncated": False}
+
+
+class AppChecker:
+    """Runs each instance's app check on the template's own interval, for `serve`.
+
+    A check's interval is the template's to choose and need not match the
+    health round's, so checks are scheduled here and a round only reads the
+    latest result. The critical streak is counted per run, as Nagios counts
+    check attempts, so "two criticals in a row" means two runs of the script
+    whatever the round's interval.
+
+    ``run(name, app_check)`` returns an ``app_result()``, or None when the
+    instance should be skipped this time (it is being bootstrapped).
+    ``on_result(name)`` is told when a new result is in, so the instance's
+    record can take it at once rather than at the next round.
+    """
+
+    TICK_SECONDS = 1.0
+    WORKERS = 4
+
+    def __init__(self, run, on_result=None):
+        self._run = run
+        self._on_result = on_result
+        self._lock = threading.Lock()
+        self._targets = {}      # name -> app_check
+        self._results = {}      # name -> latest result, with checked_at and streak
+        self._due = {}          # name -> when to run next
+        self._running = set()
+
+    def set_targets(self, targets):
+        """Check these instances from now on; results for any others are dropped.
+
+        A new instance, or one whose template changed its check, is due at
+        once, so the round that introduced it is followed by a result rather
+        than a full interval of nothing.
+        """
+        with self._lock:
+            for name in list(self._results):
+                if name not in targets:
+                    del self._results[name]
+            for name in list(self._due):
+                if name not in targets or targets[name] != self._targets.get(name):
+                    del self._due[name]
+            self._targets = dict(targets)
+            now = time.time()
+            for name in targets:
+                self._due.setdefault(name, now)
+
+    def update_template(self, template, app_check):
+        """A template's check was saved or deleted: apply it now, not next round.
+
+        Instances launched from it switch to the new check and run it at once;
+        with ``app_check`` None they stop being checked. Their old result goes
+        too -- its streak belongs to a script that is no longer the check.
+        Returns the names affected, for the caller to refold their records.
+        """
+        wanted = dict(app_check, template=template) if app_check else None
+        with self._lock:
+            changed = [n for n, c in self._targets.items()
+                       if c.get("template") == template and c != wanted]
+            now = time.time()
+            for name in changed:
+                self._results.pop(name, None)
+                if wanted is None:
+                    del self._targets[name]
+                    self._due.pop(name, None)
+                else:
+                    self._targets[name] = wanted
+                    self._due[name] = now
+        return changed
+
+    def has_target(self, name):
+        with self._lock:
+            return name in self._targets
+
+    def target(self, name):
+        """The check an instance is on (with its template), or None."""
+        with self._lock:
+            target = self._targets.get(name)
+            return dict(target) if target else None
+
+    def result(self, name):
+        with self._lock:
+            result = self._results.get(name)
+            return dict(result) if result else None
+
+    def _check(self, name, app_check):
+        try:
+            outcome = self._run(name, app_check)
+        except Exception as exc:                            # noqa: BLE001
+            outcome = app_error("the check could not be run: %s" % exc, 0)
+        with self._lock:
+            self._running.discard(name)
+            # Retargeted while it ran: the answer is to a question nobody asks now.
+            if outcome is None or self._targets.get(name) != app_check:
+                return
+            previous = self._results.get(name) or {}
+            streak = previous.get("streak", 0) + 1 if outcome["status"] == APP_CRITICAL else 0
+            self._results[name] = dict(outcome, checked_at=time.time(), streak=streak,
+                                       interval=app_check["interval_seconds"])
+        if self._on_result is not None:
+            try:
+                self._on_result(name)
+            except Exception as exc:                        # noqa: BLE001
+                print("[lemondx] app check for %s not recorded: %s" % (name, exc))
+
+    def start(self):
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(max_workers=self.WORKERS,
+                                  thread_name_prefix="lemondx-appcheck")
+
+        def loop():
+            while True:
+                now = time.time()
+                with self._lock:
+                    due = [(n, self._targets[n]) for n, at in self._due.items()
+                           if at <= now and n not in self._running]
+                    for name, app_check in due:
+                        # Scheduled from the start, not the end, of a run: an
+                        # interval means how often, and a run never overlaps
+                        # its predecessor because `_running` holds it back.
+                        self._due[name] = now + app_check["interval_seconds"]
+                        self._running.add(name)
+                for name, app_check in due:
+                    pool.submit(self._check, name, app_check)
+                time.sleep(self.TICK_SECONDS)
+        threading.Thread(target=loop, name="lemondx-appchecks", daemon=True).start()
+
+
 # -- judgement -------------------------------------------------------------
 
 
@@ -393,6 +594,9 @@ class Tracker:
         ``sample``: name, type, status, cpu_usage (ns or None), pid, processes,
         memory_usage, memory_limit, cores, started_at, at.
         ``probe``: ok, ms, error, text.
+
+        This is the instance judged as a machine; ``fold_app()`` adds its
+        template's app check, which arrives on its own schedule.
         """
         now = sample["at"]
         with self._lock:
@@ -406,6 +610,12 @@ class Tracker:
                 "memory": _memory(sample),
                 "load": None,
                 "probe": {k: probe.get(k) for k in ("ok", "ms", "error")} if probe else None,
+                "app": None,
+                # Private to fold_app(): an app check is not judged while the
+                # instance is still starting. A time rather than a flag, since
+                # a check can land between rounds after the grace has ended.
+                # Stripped before it is served.
+                "_grace_until": None,
                 "failures": 0,
                 "reasons": [],
             }
@@ -446,6 +656,8 @@ class Tracker:
         is_vm = sample["type"] == "virtual-machine"
         started = sample["started_at"]
         in_grace = started is not None and sample["at"] - started < settings["start_grace_seconds"]
+        if started is not None:
+            record["_grace_until"] = started + settings["start_grace_seconds"]
 
         parsed = parse_loadavg(probe.get("text")) if probe and probe.get("ok") else None
         counted = sample.get("cgroup_load")
@@ -496,6 +708,41 @@ class Tracker:
         # A failed probe short of the streak lands here too: degraded, with its
         # reason, so one slow minute shows without being called a failure.
         return DEGRADED if reasons else HEALTHY
+
+
+def fold_app(base, app, settings, previous=None):
+    """An instance's record: its machine judgement with its app check folded in.
+
+    ``base`` is ``Tracker.evaluate()``'s record, ``app`` the latest app check
+    (``app_result()`` plus ``streak``, the run of criticals it ends, and
+    ``configured``), ``previous`` what this returned last time, for ``since``.
+    Kept apart from evaluate() because the two change at different times: a
+    round every interval_seconds, a check on its template's own interval.
+    """
+    record = dict(base, app=app, reasons=list(base["reasons"]))
+    grace_until = record.pop("_grace_until", None)
+    grace = grace_until is not None and time.time() < grace_until
+    status = base["status"]
+    # Starting, paused, or a VM that cannot be reached to run anything: the
+    # machine-level answer already says all there is to say.
+    if app and not grace and status in (HEALTHY, DEGRADED):
+        if app["status"] not in (APP_OK, APP_PENDING):
+            record["reasons"].append("app check %s%s" % (
+                app["status"], ": " + app["output"] if app["output"] else ""))
+            status = DEGRADED
+        # Critical takes the same streak as a failed probe, like a Nagios
+        # soft state: one bad answer shows as degraded, a run of them is a
+        # failure. Warning and unknown never go further than degraded.
+        if app["status"] == APP_CRITICAL \
+                and app.get("streak", 1) >= settings["failures_before_unhealthy"]:
+            status = UNHEALTHY
+    record["status"] = status
+    if previous is not None:
+        record["since"] = previous["since"] if previous["status"] == status \
+            else time.time()
+    elif status != base["status"]:
+        record["since"] = time.time()
+    return record
 
 
 def _memory(sample):

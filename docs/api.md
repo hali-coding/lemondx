@@ -30,6 +30,7 @@ little access `403`, too many failed logins `429`.
 | `POST` | `/api/containers/{name}/snapshots/{snap}/restore` | restore |
 | `GET` | `/api/resources` | host CPU/memory/disk against what instances have allocated |
 | `GET` | `/api/health` | latest health check per running instance (see [Web UI tour](web-ui.md#health-checks)) |
+| `GET` | `/api/containers/{name}/app-check` | the latest [app check](templates.md#app-health-checks) run in full: `{template, script, interval_seconds, timeout_seconds, result}`, `result` carrying `stdout`/`stderr` (last 16 KiB each) or null before the first run |
 | `GET` | `/api/storage` | pools, volumes, local-driver availability and management status |
 | `GET`/`POST` | `/api/storage/pools` | list pools / create a local pool |
 | `GET`/`PATCH`/`DELETE` | `/api/storage/pools/{pool}` | inspect, update or remove a local pool (`?force=true` cascades) |
@@ -54,7 +55,7 @@ little access `403`, too many failed logins `429`.
 | `POST` | `/api/cluster/refresh` | pull every peer's member list and push ours |
 | `POST` | `/api/cluster/rotate` | replace the cluster credential on every member |
 | `PUT` | `/api/cluster/secret` | take a rotated credential (node to node) |
-| `GET` | `/api/cluster/containers` | instances across nodes (`?all=true`, `?nodes=`, `?groups=`) |
+| `GET` | `/api/cluster/containers` | instances across nodes (`?all=true`, `?nodes=`, `?groups=`), with each node's latest health records under `health` |
 | `POST` | `/api/cluster/containers/state` | `{"instances":[{"node","name"}],"action":...}` over several nodes |
 | `POST` | `/api/cluster/containers/delete` | delete instances that sit on several nodes |
 | *any* | `/api/nodes/{node}/{path}` | make that call against one node's own API and return its answer |

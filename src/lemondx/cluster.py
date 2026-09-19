@@ -2075,26 +2075,46 @@ class ClusterService:
     # -- reading across nodes ----------------------------------------------
 
     def containers(self, nodes=None, groups=None, everything=False):
-        """Every instance on the chosen nodes, each tagged with the node it is on."""
+        """Every instance on the chosen nodes, each tagged with the node it is on.
+
+        Each node's latest health records come along, tagged the same way.
+        Every node still judges its own instances on its own schedule -- this
+        only reads what each one last concluded, from memory, so it adds no
+        checks. A node whose health cannot be read (checks off, or an older
+        lemondx) contributes none; its instances are still listed.
+        """
         targets = self.resolve_targets(nodes, groups, everything)
 
         def one(node_name):
             if node_name == self.local_name():
                 try:
-                    return node_name, self.service.list_containers(), None
+                    found = self.service.list_containers()
                 except (ServiceError, LXDError) as exc:
-                    return node_name, [], str(exc)
+                    return node_name, [], {}, str(exc)
+                return node_name, found, self.service.health(), None
             try:
-                return node_name, self.client(node_name).containers(), None
+                client = self.client(node_name)
+                found = client.containers()
             except (ClusterError, NodeError) as exc:
-                return node_name, [], exc.message
+                return node_name, [], {}, exc.message
+            try:
+                report = client.health() or {}
+            except NodeError:
+                report = {}
+            return node_name, found, report, None
 
-        instances, errors = [], []
-        for node_name, found, error in self._fanout(targets, one):
+        instances, health, monitored, errors = [], [], [], []
+        for node_name, found, report, error in self._fanout(targets, one):
             if error:
                 errors.append({"node": node_name, "error": error})
             instances.extend(dict(c, node=node_name) for c in found)
-        return {"nodes": targets, "instances": instances, "errors": errors}
+            health.extend(dict(r, node=node_name) for r in report.get("instances") or [])
+            # Which nodes are checking at all, so a running instance with no
+            # record yet reads as pending there and as unchecked elsewhere.
+            if report.get("enabled"):
+                monitored.append(node_name)
+        return {"nodes": targets, "instances": instances, "health": health,
+                "monitored": monitored, "errors": errors}
 
 
 def _template_body(template):
@@ -2121,4 +2141,7 @@ def _template_body(template):
             # Secrets are already gone -- a template never stores one.
             "ssh_keys": template["bootstrap"]["ssh_keys"],
         },
+        # A PUT replaces the whole template, so a field left out here is not
+        # "unchanged" on the far side but deleted there.
+        "app_check": template.get("app_check"),
     }

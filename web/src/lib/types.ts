@@ -400,17 +400,32 @@ export interface InstanceSpec {
   bootstrap: BootstrapSelection
 }
 
+/**
+ * A script run inside each instance launched from a template, answering like a
+ * Nagios plugin: exit 0 ok, 1 warning, 2 critical, 3 (or anything else) unknown.
+ */
+export interface AppCheck {
+  script: string
+  /** How often it runs under `serve`. */
+  interval_seconds: number
+  /** Stopped after this long, which counts as critical. */
+  timeout_seconds: number
+}
+
 /** A saved InstanceSpec, launched as `<name_prefix>-1`, `-2`, … */
 export interface InstanceTemplate extends InstanceSpec {
   name: string
   description: string
   name_prefix: string
+  app_check: AppCheck | null
 }
 
 export type TemplateRequest = Partial<InstanceSpec> & {
   image: string
   description?: string
   name_prefix?: string
+  /** Null or absent: no app check. */
+  app_check?: Partial<AppCheck> | null
 }
 
 export interface LaunchedInstance {
@@ -666,6 +681,8 @@ export type HealthStatus = 'healthy' | 'degraded' | 'unhealthy' | 'starting' | '
 /** One instance's latest check. Times are seconds since the epoch. */
 export interface HealthRecord {
   name: string
+  /** The node that judged it; set only in a listing that spans nodes. */
+  node?: string
   type: string
   status: HealthStatus
   reasons: string[]
@@ -689,7 +706,47 @@ export interface HealthRecord {
     window: number | null
   } | null
   probe: { ok: boolean; ms: number; error: string | null } | null
+  /**
+   * The template's app check. Every running instance has one: `ok` with
+   * `configured: false` when its template defines none, `pending` until a
+   * configured check first answers. Null while paused.
+   */
+  app: AppCheckResult | null
   failures: number
+}
+
+/** GET /api/containers/{name}/app-check: the latest run, in full. */
+export interface AppCheckOutput {
+  name: string
+  template: string
+  script: string
+  interval_seconds: number
+  timeout_seconds: number
+  /** Null until the first run finishes. */
+  result: (Omit<AppCheckResult, 'configured' | 'template'> & {
+    stdout: string
+    stderr: string
+    /** Each stream is kept to its last 16 KiB. */
+    truncated: boolean
+  }) | null
+}
+
+export type AppCheckStatus = 'ok' | 'warning' | 'critical' | 'unknown' | 'pending'
+
+export interface AppCheckResult {
+  status: AppCheckStatus
+  configured: boolean
+  template: string | null
+  /** The script's exit code; null when it never ran. */
+  code: number | null
+  /** First line of its output, performance data dropped. */
+  output: string
+  ms: number | null
+  checked_at: number | null
+  /** Criticals in a row, counted per run. */
+  streak: number
+  /** Seconds between runs; null for a one-off check. */
+  interval: number | null
 }
 
 export interface HealthReport {
@@ -899,6 +956,13 @@ export interface SyncResult {
 export interface ClusterContainers {
   nodes: string[]
   instances: (Container & { node: string })[]
+  /**
+   * Each node's latest health records, as that node's own monitor judged
+   * them. Empty for a node with checks off or too old to report them.
+   */
+  health: (HealthRecord & { node: string })[]
+  /** Nodes whose health monitor is running: a record from them is only a matter of time. */
+  monitored: string[]
   errors: { node: string; error: string }[]
 }
 

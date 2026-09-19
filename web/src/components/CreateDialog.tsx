@@ -71,12 +71,21 @@ export function CreateDialog({ onCancel, onCreate, onNotify }: Props) {
     setSavingTemplate(true)
     setError(null)
     try {
+      // Read the existing record now rather than trusting the list loaded at
+      // mount: that load may not have finished, may have failed silently, or
+      // may predate a check added since -- and any of those would read as "no
+      // app check" and delete it. If this read fails, so does the save.
+      const existing = (await api.templates())
+        .find((t) => t.name === chosen.trim())
       const resolved = resolvedSpec(value)
       const saved = await api.saveTemplate(chosen.trim(), {
         ...resolved,
         bootstrap: savableSelection(modules, resolved.bootstrap),
         // The name typed here is the natural stem for instances made from it.
         name_prefix: PREFIX_RULE.test(name.trim()) ? name.trim() : undefined,
+        // This form has no app check of its own; overwriting a template must
+        // not quietly drop the one it had.
+        app_check: existing?.app_check ?? null,
       })
       setTemplateName(saved.name)
       setTemplates((current) =>
