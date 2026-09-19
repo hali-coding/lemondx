@@ -138,3 +138,24 @@ export const ExternalIcon = ({ size = 15 }: Props) => (
     <path d="M18 14.5V19a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 19V8a1.5 1.5 0 0 1 1.5-1.5H10" />
   </svg>
 )
+
+export const LogoutIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M15 5V4a1.5 1.5 0 0 0-1.5-1.5h-8A1.5 1.5 0 0 0 4 4v16a1.5 1.5 0 0 0 1.5 1.5h8A1.5 1.5 0 0 0 15 20v-1" />
+    <path d="M11 12h10m0 0-3.5-3.5M21 12l-3.5 3.5" />
+  </svg>
+)
+
+export const EjectIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M12 3.5 4.5 13.5h15z" />
+    <path d="M5 18.5h14" />
+  </svg>
+)
+
+export const ScalesIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M12 4v16M7 20h10M5 8h14l-3-3M5 8l-2.5 5.5a3 3 0 0 0 5 0z" />
+    <path d="M19 8l2.5 5.5a3 3 0 0 1-5 0z" />
+  </svg>
+)

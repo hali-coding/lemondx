@@ -1464,8 +1464,10 @@ def cmd_cluster_refresh(args, service):
 
 def cmd_cluster_leave(args, service):
     cluster = cluster_service(service)
-    if not confirm("Leave the cluster? This node keeps its instances and templates.",
-                   args.yes):
+    peers = [n["name"] for n in cluster.list_nodes(probe=False) if not n["self"]]
+    if not confirm(
+            "Leave the cluster? %s will be told to forget this node; its instances, "
+            "templates and modules stay." % (", ".join(peers) or "Nobody"), args.yes):
         print(DIM("still a member"))
         return 1
     result = cluster.leave()
@@ -1473,6 +1475,11 @@ def cmd_cluster_leave(args, service):
     def render(r):
         lines = ["%s left the cluster (forgot %s)"
                  % (GREEN("+"), ", ".join(r["left"]) or "nobody")]
+        for row in r["told"]:
+            lines.append("%s %s %s" % (GREEN("+") if row["ok"] else RED("!"),
+                                       BOLD(row["node"]),
+                                       "forgot this node" if row["ok"]
+                                       else row["error"] or "unreachable"))
         if r["note"]:
             lines.append(YELLOW("! %s" % r["note"]))
         return "\n".join(lines)
@@ -1630,16 +1637,21 @@ def cmd_cluster_join(args, service):
 
 
 def cmd_cluster_remove(args, service):
-    if not confirm("Remove node %s from the cluster?" % args.name, args.yes):
-        print(DIM("nothing removed"))
+    if not confirm("Evict node %s from the cluster? It will be told to stand down, "
+                   "and every other member to forget it." % args.name, args.yes):
+        print(DIM("nothing evicted"))
         return 1
-    cluster = cluster_service(service)
-    result = cluster.forget_node(args.name)
-    if args.rotate:
-        result["rotated"] = cluster.rotate_secret()
+    rotate = None if args.rotate is None else args.rotate
+    result = cluster_service(service).evict_node(args.name, rotate=rotate)
 
     def render(r):
-        lines = ["%s removed node %s" % (GREEN("+"), r["removed"])]
+        lines = ["%s evicted node %s" % (GREEN("+"), r["removed"])]
+        if r["stood_down"]:
+            lines.append("%s it stood down: credential, members and groups dropped "
+                         "there" % GREEN("+"))
+        else:
+            lines.append(YELLOW("! it could not be told (%s), so it still lists the "
+                                "cluster" % (r["stand_down_error"] or "unreachable")))
         for row in r["told"]:
             if not row["ok"]:
                 lines.append(YELLOW("! %s still lists it: %s"
@@ -1650,8 +1662,8 @@ def cmd_cluster_remove(args, service):
                 GREEN("+"), "" if rotated["ok"]
                 else ", but %s missed it and is cut off" % ", ".join(rotated["stranded"])))
         elif r["still_holds_credential"]:
-            # Worth saying plainly: the credential is shared, so removal alone
-            # does not stop the node calling in.
+            # Worth saying plainly: the credential is shared, so a node that was
+            # never told to give its copy up can still call in.
             lines.append(YELLOW(
                 "! %s still holds the cluster credential. Run `lemondx cluster "
                 "rotate` to cut it off." % r["removed"]))
@@ -1664,11 +1676,11 @@ def cmd_cluster_remove(args, service):
 def cmd_cluster_groups(args, service):
     groups = cluster_service(service).list_groups()
     emit(args, groups, lambda items: table(
-        [[BOLD(g["name"]), str(len(g["members"])),
+        [[BOLD(g["name"]), DIM("auto") if g["managed"] else "", str(len(g["members"])),
           ", ".join(GREEN(m) if m not in g["unknown_members"] else RED(m)
                     for m in g["members"]) or DIM("-"),
           g["description"] or DIM("-")] for g in items],
-        ["group", "nodes", "members", "description"]))
+        ["group", "kind", "nodes", "members", "description"]))
     return 0
 
 
@@ -1678,6 +1690,34 @@ def cmd_cluster_group_set(args, service):
     emit(args, group, lambda g: "%s saved group %s: %s%s" % (
         GREEN("+"), BOLD(g["name"]), ", ".join(g["members"]) or "no members",
         sync_note(g)))
+    return 0
+
+
+def cmd_cluster_group_auto(args, service):
+    result = cluster_service(service).auto_groups()
+
+    def render(r):
+        lines = [table(
+            [[BOLD(n["node"]),
+              str(n["cpu"]) if n["ok"] else DIM("-"),
+              human_bytes(n["memory"]) if n["ok"] else DIM("-"),
+              "%.2f" % n["score"] if n["ok"] else DIM("-"),
+              ", ".join(n["groups"]) if n["ok"] else RED("not measured")]
+             for n in r["nodes"]],
+            ["node", "threads", "memory", "vs average", "groups"])]
+        if r["uniform"]:
+            lines.append(DIM("every node is the same size, so each is in both groups"))
+        for reading in r["nodes"]:
+            if not reading["ok"]:
+                lines.append(YELLOW("! %s is in neither group: %s"
+                                    % (reading["node"], reading["error"])))
+        for group in r["groups"]:
+            lines.append("%s %s: %s%s" % (GREEN("+"), BOLD(group["name"]),
+                                          ", ".join(group["members"]) or "no members",
+                                          sync_note(group)))
+        return "\n".join(lines)
+
+    emit(args, result, render)
     return 0
 
 
@@ -2288,12 +2328,16 @@ def build_parser():
     p.add_argument("--description", help="a note about this node")
     p.set_defaults(func=cmd_cluster_join)
 
-    p = cluster_sub.add_parser("remove", aliases=["rm"], parents=[common],
-                               help="remove a node from the cluster, here and elsewhere")
+    p = cluster_sub.add_parser("evict", aliases=["remove", "rm"], parents=[common],
+                               help="put a node out of the cluster: it stands down, "
+                                    "every member forgets it")
     p.add_argument("name")
-    p.add_argument("--rotate", action="store_true",
-                   help="also replace the cluster credential, which is what "
-                        "actually stops the removed node calling in")
+    # Three states, not two: by default the credential is rotated only when the
+    # node could not be told to give its own copy up. See evict_node().
+    p.add_argument("--rotate", dest="rotate", action="store_true", default=None,
+                   help="replace the cluster credential even if the node stood down")
+    p.add_argument("--no-rotate", dest="rotate", action="store_false",
+                   help="leave the credential alone even if the node was not reached")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     p.set_defaults(func=cmd_cluster_remove)
 
@@ -2302,7 +2346,8 @@ def build_parser():
     p.set_defaults(func=cmd_cluster_refresh)
 
     p = cluster_sub.add_parser("leave", parents=[common],
-                               help="give up membership of the cluster")
+                               help="give up membership: every member is told to "
+                                    "forget this node")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     p.set_defaults(func=cmd_cluster_leave)
 
@@ -2323,6 +2368,11 @@ def build_parser():
                    help="a member (repeatable; replaces the current members)")
     p.add_argument("--description")
     p.set_defaults(func=cmd_cluster_group_set)
+
+    p = group_sub.add_parser("auto", parents=[common],
+                             help="rebuild the large and small groups from each "
+                                  "node's CPU and memory")
+    p.set_defaults(func=cmd_cluster_group_auto)
 
     p = group_sub.add_parser("delete", aliases=["rm"], parents=[common, only_here],
                              help="delete a group; its nodes stay")

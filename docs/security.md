@@ -217,11 +217,25 @@ clear about:
 
 - **Any member is an admin of every other.** Federate hosts you administer.
   Anyone who can create a container on a node can become root on it.
-- **Removing a node does not by itself cut it off**, because it still holds the
-  credential. `lemondx cluster rotate` replaces the credential on every remaining
-  member and is what actually excludes it; `lemondx cluster remove --rotate`
-  does both, and the CLI says so when you skip it. A member that is down during a
-  rotation is left behind and has to re-join — reported, not silent.
+- **An evicted node is cut off by giving up its own copy of the credential.**
+  `lemondx cluster evict` tells it to stand down before forgetting it, and
+  standing down deletes the credential there. A node that could not be told
+  still holds a working one, so eviction then replaces the credential on every
+  remaining member instead — which is also what `lemondx cluster rotate` does on
+  its own. A member that is down during a rotation is left behind and has to
+  re-join, which is why the rotation is not unconditional; `--rotate` and
+  `--no-rotate` decide it by hand. Either way the command says what happened.
+
+- **Syncing users copies password hashes between members.** `lemondx cluster
+  sync --kind users` exists so one set of logins works on every node, and an
+  account is only usable on another host if its hash goes with it — there is no
+  plaintext kept anywhere to re-hash there. The hash travels over the same
+  pinned-certificate TLS as everything else, to a host that is already an admin
+  of this one, and `PUT /api/auth/users/{name}/record` refuses any caller that
+  is not a member. It replaces an account of the same name on the target, so it
+  can change an administrator's password on another host: that is the point of
+  it, and the reason it is never automatic. Nothing else sync carries is a
+  credential.
 
 **A member demands a credential from other hosts even with authentication off.**
 Joining a cluster means accepting API calls from elsewhere, and a node cannot do

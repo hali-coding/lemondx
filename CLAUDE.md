@@ -143,8 +143,44 @@ The cluster credential is one shared secret held by every member, stored twice
 on purpose: plaintext in `auth/cluster.json` for calling out, and its hash as an
 ordinary token record for calls coming in -- so `AuthService.authenticate_token`
 authenticates a peer with no new code path, and `lemondx tokens` lists it. The
-consequences are in the design, not accidents: removing a node does not cut it
-off until `rotate_secret()` runs, and any member is an admin of every other.
+consequences are in the design, not accidents: a copy of it sits on every host,
+and any member is an admin of every other.
+
+**Leaving and eviction are one operation seen from two ends**, and both are
+ordered so nothing is left half-in. `evict_node()` calls the target's
+`evicted()` *first*, while its record is still here to call it with, so it
+`_stand_down()`s -- credential, peer records and node groups gone -- instead of
+carrying on as a member nobody answers; only then is it forgotten here and on
+every other member. `leave()` is the same in reverse: tell every peer, then
+`_stand_down()`. The shared credential is why the order matters: a node that
+stood down has given its copy up, so `rotate_secret()` is only needed when the
+target could not be told -- and rotating regardless would strand any member
+that merely happened to be off, turning one eviction into two. `drop_member()`
+(a peer relaying either) never re-broadcasts, for the same reason
+`from_peer()` exists.
+
+`SYNC_KINDS` includes `users`, which is the only thing sync moves that is a
+credential: an account is a name, a role and a hash, and the hash is the only
+part that makes it usable elsewhere -- there is no plaintext to re-hash on the
+far side. So it crosses as the stored record, which is why `AuthService` grew
+`export_users()`/`adopt_user()` beside `list_users()`/`set_user()` rather than
+inside them: the pair a person and the API use must never carry a hash. The
+receiving route is members-only (`_peers_only()` in server.py), narrower than
+admin, because a person setting a password already has the ordinary route and
+never needs to post a hash.
+
+`auto_groups()` is the one thing that writes a node group without being told
+what to put in it: it reads each node's CPU threads and total memory (capacity,
+never free space -- a group outlives the reading) and scores each as a share of
+the cluster *average*, so `large`/`small` mean something relative and a cluster
+of identical hosts falls out as every node in both groups rather than needing a
+special case. `SIZE_TOLERANCE` exists because two hosts of one spec never report
+the same totals. Those two names are reserved: `_refuse_managed()` guards
+`save_group()` and `delete_group()`, and the `managed=` flag that lifts it is
+passed only by the sizing itself and by `from_peer()` on the routes -- a member
+relaying the sizing must be able to write what a person may not. `list_groups()`
+derives `managed` from the name rather than storing it, so a copied file cannot
+claim to be one.
 
 **Nothing needs configuring to federate.** `ensure_identity()` works out a name
 (hostname), an address (`guess_local_address()` plus the port from

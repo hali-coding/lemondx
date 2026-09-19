@@ -137,12 +137,19 @@ lemondx cluster revoke-invite <id>
 
 ```bash
 lemondx cluster refresh      # pull every peer's member list, push ours
-lemondx cluster leave        # give up membership (local; keeps instances)
+lemondx cluster leave        # step out; every member is told to forget this node
 ```
 
 Membership converges by `refresh`: it announces this node to every peer and
 merges back what each of them knows. Joining runs it once; run it by hand after
 a node has been away.
+
+`leave` is the node's own way out, and the mirror of `evict` below. Every
+member is told to forget this node while the credential is still here to tell
+them with; only then does this node drop the credential, its record of the
+other nodes, and its node groups. Instances, templates and modules stay. A
+member that could not be reached still lists this node — the command names it,
+and the fix is `lemondx cluster evict <name>` there.
 
 ## Nodes and groups
 
@@ -150,7 +157,7 @@ a node has been away.
 lemondx cluster nodes                # who this node knows, and how they are
 lemondx cluster show nodeB           # one node, with the instances on it
 lemondx cluster containers           # every instance, across nodes
-lemondx cluster remove nodeB         # forget a node
+lemondx cluster evict nodeB          # put a node out of the cluster
 ```
 
 A group is a name for a set of nodes, so a launch or a sync can say "everywhere"
@@ -167,18 +174,77 @@ listings mark those as unknown rather than dropping them — but launching at a
 group with an unknown member is refused rather than quietly doing less than
 asked.
 
-Removing a node drops it from this node's registry and from every group, and
-tells every other member to do the same:
+### large and small, sized by the cluster
+
+Two groups are kept by lemondx rather than by you:
 
 ```bash
-lemondx cluster remove nodeC            # from the cluster, everywhere
-lemondx cluster remove nodeC --rotate   # and cut off its credential
+lemondx cluster group auto   # rebuild large and small from what each node has
 ```
 
-Because the credential is shared, removal alone does not stop the removed node
-calling in — it still holds one. `lemondx cluster rotate` replaces the credential
-on every remaining member, which is what actually cuts it off. `remove --rotate`
-does both, and the CLI says so when you skip it.
+Every node is asked for its CPU threads and total memory — its capacity, not
+what happens to be free, because a group is a saved record that outlives the
+reading it was made from. Size is then judged *relative to the rest of the
+cluster*: each node's CPU and memory are scored as a share of the cluster
+average, the two weighted equally so neither decides alone, and a node at or
+above average goes in `large`, at or below it in `small`.
+
+Nothing is chosen in advance, and the useful cases fall out of the same
+arithmetic:
+
+| the cluster | what happens |
+| --- | --- |
+| identical hosts | every node scores 1 and is in **both** groups — none of them is bigger or smaller than the others |
+| one big host, two small | the big one is `large`, the others `small` |
+| one node with more memory but fewer cores | scores about average, so it lands in both |
+| a single node | in both groups |
+
+Hosts built to one spec rarely report identical figures, so anything within 5%
+of the cluster average counts as neither bigger nor smaller and joins both
+groups.
+
+A node that cannot be reached is left out of both groups rather than guessed
+at, and named in the output — running this while a host is down would otherwise
+quietly shrink the groups it belongs to. Both groups are pushed to every member
+like any other group.
+
+**`large` and `small` cannot be edited or deleted by hand** — not from the CLI,
+not from the UI, not by `PUT`/`DELETE` on their routes. They say what the
+cluster measured, so a hand edit would leave a group whose name promises
+something it no longer means; `group auto` is the only thing that writes them.
+Everything else about them is ordinary: launch at them, sync to them, and see
+them on each node's card.
+
+In the UI they are the rows marked **auto** under Node groups, with no Edit or
+Delete, and **Size nodes** in that card's header runs the same thing.
+
+Evicting a node leaves nothing of it anywhere, and the order is the point:
+
+```bash
+lemondx cluster evict nodeC              # stand it down, then forget it everywhere
+lemondx cluster evict nodeC --rotate     # replace the credential as well
+lemondx cluster evict nodeC --no-rotate  # never replace it, reachable or not
+```
+
+1. **nodeC is told first**, while its record is still here to call it with. It
+   stands down: it drops the cluster credential, its record of every other
+   node, and its node groups. It keeps its instances, templates and modules and
+   carries on as an ordinary unfederated lemondx.
+2. **Then it goes** from this node's registry and from every group here, and
+   every remaining member is told to do the same.
+3. **Then the credential is rotated, if it has to be.** A node that stood down
+   has already given its copy up, so nothing needs replacing. One that could
+   not be reached still holds a working credential, so the credential is
+   replaced on every remaining member — which also strands any member that
+   happens to be switched off right now, and that is why it is not done
+   unconditionally. `--rotate` and `--no-rotate` decide it by hand.
+
+The command says which of those happened, including any member that could not
+be told and still lists the evicted node. `lemondx cluster rotate` can always
+be run on its own afterwards.
+
+Under the UI's **Evict** and **Leave cluster** buttons is exactly this, and both
+ask you to type the node's name first.
 
 ## Seeing the cluster in the Containers tab
 
@@ -332,13 +398,24 @@ Sync is the manual counterpart, for a node that was down when something changed:
 lemondx cluster sync --group edge                        # every template
 lemondx cluster sync --kind modules --kind templates --node nodeB
 lemondx cluster sync --name web --node nodeB             # just this one
+lemondx cluster sync --kind users --kind groups --group edge
 ```
 
-The UI has the same thing behind **Sync** on the Nodes tab.
+`--kind` takes any of `templates`, `modules`, `profiles`, `groups` and `users`,
+repeated; the UI has the same list behind **Sync** on the Nodes tab.
 
 Notes:
 
-- Node groups sync too, as `--kind groups`.
+- **Node groups** sync as `--kind groups`, `large` and `small` included — a
+  member relaying the sizing may write them even though a person may not.
+- **Users** sync as `--kind users`: each local account is copied with its role
+  and its **password hash**, so the same login works on every node. There is no
+  plaintext password anywhere to re-hash on the far side, so the stored record
+  is what crosses, over the same pinned-certificate TLS as everything else and
+  only between members — `PUT /api/auth/users/{name}/record` refuses anyone who
+  is not one. An account of the same name on the target is replaced; accounts
+  that exist only there are left alone, because sync never deletes. PAM and
+  proxy logins are not affected: they are not lemondx accounts.
 
 - It is one direction, and it overwrites. There is no merge and no
   last-writer-wins clock, because there is no shared clock — the node you pushed
@@ -347,8 +424,10 @@ Notes:
 - Syncing a template also pushes the uploaded modules it uses, so it is not
   broken on arrival. Built-in modules ship with lemondx and are skipped.
 - Only uploaded modules are pushed. A built-in exists on every node already.
-- Templates carry no secrets — a template never stores one — so a sync never
-  moves a credential. Public SSH keys in a template do travel.
+- Templates carry no secrets — a template never stores one — so syncing one
+  moves no credential. Public SSH keys in a template do travel. `--kind users`
+  is the exception and the only one: it exists to move password hashes, and
+  nothing else sync carries is a credential.
 - A cluster launch pushes the template it is launching, so the common case needs
   no explicit sync at all.
 - Sync only pushes. It never removes something the target has and this node does
@@ -419,13 +498,15 @@ for obtaining one.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/cluster` | this node's name, address, fingerprint, whether it can be joined |
+| `POST` | `/api/cluster/groups/auto` | rebuild `large` and `small` from each node's CPU and memory |
 | `GET` | `/api/cluster/nodes` | every node with its state (`?probe=false` to skip contacting them) |
 | `GET` | `/api/cluster/nodes/{name}` | one node, with the instances on it |
 | `POST` | `/api/cluster/nodes` | `{"code":"lemondx-join.…"}` → join that node's cluster |
-| `DELETE` | `/api/cluster/nodes/{name}` | remove a node, here and on every member |
+| `DELETE` | `/api/cluster/nodes/{name}` | evict a node: stand it down, forget it everywhere (`?rotate=true`/`false` overrides the credential rotation) |
 | `POST` | `/api/cluster/leave` | give up membership |
 | `GET`/`POST` | `/api/cluster/members` | the member list / announce a member |
-| `DELETE` | `/api/cluster/members/{name}` | a peer telling us a node has gone |
+| `DELETE` | `/api/cluster/members/{name}` | a peer telling us a node has gone (members only) |
+| `POST` | `/api/cluster/evicted` | a peer telling this node it was evicted, so it stands down (members only) |
 | `POST` | `/api/cluster/refresh` | pull every peer's member list and push ours |
 | `POST` | `/api/cluster/rotate` | replace the cluster credential everywhere |
 | `PUT` | `/api/cluster/secret` | take a rotated credential from the member rotating it |
@@ -434,7 +515,7 @@ for obtaining one.
 | `POST` | `/api/cluster/containers/delete` | delete instances on several nodes |
 | *any* | `/api/nodes/{node}/{path}` | make that call against one node's own API |
 | `GET` | `/api/cluster/groups` | node groups |
-| `PUT`/`DELETE` | `/api/cluster/groups/{name}` | create or replace / delete one |
+| `PUT`/`DELETE` | `/api/cluster/groups/{name}` | create or replace / delete one (`large` and `small` are refused) |
 | `GET`/`POST` | `/api/cluster/invites` | unredeemed join codes / issue one |
 | `DELETE` | `/api/cluster/invites/{id}` | withdraw one |
 | `POST` | `/api/cluster/sync` | `{"kinds":["templates"],"groups":["edge"]}` |
