@@ -5,7 +5,7 @@ import type {
   MemberSync, NodeGroup, PendingInvite, RotateResult, SyncKind, SyncResult, Synced,
   InstanceRef, ScopedStateResult,
   BootstrapModule, BootstrapProfile, BootstrapResult, BootstrapSelection, BulkStateResult,
-  Container, ModuleSource,
+  AppCheckOutput, Container, ModuleSource,
   ContainerDetail, CreateProgress, CreateRequest, ExecResult, ImageBrowse, Images, NetworkDetail,
   InstanceTemplate, NetworkRequest, NetworkSummary, SubnetInUse, Resources, SetupResult, Snapshot, SshKey,
   StateAction, Status, StorageOverview, StoragePoolDetail, StoragePoolRequest,
@@ -109,6 +109,11 @@ export const api = {
     request<Container[]>('/containers', { signal }),
 
   creates: (signal?: AbortSignal) => request<CreateProgress[]>('/creates', { signal }),
+
+  /** The latest app check run with its full output, from the node it ran on. */
+  appCheck: (name: string, node?: string, signal?: AbortSignal) =>
+    request<AppCheckOutput>(on(node, `/containers/${encodeURIComponent(name)}/app-check`),
+      { signal }),
 
   getContainer: (name: string, signal?: AbortSignal, node?: string) =>
     request<ContainerDetail>(on(node, `/containers/${encodeURIComponent(name)}`), { signal }),

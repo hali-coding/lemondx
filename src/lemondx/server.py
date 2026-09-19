@@ -152,6 +152,9 @@ def build_router(service, auth=None, cluster=None):
           lambda body, q, name: service.exec_command(
               name, body.get("command"), timeout=int(body.get("timeout", 60))))
 
+    # The latest app check run in full; health records carry only its first line.
+    r.add("GET", r"/api/containers/%s/app-check" % NAME,
+          lambda body, q, name: service.app_check_output(name))
     r.add("GET", r"/api/containers/%s/snapshots" % NAME,
           lambda body, q, name: service.get_container(name)["snapshots"])
     r.add("POST", r"/api/containers/%s/snapshots" % NAME,
@@ -260,7 +263,8 @@ def build_router(service, auth=None, cluster=None):
               secureboot=bool(body.get("secureboot", True)),
               bootstrap=body.get("bootstrap"),
               description=body.get("description", ""),
-              name_prefix=body.get("name_prefix")), principal=True)
+              name_prefix=body.get("name_prefix"),
+              app_check=body.get("app_check")), principal=True)
     r.add("DELETE", r"/api/templates/%s" % NAME,
           lambda body, q, who, name: cluster.delete_template(
               name, everywhere=_everywhere(body, q, who)), principal=True)

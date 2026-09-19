@@ -268,8 +268,11 @@ The bootstrap picker's modules and SSH keys come from *that* node, not this one:
 a module runs there and a key is installed from what that host can see, so
 offering this node's would be offering the wrong thing.
 
-Health dots are the exception — each node's health monitor judges its own
-instances on its own schedule, so only this node's rows show one. The external
+Health dots — the instance's and its app check's — show on every row. Each
+node's own monitor still judges its instances on its own schedule; the listing
+only carries what the owning node last concluded, so a node with health checks
+off (or running a lemondx too old to report app checks) shows no dot, or no
+diamond, for its rows. The external
 link on a remote row opens that node's own UI, for the things that are still
 about the host rather than the instance: its storage, networks and nodes.
 
@@ -510,7 +513,7 @@ for obtaining one.
 | `POST` | `/api/cluster/refresh` | pull every peer's member list and push ours |
 | `POST` | `/api/cluster/rotate` | replace the cluster credential everywhere |
 | `PUT` | `/api/cluster/secret` | take a rotated credential from the member rotating it |
-| `GET` | `/api/cluster/containers` | instances across nodes (`?all=true`, `?nodes=`, `?groups=`) |
+| `GET` | `/api/cluster/containers` | instances across nodes (`?all=true`, `?nodes=`, `?groups=`), with each node's latest health records under `health` |
 | `POST` | `/api/cluster/containers/state` | one state change over instances on several nodes |
 | `POST` | `/api/cluster/containers/delete` | delete instances on several nodes |
 | *any* | `/api/nodes/{node}/{path}` | make that call against one node's own API |

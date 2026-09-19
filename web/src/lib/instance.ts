@@ -1,6 +1,6 @@
 import { keyModules, missingSecrets } from './bootstrap'
 import type {
-  BootstrapModule, InstanceSpec, InstanceTemplate, ScopedContainer,
+  BootstrapModule, InstanceSpec, InstanceTemplate,
 } from './types'
 
 // What a blank CPU or memory field means in the UI. Only the forms apply
@@ -86,6 +86,6 @@ export function specProblems(
  * that remembers an instance has to remember its node too. Without a node (a
  * view scoped to this host) the name alone is already unique.
  */
-export function keyOf(container: ScopedContainer) {
+export function keyOf(container: { name: string; node?: string }) {
   return container.node ? `${container.node}/${container.name}` : container.name
 }

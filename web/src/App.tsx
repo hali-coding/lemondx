@@ -11,6 +11,7 @@ import { useTheme } from './hooks/useTheme'
 import { useToasts } from './hooks/useToasts'
 import type { ToastKind } from './hooks/useToasts'
 import { AccessView } from './components/AccessView'
+import { AppCheckDialog } from './components/AppCheckDialog'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { ContainerDrawer } from './components/ContainerDrawer'
 import { ContainerTable } from './components/ContainerTable'
@@ -52,11 +53,16 @@ export default function App() {
   const [creates, setCreates] = useState<CreateProgress[]>([])
   const [templateRuns, setTemplateRuns] = useState<TemplateRun[]>([])
   const [health, setHealth] = useState<Record<string, HealthRecord>>({})
+  // Nodes that check health at all, keyed as rows are ('' for this host
+  // alone), so a running instance not yet checked there shows as pending.
+  const [monitored, setMonitored] = useState<Set<string>>(new Set())
   const [connectionError, setConnectionError] = useState<string | null>(null)
   const [busy, setBusy] = useState<Record<string, boolean>>({})
   // The whole record, not a name: the drawer needs the name, the busy map and
   // the table need the node-qualified key, and in a cluster those differ.
   const [selected, setSelected] = useState<ScopedContainer | null>(null)
+  // Whose app check output is open; the dialog sits above the drawer and table.
+  const [appCheckFor, setAppCheckFor] = useState<ScopedContainer | null>(null)
   const [showCreate, setShowCreate] = useState(false)
   const [pendingDelete, setPendingDelete] = useState<ScopedContainer | null>(null)
   const [deleting, setDeleting] = useState(false)
@@ -153,19 +159,21 @@ export default function App() {
 
   const reportHealth = useCallback((records: HealthRecord[]) => {
     const previous = seenHealth.current
-    const next = new Map(records.map((r) => [r.name, r.status] as [string, HealthStatus]))
+    const next = new Map(records.map((r) => [keyOf(r), r.status] as [string, HealthStatus]))
     seenHealth.current = next
     if (previous === null) return
     for (const record of records) {
-      const before = previous.get(record.name)
+      const before = previous.get(keyOf(record))
       if (before === undefined || before === record.status) continue
+      const label = record.node && record.node !== localNode
+        ? `${record.name} on ${record.node}` : record.name
       if (record.status === 'unhealthy') {
-        notify('error', `${record.name} is unhealthy`, record.reasons.join('; ') || undefined)
+        notify('error', `${label} is unhealthy`, record.reasons.join('; ') || undefined)
       } else if (before === 'unhealthy' && record.status === 'healthy') {
-        notify('success', `${record.name} recovered`)
+        notify('success', `${label} recovered`)
       }
     }
-  }, [notify])
+  }, [notify, localNode])
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     const sequence = ++refreshSequence.current
@@ -176,14 +184,17 @@ export default function App() {
         // One fetch drives both the Containers and Templates tabs, so they can
         // never disagree about which hosts are in view.
         scope.kind === 'local'
-          ? api.listContainers(signal).then((list) => ({ instances: list, errors: [] }))
+          ? api.listContainers(signal).then((list) => ({
+            instances: list, errors: [], health: null, monitored: null,
+          }))
           : api.clusterContainers(scopeTargets(scope), signal),
         // Progress is extra; a failure here must not look like losing the server.
         api.creates(signal).catch(() => null),
         api.templateRuns(signal).catch(() => null),
         // Read from the server's memory, so polling it this often is free; the
-        // checks themselves run on the server's own interval.
-        api.health(signal).catch(() => null),
+        // checks themselves run on the server's own interval. A wider scope
+        // brings every node's own records along with its instances instead.
+        scope.kind === 'local' ? api.health(signal).catch(() => null) : Promise.resolve(null),
       ])
       if (sequence !== refreshSequence.current) return
       setStatus(nextStatus)
@@ -197,9 +208,16 @@ export default function App() {
         setTemplateRuns(nextRuns)
         reportRuns(nextRuns)
       }
-      if (nextHealth) {
-        setHealth(Object.fromEntries(nextHealth.instances.map((r) => [r.name, r])))
-        reportHealth(nextHealth.instances)
+      // Keyed as the rows are (keyOf), so a web-1 on two nodes keeps two dots.
+      const records = nextContainers.health ?? nextHealth?.instances
+      if (records) {
+        setHealth(Object.fromEntries(records.map((r) => [keyOf(r), r])))
+        reportHealth(records)
+      }
+      if (nextContainers.monitored) {
+        setMonitored(new Set(nextContainers.monitored))
+      } else if (nextHealth) {
+        setMonitored(new Set(nextHealth.enabled ? [''] : []))
       }
       setConnectionError(null)
     } catch (cause) {
@@ -616,6 +634,8 @@ export default function App() {
             onAction={changeState}
             onBulkAction={bulkState}
             onDelete={setPendingDelete}
+            onShowAppCheck={setAppCheckFor}
+            monitored={monitored}
             onCreate={() => setShowCreate(true)}
           />
         )}
@@ -633,8 +653,8 @@ export default function App() {
           // Undefined for this node, so its calls take the plain path; any
           // other name routes every one of them through that node.
           node={selected.node && selected.node !== localNode ? selected.node : undefined}
-          health={selected.node && selected.node !== localNode
-            ? null : health[selected.name] ?? null}
+          health={health[keyOf(selected)] ?? null}
+          healthPending={monitored.has(selected.node ?? '')}
           busy={!!busy[keyOf(selected)]}
           refreshToken={refreshToken}
           onClose={() => setSelected(null)}
@@ -643,6 +663,17 @@ export default function App() {
           onAction={(_, action) => changeState(selected, action)}
           onDelete={() => setPendingDelete(selected)}
           onNotify={notify}
+          onShowAppCheck={() => setAppCheckFor(selected)}
+        />
+      )}
+
+      {appCheckFor && (
+        <AppCheckDialog
+          key={keyOf(appCheckFor)}
+          name={appCheckFor.name}
+          // Asked of the node it ran on; this node takes the plain path.
+          node={appCheckFor.node && appCheckFor.node !== localNode ? appCheckFor.node : undefined}
+          onClose={() => setAppCheckFor(null)}
         />
       )}
 

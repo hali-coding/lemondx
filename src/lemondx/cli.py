@@ -831,13 +831,53 @@ def cmd_templates(args, service):
         [[t["name"], describe_template(t), t["name_prefix"] + "-N",
           " → ".join(t["bootstrap"]["modules"]) or "-",
           len(t["bootstrap"]["ssh_keys"]) or "-",
+          "every %ds" % t["app_check"]["interval_seconds"] if t["app_check"] else "-",
           t["description"] or "-"] for t in items],
-        ["name", "instance", "names", "modules", "keys", "description"]))
+        ["name", "instance", "names", "modules", "keys", "app check", "description"]))
     return 0
+
+
+def read_app_check(args, service):
+    """The template's app check from `template-save`'s flags.
+
+    Without --app-check an existing template keeps the check it has, since
+    retyping a script to change a memory limit would be a trap; --no-app-check
+    is how one is removed.
+    """
+    if args.no_app_check:
+        return None
+    if args.app_check is None:
+        current = next((t for t in service.list_templates() if t["name"] == args.name), None)
+        app_check = dict((current or {}).get("app_check") or {}) or None
+        if app_check is None and (args.app_check_interval or args.app_check_timeout):
+            raise ServiceError("--app-check-interval and --app-check-timeout need "
+                               "--app-check, or a template that already has one.")
+    else:
+        try:
+            if args.app_check == "-":
+                script = sys.stdin.read()
+            else:
+                with open(args.app_check, encoding="utf-8") as handle:
+                    script = handle.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ServiceError("Cannot read the app check script: %s" % exc)
+        app_check = {"script": script}
+    if app_check is not None:
+        if args.app_check_interval is not None:
+            app_check["interval_seconds"] = args.app_check_interval
+        if args.app_check_timeout is not None:
+            app_check["timeout_seconds"] = args.app_check_timeout
+    return app_check
+
+
+def describe_app_check(app_check):
+    return "every %ds, timeout %ds" % (app_check["interval_seconds"],
+                                       app_check["timeout_seconds"])
 
 
 def cmd_template_save(args, service):
     modules, params, ssh_keys = resolve_selection(args, service)
+    app_check = read_app_check(args, service)
     template = cluster_service(service).save_template(
         name=args.name, image=args.image or service.default_image(),
         instance_type="virtual-machine" if args.vm else "container",
@@ -846,11 +886,14 @@ def cmd_template_save(args, service):
         start=not args.no_start, secureboot=not args.no_secureboot,
         bootstrap={"modules": modules, "params": params, "ssh_keys": ssh_keys},
         description=args.description or "", name_prefix=args.prefix,
+        app_check=app_check,
     )
-    emit(args, template, lambda t: "%s saved template %s: %s%s%s" % (
+    emit(args, template, lambda t: "%s saved template %s: %s%s%s%s" % (
         GREEN("+"), BOLD(t["name"]), describe_template(t),
         (" · " + " → ".join(t["bootstrap"]["modules"]))
-        if t["bootstrap"]["modules"] else "", sync_note(t)))
+        if t["bootstrap"]["modules"] else "",
+        " · app check " + describe_app_check(t["app_check"]) if t["app_check"] else "",
+        sync_note(t)))
     return 0
 
 
@@ -1049,6 +1092,9 @@ HEALTH_COLORS = {
 }
 
 
+APP_COLORS = {"ok": GREEN, "warning": ORANGE, "critical": RED, "unknown": DIM}
+
+
 def cmd_health(args, service):
     settings, warning = health_checks.load_settings()
     if warning:
@@ -1079,9 +1125,11 @@ def cmd_health(args, service):
                 else human_bytes(memory["usage"]),
                 load_text,
                 ("%dms" % probe["ms"]) if probe and probe["ok"] else (RED("failed") if probe else "-"),
+                APP_COLORS.get(r["app"]["status"], str)(r["app"]["status"]) if r["app"] else "-",
                 "; ".join(r["reasons"]) or DIM("-"),
             ])
-        return table(rows, ["name", "health", "cpu", "memory", "load", "probe", "reasons"])
+        return table(rows, ["name", "health", "cpu", "memory", "load", "probe", "app",
+                            "reasons"])
 
     emit(args, records, render)
     statuses = {r["status"] for r in records}
@@ -1757,12 +1805,23 @@ def cmd_cluster_containers(args, service):
         everything=not (args.node or args.group))
 
     def render(r):
+        health = {(h["node"], h["name"]): h for h in r.get("health") or []}
+
+        def judged(c):
+            record = health.get((c["node"], c["name"])) if c["status"] == "Running" else None
+            if not record:
+                return DIM("-"), DIM("-")
+            app = record.get("app")
+            return (HEALTH_COLORS.get(record["status"], str)(record["status"]),
+                    APP_COLORS.get(app["status"], str)(app["status"]) if app else DIM("-"))
+
         out = [table([[BOLD(c["node"]), c["name"],
                        STATUS_COLORS.get(c["status"], str)(c["status"]),
+                       *judged(c),
                        ", ".join(c.get("ipv4") or []) or DIM("-"),
                        c.get("template") or DIM("-")]
                       for c in r["instances"]],
-                     ["node", "name", "status", "ipv4", "template"])]
+                     ["node", "name", "status", "health", "app", "ipv4", "template"])]
         for failure in r["errors"]:
             out.append(RED("! %s: %s" % (failure["node"], failure["error"])))
         return "\n".join(out)
@@ -2250,6 +2309,15 @@ def build_parser():
     p.add_argument("name")
     p.add_argument("--description", default="", help="what the template is for")
     p.add_argument("--prefix", help="instance name prefix (default: from the name)")
+    p.add_argument("--app-check", metavar="SCRIPT",
+                   help="a script (file, or - for stdin) run in each instance as a health "
+                        "check: exit 0 ok, 1 warning, 2 critical, 3 unknown")
+    p.add_argument("--app-check-interval", type=int, metavar="SECONDS",
+                   help="how often the app check runs (default: 60)")
+    p.add_argument("--app-check-timeout", type=int, metavar="SECONDS",
+                   help="stop the app check after this long; counts as critical (default: 10)")
+    p.add_argument("--no-app-check", action="store_true",
+                   help="remove the template's app check")
     p.set_defaults(func=cmd_template_save)
 
     p = add("template-delete", parents=[common, only_here],

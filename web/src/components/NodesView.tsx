@@ -249,7 +249,7 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
         {nodes === null && !error ? (
           <div className="loading-wrap"><span className="spinner" /></div>
         ) : (
-          <div className="node-grid">
+          <div className="node-list">
             {(nodes ?? []).map((node) => (
               <NodeCard key={node.name} node={node} canWrite={canWrite}
                 onEvict={() => setPendingEvict(node)} onNotify={onNotify} />
@@ -509,11 +509,9 @@ function NodeCard({ node, canWrite, onEvict, onNotify }: {
           {node.name}
           {node.self && <span className="badge badge-dim">this node</span>}
         </h4>
+        <p className="node-url mono">{node.url || <span className="dim">local</span>}</p>
+        {state?.error && <p className="node-error">{state.error}</p>}
       </header>
-
-      <p className="node-url mono">{node.url || <span className="dim">local</span>}</p>
-
-      {state?.error && <p className="node-error">{state.error}</p>}
 
       <dl className="node-facts">
         <div><dt>Daemon</dt><dd>{state?.product ?? '—'} {state?.server_version ?? ''}</dd></div>
@@ -527,20 +525,18 @@ function NodeCard({ node, canWrite, onEvict, onNotify }: {
         {!node.self && <div><dt>Added</dt><dd>{when(node.added)}</dd></div>}
       </dl>
 
-      {node.groups.length > 0 && (
-        <p className="node-groups">
-          {node.groups.map((group) => (
-            <span key={group} className="badge badge-dim">{group}</span>
-          ))}
-        </p>
-      )}
+      <p className="node-groups">
+        {node.groups.map((group) => (
+          <span key={group} className="badge badge-dim">{group}</span>
+        ))}
+      </p>
 
       {/* Both actions spelled out, side by side. Eviction used to be an X in
           the corner of the card, which is the shape of a control for undoing a
           mistake -- and this is the one control here that cannot be undone
           without a fresh join code on the other host. */}
       <div className="row-actions node-card-actions">
-        <button className="btn btn-sm node-expand" onClick={toggle}
+        <button className="btn btn-sm" onClick={toggle}
           disabled={!!state && !state.reachable}>
           {open ? 'Hide instances' : 'Show instances'}
         </button>
@@ -552,7 +548,7 @@ function NodeCard({ node, canWrite, onEvict, onNotify }: {
         )}
       </div>
 
-      {open && (
+      {open && <div className="node-detail">{
         detail === null ? <div className="loading-wrap"><span className="spinner" /></div>
           : detail.instances.length === 0 ? <p className="dim">No instances.</p>
             : (
@@ -568,7 +564,7 @@ function NodeCard({ node, canWrite, onEvict, onNotify }: {
                 ))}
               </ul>
             )
-      )}
+      }</div>}
     </article>
   )
 }

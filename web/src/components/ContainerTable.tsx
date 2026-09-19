@@ -7,7 +7,7 @@ import { bytes } from '../lib/format'
 import { keyOf } from '../lib/instance'
 import { ConfirmDialog } from './ConfirmDialog'
 import { CopyButton } from './CopyButton'
-import { HealthDot } from './HealthDot'
+import { AppDot, HealthDot, PendingHealth } from './HealthDot'
 import { StatusBadge } from './StatusBadge'
 import { ExternalIcon, PlayIcon, PlusIcon, RestartIcon, StopIcon, TrashIcon } from './Icons'
 
@@ -15,8 +15,15 @@ interface Props {
   containers: ScopedContainer[]
   /** Creates the server is running or recently finished, including other tabs'. */
   creates: CreateProgress[]
-  /** Latest health check per instance name; this node's only. */
+  /** Latest health check per row, keyed by keyOf(); each node judges its own. */
   health: Record<string, HealthRecord>
+  /**
+   * Nodes whose monitor runs ('' for rows without a node, in a view of this
+   * host alone): a running row there with no record yet is pending.
+   */
+  monitored: Set<string>
+  /** Open the full output of a row's app check. */
+  onShowAppCheck: (container: ScopedContainer) => void
   /** The selected row's key, from `keyOf`. */
   selected: string | null
   /** Busy rows, keyed by `keyOf`. */
@@ -69,6 +76,7 @@ function nameList(names: string[], limit = 8) {
 
 export function ContainerTable({
   containers, creates, health, selected, busy, onSelect, onAction, onBulkAction, onDelete,
+  onShowAppCheck, monitored,
   onCreate, canCreate, localNode, nodeUrls, showNodes,
 }: Props) {
   const canWrite = useCanWrite()
@@ -277,11 +285,17 @@ export function ContainerTable({
                       ? <span className="badge badge-warn"><span className="spinner" />working</span>
                       : <>
                         <StatusBadge status={container.status} />
-                        {/* Health is this node's own monitor; another node
-                            judges its instances on its own schedule. */}
-                        {here && container.status === 'Running' && health[container.name] && (
-                          <HealthDot record={health[container.name]} />
-                        )}
+                        {/* Each node's own monitor judges its instances;
+                            these are whatever the owning node last said. */}
+                        {container.status === 'Running' && (health[rowKey] ? (
+                          <>
+                            <HealthDot record={health[rowKey]} />
+                            {health[rowKey].app && (
+                              <AppDot app={health[rowKey].app!}
+                                onOpen={() => onShowAppCheck(container)} />
+                            )}
+                          </>
+                        ) : monitored.has(container.node ?? '') && <PendingHealth />)}
                       </>}
                 </td>
                 <td className="optional dim truncate" style={{ maxWidth: 190 }}>

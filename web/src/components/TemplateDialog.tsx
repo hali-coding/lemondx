@@ -14,6 +14,23 @@ interface Props {
   onSaved: (saved: Synced<InstanceTemplate>) => void
 }
 
+/** Mirror the server's bounds (store.APP_CHECK_INTERVAL / _TIMEOUT). */
+const CHECK_INTERVAL = { min: 10, max: 86400, fallback: 60 }
+const CHECK_TIMEOUT = { min: 1, max: 300, fallback: 10 }
+
+const CHECK_PLACEHOLDER = `# Exit 0 ok, 1 warning, 2 critical, 3 unknown.
+# The first line printed is shown as the status.
+if curl -fsS -o /dev/null http://localhost/; then
+  echo "OK - web server answering"; exit 0
+fi
+echo "CRITICAL - web server not answering"; exit 2`
+
+function seconds(text: string, bounds: { min: number; max: number; fallback: number }) {
+  if (!text.trim()) return bounds.fallback
+  const value = Number(text)
+  return Number.isInteger(value) && value >= bounds.min && value <= bounds.max ? value : null
+}
+
 const TEMPLATE_NAME_RULE = /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$/
 const PREFIX_RULE = /^[a-zA-Z][a-zA-Z0-9-]{0,49}$/
 
@@ -29,6 +46,11 @@ export function TemplateDialog({ template, onCancel, onSaved }: Props) {
   const [description, setDescription] = useState(template?.description ?? '')
   const [prefix, setPrefix] = useState(template?.name_prefix ?? '')
   const [spec, setSpec] = useState<InstanceSpec>(() => template ? specOf(template) : blankSpec())
+  const [checkScript, setCheckScript] = useState(template?.app_check?.script ?? '')
+  const [checkInterval, setCheckInterval] = useState(
+    template?.app_check ? String(template.app_check.interval_seconds) : '')
+  const [checkTimeout, setCheckTimeout] = useState(
+    template?.app_check ? String(template.app_check.timeout_seconds) : '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const { modules, profiles, hostKeys, reloadProfiles } = useBootstrapData()
@@ -36,7 +58,16 @@ export function TemplateDialog({ template, onCancel, onSaved }: Props) {
   const nameValid = TEMPLATE_NAME_RULE.test(name.trim())
   const prefixValid = !prefix.trim() || PREFIX_RULE.test(prefix.trim())
   const problems = specProblems(spec, modules, true)
-  const canSubmit = nameValid && prefixValid && !busy && !problems.blocked
+  const hasCheck = checkScript.trim() !== ''
+  const interval = seconds(checkInterval, CHECK_INTERVAL)
+  const timeout = seconds(checkTimeout, CHECK_TIMEOUT)
+  const checkProblem = !hasCheck ? null
+    : interval === null ? `The interval is a whole number of seconds from ${CHECK_INTERVAL.min} to ${CHECK_INTERVAL.max}.`
+    : timeout === null ? `The timeout is a whole number of seconds from ${CHECK_TIMEOUT.min} to ${CHECK_TIMEOUT.max}.`
+    : timeout >= interval ? 'The timeout must be shorter than the interval.'
+    : !spec.start ? 'An app check needs the instance started.'
+    : null
+  const canSubmit = nameValid && prefixValid && !busy && !problems.blocked && !checkProblem
   const shownPrefix = prefix.trim() || defaultPrefix(name.trim() || 'instance')
 
   async function submit(event: React.FormEvent) {
@@ -51,6 +82,9 @@ export function TemplateDialog({ template, onCancel, onSaved }: Props) {
         bootstrap: savableSelection(modules, resolved.bootstrap),
         description: description.trim(),
         name_prefix: prefix.trim() || undefined,
+        app_check: hasCheck
+          ? { script: checkScript, interval_seconds: interval!, timeout_seconds: timeout! }
+          : null,
       })
       // Saving is keyed by name, so a rename is a new record and the old one
       // has to go -- after the save, so a failure cannot lose both.
@@ -132,6 +166,48 @@ export function TemplateDialog({ template, onCancel, onSaved }: Props) {
           disabled={busy}
           secretsAtLaunch
         />
+
+        <details className="bootstrap-section" open={hasCheck}>
+          <summary>
+            App health check
+            {hasCheck && <span className="badge badge-info">every {interval ?? '?'}s</span>}
+          </summary>
+          <p className="hint" style={{ marginBottom: 10 }}>
+            Optional. A script run inside each instance from this template, alongside the
+            usual health check, answering like a Nagios plugin: exit 0 ok, 1 warning,
+            2 critical, 3 unknown. A <span className="mono">#!</span> line picks another
+            interpreter; without one it runs under <span className="mono">/bin/sh</span>.
+            Instances without a check always report their app as ok.
+          </p>
+          <div className="field">
+            <label htmlFor="t-check">Script</label>
+            <textarea id="t-check" className="input mono param-text" rows={7}
+              value={checkScript} disabled={busy} spellCheck={false}
+              onChange={(e) => setCheckScript(e.target.value)}
+              placeholder={CHECK_PLACEHOLDER} />
+          </div>
+          <div className="grid-2">
+            <div className="field">
+              <label htmlFor="t-check-interval">Run every (seconds)</label>
+              <input id="t-check-interval" className="input" inputMode="numeric"
+                value={checkInterval} disabled={busy || !hasCheck}
+                onChange={(e) => setCheckInterval(e.target.value)}
+                placeholder={String(CHECK_INTERVAL.fallback)} aria-invalid={hasCheck && interval === null} />
+            </div>
+            <div className="field">
+              <label htmlFor="t-check-timeout">Timeout (seconds)</label>
+              <input id="t-check-timeout" className="input" inputMode="numeric"
+                value={checkTimeout} disabled={busy || !hasCheck}
+                onChange={(e) => setCheckTimeout(e.target.value)}
+                placeholder={String(CHECK_TIMEOUT.fallback)} aria-invalid={hasCheck && timeout === null} />
+            </div>
+          </div>
+          <span className="hint">
+            {checkProblem
+              ? <span style={{ color: 'var(--danger)' }}>{checkProblem}</span>
+              : 'A check that overruns its timeout counts as critical. Criticals in a row, as many as the health settings’ failure streak, make the instance unhealthy; one alone, a warning or an unknown makes it degraded.'}
+          </span>
+        </details>
 
         {spec.profiles.length > 0 && (
           <span className="hint">

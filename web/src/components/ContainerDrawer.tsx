@@ -6,7 +6,7 @@ import type { ContainerDetail, HealthRecord, StateAction } from '../lib/types'
 import { CameraIcon, CloseIcon, PauseIcon, PlayIcon, RestartIcon, StopIcon, TrashIcon } from './Icons'
 import { BootstrapPanel } from './BootstrapPanel'
 import { ExecConsole } from './ExecConsole'
-import { HealthLabel } from './HealthDot'
+import { AppCheckLabel, HealthLabel } from './HealthDot'
 import { StatusBadge } from './StatusBadge'
 
 type Tab = 'overview' | 'snapshots' | 'bootstrap' | 'console'
@@ -21,16 +21,20 @@ interface Props {
   node?: string
   /** The server's latest check, or null when it has none (stopped, or checks off). */
   health: HealthRecord | null
+  /** Its node checks health, so no record yet means not checked yet. */
+  healthPending: boolean
   busy: boolean
   onClose: () => void
   onAction: (name: string, action: StateAction) => void
   onDelete: (name: string) => void
   onNotify: (kind: 'success' | 'error', title: string, detail?: string) => void
+  /** Open the full output of this instance's app check. */
+  onShowAppCheck: () => void
   refreshToken: number
 }
 
 export function ContainerDrawer({
-  name, node, health, busy, onClose, onAction, onDelete, onNotify, refreshToken,
+  name, node, health, healthPending, busy, onClose, onAction, onDelete, onNotify, onShowAppCheck, refreshToken,
 }: Props) {
   const canWrite = useCanWrite()
   const [detail, setDetail] = useState<ContainerDetail | null>(null)
@@ -180,6 +184,23 @@ export function ContainerDrawer({
 
           {detail && tab === 'overview' && (
             <>
+              {!health && healthPending && detail.status === 'Running' && (
+                <div className="panel">
+                  <h3>Health</h3>
+                  <div className="app-check" style={{ marginTop: 0 }}>
+                    <span className="health-label health-dim">
+                      <span className="health-dot" aria-hidden="true" />pending
+                    </span>
+                    <span className="faint">App</span>
+                    <span className="health-label health-dim">
+                      <span className="app-dot" aria-hidden="true" />pending
+                    </span>
+                    <span className="faint" style={{ fontSize: 12.5 }}>
+                      not checked yet; the next round will
+                    </span>
+                  </div>
+                </div>
+              )}
               {health && detail.status === 'Running' && (
                 <div className="panel">
                   <h3>Health</h3>
@@ -194,6 +215,20 @@ export function ContainerDrawer({
                     <ul className="health-reasons">
                       {health.reasons.map((reason) => <li key={reason}>{reason}</li>)}
                     </ul>
+                  )}
+                  {health.app && (
+                    <div className="app-check">
+                      <span className="faint">App</span>
+                      <AppCheckLabel app={health.app} />
+                      <span className="faint" style={{ fontSize: 12.5 }}>
+                        {appCheckDetail(health.app)}
+                      </span>
+                      {health.app.configured && (
+                        <button type="button" className="btn btn-sm" onClick={onShowAppCheck}>
+                          Output
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
               )}
@@ -445,6 +480,15 @@ export function ContainerDrawer({
       </aside>
     </>
   )
+}
+
+function appCheckDetail(app: NonNullable<HealthRecord['app']>): string {
+  if (!app.configured) return 'no app check configured'
+  if (app.status === 'pending') return `from template ${app.template} · waiting for its first run`
+  const parts = [app.output || `exit ${app.code ?? '?'}`]
+  if (app.checked_at) parts.push(`ran ${secondsAgo(app.checked_at)}`)
+  if (app.interval) parts.push(`every ${app.interval}s`)
+  return parts.join(' · ')
 }
 
 function loadTitle(load: NonNullable<HealthRecord['load']>): string {
