@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0](https://github.com/hali-coding/lemondx/compare/v0.3.0...v0.4.0) (2026-09-19)
+
+
+### Features
+
+* cluser node handling cleanup ([d008caf](https://github.com/hali-coding/lemondx/commit/d008cafc1856557f29c311bfc124f9171ad665df))
+* cluser node handling cleanup ([b7f9bf1](https://github.com/hali-coding/lemondx/commit/b7f9bf1f2697a93b66c10155a154a2218547a042))
+
+
+### Bug fixes
+
+* implementing copilit fixes via claude for previous commit ([e4ed8e0](https://github.com/hali-coding/lemondx/commit/e4ed8e0f444efb408e52c1d5d67bece44bfc0a8c))
+
 ## [0.3.0](https://github.com/hali-coding/lemondx/compare/v0.2.0...v0.3.0) (2026-09-16)
 
 
