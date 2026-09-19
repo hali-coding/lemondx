@@ -739,6 +739,30 @@ export interface NodeGroup {
   members: string[]
   /** Members that are not nodes here -- removed, or not enrolled yet. */
   unknown_members: string[]
+  /** `large` and `small`: sized by the cluster, not editable by hand. */
+  managed: boolean
+}
+
+/** One node's capacity, and where the sizing put it. */
+export interface SizedNode {
+  node: string
+  ok: boolean
+  /** CPU threads and total memory, or zeroes when the node could not be asked. */
+  cpu: number
+  memory: number
+  error: string | null
+  /** The node's CPU and memory as a share of the cluster average; 1 is average. */
+  score: number | null
+  groups: string[]
+}
+
+export interface AutoGroupResult {
+  groups: Synced<NodeGroup>[]
+  nodes: SizedNode[]
+  /** Nodes that could not be measured, and so are in neither group. */
+  skipped: string[]
+  /** Every node is the same size, so each is in both groups. */
+  uniform: boolean
 }
 
 /** This node's own place in a cluster. */
@@ -810,7 +834,35 @@ export interface RotateResult {
   results: { node: string; ok: boolean; error: string | null }[]
 }
 
-export type SyncKind = 'templates' | 'modules' | 'profiles' | 'groups'
+/** One member's answer when it is told to forget a node. */
+export interface NodeTold {
+  node: string
+  ok: boolean
+  error: string | null
+}
+
+export interface EvictResult {
+  removed: string
+  /** Whether the evicted node was reached and gave up its credential and members. */
+  stood_down: boolean
+  stand_down_error: string | null
+  /** The remaining members, and whether each was told to forget it. */
+  told: NodeTold[]
+  /** Set when the credential was replaced as part of the eviction. */
+  rotated: RotateResult | null
+  still_holds_credential: boolean
+}
+
+export interface LeaveResult {
+  /** The peers this node has just forgotten. */
+  left: string[]
+  told: NodeTold[]
+  /** Members that could not be told, and so still list this node. */
+  stale: string[]
+  note: string
+}
+
+export type SyncKind = 'templates' | 'modules' | 'profiles' | 'groups' | 'users'
 
 export interface SyncOutcome {
   node: string

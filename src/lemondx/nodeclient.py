@@ -243,6 +243,9 @@ class NodeClient:
     def containers(self):
         return self.request("GET", "/api/containers")
 
+    def resources(self):
+        return self.request("GET", "/api/resources")
+
     def templates(self):
         return self.request("GET", "/api/templates")
 
@@ -262,6 +265,10 @@ class NodeClient:
 
     def save_group(self, name, body):
         return self.request("PUT", "/api/cluster/groups/%s" % _seg(name), body)
+
+    def adopt_user(self, name, body):
+        """Hand a peer a local account as stored, password hash included."""
+        return self.request("PUT", "/api/auth/users/%s/record" % _seg(name), body)
 
     # Deletes of shared definitions, so removing one here removes it everywhere
     # rather than leaving copies behind that a push-only sync can never clear.
@@ -331,6 +338,10 @@ class NodeClient:
 
     def forget_member(self, name):
         return self.request("DELETE", "/api/cluster/members/%s" % _seg(name))
+
+    def evicted(self, timeout=None):
+        """Tell a node it is out of the cluster, so it stands down of its own accord."""
+        return self.request("POST", "/api/cluster/evicted", {}, timeout=timeout)
 
     def set_cluster_secret(self, secret):
         """Hand a peer a rotated cluster credential, authenticated with the old one."""

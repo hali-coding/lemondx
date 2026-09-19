@@ -38,7 +38,7 @@ const STATE_VERB: Record<StateAction, string> = {
 
 export default function App() {
   const { theme, toggle } = useTheme()
-  const { scope, choose: chooseScope, nodes, groups, federated } = useScope()
+  const { scope, choose: chooseScope, nodes, groups, federated, reload: reloadCluster } = useScope()
   // Where this lemondx sits, so a row here can be told apart from one elsewhere.
   const localNode = nodes.find((n) => n.self)?.name ?? ''
   const nodeUrls = Object.fromEntries(nodes.map((n) => [n.name, n.url]))
@@ -73,6 +73,10 @@ export default function App() {
   // finished, which would report it a second time.
   const mutating = useRef(0)
   const refreshSequence = useRef(0)
+  // Bumped whenever a credential is presented, so a 401 from a request that was
+  // already in flight when the user signed in cannot re-open the gate they have
+  // just closed -- nor, in token mode, throw away the token they just pasted.
+  const authEpoch = useRef(0)
   // Creates and template runs are started on the server and return at once,
   // so a poll is the only way a page hears how one ended -- whether this page
   // started it, another tab did, or it began before a reload. These hold the
@@ -165,6 +169,7 @@ export default function App() {
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     const sequence = ++refreshSequence.current
+    const epoch = authEpoch.current
     try {
       const [nextStatus, nextContainers, nextCreates, nextRuns, nextHealth] = await Promise.all([
         api.status(signal),
@@ -200,6 +205,9 @@ export default function App() {
     } catch (cause) {
       if ((cause as Error).name === 'AbortError' || sequence !== refreshSequence.current) return
       if (cause instanceof ApiError && cause.status === 401) {
+        // Signed in since this request went out: it was refused for want of a
+        // credential that now exists, and acting on that would undo the login.
+        if (epoch !== authEpoch.current) return
         // A pasted token that stopped working (revoked, expired, mistyped)
         // would otherwise be sent forever, shadowing a fresh login.
         if (hasToken()) setToken(null)
@@ -220,11 +228,16 @@ export default function App() {
   }, [])
 
   const signedIn = useCallback(async (info: AuthInfo | null) => {
+    authEpoch.current += 1
+    // Closing the gate restarts the poll, which refreshes everything; calling
+    // refresh() here as well would only duplicate that first round.
     setGate(null)
+    // The cluster was asked about before the login and refused, leaving this
+    // node nameless and the scope picker missing until a reload.
+    reloadCluster()
     // A pasted token passes null: ask who it makes us.
     setAuthInfo(info ?? await api.authInfo().catch(() => null))
-    refresh()
-  }, [refresh])
+  }, [reloadCluster])
 
   const logout = useCallback(async () => {
     setToken(null)
@@ -235,6 +248,9 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    // Nothing to poll for while the login gate is up: every request is refused,
+    // and every refusal asks the server again what it accepts.
+    if (gate) return
     const controller = new AbortController()
     // oxlint-disable-next-line react/set-state-in-effect -- async fetch, not a sync setState
     refresh(controller.signal)
@@ -245,7 +261,7 @@ export default function App() {
       controller.abort()
       window.clearInterval(timer)
     }
-  }, [refresh])
+  }, [refresh, gate])
 
   /** Run a mutation with busy tracking, toasts and a refresh afterwards. */
   const mutate = useCallback(async (
@@ -493,7 +509,7 @@ export default function App() {
         {view === 'access' ? (
           <AccessView onNotify={notify} />
         ) : view === 'nodes' ? (
-          <NodesView onNotify={notify} />
+          <NodesView onNotify={notify} onMembershipChanged={reloadCluster} />
         ) : view === 'modules' ? (
           <ModulesView onNotify={notify} />
         ) : view === 'templates' ? (

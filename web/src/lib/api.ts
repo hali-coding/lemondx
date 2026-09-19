@@ -1,6 +1,7 @@
 import type {
   ApiToken, AuthInfo, CreatedApiToken, HealthReport, LocalUser, Role,
   ClusterContainers, ClusterInfo, ClusterNode, ClusterNodeDetail, JoinCode, JoinResult,
+  AutoGroupResult, EvictResult, LeaveResult,
   MemberSync, NodeGroup, PendingInvite, RotateResult, SyncKind, SyncResult, Synced,
   InstanceRef, ScopedStateResult,
   BootstrapModule, BootstrapProfile, BootstrapResult, BootstrapSelection, BulkStateResult,
@@ -353,9 +354,16 @@ export const api = {
   joinNode: (code: string, description?: string) =>
     request<JoinResult>('/cluster/nodes', { method: 'POST', body: { code, description } }),
 
-  removeNode: (name: string) =>
-    request<{ removed: string; still_holds_credential: boolean }>(
-      `/cluster/nodes/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  /**
+   * Puts a node out of the cluster: it is told to stand down, every other
+   * member is told to forget it. `rotate` overrides when the shared credential
+   * is replaced — by default only when the node could not be told, since
+   * rotating also strands any member that happens to be switched off.
+   */
+  evictNode: (name: string, rotate?: boolean) =>
+    request<EvictResult>(
+      `/cluster/nodes/${encodeURIComponent(name)}`
+      + (rotate === undefined ? '' : `?rotate=${rotate}`), { method: 'DELETE' }),
 
   /** Pull every peer's member list and push ours, so membership converges. */
   refreshMembers: () => request<MemberSync>('/cluster/refresh', { method: 'POST' }),
@@ -363,8 +371,8 @@ export const api = {
   /** Replace the cluster credential everywhere — what actually cuts a node off. */
   rotateCluster: () => request<RotateResult>('/cluster/rotate', { method: 'POST' }),
 
-  leaveCluster: () =>
-    request<{ left: string[]; note: string }>('/cluster/leave', { method: 'POST' }),
+  /** The other end of an eviction: this node steps out and every member is told. */
+  leaveCluster: () => request<LeaveResult>('/cluster/leave', { method: 'POST' }),
 
   clusterContainers: (targets: { nodes?: string[]; groups?: string[]; all?: boolean } = {},
                       signal?: AbortSignal) => {
@@ -387,6 +395,13 @@ export const api = {
 
   nodeGroups: (signal?: AbortSignal) =>
     request<NodeGroup[]>('/cluster/groups', { signal }),
+
+  /**
+   * Rebuilds `large` and `small` from each node's CPU and memory. Those two
+   * groups are the cluster's own reading of itself, so this is the only thing
+   * that writes them — the save and delete calls below refuse them.
+   */
+  autoGroups: () => request<AutoGroupResult>('/cluster/groups/auto', { method: 'POST' }),
 
   saveNodeGroup: (name: string, body: { members: string[]; description?: string }) =>
     request<Synced<NodeGroup>>(`/cluster/groups/${encodeURIComponent(name)}`,

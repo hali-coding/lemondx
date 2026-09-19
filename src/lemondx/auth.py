@@ -426,6 +426,49 @@ class AuthService:
             raise AuthError("No such user: %s" % name, 404)
         return {"removed": name}
 
+    # -- copying accounts between nodes ------------------------------------
+    #
+    # An account is a name, a role and a password hash, and the hash is the
+    # only part that makes it usable somewhere else: there is no plaintext kept
+    # anywhere to re-hash on the far side. So a user crosses to another node as
+    # its stored record or not at all, which is why these two exist beside
+    # `list_users()`/`set_user()` rather than being folded into them -- those
+    # are what the API serves and what a person calls, and neither should ever
+    # carry a hash.
+
+    def export_users(self, names=None):
+        """Every local user as stored, password hash included, for cluster sync."""
+        wanted = None if names is None else {str(n) for n in names}
+        return sorted(({"name": name, "role": r["role"], "hash": r["hash"],
+                        "created": r["created"], "updated": r["updated"]}
+                       for name, r in self._records("users").items()
+                       if wanted is None or name in wanted),
+                      key=lambda u: u["name"])
+
+    def adopt_user(self, name, record):
+        """Write a user record received from another node, exactly as it stands.
+
+        Held to the same shape `_clean_user()` enforces on a file, because a
+        record off the network is no more trusted than one off the disk. The
+        timestamps come with it so `lemondx users` reads the same on every
+        node; nothing is merged, since sync has one direction by design.
+        """
+        name = (name or "").strip()
+        record = record if isinstance(record, dict) else {}
+        cleaned = _clean_user(name, record)
+        if cleaned is None:
+            raise AuthError(
+                "That is not a usable user record for '%s': it needs a valid name, "
+                "a role of %s, and a password hash." % (name, " or ".join(ROLES)), 400)
+
+        def mutate(records):
+            existing = records.get(name)
+            records[name] = cleaned
+            return existing is None
+        created = store.update_auth("users", mutate)
+        _log("adopted user %s from another node" % name)
+        return {"name": name, "role": cleaned["role"], "created": created}
+
     # -- password login and sessions ---------------------------------------
 
     def login(self, username, password, client, secure_transport):

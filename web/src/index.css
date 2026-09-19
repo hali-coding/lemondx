@@ -1402,6 +1402,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
   margin-bottom: 10px;
 }
 .node-self-note { margin: 14px 0 0; }
+/* Pushed to the far end of the heading: leaving is the destructive action on
+   this card, and it should not sit next to the node's own name. */
+.node-self-leave { margin-left: auto; }
 
 /* Facts as a definition list rather than a table: a node has a handful of
    them, and they wrap instead of forcing a horizontal scroll on a phone. */
@@ -1448,6 +1451,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .node-url { margin: 0; font-size: 12px; color: var(--text-dim); word-break: break-all; }
 .node-error { margin: 0; font-size: 12px; color: var(--danger); }
 .node-groups { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; }
+/* The expander first, the eviction last and hard against the other edge, so
+   the two are not adjacent to a stray click. */
+.node-card-actions { justify-content: space-between; align-items: center; }
 .node-expand { align-self: flex-start; }
 .node-instances {
   list-style: none;

@@ -106,7 +106,20 @@ FANOUT_WORKERS = 8
 REMOTE_RUN_DEADLINE = 3600
 REMOTE_POLL_SECONDS = 3
 
-SYNC_KINDS = ("templates", "modules", "profiles", "groups")
+# The two groups `auto_groups()` maintains, and how far from the cluster
+# average still counts as "the same size". The tolerance is not cosmetic: two
+# hosts built to one spec report memory totals that differ by a few MiB and a
+# hypervisor may hand one of them a thread fewer, so an exact comparison would
+# call one of a pair of identical machines large and the other small.
+SIZE_GROUPS = ("large", "small")
+SIZE_TOLERANCE = 0.05
+
+# Telling a node it has been evicted is what makes the removal clean, so it is
+# worth a real wait -- but not the full one: an operator is watching a dialog,
+# and a host that is switched off refuses at once anyway.
+EVICT_TIMEOUT = 10
+
+SYNC_KINDS = ("templates", "modules", "profiles", "groups", "users")
 # Saving something shared pushes it to every member there and then. Kept short:
 # a node that is off refuses instantly, and one that is merely unreachable must
 # not hold up the save that is already done here.
@@ -845,18 +858,8 @@ class ClusterService:
         with ThreadPoolExecutor(max_workers=min(len(items), FANOUT_WORKERS)) as pool:
             return list(pool.map(work, items))
 
-    def forget_node(self, name, everywhere=True):
-        """Remove a node from the cluster: here, and on every other member.
-
-        Because the credential is shared, this does not yet stop the removed
-        node calling in -- it still holds it. ``rotate_secret()`` is what
-        actually cuts it off, and the result says so.
-        """
-        name = (name or "").strip()
-        if name == self.local_name():
-            raise ClusterError("This node cannot remove itself from its own cluster.")
-        if name not in self._peers():
-            raise ClusterError("No node called '%s'." % name, 404)
+    def _forget(self, name):
+        """Drop one node here: its record, its group memberships, its probe."""
         store.delete_node(name)
         for group in store.load_node_groups().values():
             if name in group["members"]:
@@ -865,25 +868,74 @@ class ClusterService:
         with self._lock:
             self._probes.pop(name, None)
 
-        told = []
-        if everywhere:
-            def tell(peer):
-                try:
-                    self.client(peer).forget_member(name)
-                    return {"node": peer, "ok": True, "error": None}
-                except (ClusterError, NodeError) as exc:
-                    return {"node": peer, "ok": False, "error": exc.message}
-            told = self._fanout(sorted(self._peers()), tell)
-        _log("removed node %s" % name)
-        return {"removed": name, "told": told,
-                "still_holds_credential": self.in_cluster()}
+    def _tell_peers(self, name):
+        """Ask every remaining member to forget ``name``. Never raises."""
+        def tell(peer):
+            try:
+                self.client(peer).forget_member(name)
+                return {"node": peer, "ok": True, "error": None}
+            except (ClusterError, NodeError) as exc:
+                return {"node": peer, "ok": False, "error": exc.message}
+        return self._fanout(sorted(self._peers()), tell)
+
+    def evict_node(self, name, rotate=None):
+        """Put a node out of the cluster, leaving nothing of it anywhere.
+
+        The order is the whole point. The node is told *first*, while its
+        record is still here to call it with, so it gives up the credential and
+        its own member list instead of carrying on as a member nobody answers
+        -- still pushing templates, still forwarding calls, still listing hosts
+        that have forgotten it. Only then does it go from this registry and
+        from every other member's.
+
+        Rotating the credential afterwards is what the cluster used to rely on
+        for all of this, and it still happens when the node could not be told:
+        an evicted node that stood down has already given its copy up, and
+        rotating regardless would strand any member that merely happened to be
+        switched off -- turning one deliberate eviction into two. Pass
+        ``rotate`` to decide it by hand.
+        """
+        name = (name or "").strip()
+        if name == self.local_name():
+            raise ClusterError(
+                "A node cannot evict itself. Run `lemondx cluster leave` on %s to "
+                "take it out of the cluster from its own side." % name, 409)
+        if name not in self._peers():
+            raise ClusterError("No node called '%s'." % name, 404)
+
+        try:
+            self.client(name, timeout=EVICT_TIMEOUT).evicted()
+            stood_down, why = True, None
+        except (ClusterError, NodeError) as exc:
+            stood_down, why = False, exc.message
+
+        self._forget(name)
+        told = self._tell_peers(name)
+
+        rotating = (not stood_down) if rotate is None else bool(rotate)
+        rotated = self.rotate_secret() if rotating and self.in_cluster() else None
+        _log("evicted node %s%s" % (name, "" if stood_down
+                                    else " (could not be told: %s)" % why))
+        return {"removed": name, "stood_down": stood_down, "stand_down_error": why,
+                "told": told, "rotated": rotated,
+                "still_holds_credential": not stood_down and rotated is None}
 
     def drop_member(self, name):
-        """A peer telling us a node has left. Local only: no onward broadcast.
+        """A peer telling us a node is out. Local only: no onward broadcast.
 
-        Otherwise one removal would ricochet around the cluster forever.
+        Otherwise one removal would ricochet around the cluster forever -- the
+        node that started it is the one that tells everybody.
         """
-        return self.forget_node(name, everywhere=False)
+        name = (name or "").strip()
+        if name == self.local_name():
+            raise ClusterError("This node cannot be asked to forget itself.", 409)
+        if name not in self._peers():
+            # Already gone: a removal that reaches us twice (or after we heard
+            # it from the node itself) is a no-op, not a failure to report.
+            return {"removed": name, "told": [], "still_holds_credential": False}
+        self._forget(name)
+        _log("forgot node %s at a member's request" % name)
+        return {"removed": name, "told": [], "still_holds_credential": False}
 
     def describe_node(self, name):
         """One node with its instances, for the node's card in the UI."""
@@ -916,6 +968,9 @@ class ClusterService:
             members = group["members"]
             groups.append(dict(group, **{
                 "members": members,
+                # Not stored: it is a property of the name, so a file copied
+                # from another machine cannot claim to be managed or deny it.
+                "managed": group["name"] in SIZE_GROUPS,
                 # A group is a plain list of names, so it can name a node that
                 # has since been removed or has not joined yet. Say so
                 # rather than dropping it: the name is what the user wrote.
@@ -923,8 +978,24 @@ class ClusterService:
             }))
         return groups
 
-    def save_group(self, name, members=None, description="", propagate=True):
+    def _refuse_managed(self, name, managed, verb):
+        """Guard the two groups `auto_groups()` owns.
+
+        They say what the cluster measured, so editing one by hand would leave
+        a group whose name promises something it no longer means. ``managed``
+        is the sizing itself, or a member relaying it -- the guard is on the
+        person at either end, not on the cluster keeping itself level.
+        """
+        if not managed and name in SIZE_GROUPS:
+            raise ClusterError(
+                "'%s' is maintained by lemondx from what each node has, so it "
+                "cannot be %s by hand. Run `lemondx cluster group auto` to build "
+                "it again from the nodes as they are now." % (name, verb), 409)
+
+    def save_group(self, name, members=None, description="", propagate=True,
+                   managed=False):
         name = (name or "").strip()
+        self._refuse_managed(name, managed, "edited")
         if not GROUP_NAME.match(name):
             raise ClusterError(
                 "Invalid group name '%s'. Use letters, digits, spaces and . _ -, "
@@ -944,7 +1015,93 @@ class ClusterService:
         # kept level automatically, like templates and modules.
         return self._with_sync(record, "groups", name, propagate)
 
-    def delete_group(self, name, everywhere=True):
+    def _capacity_of(self, name):
+        """One node's CPU threads and total memory, or a NodeError/ClusterError."""
+        if name == self.local_name():
+            host = (self.service.resources() or {}).get("host") or {}
+        else:
+            host = (self.client(name).resources() or {}).get("host") or {}
+        return int(host.get("cpu_threads") or 0), int(host.get("memory_total") or 0)
+
+    def node_capacity(self):
+        """What each node has, for sizing it against the rest of the cluster.
+
+        Capacity, not what happens to be free: a group is a saved record that
+        outlives the reading it was made from, so a momentary figure would be
+        wrong by the time anything launched against it.
+        """
+        def one(name):
+            try:
+                cpu, memory = self._capacity_of(name)
+            except (ClusterError, NodeError, ServiceError, LXDError) as exc:
+                return {"node": name, "ok": False, "cpu": 0, "memory": 0,
+                        "error": getattr(exc, "message", None) or str(exc)}
+            if cpu <= 0 or memory <= 0:
+                # A daemon that answers without figures cannot be compared with
+                # one that does, and a zero would drag every other node's share
+                # of the average with it.
+                return {"node": name, "ok": False, "cpu": cpu, "memory": memory,
+                        "error": "reported no CPU or memory"}
+            return {"node": name, "ok": True, "cpu": cpu, "memory": memory,
+                    "error": None}
+
+        return self._fanout(self.all_nodes(), one)
+
+    def auto_groups(self, propagate=True):
+        """Rebuild the `large` and `small` groups from what each node has.
+
+        Size is relative, because "large" only means anything next to the rest
+        of the cluster: each node's CPU and memory are scored as a share of the
+        cluster average -- the two weighted equally, so neither a core count
+        nor a memory total decides on its own -- and a node at or above average
+        is large, at or below it small. Nothing has to be chosen in advance,
+        and a cluster of identical hosts falls out of the same arithmetic with
+        every node in both groups, which is the honest answer: none of them is
+        bigger or smaller than the others.
+
+        A node that cannot be reached is left out of both rather than guessed
+        at, and named in the result -- running this while a host is down would
+        otherwise quietly shrink the groups it belongs to.
+        """
+        readings = self.node_capacity()
+        usable = [r for r in readings if r["ok"]]
+        if not usable:
+            raise ClusterError(
+                "No node could be asked what it has, so there is nothing to "
+                "compare. Check that the nodes are reachable and try again.", 503)
+
+        mean_cpu = sum(r["cpu"] for r in usable) / float(len(usable))
+        mean_memory = sum(r["memory"] for r in usable) / float(len(usable))
+
+        def place(reading):
+            if not reading["ok"]:
+                return dict(reading, score=None, groups=[])
+            # Each resource as a share of the cluster's average, the two
+            # averaged: a node with twice the memory and half the cores of its
+            # peers is neither large nor small, which is the right answer.
+            score = (reading["cpu"] / mean_cpu + reading["memory"] / mean_memory) / 2
+            return dict(reading, score=round(score, 4), groups=[
+                name for name, fits in (("large", score >= 1 - SIZE_TOLERANCE),
+                                        ("small", score <= 1 + SIZE_TOLERANCE)) if fits])
+
+        sized = [place(r) for r in readings]
+        saved = [self.save_group(
+            name,
+            members=[r["node"] for r in sized if name in r["groups"]],
+            description="sized automatically from CPU and memory",
+            propagate=propagate, managed=True,
+        ) for name in SIZE_GROUPS]
+
+        skipped = [r["node"] for r in sized if not r["ok"]]
+        uniform = all(len(r["groups"]) == 2 for r in sized if r["ok"])
+        _log("sized %d node(s) into large/small%s%s"
+             % (len(usable), " (all the same size)" if uniform else "",
+                "; skipped %s" % ", ".join(skipped) if skipped else ""))
+        return {"groups": saved, "nodes": sized, "skipped": skipped,
+                "uniform": uniform}
+
+    def delete_group(self, name, everywhere=True, managed=False):
+        self._refuse_managed((name or "").strip(), managed, "deleted")
         if not store.delete_node_group((name or "").strip()):
             raise ClusterError("No such node group '%s'." % name, 404)
         return self._with_sync({"deleted": name}, "groups", name, everywhere,
@@ -1226,13 +1383,21 @@ class ClusterService:
         # node's name means every call routed to that name would end up at one of
         # them arbitrarily, and remember_members() drops a record with our own
         # name rather than reporting it. Better to stay out of the cluster.
-        taken = [m.get("name") for m in (answer.get("members") or [])
-                 if isinstance(m, dict) and m.get("name") == mine["name"]]
+        #
+        # Only a *different* host holding the name is that, though. The list we
+        # are looking at always names this node: enroll() records the joiner
+        # before answering, so we are in the very answer we are checking -- and
+        # a cluster still holding the record from an earlier join of ours that
+        # failed after this point would otherwise be unjoinable for good.
+        ours = clean_member(mine) or {"url": "", "fingerprint": ""}
+        taken = [m for m in map(clean_member, answer.get("members") or [])
+                 if m and m["name"] == mine["name"]
+                 and (m["url"], m["fingerprint"]) != (ours["url"], ours["fingerprint"])]
         if taken:
             raise ClusterError(
-                "That cluster already has a node called '%s'. Rename this one "
-                "with `lemondx configure cluster` and join with a fresh code."
-                % mine["name"], 409)
+                "That cluster already has a node called '%s', at %s. Rename this "
+                "one with `lemondx configure cluster` and join with a fresh code."
+                % (mine["name"], taken[0]["url"]), 409)
 
         self._install_secret(str(answer["secret"]))
         remote = answer.get("node") or {}
@@ -1255,17 +1420,18 @@ class ClusterService:
             "warning": warning,
         }
 
-    def leave(self):
-        """Give up membership: drop the credential, the members and the groups.
+    def _stand_down(self):
+        """Erase every trace of membership here: credential, peers, groups.
 
-        Local only. The cluster keeps its record of this node until someone
-        removes it there, which is also what rotates the credential away.
+        What leaving and being evicted have in common -- whichever end starts
+        it, what has to be true here afterwards is the same. The groups go too:
+        a group is a list of node names, and without the nodes it names nothing.
         """
-        if not self.in_cluster():
-            raise ClusterError("This node is not in a cluster.", 409)
         peers = sorted(self._peers())
         for name in peers:
             store.delete_node(name)
+        for group in list(store.load_node_groups()):
+            store.delete_node_group(group)
         token_id = (self.cluster_secret() or "").split("_", 2)[1]
 
         def drop_token(records):
@@ -1277,11 +1443,47 @@ class ClusterService:
         store.update_auth("cluster", drop_secret)
         with self._lock:
             self._probes.clear()
-        _log("left the cluster")
-        return {"left": peers,
-                "note": "Run `lemondx cluster remove %s` on a remaining node, then "
-                        "`lemondx cluster rotate` there, so this node's credential "
-                        "stops working." % self.local_name() if peers else ""}
+        return peers
+
+    def leave(self):
+        """Give up membership, and be forgotten by the cluster.
+
+        The mirror of ``evict_node()`` from the other end, and told in the same
+        order: every member hears about it while the credential is still here
+        to tell them with, and only then is anything dropped locally. A member
+        that cannot be reached keeps its record of this node -- reported,
+        because the only way to clear it is to evict there.
+
+        Nothing has to be rotated afterwards: the credential this node held is
+        gone from it, which is exactly what a rotation would have achieved.
+        """
+        if not self.in_cluster():
+            raise ClusterError("This node is not in a cluster.", 409)
+        me = self.local_name()
+        told = self._tell_peers(me)
+        left = self._stand_down()
+        stale = [row["node"] for row in told if not row["ok"]]
+        _log("left the cluster (told %d of %d member(s))"
+             % (len(told) - len(stale), len(told)))
+        return {
+            "left": left, "told": told, "stale": stale,
+            "note": "%s could not be told and still lists this node: run `lemondx "
+                    "cluster evict %s` there." % (", ".join(stale), me) if stale else "",
+        }
+
+    def evicted(self, peer_address=None):
+        """A member telling this node it has been put out of the cluster.
+
+        Authenticated as a peer, like every call between members. Deliberately
+        not a broadcast: the node doing the evicting tells the others itself,
+        so a node standing down here never calls back into a cluster it has
+        just left -- and an eviction cannot ricochet.
+        """
+        if not self.in_cluster():
+            return {"left": [], "already": True}
+        left = self._stand_down()
+        _log("evicted from the cluster by %s; stood down" % (peer_address or "a member"))
+        return {"left": left, "already": False}
 
     def probe_fingerprint(self, url):
         """What certificate an address presents right now, for an operator to compare."""
@@ -1363,6 +1565,13 @@ class ClusterService:
                 items.append(("groups", group["name"], {
                     "members": group["members"], "description": group["description"]}))
 
+        if "users" in kinds:
+            # As stored, hash and all: an account is only usable on the far
+            # side if the hash goes with it, and there is no plaintext kept
+            # anywhere to re-hash there. See AuthService.export_users().
+            for user in self.auth.export_users(names):
+                items.append(("users", user["name"], user))
+
         available = discover_modules()
         if "modules" in kinds:
             for module_id, module in sorted(available.items()):
@@ -1387,7 +1596,7 @@ class ClusterService:
 
         # Modules first: a template that arrives before the module it names is
         # accepted but cannot be launched until the module follows.
-        order = {"modules": 0, "profiles": 1, "templates": 2, "groups": 3}
+        order = {"modules": 0, "profiles": 1, "templates": 2, "groups": 3, "users": 4}
         return sorted(items, key=lambda item: (order[item[0]], item[1]))
 
     def _sync_to(self, node_name, items, timeout=DEFAULT_TIMEOUT):
@@ -1406,6 +1615,8 @@ class ClusterService:
                     client.save_profile(name, body)
                 elif kind == "groups":
                     client.save_group(name, body)
+                elif kind == "users":
+                    client.adopt_user(name, body)
                 else:
                     client.upload_module(name, body["content"], overwrite=True)
             except NodeError as exc:

@@ -44,7 +44,9 @@ little access `403`, too many failed logins `429`.
 | `GET` | `/api/cluster/nodes` | federated nodes and their state (`?probe=false` skips contacting them) |
 | `GET` | `/api/cluster/nodes/{name}` | one node, with the instances on it |
 | `POST` | `/api/cluster/nodes` | `{"code":"lemondx-join.…"}` → join that node's cluster |
-| `DELETE` | `/api/cluster/nodes/{name}` | remove a node, here and on every member |
+| `DELETE` | `/api/cluster/nodes/{name}` | evict a node: stand it down, forget it everywhere (`?rotate=` overrides) |
+| `POST` | `/api/cluster/groups/auto` | rebuild the `large` and `small` groups from each node's CPU and memory |
+| `PUT` | `/api/auth/users/{name}/record` | take a synced account as stored, hash included — cluster members only |
 | `POST` | `/api/cluster/leave` | give up membership of the cluster |
 | `GET`/`POST` | `/api/cluster/members` | the member list / announce a member (node to node) |
 | `DELETE` | `/api/cluster/members/{name}` | a peer saying a node has left |
@@ -56,7 +58,7 @@ little access `403`, too many failed logins `429`.
 | `POST` | `/api/cluster/containers/delete` | delete instances that sit on several nodes |
 | *any* | `/api/nodes/{node}/{path}` | make that call against one node's own API and return its answer |
 | `GET` | `/api/cluster/groups` | node groups |
-| `PUT`/`DELETE` | `/api/cluster/groups/{name}` | create or replace / delete a group |
+| `PUT`/`DELETE` | `/api/cluster/groups/{name}` | create or replace / delete a group (`large` and `small` are refused: they are sized, not written) |
 | `GET`/`POST` | `/api/cluster/invites` | unredeemed join codes / issue one |
 | `DELETE` | `/api/cluster/invites/{id}` | withdraw a join code |
 | `POST` | `/api/cluster/sync` | push templates, modules or profiles to other nodes |

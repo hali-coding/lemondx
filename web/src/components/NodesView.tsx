@@ -2,25 +2,43 @@ import { useCallback, useEffect, useState } from 'react'
 import { useCanWrite } from '../hooks/useAuth'
 import { api } from '../lib/api'
 import type {
-  ClusterInfo, ClusterNode, ClusterNodeDetail, JoinCode, NodeGroup, SyncKind, SyncResult,
+  AutoGroupResult, ClusterInfo, ClusterNode, ClusterNodeDetail, EvictResult, JoinCode,
+  LeaveResult, NodeGroup, NodeTold, SyncKind, SyncResult,
 } from '../lib/types'
 import { ConfirmDialog } from './ConfirmDialog'
 import { CopyButton } from './CopyButton'
-import { KeyIcon, PlusIcon, RefreshIcon, ServerIcon, TrashIcon, UploadIcon } from './Icons'
+import {
+  EjectIcon, KeyIcon, LogoutIcon, PlusIcon, RefreshIcon, ScalesIcon, ServerIcon, TrashIcon,
+  UploadIcon,
+} from './Icons'
 import { Modal } from './Modal'
 
 interface Props {
   onNotify: (kind: 'success' | 'error' | 'info', title: string, detail?: string) => void
+  /**
+   * Joining, evicting and leaving change who the Containers and Templates tabs
+   * can be scoped to, and that list is read once rather than polled — so the
+   * scope picker would go on offering a node this tab has just removed, or
+   * survive a `leave` that emptied the cluster, until a reload.
+   */
+  onMembershipChanged: () => void
 }
 
 // Reachability comes from the server's own probe, which it caches for a few
 // seconds; polling faster than that would only re-read the same answer.
 const POLL_INTERVAL = 10000
 
-const SYNC_KINDS: { id: SyncKind; label: string; hint: string }[] = [
+const SYNC_KINDS: { id: SyncKind; label: string; hint: string; warn?: string }[] = [
   { id: 'templates', label: 'Templates', hint: 'with the uploaded modules they use' },
   { id: 'modules', label: 'Modules', hint: 'uploaded ones; built-ins are everywhere already' },
   { id: 'profiles', label: 'Bootstrap profiles', hint: 'named module selections' },
+  { id: 'groups', label: 'Node groups', hint: 'including the sized large and small' },
+  {
+    id: 'users', label: 'Users', hint: 'local accounts, so the same logins work there',
+    warn: 'Each account is copied with its password hash and role, replacing any '
+      + 'account of the same name on the target. Accounts that exist only there are '
+      + 'left alone — sync never deletes.',
+  },
 ]
 
 function when(epoch: number | null | undefined) {
@@ -31,8 +49,55 @@ function short(fingerprint: string) {
   return fingerprint ? `${fingerprint.slice(0, 8)}…${fingerprint.slice(-8)}` : '—'
 }
 
+const SIZE_GROUP_NAMES = 'large and small'
+
+/** What the sizing decided, short enough for a toast. */
+function sizeDetail(result: AutoGroupResult) {
+  const parts = result.uniform
+    ? ['Every node is the same size, so each is in both groups.']
+    : result.groups.map((group) => `${group.name}: ${group.members.join(', ') || 'none'}.`)
+  if (result.skipped.length > 0) {
+    parts.push(`${result.skipped.join(', ')} could not be measured and is in neither.`)
+  }
+  return parts.join(' ')
+}
+
+function stragglers(told: NodeTold[]) {
+  return told.filter((row) => !row.ok).map((row) => row.node)
+}
+
+/**
+ * What is left to do by hand, if anything. Both removals are best-effort
+ * against hosts that may be off, so the one thing the toast must carry is
+ * which node did not get the message — that is the only part someone has to
+ * act on, and nothing else will bring it up again.
+ */
+function evictDetail(result: EvictResult) {
+  const parts: string[] = []
+  parts.push(result.stood_down
+    ? `${result.removed} stood down and gave up the cluster credential.`
+    : `${result.removed} could not be told (${result.stand_down_error ?? 'unreachable'}).`)
+  if (result.rotated) {
+    parts.push(result.rotated.stranded.length === 0
+      ? 'The cluster credential was replaced on every member.'
+      : `The credential was replaced, but ${result.rotated.stranded.join(', ')} missed it and must rejoin.`)
+  } else if (result.still_holds_credential) {
+    parts.push('It still holds the cluster credential — run `lemondx cluster rotate` to cut it off.')
+  }
+  const behind = stragglers(result.told)
+  if (behind.length > 0) parts.push(`${behind.join(', ')} still lists it.`)
+  return parts.join(' ')
+}
+
+function leaveDetail(result: LeaveResult) {
+  const gone = result.left.length === 0 ? 'Nothing was federated.'
+    : `Forgot ${result.left.join(', ')}.`
+  return result.stale.length === 0 ? gone
+    : `${gone} ${result.stale.join(', ')} could not be told and still lists this node.`
+}
+
 /** Nodes this lemondx federates with, the groups they form, and what spans them. */
-export function NodesView({ onNotify }: Props) {
+export function NodesView({ onNotify, onMembershipChanged }: Props) {
   const canWrite = useCanWrite()
   const [info, setInfo] = useState<ClusterInfo | null>(null)
   const [nodes, setNodes] = useState<ClusterNode[] | null>(null)
@@ -40,7 +105,9 @@ export function NodesView({ onNotify }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [dialog, setDialog] = useState<'join' | 'invite' | 'sync' | null>(null)
   const [editingGroup, setEditingGroup] = useState<NodeGroup | 'new' | null>(null)
-  const [pendingRemove, setPendingRemove] = useState<ClusterNode | null>(null)
+  const [pendingEvict, setPendingEvict] = useState<ClusterNode | null>(null)
+  const [pendingLeave, setPendingLeave] = useState(false)
+  const [pendingSize, setPendingSize] = useState(false)
   const [busy, setBusy] = useState(false)
 
   const load = useCallback(async (signal?: AbortSignal) => {
@@ -69,20 +136,52 @@ export function NodesView({ onNotify }: Props) {
     }
   }, [load])
 
-  async function removeNode() {
-    if (!pendingRemove) return
+  async function evictNode() {
+    if (!pendingEvict) return
+    const name = pendingEvict.name
     setBusy(true)
     try {
-      const result = await api.removeNode(pendingRemove.name)
-      onNotify('success', `Removed ${pendingRemove.name}`, result.still_holds_credential
-        ? `It still holds the cluster credential — run \`lemondx cluster rotate\` to cut it off.`
-        : undefined)
+      const result = await api.evictNode(name)
+      onNotify(result.stood_down && stragglers(result.told).length === 0 ? 'success' : 'info',
+        `Evicted ${name}`, evictDetail(result))
+      onMembershipChanged()
       await load()
     } catch (cause) {
-      onNotify('error', `Could not remove ${pendingRemove.name}`, (cause as Error).message)
+      onNotify('error', `Could not evict ${name}`, (cause as Error).message)
     } finally {
       setBusy(false)
-      setPendingRemove(null)
+      setPendingEvict(null)
+    }
+  }
+
+  async function leaveCluster() {
+    setBusy(true)
+    try {
+      const result = await api.leaveCluster()
+      onNotify(result.stale.length === 0 ? 'success' : 'info', 'Left the cluster',
+        leaveDetail(result))
+      onMembershipChanged()
+      await load()
+    } catch (cause) {
+      onNotify('error', 'Could not leave the cluster', (cause as Error).message)
+    } finally {
+      setBusy(false)
+      setPendingLeave(false)
+    }
+  }
+
+  async function sizeGroups() {
+    setBusy(true)
+    try {
+      const result = await api.autoGroups()
+      onNotify(result.skipped.length === 0 ? 'success' : 'info',
+        'Sized the nodes', sizeDetail(result))
+      await load()
+    } catch (cause) {
+      onNotify('error', 'Could not size the nodes', (cause as Error).message)
+    } finally {
+      setBusy(false)
+      setPendingSize(false)
     }
   }
 
@@ -113,7 +212,10 @@ export function NodesView({ onNotify }: Props) {
         </div>
       )}
 
-      {info && <ThisNode info={info} peers={peers.length} />}
+      {info && (
+        <ThisNode info={info} peers={peers.length} canWrite={canWrite}
+          onLeave={() => setPendingLeave(true)} />
+      )}
 
       <section className="card access-card">
         <header className="access-head">
@@ -150,7 +252,7 @@ export function NodesView({ onNotify }: Props) {
           <div className="node-grid">
             {(nodes ?? []).map((node) => (
               <NodeCard key={node.name} node={node} canWrite={canWrite}
-                onRemove={() => setPendingRemove(node)} onNotify={onNotify} />
+                onEvict={() => setPendingEvict(node)} onNotify={onNotify} />
             ))}
           </div>
         )}
@@ -172,10 +274,17 @@ export function NodesView({ onNotify }: Props) {
         <header className="access-head">
           <h3>Node groups</h3>
           <span className="faint">A name for a set of nodes, to launch or sync across at once.</span>
-          <button className="btn btn-sm btn-primary access-head-end" disabled={!canWrite}
-            onClick={() => setEditingGroup('new')}>
-            <PlusIcon /> New group
-          </button>
+          <div className="row-actions access-head-end">
+            <button className="btn btn-sm" disabled={!canWrite}
+              onClick={() => setPendingSize(true)}
+              title="Rebuild large and small from each node's CPU and memory">
+              <ScalesIcon /> Size nodes
+            </button>
+            <button className="btn btn-sm btn-primary" disabled={!canWrite}
+              onClick={() => setEditingGroup('new')}>
+              <PlusIcon /> New group
+            </button>
+          </div>
         </header>
 
         {groups.length === 0 ? (
@@ -187,7 +296,15 @@ export function NodesView({ onNotify }: Props) {
                 <th aria-label="Actions" /></tr></thead>
               <tbody>{groups.map((group) => (
                 <tr key={group.name}>
-                  <td><strong>{group.name}</strong></td>
+                  <td>
+                    <strong>{group.name}</strong>
+                    {group.managed && (
+                      <span className="badge badge-dim" style={{ marginLeft: 6 }}
+                        title="Sized by lemondx from each node's CPU and memory">
+                        auto
+                      </span>
+                    )}
+                  </td>
                   <td>
                     {group.members.length === 0 ? <span className="dim">none</span>
                       : group.members.map((member) => (
@@ -203,15 +320,20 @@ export function NodesView({ onNotify }: Props) {
                   </td>
                   <td className="dim">{group.description || '—'}</td>
                   <td>
-                    <div className="row-actions">
-                      <button className="btn btn-sm" disabled={!canWrite}
-                        onClick={() => setEditingGroup(group)}>Edit</button>
-                      <button className="btn btn-sm btn-icon btn-danger" disabled={!canWrite}
-                        aria-label={`Delete group ${group.name}`} title="Delete"
-                        onClick={() => deleteGroup(group.name)}>
-                        <TrashIcon />
-                      </button>
-                    </div>
+                    {/* No controls at all on a managed row rather than disabled
+                        ones: the server refuses these two names outright, so an
+                        Edit that could only ever fail is worse than none. */}
+                    {!group.managed && (
+                      <div className="row-actions">
+                        <button className="btn btn-sm" disabled={!canWrite}
+                          onClick={() => setEditingGroup(group)}>Edit</button>
+                        <button className="btn btn-sm btn-icon btn-danger" disabled={!canWrite}
+                          aria-label={`Delete group ${group.name}`} title="Delete"
+                          onClick={() => deleteGroup(group.name)}>
+                          <TrashIcon />
+                        </button>
+                      </div>
+                    )}
                   </td>
                 </tr>
               ))}</tbody>
@@ -225,6 +347,7 @@ export function NodesView({ onNotify }: Props) {
           onDone={(message, detail) => {
             setDialog(null)
             onNotify('success', message, detail)
+            onMembershipChanged()
             load()
           }} />
       )}
@@ -249,15 +372,40 @@ export function NodesView({ onNotify }: Props) {
           }} />
       )}
 
-      {pendingRemove && (
+      {pendingEvict && (
         <ConfirmDialog
-          title={`Remove ${pendingRemove.name}?`}
-          message={`Every member is told to drop ${pendingRemove.name}. Its instances are untouched. Because the cluster credential is shared, this does not by itself stop it calling in — run \`lemondx cluster rotate\` afterwards for that.`}
-          confirmLabel="Remove"
+          title={`Evict ${pendingEvict.name} from the cluster?`}
+          message={`${pendingEvict.name} is told to stand down — it gives up the cluster credential, its member list and its node groups — and every remaining member is told to forget it. Its instances, templates and modules are untouched, and it goes on working on its own. If it cannot be reached, the credential is replaced here instead, which also cuts off any member that is switched off right now.`}
+          confirmLabel="Evict"
+          confirmText={pendingEvict.name}
           danger
           busy={busy}
-          onConfirm={removeNode}
-          onCancel={() => setPendingRemove(null)}
+          onConfirm={evictNode}
+          onCancel={() => setPendingEvict(null)}
+        />
+      )}
+
+      {pendingSize && (
+        <ConfirmDialog
+          title="Size the nodes?"
+          message={`Every node is asked what CPU and memory it has, and the ${SIZE_GROUP_NAMES} groups are rebuilt from the answers: a node at or above the cluster average goes in large, at or below it in small, so a cluster of identical hosts puts every node in both. Whatever those two groups hold now is replaced, and the new lists are pushed to every member. A node that cannot be reached is left out of both rather than guessed at.`}
+          confirmLabel="Size nodes"
+          busy={busy}
+          onConfirm={sizeGroups}
+          onCancel={() => setPendingSize(false)}
+        />
+      )}
+
+      {pendingLeave && info && (
+        <ConfirmDialog
+          title={`Take ${info.node.name} out of the cluster?`}
+          message={`Every other member is told to forget this node, and this node gives up the cluster credential, its record of the ${peers.length} other node${peers.length === 1 ? '' : 's'} and its node groups. Instances, templates and modules stay exactly as they are; only federation stops. Rejoining needs a fresh join code.`}
+          confirmLabel="Leave cluster"
+          confirmText={info.node.name}
+          danger
+          busy={busy}
+          onConfirm={leaveCluster}
+          onCancel={() => setPendingLeave(false)}
         />
       )}
     </>
@@ -265,11 +413,29 @@ export function NodesView({ onNotify }: Props) {
 }
 
 /** What this node looks like to the others, and whether anything can join it. */
-function ThisNode({ info, peers }: { info: ClusterInfo; peers: number }) {
+function ThisNode({ info, peers, canWrite, onLeave }: {
+  info: ClusterInfo
+  peers: number
+  canWrite: boolean
+  onLeave: () => void
+}) {
   return (
     <section className="card node-self">
       <div className="node-self-main">
-        <h3><ServerIcon size={16} /> {info.node.name} <span className="badge badge-dim">this node</span></h3>
+        <h3>
+          <ServerIcon size={16} /> {info.node.name}
+          <span className="badge badge-dim">this node</span>
+          {/* Leaving lives here rather than on the node's card in the grid: it
+              is the one action that acts on this host, and the grid's buttons
+              all act on somebody else. */}
+          {info.in_cluster && (
+            <button className="btn btn-sm btn-danger node-self-leave" disabled={!canWrite}
+              onClick={onLeave}
+              title="Take this node out of the cluster and have every member forget it">
+              <LogoutIcon /> Leave cluster
+            </button>
+          )}
+        </h3>
         <dl className="node-facts">
           <div><dt>Address</dt><dd>{info.node.url || <span className="dim">not advertised</span>}</dd></div>
           <div>
@@ -311,10 +477,10 @@ function ThisNode({ info, peers }: { info: ClusterInfo; peers: number }) {
   )
 }
 
-function NodeCard({ node, canWrite, onRemove, onNotify }: {
+function NodeCard({ node, canWrite, onEvict, onNotify }: {
   node: ClusterNode
   canWrite: boolean
-  onRemove: () => void
+  onEvict: () => void
   onNotify: Props['onNotify']
 }) {
   const [detail, setDetail] = useState<ClusterNodeDetail | null>(null)
@@ -343,12 +509,6 @@ function NodeCard({ node, canWrite, onRemove, onNotify }: {
           {node.name}
           {node.self && <span className="badge badge-dim">this node</span>}
         </h4>
-        {canWrite && !node.self && (
-          <button className="btn btn-sm btn-icon btn-danger" onClick={onRemove}
-            aria-label={`Remove node ${node.name}`} title="Remove">
-            <TrashIcon />
-          </button>
-        )}
       </header>
 
       <p className="node-url mono">{node.url || <span className="dim">local</span>}</p>
@@ -375,10 +535,22 @@ function NodeCard({ node, canWrite, onRemove, onNotify }: {
         </p>
       )}
 
-      <button className="btn btn-sm node-expand" onClick={toggle}
-        disabled={!!state && !state.reachable}>
-        {open ? 'Hide instances' : 'Show instances'}
-      </button>
+      {/* Both actions spelled out, side by side. Eviction used to be an X in
+          the corner of the card, which is the shape of a control for undoing a
+          mistake -- and this is the one control here that cannot be undone
+          without a fresh join code on the other host. */}
+      <div className="row-actions node-card-actions">
+        <button className="btn btn-sm node-expand" onClick={toggle}
+          disabled={!!state && !state.reachable}>
+          {open ? 'Hide instances' : 'Show instances'}
+        </button>
+        {!node.self && (
+          <button className="btn btn-sm btn-danger" disabled={!canWrite} onClick={onEvict}
+            title={`Put ${node.name} out of the cluster`}>
+            <EjectIcon /> Evict
+          </button>
+        )}
+      </div>
 
       {open && (
         detail === null ? <div className="loading-wrap"><span className="spinner" /></div>
@@ -623,7 +795,11 @@ function GroupDialog({ group, nodes, onCancel, onSaved }: {
             <input id="group-name" className="input" value={name} maxLength={64}
               disabled={!!group} placeholder="edge" spellCheck={false}
               onChange={(event) => setName(event.target.value)} />
-            {group && <span className="hint">Renaming means making a new group.</span>}
+            {group ? <span className="hint">Renaming means making a new group.</span>
+              : <span className="hint">
+                  <code>large</code> and <code>small</code> are kept by <strong>Size
+                  nodes</strong> and cannot be used here.
+                </span>}
           </div>
           <div className="field">
             <label htmlFor="group-description">Description</label>
@@ -718,6 +894,11 @@ function SyncDialog({ nodes, groups, onCancel, onNotify }: {
               </label>
             ))}
           </div>
+          {/* Only once it is actually chosen: a standing warning about an
+              option nobody ticked is noise, and stops being read. */}
+          {SYNC_KINDS.filter((kind) => kind.warn && kinds.includes(kind.id)).map((kind) => (
+            <span key={kind.id} className="hint">{kind.label}: {kind.warn}</span>
+          ))}
         </div>
 
         <div className="field">
