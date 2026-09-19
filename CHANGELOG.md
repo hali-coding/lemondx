@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.0](https://github.com/hali-coding/lemondx/compare/v0.4.0...v0.5.0) (2026-09-19)
+
+
+### Features
+
+* cluster fixes batch 2 ([debfb5f](https://github.com/hali-coding/lemondx/commit/debfb5f99b988c9a6625f9b5ed90c1f147b2a3ca))
+* cluster fixes batch 2 ([4cb4143](https://github.com/hali-coding/lemondx/commit/4cb4143770527bfd5f3728cc033f6ccfef955b11))
+
 ## [0.4.0](https://github.com/hali-coding/lemondx/compare/v0.3.0...v0.4.0) (2026-09-19)
 
 
