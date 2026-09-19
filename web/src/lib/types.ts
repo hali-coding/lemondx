@@ -761,7 +761,7 @@ export interface AutoGroupResult {
   nodes: SizedNode[]
   /** Nodes that could not be measured, and so are in neither group. */
   skipped: string[]
-  /** Every node is the same size, so each is in both groups. */
+  /** Every node was measured and is the same size, so each is in both groups. */
   uniform: boolean
 }
 

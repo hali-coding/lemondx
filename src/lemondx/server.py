@@ -57,15 +57,20 @@ class Router:
     ``admin``, so a new mutating route is admin-only unless someone decides
     otherwise; pass ``role=`` only where the method gets it wrong. A route
     with ``principal=True`` receives the caller after the query, for the few
-    handlers whose answer depends on who is asking.
+    handlers whose answer depends on who is asking. ``peers=True`` marks a
+    route only members call each other on; the handler still guards it with
+    ``_peers_only()``, and the mark is what stops ``_forward()`` relaying it.
     """
 
     def __init__(self):
         self.routes = []
+        self.peer_routes = set()
 
-    def add(self, method, pattern, handler, role=None, principal=False):
+    def add(self, method, pattern, handler, role=None, principal=False, peers=False):
         role = role or (READ if method == "GET" else ADMIN)
         self.routes.append((method, re.compile("^%s$" % pattern), handler, role, principal))
+        if peers:
+            self.peer_routes.add(handler)
 
     def resolve(self, method, path):
         """``(handler, args, role, wants_principal)``; handler is None for no match."""
@@ -333,12 +338,23 @@ def build_router(service, auth=None, cluster=None):
     r.add("GET", r"/api/cluster/members", lambda body, q: cluster.members())
     r.add("POST", r"/api/cluster/members",
           lambda body, q: cluster.announce(body))
+    # Both of these are one member relaying a removal it already made, so
+    # neither tells anyone else. From a person that is exactly what must not
+    # happen -- this node alone out of step with the cluster -- so they are
+    # members only; a person evicts (`DELETE /api/cluster/nodes/{name}`) or
+    # leaves, which do the telling.
     r.add("DELETE", r"/api/cluster/members/%s" % NAME,
-          lambda body, q, name: cluster.drop_member(name))
+          lambda body, q, who, name: _peers_only(who, _RELAYED)
+          or cluster.drop_member(name), principal=True, peers=True)
     # The other half of an eviction, from the evicted node's side: a member
     # telling this one it is out, so it stands down instead of going on calling
-    # a cluster that has forgotten it. Authenticated as a peer, like the rest.
-    r.add("POST", r"/api/cluster/evicted", lambda body, q: cluster.evicted())
+    # a cluster that has forgotten it. A node that is already out still
+    # answers "already" to anyone: it holds no credential to check a peer
+    # against, and a refusal would read as "could not be told" and rotate the
+    # secret for nothing.
+    r.add("POST", r"/api/cluster/evicted",
+          lambda body, q, who: (cluster.in_cluster() and _peers_only(who, _RELAYED))
+          or cluster.evicted(), principal=True, peers=True)
     r.add("POST", r"/api/cluster/refresh", lambda body, q: cluster.sync_members())
     # Rotating replaces the credential everywhere; accepting one is a member
     # being told by whoever ran the rotation.
@@ -427,8 +443,8 @@ def build_router(service, auth=None, cluster=None):
     # password has `PUT /api/auth/users/{name}` and never needs to post a hash,
     # so the narrower door is the one to leave open.
     r.add("PUT", r"/api/auth/users/%s/record" % NAME,
-          lambda body, q, who, name: _peers_only(who, "user records")
-          or auth.adopt_user(name, body), principal=True)
+          lambda body, q, who, name: _peers_only(who, _SYNCED % "User records")
+          or auth.adopt_user(name, body), principal=True, peers=True)
     return r
 
 
@@ -911,18 +927,23 @@ def _parse_query(query):
     return out
 
 
-def _peers_only(principal, what):
+_SYNCED = ("%s are pushed between cluster members, not set by hand. Use the "
+           "ordinary route for this object, or `lemondx cluster sync` to copy "
+           "it here from another node.")
+_RELAYED = ("Only a cluster member relays a removal. Use `lemondx cluster "
+            "evict` or `lemondx cluster leave`, which tell every member.")
+
+
+def _peers_only(principal, message):
     """Raise unless this caller is another cluster member; returns None to pass.
 
-    Sync speaks with the cluster credential, so a route that exists purely for
-    it can say so rather than being open to every admin. Returning None lets it
-    read as a guard in front of the handler: ``_peers_only(...) or handle()``.
+    Some routes exist purely for members to call each other with the cluster
+    credential, so they can say so rather than being open to every admin.
+    Returning None lets it read as a guard in front of the handler:
+    ``_peers_only(...) or handle()``.
     """
     if not from_peer(principal):
-        raise AuthError(
-            "%s are pushed between cluster members, not set by hand. Use the "
-            "ordinary route for this object, or `lemondx cluster sync` to copy "
-            "it here from another node." % what.capitalize(), 403)
+        raise AuthError(message, 403)
     return None
 
 
@@ -943,6 +964,12 @@ def _forward(router, cluster, method, principal, node, rest, body, query):
     handler, args, role, wants = router.resolve(method, path)
     if not principal.can(role):
         raise AuthError("Forbidden: %s access is read-only" % principal.name, 403)
+    if node != cluster.local_name() and handler in router.peer_routes \
+            and not from_peer(principal):
+        # A relayed call reaches the member under the cluster credential, so
+        # there it would pass as a peer; the caller's own standing is only
+        # known here.
+        raise AuthError("Forbidden: that route is for cluster members only", 403)
     if node == cluster.local_name():
         # Addressing this node by name is the same request without the prefix;
         # answering it here keeps the front end from having to special-case it.

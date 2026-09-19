@@ -49,7 +49,8 @@ little access `403`, too many failed logins `429`.
 | `PUT` | `/api/auth/users/{name}/record` | take a synced account as stored, hash included — cluster members only |
 | `POST` | `/api/cluster/leave` | give up membership of the cluster |
 | `GET`/`POST` | `/api/cluster/members` | the member list / announce a member (node to node) |
-| `DELETE` | `/api/cluster/members/{name}` | a peer saying a node has left |
+| `DELETE` | `/api/cluster/members/{name}` | a peer saying a node has left — cluster members only |
+| `POST` | `/api/cluster/evicted` | a peer saying this node was evicted, so it stands down — cluster members only |
 | `POST` | `/api/cluster/refresh` | pull every peer's member list and push ours |
 | `POST` | `/api/cluster/rotate` | replace the cluster credential on every member |
 | `PUT` | `/api/cluster/secret` | take a rotated credential (node to node) |

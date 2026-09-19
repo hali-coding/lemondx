@@ -505,7 +505,8 @@ for obtaining one.
 | `DELETE` | `/api/cluster/nodes/{name}` | evict a node: stand it down, forget it everywhere (`?rotate=true`/`false` overrides the credential rotation) |
 | `POST` | `/api/cluster/leave` | give up membership |
 | `GET`/`POST` | `/api/cluster/members` | the member list / announce a member |
-| `DELETE` | `/api/cluster/members/{name}` | a peer telling us a node has gone |
+| `DELETE` | `/api/cluster/members/{name}` | a peer telling us a node has gone (members only) |
+| `POST` | `/api/cluster/evicted` | a peer telling this node it was evicted, so it stands down (members only) |
 | `POST` | `/api/cluster/refresh` | pull every peer's member list and push ours |
 | `POST` | `/api/cluster/rotate` | replace the cluster credential everywhere |
 | `PUT` | `/api/cluster/secret` | take a rotated credential from the member rotating it |

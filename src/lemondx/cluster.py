@@ -1093,7 +1093,9 @@ class ClusterService:
         ) for name in SIZE_GROUPS]
 
         skipped = [r["node"] for r in sized if not r["ok"]]
-        uniform = all(len(r["groups"]) == 2 for r in sized if r["ok"])
+        # "Every node is the same size" is a claim about the whole cluster, so
+        # a node nobody could measure makes it unknown, not true.
+        uniform = not skipped and all(len(r["groups"]) == 2 for r in sized)
         _log("sized %d node(s) into large/small%s%s"
              % (len(usable), " (all the same size)" if uniform else "",
                 "; skipped %s" % ", ".join(skipped) if skipped else ""))
