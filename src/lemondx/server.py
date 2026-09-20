@@ -23,6 +23,7 @@ from .cluster import ClusterError, ClusterService, from_peer
 from .lxd import LXDError
 from .nodeclient import NodeError
 from .service import ContainerService, ServiceError
+from .stacks import StackService
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8099
@@ -87,11 +88,12 @@ class Router:
         return None, [], ADMIN, False
 
 
-def build_router(service, auth=None, cluster=None):
+def build_router(service, auth=None, cluster=None, stacks=None):
     r = Router()
     NAME = r"([^/]+)"
     auth = auth or AuthService()
     cluster = cluster or ClusterService(service, auth)
+    stacks = stacks or StackService(cluster)
 
     r.add("GET", r"/api/status", lambda body, q: service.status())
     r.add("POST", r"/api/setup", lambda body, q: service.initialize(
@@ -274,11 +276,12 @@ def build_router(service, auth=None, cluster=None):
     # asks for particular instance names, so numbering stays unique across a
     # cluster; on its own this node picks them.
     r.add("POST", r"/api/templates/%s/launch" % NAME,
-          lambda body, q, name: cluster.launch_template(
+          lambda body, q, who, name: cluster.launch_template(
               name, count=body.get("count", 1), prefix=body.get("prefix"),
               params=body.get("params"), nodes=body.get("nodes"),
               groups=body.get("groups"), names=body.get("names"),
-              background=bool(body.get("background", False))))
+              stack=_stack_tag(body, who),
+              background=bool(body.get("background", False))), principal=True)
     r.add("GET", r"/api/template-runs", lambda body, q: service.template_runs())
     r.add("DELETE", r"/api/template-runs/%s" % NAME,
           lambda body, q, name: service.dismiss_template_run(name))
@@ -302,6 +305,37 @@ def build_router(service, auth=None, cluster=None):
           lambda body, q, name: cluster.template_action(
               name, "recreate", body.get("instances"), params=body.get("params"),
               background=bool(body.get("background", False))))
+
+    # Stacks are kept level across the cluster like templates, and a launch is
+    # a run held by this process like a template's -- see stacks.py.
+    r.add("GET", r"/api/stacks", lambda body, q: stacks.list_stacks())
+    r.add("PUT", r"/api/stacks/%s" % NAME,
+          lambda body, q, who, name: stacks.save_stack(
+              name, stages=body.get("stages"), description=body.get("description", ""),
+              propagate=not from_peer(who)), principal=True)
+    r.add("DELETE", r"/api/stacks/%s" % NAME,
+          lambda body, q, who, name: stacks.delete_stack(
+              name, everywhere=_everywhere(body, q, who)), principal=True)
+    # `replace` makes it a relaunch: the stack's instances as the caller
+    # confirmed them are destroyed first, as part of the same run.
+    r.add("POST", r"/api/stacks/%s/launch" % NAME,
+          lambda body, q, name: stacks.launch_stack(
+              name, params=body.get("params"), replace=body.get("replace"),
+              background=bool(body.get("background", False))))
+    # What each stack is running, read from the instances' own tags on every node.
+    r.add("GET", r"/api/stack-instances", lambda body, q: stacks.stack_instances())
+    r.add("POST", r"/api/stacks/%s/state" % NAME,
+          lambda body, q, name: stacks.stack_state(
+              name, body.get("action", ""), body.get("instances")))
+    r.add("POST", r"/api/stacks/%s/destroy" % NAME,
+          lambda body, q, name: stacks.destroy_stack(
+              name, body.get("instances"), background=bool(body.get("background", False))))
+    r.add("GET", r"/api/stack-runs", lambda body, q: stacks.stack_runs())
+    r.add("POST", r"/api/stack-runs/%s/cancel" % NAME,
+          lambda body, q, name: stacks.cancel_stack_run(name))
+    r.add("DELETE", r"/api/stack-runs/%s" % NAME,
+          lambda body, q, name: stacks.dismiss_stack_run(name))
+
     r.add("GET", r"/api/ssh-keys", lambda body, q: service.list_ssh_keys())
     # Parses a key the caller pasted; changes nothing.
     r.add("POST", r"/api/ssh-keys/validate",
@@ -360,6 +394,27 @@ def build_router(service, auth=None, cluster=None):
           lambda body, q, who: (cluster.in_cluster() and _peers_only(who, _RELAYED))
           or cluster.evicted(), principal=True, peers=True)
     r.add("POST", r"/api/cluster/refresh", lambda body, q: cluster.sync_members())
+    # Reconciliation, the pull half of keeping shared definitions level: a node
+    # that has been off missed every push made while it was away and, sync
+    # being push-only, has no other way to find out. The two member-only routes
+    # are what a peer reads to work that out -- a digest per artifact, then the
+    # bodies behind the ones that differ. Members only because between them
+    # they hand over every template, profile and module this node holds, and
+    # the ordinary routes already serve those to a person.
+    r.add("GET", r"/api/cluster/manifest",
+          lambda body, q, who: _peers_only(who, _COMPARED)
+          or cluster.manifest(kinds=_list(q.get("kinds")) or None),
+          principal=True, peers=True)
+    r.add("POST", r"/api/cluster/artifacts",
+          lambda body, q, who: _peers_only(who, _COMPARED)
+          or cluster.artifacts(body.get("items")), principal=True, peers=True)
+    # Setting one going, and reading what the last one found. There is no route
+    # that reconciles *another* node: a node settles its own state, the way it
+    # is the one that judges its own instances' health.
+    r.add("POST", r"/api/cluster/reconcile", lambda body, q: cluster.reconcile(
+        apply=bool(body.get("apply", True)), nodes=body.get("nodes"),
+        groups=body.get("groups")))
+    r.add("GET", r"/api/cluster/drift", lambda body, q: cluster.drift())
     # Rotating replaces the credential everywhere; accepting one is a member
     # being told by whoever ran the rotation.
     r.add("POST", r"/api/cluster/rotate", lambda body, q: cluster.rotate_secret())
@@ -459,6 +514,7 @@ class LemondxHandler(BaseHTTPRequestHandler):
     # Injected by make_server().
     router = None
     service = None
+    stacks = None
     auth = None
     cluster = None
     web_root = None
@@ -936,6 +992,31 @@ _SYNCED = ("%s are pushed between cluster members, not set by hand. Use the "
            "it here from another node.")
 _RELAYED = ("Only a cluster member relays a removal. Use `lemondx cluster "
             "evict` or `lemondx cluster leave`, which tell every member.")
+_COMPARED = ("Only a cluster member compares what this node holds. Run `lemondx "
+             "cluster reconcile` on a node to settle its own copies against the "
+             "rest; what the last pass found is on the Nodes tab and at "
+             "GET /api/cluster/drift.")
+
+
+_CLAIMED = ("A stack tag says which stack launched an instance, so it is set by "
+            "that stack and not by the caller. Run the stack (`lemondx "
+            "stack-launch`) to launch instances that belong to one.")
+
+
+def _stack_tag(body, principal):
+    """The stack an instance belongs to -- accepted only from the stack itself.
+
+    The tag is the whole of what stop/destroy/relaunch act on, so a caller able
+    to set it on an ordinary launch could hand a stack instances it never
+    created and have a later teardown take them with it. A stack's local share
+    never arrives here (StackService calls the service in this process); a
+    remote share does, carrying the cluster credential like any other peer
+    call, which is the one case that may claim a stack.
+    """
+    stack = body.get("stack")
+    if stack and not from_peer(principal):
+        raise AuthError(_CLAIMED, 403)
+    return stack
 
 
 def _peers_only(principal, message):
@@ -974,6 +1055,12 @@ def _forward(router, cluster, method, principal, node, rest, body, query):
         # there it would pass as a peer; the caller's own standing is only
         # known here.
         raise AuthError("Forbidden: that route is for cluster members only", 403)
+    # And for the same reason, judged here where the caller's standing is
+    # known: relayed, a person's launch would reach the target wearing the
+    # cluster credential and be taken for a stack's own remote share. No route
+    # but the launch reads a `stack` from the body, so this costs them nothing.
+    if isinstance(body, dict):
+        _stack_tag(body, principal)
     if node == cluster.local_name():
         # Addressing this node by name is the same request without the prefix;
         # answering it here keeps the front end from having to special-case it.
@@ -1053,9 +1140,11 @@ def make_server(host=DEFAULT_HOST, port=DEFAULT_PORT, service=None, token=None,
     service = service or ContainerService()
     auth = auth or AuthService(AuthConfig(static_token=token))
     cluster = cluster or ClusterService(service, auth)
+    stacks = StackService(cluster)
     handler = type("BoundHandler", (LemondxHandler,), {
-        "router": build_router(service, auth, cluster),
+        "router": build_router(service, auth, cluster, stacks),
         "service": service,
+        "stacks": stacks,
         "auth": auth,
         "cluster": cluster,
         "web_root": os.path.realpath(web_root) if web_root else None,
@@ -1134,6 +1223,11 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
             # that nobody configured, and it changes what a remote browser sees.
             print("         authentication is off, so requests from other hosts "
                   "need an API token; loopback is unchanged.")
+        # Starting is exactly when this matters: whatever was pushed while this
+        # node was off is still missing, and nothing else would tell it.
+        cluster.start_reconciler()
+        print("         reconciling shared definitions with the other members "
+              "shortly, then hourly")
     if dev:
         print("Dev mode: CORS is open for the Vite dev server (npm --prefix web run dev).")
     if not os.path.isdir(WEB_DIST) and not dev:
@@ -1151,32 +1245,37 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        _wait_for_background_work(getattr(httpd.RequestHandlerClass, "service", None))
+        _wait_for_background_work(getattr(httpd.RequestHandlerClass, "service", None),
+                                  getattr(httpd.RequestHandlerClass, "stacks", None))
         print("Shutting down.")
     finally:
         store.clear_runtime()
         httpd.server_close()
 
 
-def _wait_for_background_work(service):
-    """Give creates and template runs the chance to finish before exiting.
+def _wait_for_background_work(service, stacks=None):
+    """Give creates, template runs and stacks the chance to finish before exiting.
 
     They run on threads the process takes down with it, and stopping one
     halfway leaves an instance created but never bootstrapped, or a recreate
     that deleted without recreating. So say what is running and wait, unless
     asked a second time.
     """
-    pending = service.pending_work() if service else []
-    if not pending:
+    # A stack between stages has no template run going, but stopping then
+    # leaves the rest of it never launched.
+    def pending():
+        return (service.pending_work() if service else []) + \
+            (stacks.pending_work() if stacks else [])
+    if not pending():
         return
-    print("\nStill running: %s." % "; ".join(pending))
+    print("\nStill running: %s." % "; ".join(pending()))
     print("Waiting for it to finish -- press Ctrl-C again to stop anyway, "
           "leaving that work half done.")
     try:
-        while service.pending_work():
+        while pending():
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nAbandoning: %s." % "; ".join(service.pending_work()))
+        print("\nAbandoning: %s." % "; ".join(pending()))
 
 
 def _open(url):

@@ -151,6 +151,29 @@ other nodes, and its node groups. Instances, templates and modules stay. A
 member that could not be reached still lists this node — the command names it,
 and the fix is `lemondx cluster evict <name>` there.
 
+The Nodes tab has the same thing: **Leave cluster**, next to this node's name.
+
+### Leaving a cluster that is already broken
+
+A node can end up in a cluster from its own side only — it still lists peers and
+groups, but its credential is gone, revoked, or rotated past while it was off.
+Every call it makes then fails, and there is nothing to press on any other node
+because none of them is the problem.
+
+`leave` handles that too. With no credential there is nobody to tell, so it says
+so and simply drops the peer records and node groups:
+
+```
+$ lemondx cluster leave
++ left the cluster (forgot prdev1, prdev2)
+! This node had no cluster credential, so no member could be told it has gone.
+  Any that still list 'orange' need `lemondx cluster evict orange` run there.
+```
+
+The Nodes tab shows the same state as a banner, with the button reading **Clear
+cluster state** instead. Instances, templates and modules are untouched either
+way — only the federation records go.
+
 ## Nodes and groups
 
 ```bash
@@ -365,7 +388,7 @@ the template, exactly as a single-node run is.
 
 ## Shared definitions stay level by themselves
 
-Templates, modules, bootstrap profiles and node groups are things the whole
+Templates, modules, bootstrap profiles, node groups and [stacks](stacks.md) are things the whole
 cluster is meant to agree on, so **saving one pushes it to every member there
 and then** — no sync step to remember. The same goes for deleting one, since a
 copy left behind on one node is drift that a push-only sync can never clear.
@@ -393,9 +416,67 @@ $ lemondx template-save web --image images:alpine/3.24
 Deleting removes it from every member. Pass `--local-only` (or untick the box in
 the UI's confirmation) to leave the other nodes' copies alone.
 
-## Catching up a node that drifted
+## A node that was switched off catches itself up
 
-Sync is the manual counterpart, for a node that was down when something changed:
+Pushing happens at the moment of the save, so a node that is off misses every
+change made while it was away — and, since sync only ever pushes, it has no way
+to find out on its own. **Reconciling is that missing half.** It runs shortly
+after `serve` starts, hourly after that, and whenever you ask:
+
+```bash
+lemondx cluster reconcile              # settle this node against every member
+lemondx cluster reconcile --dry-run    # report what differs, change nothing
+```
+
+The Nodes tab has the same thing behind **Reconcile**, and a **Shared
+definitions** panel showing what the last pass found.
+
+Each member is asked for a digest of everything shared — one SHA-256 per
+template, module, profile, stack and node group, taken over the very body a push
+would send. Only what actually differs is then fetched, so an hourly pass over a
+whole cluster costs one small request per node.
+
+What it does with a difference depends on which side moved, and lemondx knows
+that because each node keeps a **change ledger**: when it last saved or deleted
+each shared artifact. The ledger is local, never synced, and never inside the
+record files — those are copyable and hand-editable, so a timestamp in one would
+prove nothing.
+
+| Situation | What happens |
+| --- | --- |
+| A member has it, this node does not | Taken from the member that saved it most recently |
+| This node has it, a member does not | Pushed to that member |
+| This node deleted it while a member was off | The deletion is pushed on; the copy is never adopted back |
+| A member deleted it while this node was off | Dropped here too, and relayed to any member still holding it |
+| Both hold it, and they differ | **Reported, and nothing is touched** |
+
+That last row is the important one. Two nodes holding different copies of one
+template is not something the data can settle — there is no shared clock and the
+records carry no version — so both are left exactly as they are and the conflict
+is reported:
+
+```
+$ lemondx cluster reconcile
+? templates/web differs on prdev2 -- push the copy that is right with `lemondx cluster sync`
+0 change(s), 1 conflict(s), against prdev1, prdev2
+```
+
+You resolve it by pushing whichever copy is right, with `lemondx cluster sync
+--name web --node prdev2` or **Sync** in the UI. A copy that is merely out of
+date is not an emergency; being unable to see that it is would be.
+
+Two things it deliberately does not do:
+
+- **It does not move users.** `--kind users` carries password hashes and is
+  pushed only when someone asks for it by name; a pass that runs unattended has
+  no business creating accounts.
+- **It does not resurrect deletions for ever.** A deletion is remembered for 30
+  days. A node that has been off longer than that brings its copies back, because
+  by then nothing can tell a copy that outlived a deletion from one made since.
+
+## Catching up a node by hand
+
+Sync is the manual counterpart, and the way to settle a conflict:
 
 ```bash
 lemondx cluster sync --group edge                        # every template
@@ -482,7 +563,13 @@ refuse it — with a message saying exactly that. Re-join it with a fresh code.
   config/cluster.json      name, address and certificate, once worked out
   tls/node-cert.pem        generated on first federating
   runtime.json             what `serve` is listening on, so the CLI can advertise it
+  changes.json             when this node last saved or deleted each shared artifact
 ```
+
+`changes.json` is the change ledger reconciliation reads. Unlike everything else
+here it is **not** meant to be copied: it records what this node did, and is
+what tells a deletion apart from a copy never received. Leaving a cluster clears
+the deletions from it, keeping the entries for what this node still holds.
 
 Like profiles and templates, a `nodes/` or `node-groups/` file is one record
 that can be copied between machines or checked into a repo, and is treated as
@@ -506,11 +593,15 @@ for obtaining one.
 | `GET` | `/api/cluster/nodes/{name}` | one node, with the instances on it |
 | `POST` | `/api/cluster/nodes` | `{"code":"lemondx-join.…"}` → join that node's cluster |
 | `DELETE` | `/api/cluster/nodes/{name}` | evict a node: stand it down, forget it everywhere (`?rotate=true`/`false` overrides the credential rotation) |
-| `POST` | `/api/cluster/leave` | give up membership |
+| `POST` | `/api/cluster/leave` | give up membership, or clear the records left behind when the credential is already gone |
 | `GET`/`POST` | `/api/cluster/members` | the member list / announce a member |
 | `DELETE` | `/api/cluster/members/{name}` | a peer telling us a node has gone (members only) |
 | `POST` | `/api/cluster/evicted` | a peer telling this node it was evicted, so it stands down (members only) |
 | `POST` | `/api/cluster/refresh` | pull every peer's member list and push ours |
+| `POST` | `/api/cluster/reconcile` | settle this node's shared definitions against every member's (`{"apply": false}` to only report) |
+| `GET` | `/api/cluster/drift` | what the last reconciliation found; `null` until one has run |
+| `GET` | `/api/cluster/manifest` | a digest per shared artifact, with this node's change ledger (members only) |
+| `POST` | `/api/cluster/artifacts` | the bodies behind named manifest entries (members only) |
 | `POST` | `/api/cluster/rotate` | replace the cluster credential everywhere |
 | `PUT` | `/api/cluster/secret` | take a rotated credential from the member rotating it |
 | `GET` | `/api/cluster/containers` | instances across nodes (`?all=true`, `?nodes=`, `?groups=`), with each node's latest health records under `health` |

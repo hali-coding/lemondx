@@ -6,11 +6,13 @@ Everything lemondx keeps between runs lives under one data directory,
     settings.json     pre-selected modules and remembered parameter values
     profiles/         one JSON file per bootstrap profile
     templates/        one JSON file per instance template
+    stacks/           one JSON file per stack (templates launched in sequence)
     nodes/            one JSON file per federated lemondx node
     node-groups/      one JSON file per node group
     modules/          uploaded modules
     auth/             local users and API tokens (0700; only hashes, never secrets)
     config/           one JSON file per `lemondx configure` section, e.g. auth.json
+    changes.json      when this node last saved or deleted each shared artifact
 
 This is state lemondx writes for itself rather than hand-authored
 configuration, which is what ``XDG_DATA_HOME`` is for. Earlier versions kept it
@@ -28,6 +30,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 
 # 1 kept profiles inside settings.json; 2 moved them to profiles/.
 SETTINGS_VERSION = 2
@@ -81,6 +84,10 @@ def templates_dir():
     return os.path.join(data_dir(), "templates")
 
 
+def stacks_dir():
+    return os.path.join(data_dir(), "stacks")
+
+
 def nodes_dir():
     return os.path.join(data_dir(), "nodes")
 
@@ -95,6 +102,10 @@ def auth_dir():
 
 def config_dir():
     return os.path.join(data_dir(), "config")
+
+
+def changes_path():
+    return os.path.join(data_dir(), "changes.json")
 
 
 # -- migration -------------------------------------------------------------
@@ -339,6 +350,71 @@ def _clean_template(stored, name):
     }
 
 
+# -- stacks ----------------------------------------------------------------
+#
+# A stack is a list of stages run one after another, each holding steps that
+# run side by side: launch a template, sleep, or wait for everything launched
+# so far to be healthy. The file is as untrusted as a template's, so this only
+# shapes it -- a step it cannot make sense of is dropped, numbers are clamped --
+# and the service holds a save to the stricter rules (see stacks.py).
+
+STACK_STEP_TYPES = ("launch", "sleep", "wait_healthy")
+STACK_SLEEP = (1, 86400, 30)              # lowest, highest, default seconds
+STACK_WAIT = (10, 86400, 900)
+STACK_LAUNCH_COUNT = (1, 20, 1)
+
+
+def _bounded(value, bounds):
+    low, high, default = bounds
+    if isinstance(value, bool):
+        return default
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(high, max(low, value))
+
+
+def _clean_stack_step(stored):
+    if not isinstance(stored, dict) or stored.get("type") not in STACK_STEP_TYPES:
+        return None
+    kind = stored["type"]
+    step = {"id": _text(stored.get("id"), 32), "type": kind}
+    if kind == "launch":
+        params = stored.get("params")
+        step.update({
+            "template": _text(stored.get("template"), 200),
+            "count": _bounded(stored.get("count"), STACK_LAUNCH_COUNT),
+            "prefix": _text(stored.get("prefix"), 50),
+            # Absent means wait: the next stage usually needs what this one built.
+            "wait_bootstrap": stored.get("wait_bootstrap") is not False,
+            "params": {str(k): str(v) for k, v in
+                       (params.items() if isinstance(params, dict) else ())},
+            "nodes": _strings(stored.get("nodes")),
+            "groups": _strings(stored.get("groups")),
+        })
+    elif kind == "sleep":
+        step["seconds"] = _bounded(stored.get("seconds"), STACK_SLEEP)
+    else:
+        step["timeout_seconds"] = _bounded(stored.get("timeout_seconds"), STACK_WAIT)
+    return step
+
+
+def _clean_stack(stored, name):
+    stages = []
+    for stage in stored.get("stages") if isinstance(stored.get("stages"), list) else []:
+        raw = stage.get("steps") if isinstance(stage, dict) else None
+        steps = [s for s in (_clean_stack_step(r) for r in
+                             (raw if isinstance(raw, list) else [])) if s]
+        if steps:
+            stages.append({"steps": steps})
+    return {
+        "name": name,
+        "description": _text(stored.get("description"), 200),
+        "stages": stages,
+    }
+
+
 class _Records:
     """One directory of named JSON records, with a cleaner applied on read."""
 
@@ -465,26 +541,129 @@ def _epoch(value):
         return 0
 
 
+# -- the change ledger -----------------------------------------------------
+#
+# When this node last saved or deleted each artifact the cluster shares. It is
+# what lets a node that has been switched off work out, on its return, which
+# way round a difference goes: a template a peer holds and this node does not
+# is either one this node missed while it was away, or one it deleted while
+# *the peer* was away, and only a record of the deletion tells the two apart.
+# Without it a returning node would resurrect everything it had ever deleted.
+#
+# Deliberately *not* inside the record files. Those are copyable, hand-editable
+# and explicitly untrusted, so a timestamp in one proves nothing; this ledger is
+# written only by this node, about its own actions, and is never synced. That is
+# also why it is one file rather than a directory: nothing is meant to copy it.
+#
+# A deletion is kept for TOMBSTONE_TTL and then forgotten. After that a peer
+# that was off for longer brings the artifact back -- by then nobody can tell
+# the difference between a copy that outlived a deletion and one created since,
+# and the alternative is keeping every name ever used for good.
+
+CHANGES_VERSION = 1
+TOMBSTONE_TTL = 30 * 86400
+
+
+def _read_changes():
+    try:
+        with open(changes_path(), encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    kinds = stored.get("kinds") if isinstance(stored, dict) else None
+    if not isinstance(kinds, dict):
+        return {}
+    clean = {}
+    for kind, entries in kinds.items():
+        if not isinstance(kind, str) or not isinstance(entries, dict):
+            continue
+        for name, entry in entries.items():
+            if not isinstance(name, str) or not isinstance(entry, dict):
+                continue
+            clean.setdefault(kind, {})[name] = {
+                "at": _epoch(entry.get("at")), "deleted": entry.get("deleted") is True}
+    return clean
+
+
+def load_changes(now=None):
+    """``{kind: {name: {"at": epoch, "deleted": bool}}}``, expired deletions dropped."""
+    cutoff = (now if now is not None else time.time()) - TOMBSTONE_TTL
+    return {kind: {name: entry for name, entry in entries.items()
+                   if not entry["deleted"] or entry["at"] >= cutoff}
+            for kind, entries in _read_changes().items()}
+
+
+def note_change(kind, name, deleted=False):
+    """Record that this node has just saved or deleted one shared artifact."""
+    name = (name or "").strip()
+    if not kind or not name:
+        return None
+    entry = {"at": int(time.time()), "deleted": bool(deleted)}
+    with _lock:
+        kinds = load_changes()
+        kinds.setdefault(kind, {})[name] = entry
+        _write_json(changes_path(), {"version": CHANGES_VERSION, "kinds": kinds})
+    return entry
+
+
+def drop_tombstones():
+    """Forget every recorded deletion, keeping what this node still holds.
+
+    For a node leaving a cluster. Its own artifacts are still its own, but the
+    deletions are answers to a question only the cluster it just left was
+    asking -- carried into the next one they would push removals for names that
+    cluster never agreed to delete.
+    """
+    with _lock:
+        remaining = {kind: {name: entry for name, entry in entries.items()
+                            if not entry["deleted"]}
+                     for kind, entries in load_changes().items()}
+        _write_json(changes_path(), {"version": CHANGES_VERSION, "kinds": remaining})
+    return remaining
+
+
 _profiles = _Records(profiles_dir, _clean_profile)
 _templates = _Records(templates_dir, _clean_template)
+_stacks = _Records(stacks_dir, _clean_stack)
 _nodes = _Records(nodes_dir, _clean_node)
 _node_groups = _Records(node_groups_dir, _clean_node_group)
 
+# Node records are the one _Records directory that is not a shared artifact --
+# membership converges through sync_members(), not through reconciliation --
+# so they are bound straight through without touching the ledger.
 load_nodes = _nodes.load
 save_node = _nodes.save
 delete_node = _nodes.delete
 
 load_node_groups = _node_groups.load
-save_node_group = _node_groups.save
-delete_node_group = _node_groups.delete
-
 load_profiles = _profiles.load
-save_profile = _profiles.save
-delete_profile = _profiles.delete
-
 load_templates = _templates.load
-save_template = _templates.save
-delete_template = _templates.delete
+load_stacks = _stacks.load
+
+
+def _tracked(records, kind):
+    """Bind one record directory's save and delete, noting each in the ledger."""
+    def save(name, record, note=True):
+        saved = records.save(name, record)
+        if note:
+            note_change(kind, saved.get("name") or name)
+        return saved
+
+    def delete(name, note=True):
+        removed = records.delete(name)
+        # Only a deletion that removed something is a tombstone: a name that
+        # was not here never was, and claiming otherwise would have this node
+        # pushing the removal of a record it has simply never seen.
+        if removed and note:
+            note_change(kind, name, deleted=True)
+        return removed
+    return save, delete
+
+
+save_profile, delete_profile = _tracked(_profiles, "profiles")
+save_template, delete_template = _tracked(_templates, "templates")
+save_stack, delete_stack = _tracked(_stacks, "stacks")
+save_node_group, delete_node_group = _tracked(_node_groups, "groups")
 
 
 def prune_module(module_id):
@@ -502,17 +681,14 @@ def prune_module(module_id):
             m for m in (settings.get("default_modules") or []) if m != module_id]
     update(mutate)
 
-    for path, name, record in _profiles.scan():
+    for _, name, record in _profiles.scan():
         if module_id not in record["modules"]:
             continue
         remaining = [m for m in record["modules"] if m != module_id]
         if remaining:
             save_profile(name, dict(record, modules=remaining))
         else:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+            delete_profile(name)
 
     for _, name, record in _templates.scan():
         bootstrap = record["bootstrap"]

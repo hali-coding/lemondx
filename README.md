@@ -137,6 +137,7 @@ pass to `-i`.
 | --- | --- |
 | [Bootstrap modules](docs/modules.md) | writing and uploading modules, defaults, saved settings, profiles, secrets, the shipped modules |
 | [Instance templates](docs/templates.md) | saving a full instance setup and launching one or many from it |
+| [Stacks](docs/stacks.md) | launching several templates in sequence, handing names and addresses along, with health gates |
 | [Nodes and federation](docs/cluster.md) | joining nodes securely, node groups, launching and syncing across them |
 | [REST API](docs/api.md) | every endpoint, request/response shapes, curl examples |
 | [Daemons, images and storage](docs/daemons-and-storage.md) | LXD vs Incus, socket discovery, image remotes, disk quotas, units |

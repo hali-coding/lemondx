@@ -229,6 +229,31 @@ The drawer takes the owning node and routes every call there,
 including the bootstrap pickers, since a module runs on that host and a key is
 installed from what that host can see.
 
+**Reconciliation is the pull half of that push.** `reconcile()` runs on a
+daemon thread shortly after `serve` starts and hourly after, because a node
+that was off missed every push made meanwhile and push-only sync gives it no
+way to find out. It compares `manifest()`s -- one digest per artifact, taken
+over the very body `_sync_payload()` would send, so "differs" and "what would
+be pushed" cannot disagree -- and settles each difference with `store`'s change
+ledger (`changes.json`, `note_change()`): when *this* node last saved or deleted
+each thing. The ledger is why a returning node does not resurrect what it
+deleted while a peer was off, and it is local and never synced, because the
+record files are copyable and untrusted so a timestamp in one proves nothing.
+`_inward()` acts locally first and `_outward()` then pushes the corrected state,
+in that order -- the other way round a week-stale node overwrites everyone
+before discovering it is stale. A difference on *both* sides is a conflict:
+reported by `_conflicts()`, never resolved, since nothing in the data can say
+which copy is right. `RECONCILE_KINDS` leaves `users` out on purpose -- it
+carries password hashes and only an explicit `cluster sync` should move it.
+`_stand_down()` drops the tombstones (`store.drop_tombstones()`) so deletions
+decided by one cluster are not carried into the next.
+
+`leave()` also clears the half-state a broken cluster leaves behind -- peer
+records and groups with no credential to use them with. Refusing that as "not
+in a cluster" would be true and useless, since the leftovers are what wants
+clearing, and it is the one case with no other way out: `info()["leftovers"]`
+is what the UI reads to offer it.
+
 Templates, modules, bootstrap profiles and node groups are pushed to every
 member the moment they are saved, and removed from every member when deleted --
 `ClusterService.save_template()` and friends wrap the `ContainerService` call
@@ -262,6 +287,51 @@ the substitution is returned as run notes *and* logged, since a launch started
 from another node's UI is only visible here in the log. It says "this node"
 rather than naming one -- naming is the coordinator's job, and it knows where
 each set of notes came from.
+
+### Stacks
+
+`stacks.py` (`StackService`) sits one layer above `ClusterService`, because a
+launch step may name nodes and groups: every launch goes through
+`ClusterService.launch_template()`, which takes the plain local path when the
+only node is this one. Each launch is therefore an ordinary tracked template run
+(the Templates tab shows it, the one-run-per-template lock holds), and a stack
+run is the record around those, in memory on the `StackService` like template
+runs are on `ContainerService` -- `serve` builds one and hands it to
+`build_router()`, and `_wait_for_background_work()` counts its runs too. Stages
+run in order and the steps in one on threads side by side; a launch with
+`wait_bootstrap` off returns once its instances run and leaves a follower
+thread on its template run, which a health gate, a later launch of the same
+template and the end of the stack all join. Metadata crosses to later launches
+as ordinary launch params: `LEMONDX_STACK_<ID>_*` values (the runner exports
+every param as an env var) plus `{{step.field}}` placeholders rendered into the
+step's own params, so remote shares get it through the existing API. Stacks
+sync like templates (`SYNC_KINDS`), dragging their templates along in
+`_sync_payload()`. A stack may set a secret param only to `{{params.NAME}}`
+(a value entered at launch), never a literal; `_check_stages()` refuses one on
+save and `public_stack()` strips one on the way out, because a stack file is
+untrusted input like every other record and only a save goes through the check
+-- the two share `_input_only()` so they cannot disagree about what a literal
+is. A step naming a template this node lacks is judged against every module's
+secrets, since nothing says which of its params are secret.
+The designer's parameter panel (`LaunchParams` in `StackEditor.tsx`) lists every
+param the step's template *declares*, not just the overrides the stack stores,
+with the inherited value as the box's placeholder -- the panel answers "what
+will this launch use?", while the record stays a diff. `ReferenceInput` completes
+`{{...}}` at the caret from `suggestionsFor()`, which is the one place the
+designer's idea of a valid reference lives; it must stay in step with `FIELDS`
+and `REFERENCE`/`INPUT_REFERENCE` in `stacks.py`, since the server is what
+actually refuses a bad one.
+What a stack is running is the `user.lemondx.stack` tag (`STACK_CONFIG_KEY`)
+threaded through every launch path -- `launch_instances()`, the peer launch API,
+and recreate, which carries it over -- and read back with
+`cluster.containers(everything=True)`; stop/start/destroy/relaunch confirm
+against that like a template's destroy, and destroy/relaunch run as a stack run
+whose first step is `_teardown`. Because the tag is the whole of what a teardown
+acts on, the launch route takes it only from a member (`_stack_tag()` in
+server.py, and again in `_forward()`, where a relayed call would otherwise reach
+the target wearing the cluster credential): a stack's local share never goes
+through the API at all, and a person naming a stack on an ordinary launch would
+be giving it instances to destroy later.
 
 ### Health checks
 
@@ -370,7 +440,9 @@ local disk).
 JSON file per bootstrap profile, `templates/` for one per instance template,
 `nodes/` and `node-groups/` for federation, `modules/` for uploads, `auth/`
 (0700) for local users, API token hashes, the cluster credential and join-code
-hashes, `runtime.json` for what `serve` is listening on, `config/`
+hashes, `runtime.json` for what `serve` is listening on, `changes.json` for
+when this node last saved or deleted each shared artifact (the one file here
+that is *not* meant to be copied -- see reconciliation above), `config/`
 for `lemondx configure` sections -- the one place where an unparseable file is an error,
 not a default. Nothing else in the codebase builds those paths — go
 through `store.py` so migration and atomic writes apply.

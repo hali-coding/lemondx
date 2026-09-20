@@ -331,6 +331,7 @@ def save_module(name, content, overwrite=False):
         handle.write(content if content.endswith("\n") else content + "\n")
     os.chmod(target, 0o644)
 
+    store.note_change("modules", module_id)
     parsed = parse_module(target)
     parsed["shadows_builtin"] = bool(existing) and (
         existing["builtin"] or existing["shadows_builtin"])
@@ -358,6 +359,7 @@ def delete_module(module_id):
         raise BootstrapError("No such uploaded module '%s'." % module_id, 404)
     os.unlink(target)
 
+    store.note_change("modules", module_id, deleted=True)
     # A shadow's removal brings the built-in back under the same id, so the
     # defaults and profiles naming it still have something to run.
     if not module["shadows_builtin"]:

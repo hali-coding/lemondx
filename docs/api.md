@@ -53,6 +53,10 @@ little access `403`, too many failed logins `429`.
 | `DELETE` | `/api/cluster/members/{name}` | a peer saying a node has left — cluster members only |
 | `POST` | `/api/cluster/evicted` | a peer saying this node was evicted, so it stands down — cluster members only |
 | `POST` | `/api/cluster/refresh` | pull every peer's member list and push ours |
+| `POST` | `/api/cluster/reconcile` | settle this node's shared definitions against every member's (`{"apply": false}` reports without changing) |
+| `GET` | `/api/cluster/drift` | what the last reconciliation found; `null` until one has run in this `serve` |
+| `GET` | `/api/cluster/manifest` | a digest per shared artifact, with this node's change ledger — cluster members only |
+| `POST` | `/api/cluster/artifacts` | `{"items":[{"kind","name"}]}` → the bodies behind them — cluster members only |
 | `POST` | `/api/cluster/rotate` | replace the cluster credential on every member |
 | `PUT` | `/api/cluster/secret` | take a rotated credential (node to node) |
 | `GET` | `/api/cluster/containers` | instances across nodes (`?all=true`, `?nodes=`, `?groups=`), with each node's latest health records under `health` |
@@ -88,6 +92,16 @@ little access `403`, too many failed logins `429`.
 | `POST` | `/api/templates/{name}/destroy` | `{"instances":[...]}` → stop and delete each |
 | `GET` | `/api/template-runs` | launches/recreates/destroys in progress, or last finished, per template |
 | `DELETE` | `/api/template-runs/{name}` | dismiss a finished run |
+| `GET` | `/api/stacks` | saved stacks; see [Stacks](stacks.md#api) for the rest |
+| `PUT` | `/api/stacks/{name}` | `{"description","stages"}` → create or replace one |
+| `DELETE` | `/api/stacks/{name}` | delete one |
+| `POST` | `/api/stacks/{name}/launch` | `{"params":{},"background":true}` → run it stage by stage |
+| `GET` | `/api/stack-runs` | stacks running, or last finished |
+| `GET` | `/api/stack-instances` | each stack's instances, by their tags, on every node |
+| `POST` | `/api/stacks/{name}/state` | `{"action":"stop","instances":[...]}` → start/stop/restart them all |
+| `POST` | `/api/stacks/{name}/destroy` | `{"instances":[...]}` → stop and delete them all |
+| `POST` | `/api/stack-runs/{name}/cancel` | start nothing new in a running stack |
+| `DELETE` | `/api/stack-runs/{name}` | dismiss a finished run |
 | `GET` | `/api/profiles` | available profiles |
 
 Authentication:

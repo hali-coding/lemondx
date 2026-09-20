@@ -32,6 +32,10 @@ VALID_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,61}$")
 VALID_PREFIX = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,49}$")
 # Set on every instance a template launches, so front ends can group them.
 TEMPLATE_CONFIG_KEY = "user.lemondx.template"
+# Set on everything a stack launches: the instances themselves are the record
+# of what a stack is running, as the template tag is for a template, so it
+# survives a restart and needs no reconciling with a file. See stacks.py.
+STACK_CONFIG_KEY = "user.lemondx.stack"
 # A shell the caller asks for by path. Deliberately narrow: it is handed to the
 # daemon as argv[0], and an absolute path with no metacharacters cannot become
 # anything else on the way.
@@ -1680,8 +1684,11 @@ class ContainerService:
             _log(note)
         return placed, notes
 
-    def _create_from_template(self, template, bootstrap, instance_name):
+    def _create_from_template(self, template, bootstrap, instance_name, stack=None):
         """One instance, reported rather than raised so its siblings carry on."""
+        config = {TEMPLATE_CONFIG_KEY: template["name"]}
+        if stack:
+            config[STACK_CONFIG_KEY] = stack
         try:
             container = self.create_container(
                 name=instance_name, image=template["image"],
@@ -1692,7 +1699,7 @@ class ContainerService:
                 network=template["network"] or None,
                 ephemeral=template["ephemeral"], start=template["start"],
                 secureboot=template["secureboot"],
-                config={TEMPLATE_CONFIG_KEY: template["name"]}, bootstrap=bootstrap,
+                config=config, bootstrap=bootstrap,
                 # A template launches its own values; it should not quietly
                 # rewrite the module settings the create form starts from.
                 remember_params=False,
@@ -1782,17 +1789,18 @@ class ContainerService:
             template, notes = self.place_template(template)
         return template, bootstrap, names, count, prefix, notes
 
-    def launch_instances(self, template, bootstrap, names):
+    def launch_instances(self, template, bootstrap, names, stack=None):
         """Create the named instances from an already-prepared template.
 
         Separate from ``launch_template`` because a cluster-wide launch tracks
         the run itself, across every node, and must not start a second run on
         this one; see ``cluster.py``.
         """
-        return self._each(names, lambda n: self._create_from_template(template, bootstrap, n))
+        return self._each(names, lambda n: self._create_from_template(
+            template, bootstrap, n, stack))
 
     def launch_template(self, name, count=1, prefix=None, params=None, background=False,
-                        names=None):
+                        names=None, stack=None):
         """Create ``count`` instances from a template, several at a time.
 
         Anything that would fail for every instance -- a missing secret or
@@ -1802,14 +1810,21 @@ class ContainerService:
         """
         template, bootstrap, chosen, count, prefix, notes = self.prepare_launch(
             name, count=count, prefix=prefix, params=params, names=names)
+        stack = self.stack_tag(stack)
 
         def work():
             # Names the caller did not choose are picked inside the run, so two
             # launches racing here cannot pick alike.
             return self.launch_instances(
-                template, bootstrap, chosen or self._free_names(prefix, count))
+                template, bootstrap, chosen or self._free_names(prefix, count), stack)
         return self.track_run(template["name"], "launch", count, work, background,
                               notes=notes)
+
+    def stack_tag(self, stack):
+        """The stack a launch belongs to, as it will be tagged, or None."""
+        if stack in (None, ""):
+            return None
+        return self._record_name(str(stack), "stack")
 
     def template_instances(self, name):
         """Names of the instances launched from template ``name``, sorted."""
@@ -1862,13 +1877,16 @@ class ContainerService:
         names = self._confirmed_instances(name, instances)
         bootstrap = self._launch_bootstrap(template, params)
         template, notes = self.place_template(template)
+        # A recreated instance stays in the stack it was launched by.
+        stacks = {c["name"]: c["stack"] for c in self.list_containers()}
 
         def replace(instance_name):
             removed = self._remove_instance(instance_name)
             if not removed["ok"]:
                 return dict(removed, error="Not recreated: could not delete it: %s"
                             % removed["error"])
-            return self._create_from_template(template, bootstrap, instance_name)
+            return self._create_from_template(template, bootstrap, instance_name,
+                                              stacks.get(instance_name))
 
         return self._each(names, replace), notes
 
@@ -3268,6 +3286,7 @@ def _summarize(instance):
         "network_tx": network_totals["tx"],
         "snapshot_count": len(instance.get("snapshots") or []),
         "template": config.get(TEMPLATE_CONFIG_KEY) or None,
+        "stack": config.get(STACK_CONFIG_KEY) or None,
     }
 
 

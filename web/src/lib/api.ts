@@ -1,7 +1,7 @@
 import type {
   ApiToken, AuthInfo, CreatedApiToken, HealthReport, LocalUser, Role,
   ClusterContainers, ClusterInfo, ClusterNode, ClusterNodeDetail, JoinCode, JoinResult,
-  AutoGroupResult, EvictResult, LeaveResult,
+  AutoGroupResult, DriftReport, EvictResult, LeaveResult,
   MemberSync, NodeGroup, PendingInvite, RotateResult, SyncKind, SyncResult, Synced,
   InstanceRef, ScopedStateResult,
   BootstrapModule, BootstrapProfile, BootstrapResult, BootstrapSelection, BulkStateResult,
@@ -10,6 +10,7 @@ import type {
   InstanceTemplate, NetworkRequest, NetworkSummary, SubnetInUse, Resources, SetupResult, Snapshot, SshKey,
   StateAction, Status, StorageOverview, StoragePoolDetail, StoragePoolRequest,
   StorageVolume, StorageVolumeRequest, TemplateRequest, TemplateRun,
+  Stack, StackInstances, StackRun, StackStage, BulkStateResult as StackStateResult,
 } from './types'
 
 /** Error carrying the HTTP status so callers can react to 401/409 specifically. */
@@ -317,6 +318,49 @@ export const api = {
     request<TemplateRun>(`/templates/${encodeURIComponent(name)}/recreate`,
       { method: 'POST', body: { instances, params, background: true } }),
 
+  stacks: (signal?: AbortSignal) =>
+    request<Stack[]>('/stacks', { signal }),
+
+  /** Kept level across a cluster like templates, with the templates it uses. */
+  saveStack: (name: string, body: { description: string; stages: StackStage[] }) =>
+    request<Synced<Stack>>(`/stacks/${encodeURIComponent(name)}`, { method: 'PUT', body }),
+
+  deleteStack: (name: string, everywhere = true) =>
+    request<Synced<{ deleted: string }>>(
+      `/stacks/${encodeURIComponent(name)}?everywhere=${everywhere}`,
+      { method: 'DELETE' }),
+
+  /**
+   * Starts a stack and returns its run record at once; follow it with
+   * stackRuns(). `replace` makes it a relaunch: exactly those instances, as the
+   * user confirmed them, are destroyed first.
+   */
+  launchStack: (name: string, params: Record<string, string>, replace?: InstanceRef[]) =>
+    request<StackRun>(`/stacks/${encodeURIComponent(name)}/launch`,
+      { method: 'POST', body: { params, replace, background: true } }),
+
+  /** What every stack is running, by the tags on the instances, across the cluster. */
+  stackInstances: (signal?: AbortSignal) =>
+    request<StackInstances>('/stack-instances', { signal }),
+
+  stackState: (name: string, action: 'start' | 'stop' | 'restart', instances: InstanceRef[]) =>
+    request<StackStateResult>(`/stacks/${encodeURIComponent(name)}/state`,
+      { method: 'POST', body: { action, instances } }),
+
+  destroyStack: (name: string, instances: InstanceRef[]) =>
+    request<StackRun>(`/stacks/${encodeURIComponent(name)}/destroy`,
+      { method: 'POST', body: { instances, background: true } }),
+
+  stackRuns: (signal?: AbortSignal) =>
+    request<StackRun[]>('/stack-runs', { signal }),
+
+  cancelStackRun: (name: string) =>
+    request<StackRun>(`/stack-runs/${encodeURIComponent(name)}/cancel`, { method: 'POST' }),
+
+  dismissStackRun: (name: string) =>
+    request<{ dismissed: string }>(`/stack-runs/${encodeURIComponent(name)}`,
+      { method: 'DELETE' }),
+
   sshKeys: (signal?: AbortSignal, node?: string) =>
     request<SshKey[]>(on(node, '/ssh-keys'), { signal }),
 
@@ -378,6 +422,22 @@ export const api = {
 
   /** The other end of an eviction: this node steps out and every member is told. */
   leaveCluster: () => request<LeaveResult>('/cluster/leave', { method: 'POST' }),
+
+  /**
+   * Settle this node's shared definitions against every member's. The pull
+   * half of sync: what a node missed while it was switched off, and what it
+   * deleted while somebody else was.
+   */
+  reconcile: (apply = true) =>
+    request<DriftReport>('/cluster/reconcile', { method: 'POST', body: { apply } }),
+
+  /**
+   * What the last pass found, without setting another going. Null until one
+   * has run in this `serve` process — the report is held in memory like a
+   * template run, so a restart forgets it and the startup pass fills it in.
+   */
+  drift: (signal?: AbortSignal) =>
+    request<DriftReport | null>('/cluster/drift', { signal }),
 
   clusterContainers: (targets: { nodes?: string[]; groups?: string[]; all?: boolean } = {},
                       signal?: AbortSignal) => {
