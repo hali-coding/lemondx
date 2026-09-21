@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0](https://github.com/hali-coding/lemondx/compare/v0.5.0...v0.6.0) (2026-09-21)
+
+
+### Features
+
+* implements the stack feature ([f18c0c8](https://github.com/hali-coding/lemondx/commit/f18c0c825ea297ae36e2980ade129671609d2767))
+* implements the stack feature ([1d8c547](https://github.com/hali-coding/lemondx/commit/1d8c54766dc59e0fc4ca5d218143e389080db0e0))
+
 ## [0.5.0](https://github.com/hali-coding/lemondx/compare/v0.4.0...v0.5.0) (2026-09-19)
 
 
