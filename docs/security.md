@@ -180,6 +180,37 @@ it, for a node behind a proxy that terminates TLS.
 The static UI files are served without authentication — they contain no data.
 Only `/api/*` is gated.
 
+## The fabric holds privilege, opt in
+
+Everything else in lemondx is a front end to a socket. The fabric is the one
+feature that writes host state: a route between two nodes is kernel state no
+container API can set. It is off until you install its sudo rules, and without
+them `lemondx fabric plan` prints the commands for you to run instead.
+
+The rules grant one command, to the daemon's own admin group:
+
+```
+%lxd ALL=(root) NOPASSWD: /path/to/lemondx fabric-helper
+```
+
+Two things bound what that means:
+
+- **The helper takes data, not commands.** stdin carries subnets and the host
+  each belongs to; the helper decides what to run. It refuses any route that is
+  not a /24 inside this cluster's fabric prefix, reached through a
+  directly-connected network -- so the default route and the host's own LAN
+  cannot be expressed through it at all.
+- **The group is already root-equivalent.** As above, creating a container is
+  enough to become root on the host, which is why `lxd`/`incus-admin` is
+  treated that way throughout. The fabric grants that group nothing it did not
+  already have.
+
+`ip` itself is deliberately *not* granted: without arguments it allows
+`ip netns exec X sh`, a root shell, and argument patterns cannot confine it
+portably -- Ubuntu 25.10's sudo-rs matches arguments literally and supports
+neither wildcards nor regular expressions, while classic sudo supports both.
+See [networking.md](networking.md).
+
 ## Federation
 
 Federating nodes is opt-in and hand-carried: nothing is trusted for being on the

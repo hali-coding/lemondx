@@ -249,6 +249,17 @@ export function InstanceForm({
           gets its address from whatever serves that network, not from the daemon.
         </span>
       )}
+      <label className="check" style={{ marginTop: -4 }}>
+        <input type="checkbox" checked={value.fabric} disabled={disabled}
+          onChange={(event) => set({ fabric: event.target.checked })} />
+        <span>
+          Join the fabric
+          <span className="hint">
+            A second NIC, so this instance can reach instances on other nodes
+            directly. A node that is not on the fabric launches without it.
+          </span>
+        </span>
+      </label>
       {newNetwork === null && (
         <button type="button" className="btn btn-ghost btn-sm"
           style={{ alignSelf: 'flex-start', marginTop: -8 }} disabled={disabled}

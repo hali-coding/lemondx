@@ -54,6 +54,7 @@ Four layers, one direction of dependency:
 
 ```
 lxd.py          transport: HTTP over the daemon's AF_UNIX socket, no shelling out
+hostnet.py      transport: the host's routing table, the one place that shells out
   ↓
 service.py      domain: ContainerService turns raw daemon records into lemondx shapes
   ↓
@@ -332,6 +333,51 @@ server.py, and again in `_forward()`, where a relayed call would otherwise reach
 the target wearing the cluster credential): a stack's local share never goes
 through the API at all, and a person naming a stack on an ordinary launch would
 be giving it instances to destroy later.
+
+### The fabric
+
+`fabric.py` (`FabricService`) sits above `ClusterService` like `stacks.py` does,
+and for the same reason -- it needs the member list -- reached through a lazy
+`ClusterService._fabric()`. It gives each node a /24 out of one cluster-wide
+/16, a bridge with `ipv4.nat=false`, and a host route to every peer's /24;
+instances get a *second* NIC (`_fabric_nic()`, `FABRIC_NIC`) so the profile's
+NAT'd `eth0` still carries everything else. `hostnet.py` is to the host's
+routing table what `lxd.py` is to the daemon, and is the only place lemondx
+shells out to a privileged command.
+
+Three things are easy to get wrong here:
+
+**The bridge must not offer a default route.** `raw.dnsmasq=dhcp-option=3` is
+set by `fabric.py` straight through `lxd.update_network()`, deliberately
+bypassing `BRIDGE_CONFIG` -- dnsmasq runs as root under the daemon, so
+`dhcp-script=` through the REST API would be host execution. Two default routes
+in a container is a coin toss over whether its internet traffic leaves by a
+bridge that cannot NAT it.
+
+**Attaching a NIC is not an address.** Almost every image configures `eth0`
+alone, so `configure_guest()` runs `_CONFIGURE_NIC` inside the instance to bring
+`eth1` up and keep it up at boot. Without it the device is there and the
+interface is dark.
+
+**Privilege is one command, not one binary.** The sudoers rules name
+`lemondx fabric-helper` (`fabrichelper.py`), which takes the wanted state on
+stdin and decides what to run itself. `ip` cannot be granted -- `ip netns exec X
+sh` is a root shell -- and argument patterns do not confine portably, because
+Ubuntu 25.10's sudo-rs matches arguments literally and supports neither
+wildcards nor regexes while classic sudo supports both. So the confinement is
+Python: a /24 inside this cluster's prefix, via a directly-connected address.
+
+Allocation is coordinated, never reconciled: `_conflicts()` refuses two-sided
+differences and two nodes claiming one subnet is exactly that. `enable()` works
+out the whole assignment and pushes each node its own through a peers-only
+route; `enroll()` hands a joiner one in its answer. The claim rides on the node
+record (`store.clean_fabric`), so it converges through `sync_members()` with no
+new artifact kind -- which is why `remember_members()` takes `authoritative=`:
+levelling with three peers pulls three copies of every node, and without it the
+last one read would overwrite the node's own word about itself.
+
+A stack spanning nodes works because `_reachable_address()` hands on the fabric
+address when there is one, so `{{step.ip}}` means something on another host.
 
 ### Health checks
 

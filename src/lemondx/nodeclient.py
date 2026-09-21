@@ -363,6 +363,11 @@ class NodeClient:
         """Hand a peer a rotated cluster credential, authenticated with the old one."""
         return self.request("PUT", "/api/cluster/secret", {"secret": secret})
 
+    def set_fabric_claim(self, subnet, prefix):
+        """Tell a peer which fabric subnet the cluster allocated it."""
+        return self.request("PUT", "/api/fabric/claim",
+                            {"subnet": subnet, "prefix": prefix})
+
     def health(self):
         return self.request("GET", "/api/health")
 

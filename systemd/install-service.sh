@@ -4,19 +4,22 @@
 #   ./systemd/install-service.sh              # user service, runs as you (recommended)
 #   ./systemd/install-service.sh --system     # system service, dedicated account
 #   ./systemd/install-service.sh --uninstall  # remove whichever was installed
+#   ./systemd/install-service.sh --fabric     # also let lemondx program host routes
 #
 # Safe to re-run: re-installing just overwrites the unit file and reloads.
 set -euo pipefail
 
 mode=user
 action=install
+fabric=no
 for arg in "$@"; do
     case "$arg" in
         --system) mode=system ;;
         --user) mode=user ;;
         --uninstall) action=uninstall ;;
+        --fabric) fabric=yes ;;
         -h|--help)
-            sed -n '2,8p' "$0" | sed 's/^# \?//'
+            sed -n '2,9p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
@@ -162,6 +165,58 @@ uninstall_system() {
     echo "Left in place: the 'lemondx' account and /var/lib/lemondx (its state)."
     echo "To remove those too: userdel -r lemondx"
 }
+
+# --- the fabric: let lemondx program host routes between cluster nodes -------
+
+install_fabric() {
+    [ "$(id -u)" -eq 0 ] || { echo "--fabric needs root: sudo $0 --fabric" >&2; exit 1; }
+    local group template target tmp
+    group=$(detect_group)
+    [ -n "$group" ] || { echo "No LXD or Incus socket found, so there is no admin group to grant this to." >&2; exit 1; }
+    template="$script_dir/lemondx-fabric.sudoers"
+    target=/etc/sudoers.d/lemondx-fabric
+    [ -f "$template" ] || { echo "Missing $template" >&2; exit 1; }
+
+    tmp=$(mktemp)
+    # `visudo -c` before it is in place: a sudoers file that does not parse
+    # takes sudo out on the whole host, and this script is run with it.
+    sed -e "s|@HELPER@|$repo_dir/lemondx|g" -e "s|@GROUP@|$group|g" "$template" > "$tmp"
+    if ! visudo -c -f "$tmp" >/dev/null; then
+        echo "Refusing to install: the generated sudoers file does not parse." >&2
+        visudo -c -f "$tmp" >&2 || true
+        rm -f "$tmp"
+        exit 1
+    fi
+    install -m 0440 -o root -g root "$tmp" "$target"
+    rm -f "$tmp"
+
+    echo "Installed $target"
+    echo "  members of '$group' may now run: $repo_dir/lemondx fabric-helper"
+    echo "  and nothing else. That group already grants root on this host via"
+    echo "  the daemon, so this adds no access it did not have."
+    echo
+    echo "Next: lemondx fabric enable   (on one node; it allocates for the cluster)"
+    if [ "$mode" = user ] && [ -f "$HOME/.config/systemd/user/lemondx.service" ]; then
+        echo
+        echo "Note: the unit sets NoNewPrivileges=yes, which stops sudo from raising"
+        echo "privilege. Set NoNewPrivileges=no for lemondx.service if you want"
+        echo "\`serve\` to program routes itself -- see docs/service.md."
+    fi
+}
+
+uninstall_fabric() {
+    [ "$(id -u)" -eq 0 ] || { echo "--fabric --uninstall needs root." >&2; exit 1; }
+    rm -f /etc/sudoers.d/lemondx-fabric
+    echo "Removed /etc/sudoers.d/lemondx-fabric; lemondx can no longer program routes."
+}
+
+if [ "$fabric" = yes ]; then
+    case "$action" in
+        install)   install_fabric ;;
+        uninstall) uninstall_fabric ;;
+    esac
+    exit 0
+fi
 
 case "$mode-$action" in
     user-install)    install_user ;;

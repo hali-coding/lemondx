@@ -63,3 +63,8 @@ around `NoNewPrivileges=yes`, which both units set and which stops PAM's
 
 `serve` prints a warning at startup when PAM cannot work as configured, so
 check `journalctl` after the change.
+
+The fabric (routed networking between nodes) is blocked by `NoNewPrivileges=yes`
+for the same reason: it raises privilege through `sudo` for one command. Set it
+to `no` for the unit, or program the routes yourself with `lemondx fabric apply`
+-- the result is identical. See [networking.md](networking.md).

@@ -19,6 +19,7 @@ import secrets
 import sys
 
 from . import auth, cluster, pam, store
+from . import fabric as fabric_net
 from . import health as health_checks
 
 
@@ -572,6 +573,69 @@ class ClusterSection(Section):
               "set up first.")
 
 
+@register
+class FabricSection(Section):
+    name = "fabric"
+    help = "routed, non-NAT networking between the containers of a cluster"
+
+    def load(self):
+        try:
+            raw = store.load_config(self.name)
+            return None if raw is None else fabric_net.clean_settings(raw)
+        except (ValueError, fabric_net.FabricError) as exc:
+            raise ConfigureError(getattr(exc, "message", str(exc)))
+
+    def defaults(self):
+        return dict(fabric_net.DEFAULT_SETTINGS)
+
+    def save(self, settings):
+        try:
+            return fabric_net.save_settings(settings)
+        except fabric_net.FabricError as exc:
+            raise ConfigureError("Not saved: %s" % exc.message, exc.code)
+
+    def reset(self):
+        return fabric_net.reset_settings()
+
+    def prompt(self, p, current):
+        s = self.defaults()
+        s.update(current or {})
+        p.say("The fabric gives each node a subnet of its own and routes between "
+              "the hosts, so a container can reach one on another node directly. "
+              "Each node keeps its existing NAT'd bridge for the internet.")
+        p.say()
+        p.say("Every node must be on one L2 network, and lemondx needs sudo for "
+              "`ip route` -- see docs/networking.md.")
+        p.say()
+
+        s["prefix"] = p.ask(
+            "Address space for the whole cluster (a /16, split into a /24 per node)",
+            default=s["prefix"], validate=_fabric_prefix)
+        s["bridge"] = p.ask("Name for the fabric bridge on each node",
+                            default=s["bridge"], validate=_bridge_name)
+        s["via"] = p.ask(
+            "Address peers route this node's containers to (blank: work it out)",
+            default=s["via"], allow_empty=True, validate=_optional_ip) or ""
+        # `enabled` and `subnet` are not asked for: turning the fabric on means
+        # allocating a subnet to every member, which is `fabric enable`'s job
+        # and needs the cluster, not a form.
+        return s
+
+    def describe(self, s):
+        rows = [("address space", s["prefix"]),
+                ("bridge", s["bridge"]),
+                ("this node routes to",
+                 s["via"] or "the address on this host's default route")]
+        rows.append(("this node's subnet", s["subnet"] or "not allocated yet"))
+        rows.append(("fabric", "on" if s["enabled"] and s["subnet"] else "off"))
+        return rows
+
+    def after_save(self, p, s):
+        p.say()
+        p.say("`lemondx fabric enable` allocates a subnet to every member and "
+              "programs the routes; `lemondx fabric status` says what is missing.")
+
+
 # -- validators ------------------------------------------------------------
 
 
@@ -674,3 +738,26 @@ def _token_file(prompter, answer):
         out.write(secrets.token_urlsafe(32) + "\n")
     prompter.say("  + wrote a new token to %s" % path)
     return path
+
+
+def _fabric_prefix(answer):
+    try:
+        return str(fabric_net.clean_prefix(answer))
+    except fabric_net.FabricError as exc:
+        raise ValueError(exc.message)
+
+
+def _bridge_name(answer):
+    from .service import VALID_NETWORK_NAME
+    if not VALID_NETWORK_NAME.match(answer or ""):
+        raise ValueError("Letters, digits and -, starting with a letter, up to "
+                         "15 characters (the kernel's limit on an interface name).")
+    return answer
+
+
+def _optional_ip(answer):
+    import ipaddress
+    try:
+        return str(ipaddress.ip_address((answer or "").strip()))
+    except ValueError:
+        raise ValueError("Enter an IP address.")

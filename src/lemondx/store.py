@@ -24,6 +24,7 @@ Writes are atomic so a crash mid-save cannot leave a truncated file behind.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -339,6 +340,9 @@ def _clean_template(stored, name):
         "disk": _text(stored.get("disk"), 32),
         "pool": _text(stored.get("pool"), 64),
         "network": _text(stored.get("network"), 64),
+        # Whether instances also get a NIC on this node's fabric bridge, so
+        # they can reach instances of the same stack on other nodes.
+        "fabric": stored.get("fabric") is True,
         "profiles": _strings(stored.get("profiles")),
         "ephemeral": stored.get("ephemeral") is True,
         # Absent means start: an instance that never boots cannot be bootstrapped.
@@ -523,7 +527,33 @@ def _clean_node(stored, name):
         "fingerprint": fingerprint if _FINGERPRINT.match(fingerprint) else "",
         "description": _text(stored.get("description"), 200),
         "added": _epoch(stored.get("added")),
+        "fabric": clean_fabric(stored.get("fabric")),
     }
+
+
+def clean_fabric(stored):
+    """A node's fabric claim: the subnet its containers use, and how to reach it.
+
+    This rides on the node record rather than being an artifact of its own
+    because a claim is not something reconciliation could ever settle: two
+    nodes holding overlapping subnets is a two-sided difference, which
+    `_conflicts()` reports and refuses to resolve. Allocation is coordinated
+    instead, and this is only how the answer travels.
+
+    An unparseable half is dropped rather than failing the record -- a node
+    with no usable claim is simply not on the fabric yet.
+    """
+    if not isinstance(stored, dict):
+        return {"subnet": "", "via": ""}
+    try:
+        subnet = str(ipaddress.ip_network(_text(stored.get("subnet"), 43), strict=False))
+    except ValueError:
+        subnet = ""
+    try:
+        via = str(ipaddress.ip_address(_text(stored.get("via"), 45)))
+    except ValueError:
+        via = ""
+    return {"subnet": subnet, "via": via}
 
 
 def _clean_node_group(stored, name):

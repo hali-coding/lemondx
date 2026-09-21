@@ -5,7 +5,7 @@ import { api } from '../lib/api'
 import { bytes } from '../lib/format'
 import { displayAddress, subnetStatus } from '../lib/cidr'
 import type {
-  NetworkDetail, NetworkFamily, NetworkRequest, NetworkSummary, SubnetInUse,
+  FabricStatus, NetworkDetail, NetworkFamily, NetworkRequest, NetworkSummary, SubnetInUse,
 } from '../lib/types'
 import type { ToastKind } from '../hooks/useToasts'
 import { Modal } from './Modal'
@@ -99,6 +99,8 @@ export function NetworkView({ onNotify }: Props) {
       {error && (
         <div className="banner banner-error"><div className="banner-body"><p>{error}</p></div></div>
       )}
+
+      <FabricCard onNotify={onNotify} onChanged={load} />
 
       <div className="storage-toolbar">
         <span className="faint" style={{ fontSize: 12.5 }}>
@@ -218,6 +220,127 @@ export function NetworkView({ onNotify }: Props) {
         />
       )}
     </>
+  )
+}
+
+/**
+ * The fabric: this node's slice of the cluster-wide address space, and whether
+ * the routes to the other nodes are actually in the kernel.
+ *
+ * Shown only once there is something to say. On a single, unfederated host the
+ * fabric is meaningless, and a card explaining a feature that cannot apply is
+ * worse than no card.
+ */
+function FabricCard({ onNotify, onChanged }: {
+  onNotify: (kind: ToastKind, title: string, detail?: string) => void
+  onChanged: () => void
+}) {
+  const canWrite = useCanWrite()
+  const [state, setState] = useState<FabricStatus | null>(null)
+  const [plan, setPlan] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const load = useCallback((signal?: AbortSignal) => {
+    api.fabric(signal).then(setState).catch(() => { /* not fatal to the tab */ })
+  }, [])
+
+  // Its own 10s interval rather than the tab's 5s one: this polls the peers'
+  // claims and the kernel's routing table, neither of which moves that fast.
+  useEffect(() => {
+    const controller = new AbortController()
+    load(controller.signal)
+    const timer = window.setInterval(() => { if (!busy) load() }, 10000)
+    return () => { controller.abort(); window.clearInterval(timer) }
+  }, [load, busy])
+
+  if (!state || (!state.enabled && !state.configured)) return null
+
+  const act = async (what: string, run: () => Promise<unknown>) => {
+    setBusy(true)
+    try {
+      await run()
+      onNotify('success', `Fabric ${what}`)
+      load()
+      // Applying creates or corrects the fabric bridge, so the list above it
+      // is now out of date too.
+      onChanged()
+    } catch (err) {
+      onNotify('error', `Could not ${what} the fabric`, (err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const badge: Record<string, string> = {
+    ok: 'badge-ok', missing: 'badge-warn', wrong: 'badge-warn', unreachable: 'badge-error',
+  }
+
+  return (
+    <section className="card net-card">
+      <header className="net-head">
+        <h3>Fabric</h3>
+        <span className={`badge ${state.enabled ? 'badge-ok' : 'badge-warn'}`}>
+          {state.enabled ? 'on' : 'not allocated'}
+        </span>
+        {state.subnet && <span className="badge badge-info mono">{state.subnet}</span>}
+        {!state.privileged && (
+          <span className="badge badge-dim"
+            title="lemondx cannot program routes here; the plan shows what to run">
+            no privilege
+          </span>
+        )}
+        <span className="net-head-end">
+          {state.pending > 0 && canWrite && state.privileged && (
+            <button className="btn btn-sm btn-primary" disabled={busy}
+              onClick={() => act('updated', () => api.fabricApply())}>
+              Apply {state.pending} change{state.pending === 1 ? '' : 's'}
+            </button>
+          )}
+          <button className="btn btn-sm" disabled={busy}
+            onClick={() => {
+              if (plan !== null) { setPlan(null); return }
+              api.fabricPlan().then((p) => setPlan(p.text || 'Nothing to do.'))
+                .catch((err) => onNotify('error', 'Could not read the plan', err.message))
+            }}>
+            {plan !== null ? 'Hide plan' : 'Show plan'}
+          </button>
+        </span>
+      </header>
+
+      <p className="faint" style={{ margin: '0 0 10px' }}>
+        Instances on <span className="mono">{state.bridge}</span> reach instances on other
+        nodes directly, without NAT. Their NAT&apos;d NIC still carries everything else.
+      </p>
+
+      {state.routes.length > 0 && (
+        <table className="table net-leases">
+          <thead>
+            <tr><th>Node</th><th>Subnet</th><th>Route via</th><th>Route</th></tr>
+          </thead>
+          <tbody>
+            {state.routes.map((route) => (
+              <tr key={route.node}>
+                <td>{route.node}</td>
+                <td className="mono">{route.subnet}</td>
+                <td className="mono">{route.via}</td>
+                <td><span className={`badge ${badge[route.state]}`}>{route.state}</span></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {plan !== null && <pre className="net-plan">{plan}</pre>}
+
+      {state.check && (
+        <div className="banner banner-warn"><div className="banner-body"><p>{state.check}</p></div></div>
+      )}
+      {state.warnings.map((warning) => (
+        <div className="banner banner-warn" key={warning}>
+          <div className="banner-body"><p style={{ whiteSpace: 'pre-wrap' }}>{warning}</p></div>
+        </div>
+      ))}
+    </section>
   )
 }
 

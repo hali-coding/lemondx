@@ -112,6 +112,11 @@ LOCAL_VOLUME_CONFIG = frozenset({
 })
 
 # A bridge is a host interface, and Linux caps those at 15 bytes.
+# The device key and interface name a fabric NIC always takes. Fixed rather
+# than derived: it is the second NIC by construction, and the guest-side
+# configuration has to name the same interface.
+FABRIC_NIC = "eth1"
+
 VALID_NETWORK_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,14}$")
 _DNS_DOMAIN = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,62}\.)*[a-zA-Z0-9-]{1,63}$")
 
@@ -352,6 +357,14 @@ class ContainerService:
         # Per-container load averages, sampled every few seconds; only `serve`
         # runs one, and a one-off check measures over its window instead.
         self._load_sampler = None
+        # Set by ClusterService: () -> this node's fabric bridge name, or "".
+        # The service does not read fabric settings itself -- a template says
+        # only *whether* it wants the fabric, and each node resolves that to
+        # its own bridge, the same way it resolves a pool or a network name.
+        self.fabric_bridge = None
+        # Set by ClusterService too: (name, iface) -> configure the fabric NIC
+        # inside a started instance. Attaching the device only gives it a link.
+        self.fabric_configure = None
         # Template app checks on their own intervals; `serve` only, like the
         # sampler. Without it a round runs each check itself.
         self._app_checker = None
@@ -530,7 +543,8 @@ class ContainerService:
                          profiles=None, cpu=None, memory=None, disk=None, pool=None,
                          network=None, description=None, ephemeral=False, start=True,
                          config=None, wait=True, bootstrap=None,
-                         remember_params=True, background=False, secureboot=True):
+                         remember_params=True, background=False, secureboot=True,
+                         fabric=None):
         """Create an instance, start it and run its bootstrap modules.
 
         With ``background`` everything that can be checked up front still is
@@ -591,6 +605,11 @@ class ContainerService:
         if network:
             key, nic = self._instance_nic(payload["profiles"], str(network).strip())
             payload.setdefault("devices", {})[key] = nic
+        if fabric:
+            # A second NIC beside the profile's, never instead of it: the
+            # fabric carries traffic to other nodes and nothing else.
+            key, nic = self.fabric_nic(str(fabric).strip())
+            payload.setdefault("devices", {})[key] = nic
 
         if bootstrap and bootstrap.get("modules") and not (start and wait):
             raise ServiceError(
@@ -622,6 +641,11 @@ class ContainerService:
             if start:
                 self._create_stage(record, stage="starting")
                 self.lxd.set_state(name, "start")
+                # Before bootstrap, not after: a module may well want to reach
+                # another node, and an interface with no address is not there
+                # yet as far as anything inside the instance is concerned.
+                if payload.get("devices", {}).get(FABRIC_NIC) and self.fabric_configure:
+                    self.fabric_configure(name, FABRIC_NIC)
 
             container = self.get_container(name)
             if modules:
@@ -1477,6 +1501,7 @@ class ContainerService:
     def save_template(self, name, image, instance_type="container", cpu=None,
                       memory=None, disk=None, pool=None, network=None, profiles=None,
                       ephemeral=False, start=True, bootstrap=None, description="",
+                      fabric=False,
                       name_prefix=None, secureboot=True, app_check=None):
         name = self._record_name(name, "template")
         image = str(image or "").strip()
@@ -1524,6 +1549,7 @@ class ContainerService:
             "disk": normalize_size(disk, "disk size") or "",
             "pool": str(pool).strip() if pool else "",
             "network": str(network).strip() if network else "",
+            "fabric": bool(fabric),
             "profiles": [str(p) for p in profiles or []],
             "ephemeral": bool(ephemeral),
             "start": bool(start),
@@ -1668,6 +1694,16 @@ class ContainerService:
                        "the default profile's network (%s)" % _nic_network(nic)
                        if _nic_network(nic) else "the default profile's NIC"))
 
+        if template.get("fabric"):
+            # Resolved to a local name like pool and network above, so
+            # `placed["fabric"]` is this node's bridge rather than a flag.
+            bridge = (self.fabric_bridge() if self.fabric_bridge else "") or ""
+            placed["fabric"] = bridge
+            if not bridge:
+                notes.append("This node is not on the fabric; launched without "
+                             "the fabric NIC, so these instances can only be "
+                             "reached from this host.")
+
         wanted = [p for p in (template["profiles"] or []) if p != "default"]
         if wanted:
             known = {p.get("name") for p in self.lxd.list_profiles()}
@@ -1697,6 +1733,7 @@ class ContainerService:
                 cpu=template["cpu"] or None, memory=template["memory"] or None,
                 disk=template["disk"] or None, pool=template["pool"] or None,
                 network=template["network"] or None,
+                fabric=template.get("fabric") or None,
                 ephemeral=template["ephemeral"], start=template["start"],
                 secureboot=template["secureboot"],
                 config=config, bootstrap=bootstrap,
@@ -2411,6 +2448,19 @@ class ContainerService:
         if not nics:
             return None, None
         return next(((k, d) for k, d in nics if d.get("name") == "eth0"), nics[0])
+
+    def fabric_nic(self, network, name=FABRIC_NIC):
+        """A NIC that *adds* to the profiles' one instead of replacing it.
+
+        The opposite of `_instance_nic()`: a new device key, so the profile's
+        NAT'd eth0 stays exactly as it was and keeps the instance's internet
+        access. The fabric is only for reaching other nodes.
+        """
+        record = next((n for n in self.lxd.list_networks()
+                       if n.get("name") == network), None)
+        if record is None:
+            raise ServiceError("No network called '%s'." % network, 404)
+        return name, {"type": "nic", "network": network, "name": name}
 
     def _instance_nic(self, profiles, network):
         """An instance-level NIC that replaces the profiles' one with ``network``.

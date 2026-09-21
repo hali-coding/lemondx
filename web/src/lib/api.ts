@@ -11,6 +11,10 @@ import type {
   StateAction, Status, StorageOverview, StoragePoolDetail, StoragePoolRequest,
   StorageVolume, StorageVolumeRequest, TemplateRequest, TemplateRun,
   Stack, StackInstances, StackRun, StackStage, BulkStateResult as StackStateResult,
+  FabricStatus,
+  FabricPlan,
+  FabricApplyResult,
+  FabricEnableResult,
 } from './types'
 
 /** Error carrying the HTTP status so callers can react to 401/409 specifically. */
@@ -229,6 +233,25 @@ export const api = {
 
   deleteNetwork: (name: string) =>
     request<{ deleted: string }>(`/networks/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  // The fabric. Status and plan are reads and need no privilege on the host,
+  // so they answer even where routes cannot be programmed.
+  fabric: (signal?: AbortSignal) => request<FabricStatus>('/fabric', { signal }),
+
+  fabricPlan: (signal?: AbortSignal) => request<FabricPlan>('/fabric/plan', { signal }),
+
+  fabricApply: () => request<FabricApplyResult>('/fabric/apply', { method: 'POST' }),
+
+  fabricEnable: (prefix?: string) =>
+    request<FabricEnableResult>('/fabric/enable', { method: 'POST', body: { prefix } }),
+
+  fabricDisable: () => request<FabricApplyResult>('/fabric/disable', { method: 'POST' }),
+
+  fabricAttach: (name: string) =>
+    request<Container>(`/fabric/instances/${encodeURIComponent(name)}/attach`, { method: 'POST' }),
+
+  fabricDetach: (name: string) =>
+    request<Container>(`/fabric/instances/${encodeURIComponent(name)}/detach`, { method: 'POST' }),
 
   // Bootstrapping a container runs modules on *its* node and installs keys
   // that node can see, so the pickers come from there too.

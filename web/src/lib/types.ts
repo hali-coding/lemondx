@@ -163,6 +163,8 @@ export interface CreateRequest {
   pool?: string
   /** Replaces the profiles' NIC; the default profile's network when omitted. */
   network?: string
+  /** Adds a second NIC on this node's fabric bridge, beside the NAT'd one. */
+  fabric?: boolean
   /** LXD/Incus profiles; the daemon's default when omitted. */
   profiles?: string[]
   description?: string
@@ -393,6 +395,11 @@ export interface InstanceSpec {
   pool: string
   /** Blank means the network the default profile's NIC joins. */
   network: string
+  /**
+   * A second NIC on the fabric, so instances can reach those on other nodes.
+   * A node that is not on the fabric launches without it and says so.
+   */
+  fabric: boolean
   /** LXD/Incus profiles, not bootstrap ones. */
   profiles: string[]
   ephemeral: boolean
@@ -887,6 +894,78 @@ export interface NodeState {
   running: number
 }
 
+/** One node's slice of the fabric: the subnet it holds and where to route it. */
+export interface FabricClaim {
+  subnet: string
+  via: string
+}
+
+/** One peer's route as this node sees it. `ok` means programmed and reachable. */
+export interface FabricRoute {
+  node: string
+  subnet: string
+  via: string
+  state: 'ok' | 'missing' | 'wrong' | 'unreachable'
+}
+
+export interface FabricCommand {
+  command: string
+  why: string
+}
+
+/** What `GET /api/fabric` serves: this node's half of the fabric. */
+export interface FabricStatus {
+  /** On *and* holding a subnet. `configured` without this means half set up. */
+  enabled: boolean
+  configured: boolean
+  node: string
+  /** The cluster-wide address space, always a /16. */
+  prefix: string
+  bridge: string
+  subnet: string
+  via: string
+  bridge_ready: boolean
+  /** Whether routes can be programmed here; false means the plan is advisory. */
+  privileged: boolean
+  routes: FabricRoute[]
+  /** How many commands `apply` would run. */
+  pending: number
+  error: string
+  /** One sentence on why traffic will not flow, or blank. */
+  check: string
+  warnings: string[]
+}
+
+export interface FabricPlan {
+  node: string
+  commands: FabricCommand[]
+  text: string
+  privileged: boolean
+}
+
+export interface FabricApplied {
+  command: string
+  why: string
+  ok: boolean
+  error: string
+}
+
+export interface FabricApplyResult {
+  node: string
+  ok: boolean
+  applied: FabricApplied[]
+  check: string
+  status: FabricStatus
+}
+
+export interface FabricEnableResult {
+  prefix: string
+  /** node name -> the /24 it was given. */
+  assigned: Record<string, string>
+  peers: { node: string; subnet: string; ok: boolean; error: string }[]
+  status: FabricStatus
+}
+
 export interface ClusterNode {
   name: string
   url: string
@@ -895,6 +974,8 @@ export interface ClusterNode {
   description: string
   /** Unix seconds; 0 for this node, which was never "added". */
   added: number
+  /** Where this node's containers live on the fabric, blank when it is not on one. */
+  fabric: FabricClaim
   self: boolean
   groups: string[]
   /** Null when the listing was asked not to contact anyone. */

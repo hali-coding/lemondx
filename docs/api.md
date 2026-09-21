@@ -191,3 +191,21 @@ See also [Nodes and federation](cluster.md) for `/api/cluster`,
 [Instance templates](templates.md) for `/api/templates`, and
 [Web UI tour](web-ui.md) for `/api/resources`, `/api/networks` and
 `/api/images/browse`.
+
+## Fabric
+
+| Endpoint | What it does |
+| --- | --- |
+| `GET /api/fabric` | this node's fabric: subnet, bridge, per-peer routes |
+| `GET /api/fabric/plan` | the host commands that would bring routes up to date |
+| `POST /api/fabric/apply` | create the bridge and program the routes |
+| `POST /api/fabric/enable` | allocate a subnet to every member and turn the fabric on |
+| `POST /api/fabric/disable` | stop routing here and give this node's subnet back |
+| `POST /api/fabric/instances/{name}/attach` | give an instance a NIC on the fabric (`detach` removes it) |
+
+`PUT /api/fabric/claim` exists too, but is members-only: it is how the node
+running `enable` tells each peer which subnet it was allocated. A person turns
+the fabric on with `enable`, which allocates for the whole cluster — setting one
+node's subnet by hand is how two nodes end up holding the same range.
+
+See [Networking between nodes](networking.md).

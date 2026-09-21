@@ -2088,3 +2088,17 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 .stack-members { display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
 .stack-ref-input.input { width: 130px; padding: 3px 7px; font-size: 11.5px; }
+
+/* The fabric's copyable plan: shell commands, so it must not reflow. */
+.net-plan {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre;
+  overflow-x: auto;
+}

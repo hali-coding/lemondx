@@ -20,6 +20,8 @@ from urllib.parse import unquote, urlparse
 from . import store, websocket
 from .auth import ADMIN, READ, SESSION_COOKIE, AuthConfig, AuthError, AuthService
 from .cluster import ClusterError, ClusterService, from_peer
+from .fabric import FabricError
+from .hostnet import HostNetError
 from .lxd import LXDError
 from .nodeclient import NodeError
 from .service import ContainerService, ServiceError
@@ -115,6 +117,7 @@ def build_router(service, auth=None, cluster=None, stacks=None):
         disk=body.get("disk"),
         pool=body.get("pool"),
         network=body.get("network"),
+        fabric=_fabric_bridge(cluster, body.get("fabric")),
         description=body.get("description"),
         ephemeral=body.get("ephemeral", False),
         start=body.get("start", True),
@@ -259,6 +262,7 @@ def build_router(service, auth=None, cluster=None, stacks=None):
               instance_type=body.get("type", "container"),
               cpu=body.get("cpu"), memory=body.get("memory"), disk=body.get("disk"),
               pool=body.get("pool"), network=body.get("network"),
+              fabric=bool(body.get("fabric", False)),
               profiles=body.get("profiles"),
               ephemeral=bool(body.get("ephemeral", False)),
               start=bool(body.get("start", True)),
@@ -431,6 +435,29 @@ def build_router(service, auth=None, cluster=None, stacks=None):
     r.add("POST", r"/api/cluster/containers/delete",
           lambda body, q: cluster.delete_containers(
               body.get("instances"), force=bool(body.get("force"))))
+
+    # The fabric: routed, non-NAT networking between the containers of a
+    # cluster. Reading it needs no privilege on the host, so status answers
+    # everywhere and only apply can fail for want of the sudoers rules.
+    r.add("GET", r"/api/fabric", lambda body, q: cluster.fabric().status())
+    r.add("GET", r"/api/fabric/plan", lambda body, q: cluster.fabric().plan())
+    r.add("POST", r"/api/fabric/apply", lambda body, q: cluster.fabric().apply())
+    r.add("POST", r"/api/fabric/enable",
+          lambda body, q: cluster.fabric().enable(prefix=body.get("prefix")))
+    r.add("POST", r"/api/fabric/disable", lambda body, q: cluster.fabric().disable())
+    # Members only, and narrower than admin on purpose: a person turning the
+    # fabric on uses `enable`, which allocates for the whole cluster. Setting
+    # one node's subnet by hand is only ever a member relaying that allocation,
+    # and letting an admin do it directly is how two nodes end up on one range.
+    r.add("PUT", r"/api/fabric/claim",
+          lambda body, q, who: _peers_only(who, "Only a cluster member allocates a "
+                                           "fabric subnet; use /api/fabric/enable.")
+          or cluster.fabric().accept_claim(body.get("subnet"), body.get("prefix")),
+          principal=True, peers=True)
+    r.add("POST", r"/api/fabric/instances/%s/attach" % NAME,
+          lambda body, q, name: cluster.fabric().attach(name))
+    r.add("POST", r"/api/fabric/instances/%s/detach" % NAME,
+          lambda body, q, name: cluster.fabric().detach(name))
 
     r.add("GET", r"/api/cluster/groups", lambda body, q: cluster.list_groups())
     # `large` and `small` are the cluster's own reading of itself, so a person
@@ -621,7 +648,7 @@ class LemondxHandler(BaseHTTPRequestHandler):
             self._send_json({"error": exc.message}, exc.code)
         except AuthError as exc:
             self._send_json({"error": exc.message}, exc.code)
-        except (LXDError, ClusterError, NodeError) as exc:
+        except (LXDError, ClusterError, NodeError, FabricError, HostNetError) as exc:
             self._send_json({"error": exc.message}, _http_code(exc.code))
         except Exception as exc:  # noqa: BLE001 - never leak a traceback to the client
             self.log_message("unhandled error: %r", exc)
@@ -1019,6 +1046,23 @@ def _stack_tag(body, principal):
     return stack
 
 
+def _fabric_bridge(cluster, wanted):
+    """Turn a create request's `fabric: true` into this node's bridge name.
+
+    Resolved here rather than in the service, which knows nothing about fabric
+    settings: a request asks for "the fabric", and which bridge that is depends
+    on the node the instance lands on.
+    """
+    if not wanted:
+        return None
+    fabric = cluster.fabric()
+    if not fabric.enabled():
+        raise FabricError(
+            "This node is not on the fabric, so an instance cannot join it. "
+            "Run `lemondx fabric enable`.", 409)
+    return fabric.bridge()
+
+
 def _peers_only(principal, message):
     """Raise unless this caller is another cluster member; returns None to pass.
 
@@ -1228,6 +1272,17 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
         cluster.start_reconciler()
         print("         reconciling shared definitions with the other members "
               "shortly, then hourly")
+
+    fabric = cluster.fabric()
+    if fabric.enabled():
+        print("Fabric: %s on %s, routing to %d peer(s)"
+              % (fabric.settings()["subnet"], fabric.bridge(),
+                 len(fabric.desired_routes())))
+        # The routes are kernel state and do not survive a reboot, so standing
+        # them back up at startup is not a repair but the normal path.
+        fabric.start()
+        for warning in fabric.status()["warnings"]:
+            print("WARNING: %s" % warning)
     if dev:
         print("Dev mode: CORS is open for the Vite dev server (npm --prefix web run dev).")
     if not os.path.isdir(WEB_DIST) and not dev:
