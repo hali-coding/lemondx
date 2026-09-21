@@ -119,7 +119,18 @@ SIZE_TOLERANCE = 0.05
 # and a host that is switched off refuses at once anyway.
 EVICT_TIMEOUT = 10
 
-SYNC_KINDS = ("templates", "modules", "profiles", "groups", "users")
+SYNC_KINDS = ("templates", "modules", "profiles", "groups", "users", "stacks")
+
+# What a node reconciles on its own when it comes back. The auto-propagated
+# kinds and only those: `users` crosses as a password hash and is pushed only
+# when somebody asks for it by name, so a pass that runs unattended has no
+# business creating accounts on this host or anywhere else.
+RECONCILE_KINDS = tuple(k for k in SYNC_KINDS if k != "users")
+# The first pass waits for `serve` to be listening -- a peer reconciling back
+# at us mid-startup would find nothing answering -- and then it is an hourly
+# background chore. Drift is not an emergency; it only has to be found.
+RECONCILE_DELAY = 20
+RECONCILE_INTERVAL = 3600
 # Saving something shared pushes it to every member there and then. Kept short:
 # a node that is off refuses instantly, and one that is merely unreachable must
 # not hold up the save that is already done here.
@@ -391,6 +402,15 @@ class ClusterService:
         self._settings = settings
         self._lock = threading.Lock()
         self._probes = {}            # node name -> (checked_at, record)
+        # What the last reconciliation found, kept like a template run: in
+        # memory on the one service `serve` builds, so the UI can read drift
+        # without setting a pass going every time somebody opens the tab.
+        self._drift = None
+        # Held for a whole pass, and never by anything that serves a read:
+        # `drift()` must answer while one is running. Not `_lock`, which is
+        # taken and dropped around each small piece of shared state.
+        self._reconcile_lock = threading.Lock()
+        self._stacks = None          # set by StackService, for applying a pulled stack
 
     # -- this node ---------------------------------------------------------
 
@@ -555,6 +575,11 @@ class ClusterService:
             "reachable_because": self.self_check(),
             "fingerprint_pretty": pretty_fingerprint(local["fingerprint"]),
             "peers": len(store.load_nodes()),
+            # Peer records or node groups with no credential to use them with:
+            # a cluster this node is in only from its own side. Nothing works,
+            # and `leave()` is what clears it -- so the UI has to know to offer.
+            "leftovers": not self.in_cluster() and bool(
+                store.load_nodes() or store.load_node_groups()),
             "configured_url": settings["url"],
             "settings_path": settings_path(),
         }
@@ -1433,12 +1458,23 @@ class ClusterService:
         for name in peers:
             store.delete_node(name)
         for group in list(store.load_node_groups()):
-            store.delete_node_group(group)
-        token_id = (self.cluster_secret() or "").split("_", 2)[1]
+            # note=False: a group going because there are no nodes left to name
+            # is not a deletion the cluster decided on, and a tombstone for it
+            # would push that removal into whatever cluster this node joins next.
+            store.delete_node_group(group, note=False)
+        # Same reasoning for every other recorded deletion. What this node still
+        # holds stays in the ledger -- those are its own artifacts either way.
+        store.drop_tombstones()
+        # Not always three parts: standing down is also how a node with nothing
+        # but leftovers is cleaned up, and there is no credential to pick an id
+        # out of then.
+        parts = (self.cluster_secret() or "").split("_", 2)
+        token_id = parts[1] if len(parts) == 3 else None
 
         def drop_token(records):
             records.pop(token_id, None)
-        store.update_auth("tokens", drop_token)
+        if token_id:
+            store.update_auth("tokens", drop_token)
 
         def drop_secret(records):
             records.pop("secret", None)
@@ -1458,20 +1494,39 @@ class ClusterService:
 
         Nothing has to be rotated afterwards: the credential this node held is
         gone from it, which is exactly what a rotation would have achieved.
+
+        It also works on the half-state a broken cluster leaves behind. A node
+        whose credential is gone -- revoked, rotated past, a stand-down that
+        failed part way -- still holds peer records and node groups, and every
+        call it makes with them fails; refusing to leave because it is "not in
+        a cluster" would be true and useless, since that leftover state is
+        exactly what wants clearing. There is nothing to tell the peers with in
+        that case, so the telling is skipped and said to have been.
         """
-        if not self.in_cluster():
-            raise ClusterError("This node is not in a cluster.", 409)
         me = self.local_name()
-        told = self._tell_peers(me)
+        member = self.in_cluster()
+        leftovers = bool(self._peers()) or bool(store.load_node_groups())
+        if not member and not leftovers:
+            raise ClusterError("This node is not in a cluster.", 409)
+
+        told = self._tell_peers(me) if member else []
         left = self._stand_down()
         stale = [row["node"] for row in told if not row["ok"]]
-        _log("left the cluster (told %d of %d member(s))"
-             % (len(told) - len(stale), len(told)))
-        return {
-            "left": left, "told": told, "stale": stale,
-            "note": "%s could not be told and still lists this node: run `lemondx "
-                    "cluster evict %s` there." % (", ".join(stale), me) if stale else "",
-        }
+        if member:
+            _log("left the cluster (told %d of %d member(s))"
+                 % (len(told) - len(stale), len(told)))
+        else:
+            _log("cleared leftover cluster state (forgot %s)" % (", ".join(left) or "nobody"))
+        note = ""
+        if stale:
+            note = ("%s could not be told and still lists this node: run `lemondx "
+                    "cluster evict %s` there." % (", ".join(stale), me))
+        elif not member:
+            note = ("This node had no cluster credential, so no member could be told "
+                    "it has gone. Any that still list '%s' need `lemondx cluster evict "
+                    "%s` run there." % (me, me))
+        return {"left": left, "told": told, "stale": stale,
+                "had_credential": member, "note": note}
 
     def evicted(self, peer_address=None):
         """A member telling this node it has been put out of the cluster.
@@ -1542,12 +1597,25 @@ class ClusterService:
         wanted = None if names is None else {str(n) for n in names}
         items, module_ids = [], set()
 
-        if "templates" in kinds:
-            for template in self.service.list_templates():
-                if wanted is not None and template["name"] not in wanted:
+        # A stack drags its templates along the way a template drags its
+        # modules: one that arrives naming a template the far side lacks is
+        # accepted there and then refused on its first launch.
+        stack_templates = set()
+        if "stacks" in kinds:
+            for name, stack in sorted(store.load_stacks().items()):
+                if wanted is not None and name not in wanted:
                     continue
-                items.append(("templates", template["name"], _template_body(template)))
-                module_ids.update(template["bootstrap"]["modules"])
+                items.append(("stacks", name, {"description": stack["description"],
+                                               "stages": stack["stages"]}))
+                stack_templates.update(step["template"] for stage in stack["stages"]
+                                       for step in stage["steps"] if step["type"] == "launch")
+
+        for template in self.service.list_templates():
+            asked = "templates" in kinds and (wanted is None or template["name"] in wanted)
+            if not asked and template["name"] not in stack_templates:
+                continue
+            items.append(("templates", template["name"], _template_body(template)))
+            module_ids.update(template["bootstrap"]["modules"])
         if "profiles" in kinds:
             for profile in self.service.list_bootstrap_profiles():
                 if wanted is not None and profile["name"] not in wanted:
@@ -1598,7 +1666,8 @@ class ClusterService:
 
         # Modules first: a template that arrives before the module it names is
         # accepted but cannot be launched until the module follows.
-        order = {"modules": 0, "profiles": 1, "templates": 2, "groups": 3, "users": 4}
+        order = {"modules": 0, "profiles": 1, "templates": 2, "stacks": 3, "groups": 4,
+                 "users": 5}
         return sorted(items, key=lambda item: (order[item[0]], item[1]))
 
     def _sync_to(self, node_name, items, timeout=DEFAULT_TIMEOUT):
@@ -1619,6 +1688,8 @@ class ClusterService:
                     client.save_group(name, body)
                 elif kind == "users":
                     client.adopt_user(name, body)
+                elif kind == "stacks":
+                    client.save_stack(name, body)
                 else:
                     client.upload_module(name, body["content"], overwrite=True)
             except NodeError as exc:
@@ -1671,6 +1742,8 @@ class ClusterService:
                 client.delete_profile(name)
             elif kind == "groups":
                 client.delete_group(name)
+            elif kind == "stacks":
+                client.delete_stack(name)
             else:
                 client.delete_module(name)
         except NodeError as exc:
@@ -1684,6 +1757,349 @@ class ClusterService:
             return {"node": node_name, "kind": kind, "name": name, "ok": False,
                     "error": exc.message}
         return {"node": node_name, "kind": kind, "name": name, "ok": True, "error": None}
+
+    # -- reconciling a node that has been away -----------------------------
+    #
+    # Propagation is a push at the moment of the save, so a node that is
+    # switched off misses every one made while it was away -- and, being
+    # push-only, has no way to find out. Reconciling is that missing half: the
+    # node asks each member for a digest of everything shared, and the two
+    # ledgers settle which way each difference goes.
+    #
+    # Digests rather than whole records because the comparison is the cheap
+    # part and should stay that way: an hourly pass over a few dozen artifacts
+    # on every member must not turn a cluster into a load generator, and only
+    # what actually differs is then fetched. The digest is taken over the very
+    # body `_sync_payload()` would push, so "this differs" and "this is what
+    # would be sent" can never disagree.
+    #
+    # What it deliberately does not do is resolve a genuine conflict. Two nodes
+    # holding different copies of one template is not something the data can
+    # settle -- there is no shared clock and the records carry no version -- so
+    # a difference on both sides is reported and left for a person to push
+    # whichever copy is right. A copy that is merely out of date is not an
+    # emergency; being unable to see that it is would be.
+
+    def manifest(self, kinds=None):
+        """A digest per shared artifact, with this node's change ledger.
+
+        What a peer compares itself against. The ledger rides along because a
+        digest alone cannot say whether an artifact one side lacks was never
+        received or was deliberately deleted.
+        """
+        kinds = tuple(k for k in (kinds or RECONCILE_KINDS) if k in RECONCILE_KINDS)
+        digests = {kind: {} for kind in kinds}
+        for kind, name, body in self._sync_payload(kinds, None):
+            # _sync_payload drags a stack's templates and a template's modules
+            # in whether or not they were asked for; a manifest reports only
+            # what it was asked about.
+            if kind in digests:
+                digests[kind][name] = _digest(body)
+        changes = store.load_changes()
+        return {"node": self.local_name(), "kinds": digests,
+                "changes": {kind: changes.get(kind, {}) for kind in kinds}}
+
+    def artifacts(self, wanted):
+        """The bodies behind named manifest entries, for a peer pulling them."""
+        asked = {(str(item.get("kind")), str(item.get("name")))
+                 for item in (wanted or []) if isinstance(item, dict)}
+        asked = {(kind, name) for kind, name in asked if kind in RECONCILE_KINDS}
+        if not asked:
+            return {"items": []}
+        kinds = tuple({kind for kind, _ in asked})
+        names = sorted({name for _, name in asked})
+        return {"items": [{"kind": kind, "name": name, "body": body}
+                          for kind, name, body in self._sync_payload(kinds, names)
+                          if (kind, name) in asked]}
+
+    def reconcile(self, apply=True, nodes=None, groups=None):
+        """Settle this node's shared artifacts against every member's.
+
+        Run when `serve` starts, hourly after that, and on demand. The order is
+        local first, then outward: what this node is missing (or should have
+        dropped) is put right here, and only then is the corrected local state
+        pushed to the members that are behind. Doing it the other way round
+        would have a node that has been off for a week push its stale copies
+        over everyone else's before discovering they were stale.
+
+        One pass at a time, whoever asked for it. The hourly thread and a
+        person pressing Reconcile otherwise each act on a manifest the other
+        is busy invalidating, and push corrections for drift the other has
+        already settled. Waiting rather than refusing, because somebody who
+        asked for a pass asked because they had just changed something. This
+        is per process: a `lemondx cluster reconcile` run beside a `serve` is
+        two processes and only `store`'s atomic writes stand between them.
+        """
+        if not self.in_cluster():
+            raise ClusterError("This node is not in a cluster.", 409)
+        with self._reconcile_lock:
+            return self._reconcile_pass(apply, nodes, groups)
+
+    def _reconcile_pass(self, apply, nodes, groups):
+        # Every member unless told otherwise: reconciling against some of the
+        # cluster would settle this node against a subset and leave it as far
+        # from the rest as it started.
+        chosen = self.resolve_targets(nodes, groups) if (nodes or groups) else self.all_nodes()
+        targets = [n for n in chosen if n != self.local_name()]
+        if not targets:
+            return self._record_drift({
+                "ok": True, "node": self.local_name(), "applied": bool(apply),
+                "nodes": [], "unreachable": [], "actions": [], "conflicts": [],
+                "checked": int(time.time())})
+
+        def fetch(node_name):
+            try:
+                return {"node": node_name, "ok": True, "error": None,
+                        "manifest": self.client(node_name).manifest()}
+            except (ClusterError, NodeError) as exc:
+                return {"node": node_name, "ok": False, "error": exc.message,
+                        "manifest": None}
+
+        fetched = self._fanout(targets, fetch)
+        peers = {row["node"]: _clean_manifest(row["manifest"])
+                 for row in fetched if row["ok"]}
+        unreachable = [{"node": row["node"], "error": row["error"]}
+                       for row in fetched if not row["ok"]]
+
+        actions = self._inward(peers, apply)
+        # Read again: what goes out, and what counts as a conflict, is judged on
+        # the state _inward() has just put right, not the one it started from.
+        settled = self.manifest()
+        actions.extend(self._outward(settled, peers, apply))
+        conflicts = self._conflicts(settled, peers)
+        failed = [a for a in actions if a["applied"] and not a["ok"]]
+        report = {
+            "ok": not failed and not unreachable and not conflicts,
+            "node": self.local_name(),
+            "applied": bool(apply), "nodes": sorted(peers),
+            "unreachable": unreachable, "actions": actions, "conflicts": conflicts,
+            "checked": int(time.time()),
+        }
+        if apply and (actions or conflicts):
+            _log("reconciled with %s: %d change(s), %d conflict(s)"
+                 % (", ".join(sorted(peers)) or "nobody", len(actions), len(conflicts)))
+        return self._record_drift(report)
+
+    def _inward(self, peers, apply):
+        """Adopt what this node missed, drop what it should have: local changes only."""
+        local = self.manifest()
+        actions = []
+        for kind in RECONCILE_KINDS:
+            mine, my_changes = local["kinds"][kind], local["changes"][kind]
+            for name in sorted(_names(peers, kind) - set(mine)):
+                # Somebody has it and this node does not. Either a push that
+                # arrived while this node was off, or something this node
+                # deleted while *they* were off -- the ledgers say which.
+                deleted_here = my_changes.get(name, {})
+                holders = [node for node, m in peers.items() if name in m["kinds"][kind]]
+                if deleted_here.get("deleted") and all(
+                        deleted_here["at"] >= _changed_at(peers[node], kind, name)
+                        for node in holders):
+                    continue          # our deletion is the newer word; _outward pushes it
+                actions.append(self._apply_local(
+                    kind, name, "pull", apply,
+                    source=self._newest_copy(peers, kind, name, holders)))
+            for name in sorted(set(mine)):
+                # We hold it; a member may have deleted it while we were off.
+                buried = [(node, _changed_at(peers[node], kind, name)) for node in peers
+                          if peers[node]["changes"][kind].get(name, {}).get("deleted")
+                          and name not in peers[node]["kinds"][kind]]
+                newest = max((at for _, at in buried), default=0)
+                if newest and newest > my_changes.get(name, {}).get("at", 0):
+                    actions.append(self._apply_local(
+                        kind, name, "delete", apply,
+                        source=next(node for node, at in buried if at == newest)))
+        return actions
+
+    def _outward(self, local, peers, apply):
+        """Push this node's now-current state to the members that are behind."""
+        actions = []
+        for node, peer in sorted(peers.items()):
+            push, drop = [], []
+            for kind in RECONCILE_KINDS:
+                mine, my_changes = local["kinds"][kind], local["changes"][kind]
+                theirs = peer["kinds"][kind]
+                for name in sorted(set(mine) - set(theirs)):
+                    # Their deletion beats our copy only if it is the newer
+                    # word; otherwise ours is a save they never received.
+                    their_delete = peer["changes"][kind].get(name, {})
+                    if their_delete.get("deleted") and \
+                            their_delete["at"] > my_changes.get(name, {}).get("at", 0):
+                        continue      # _inward already dropped it here
+                    push.append((kind, name))
+                for name in sorted(set(theirs) - set(mine)):
+                    mine_deleted = my_changes.get(name, {})
+                    if mine_deleted.get("deleted") and \
+                            mine_deleted["at"] >= _changed_at(peer, kind, name):
+                        drop.append((kind, name))
+            actions.extend(self._push(node, push, apply))
+            actions.extend(self._drop(node, drop, apply))
+        return actions
+
+    def _conflicts(self, local, peers):
+        """Artifacts two nodes both hold and disagree about. Reported, never resolved."""
+        found = []
+        for kind in RECONCILE_KINDS:
+            mine = local["kinds"][kind]
+            for name in sorted(mine):
+                differing = sorted(node for node, peer in peers.items()
+                                   if peer["kinds"][kind].get(name) not in (None, mine[name]))
+                if differing:
+                    found.append({"kind": kind, "name": name, "nodes": differing})
+        return found
+
+    def _newest_copy(self, peers, kind, name, holders):
+        """Which member to take an artifact from, when more than one has it.
+
+        The one that saved it most recently. They may disagree about its
+        contents -- ``_conflicts()`` reports that separately -- but a node with
+        nothing at all is better off holding the freshest copy than the
+        alphabetically first one.
+        """
+        return max(holders, key=lambda node: (_changed_at(peers[node], kind, name), node))
+
+    def _apply_local(self, kind, name, action, apply, source=None):
+        row = {"node": self.local_name(), "from": source, "kind": kind, "name": name,
+               "action": action, "applied": bool(apply), "ok": True, "error": None}
+        if not apply:
+            return row
+        try:
+            if action == "pull":
+                self._adopt(kind, name, self._fetch_artifact(source, kind, name))
+            else:
+                self._remove_local(kind, name)
+        except (ClusterError, NodeError, ServiceError, LXDError) as exc:
+            row["ok"], row["error"] = False, getattr(exc, "message", str(exc))
+        return row
+
+    def _fetch_artifact(self, node_name, kind, name):
+        answer = self.client(node_name).artifacts([{"kind": kind, "name": name}]) or {}
+        for item in answer.get("items") or []:
+            if item.get("kind") == kind and item.get("name") == name:
+                return item.get("body")
+        raise ClusterError("%s no longer has %s '%s'." % (node_name, kind, name), 404)
+
+    def _adopt(self, kind, name, body):
+        """Save an artifact taken from a member, without pushing it back out."""
+        body = body if isinstance(body, dict) else {}
+        if kind == "templates":
+            self.service.save_template(
+                name=name, image=body.get("image"),
+                instance_type=body.get("type", "container"),
+                cpu=body.get("cpu"), memory=body.get("memory"), disk=body.get("disk"),
+                pool=body.get("pool"), network=body.get("network"),
+                profiles=body.get("profiles"),
+                ephemeral=bool(body.get("ephemeral", False)),
+                start=bool(body.get("start", True)),
+                secureboot=bool(body.get("secureboot", True)),
+                bootstrap=body.get("bootstrap"),
+                description=body.get("description", ""),
+                name_prefix=body.get("name_prefix"), app_check=body.get("app_check"))
+        elif kind == "profiles":
+            self.service.save_bootstrap_profile(
+                name=name, modules=body.get("modules") or [], params=body.get("params"),
+                description=body.get("description", ""), ssh_keys=body.get("ssh_keys"))
+        elif kind == "groups":
+            # Through save_group, so `large` and `small` keep the one route that
+            # may write them -- a member's sizing is exactly what managed= is for.
+            self.save_group(name, members=body.get("members"),
+                            description=body.get("description", ""), propagate=False,
+                            managed=name in SIZE_GROUPS)
+        elif kind == "stacks":
+            self._stack_service().save_stack(name, stages=body.get("stages"),
+                                             description=body.get("description", ""),
+                                             propagate=False)
+        else:
+            self.service.upload_module(name, body.get("content"), overwrite=True)
+
+    def _remove_local(self, kind, name):
+        if kind == "templates":
+            self.service.delete_template(name)
+        elif kind == "profiles":
+            self.service.delete_bootstrap_profile(name)
+        elif kind == "groups":
+            self.delete_group(name, everywhere=False, managed=name in SIZE_GROUPS)
+        elif kind == "stacks":
+            self._stack_service().delete_stack(name, everywhere=False)
+        else:
+            self.service.remove_module(name)
+
+    def _stack_service(self):
+        """The StackService, for saving a stack to the rules a person's save meets.
+
+        Imported here rather than at the top: stacks.py sits above this module
+        and imports from it, so the dependency can only go this way at runtime.
+        """
+        if self._stacks is None:
+            from .stacks import StackService
+            self._stacks = StackService(self)
+        return self._stacks
+
+    def _push(self, node_name, items, apply):
+        rows = [{"node": node_name, "from": self.local_name(), "kind": kind,
+                 "name": name, "action": "push", "applied": bool(apply),
+                 "ok": True, "error": None} for kind, name in items]
+        if not items or not apply:
+            return rows
+        payload = self._sync_payload(tuple({k for k, _ in items}),
+                                     sorted({n for _, n in items}))
+        wanted = set(items)
+        outcome = {(r["kind"], r["name"]): r for r in self._sync_to(
+            node_name, [i for i in payload if (i[0], i[1]) in wanted])}
+        for row in rows:
+            result = outcome.get((row["kind"], row["name"]))
+            if result and not result["ok"]:
+                row["ok"], row["error"] = False, result["error"]
+        return rows
+
+    def _drop(self, node_name, items, apply):
+        rows = []
+        for kind, name in items:
+            row = {"node": node_name, "from": self.local_name(), "kind": kind,
+                   "name": name, "action": "delete", "applied": bool(apply),
+                   "ok": True, "error": None}
+            if apply:
+                result = self._delete_on(node_name, kind, name)
+                row["ok"], row["error"] = result["ok"], result["error"]
+            rows.append(row)
+        return rows
+
+    def _record_drift(self, report):
+        with self._lock:
+            self._drift = report
+        return report
+
+    def drift(self):
+        """The last reconciliation's report, without setting another going."""
+        with self._lock:
+            return self._drift
+
+    def start_reconciler(self, interval=RECONCILE_INTERVAL, delay=RECONCILE_DELAY):
+        """A daemon thread that reconciles shortly after startup and then hourly.
+
+        Startup is the point of it: a node that has been off is out of date the
+        moment it returns, and nothing else would tell it. The repeat is for the
+        pushes that failed while everyone was up -- best-effort propagation
+        means a member that was merely busy stays behind for ever otherwise.
+        """
+        def loop():
+            while True:
+                time.sleep(delay if self._drift is None else interval)
+                if not self.in_cluster():
+                    continue
+                try:
+                    # Waits its turn behind a manual pass rather than skipping
+                    # this hour: a chore thread has nothing to lose by waiting,
+                    # and the pass it skipped would be an hour late.
+                    self.reconcile()
+                except (ClusterError, NodeError, ServiceError, LXDError) as exc:
+                    _log("reconciliation failed: %s" % getattr(exc, "message", exc))
+                except Exception as exc:              # noqa: BLE001 - a chore thread
+                    _log("reconciliation failed: %s" % exc)
+
+        thread = threading.Thread(target=loop, name="lemondx-reconcile", daemon=True)
+        thread.start()
+        return thread
 
     def save_template(self, propagate=True, **kwargs):
         record = self.service.save_template(**kwargs)
@@ -1721,7 +2137,7 @@ class ClusterService:
     # -- launching across nodes --------------------------------------------
 
     def launch_template(self, name, count=1, nodes=None, groups=None, params=None,
-                        prefix=None, background=False, sync=True, names=None):
+                        prefix=None, background=False, sync=True, names=None, stack=None):
         """Launch a template's instances spread over several nodes.
 
         The run is recorded on this node's template exactly as a local launch
@@ -1743,7 +2159,7 @@ class ClusterService:
             # never been joined to anything makes.
             return self.service.launch_template(name, count=count, prefix=prefix,
                                                 params=params, names=names,
-                                                background=background)
+                                                background=background, stack=stack)
         if names is not None:
             raise ClusterError(
                 "Instance names cannot be chosen for a launch spread over several "
@@ -1753,6 +2169,7 @@ class ClusterService:
         template, bootstrap, _, total, chosen_prefix, local_notes = \
             self.service.prepare_launch(name, count=count, prefix=prefix, params=params,
                                         place=local_name in targets)
+        stack = self.service.stack_tag(stack)
 
         shares = self._share_names(chosen_prefix, total, targets)
         # The template as saved, not as placed for this host: what goes to a
@@ -1764,7 +2181,8 @@ class ClusterService:
             plans = [(node, shares[node]) for node in targets if shares[node]]
             collected, notes = [], []
             for outcome in self._fanout(plans, lambda plan: self._launch_on(
-                    plan[0], raw, template, local_notes, bootstrap, plan[1], params, sync)):
+                    plan[0], raw, template, local_notes, bootstrap, plan[1], params, sync,
+                    stack)):
                 collected.extend(outcome[0])
                 notes.extend(outcome[1])
             return collected, notes
@@ -1819,7 +2237,7 @@ class ClusterService:
             return set()
 
     def _launch_on(self, node_name, template, placed, placed_notes, bootstrap, names,
-                   params, sync):
+                   params, sync, stack=None):
         """One node's share. Returns ``(instances, notes)``; never raises.
 
         ``placed`` is the template already adjusted to this host, from the
@@ -1827,7 +2245,7 @@ class ClusterService:
         placed a second time, which would repeat every note.
         """
         if node_name == self.local_name():
-            instances = self.service.launch_instances(placed, bootstrap, names)
+            instances = self.service.launch_instances(placed, bootstrap, names, stack)
             return ([dict(i, node=node_name) for i in instances],
                     ["%s: %s" % (node_name, n) for n in placed_notes])
         try:
@@ -1840,7 +2258,8 @@ class ClusterService:
                     raise NodeError(
                         "could not copy the template there first: %s"
                         % "; ".join(f["error"] or "failed" for f in failures), 502)
-            started = client.launch(template["name"], names, params=params, background=True)
+            started = client.launch(template["name"], names, params=params, background=True,
+                                    stack=stack)
             run = self._await_run(client, template["name"], started)
         except (ClusterError, NodeError) as exc:
             _log("launch on %s failed: %s" % (node_name, exc.message))
@@ -2115,6 +2534,54 @@ class ClusterService:
                 monitored.append(node_name)
         return {"nodes": targets, "instances": instances, "health": health,
                 "monitored": monitored, "errors": errors}
+
+
+def _digest(body):
+    """The fingerprint of one artifact, taken over the body that would be pushed.
+
+    Separators and sorted keys so two nodes that hold the same record agree on
+    the bytes; ensure_ascii off so a description in any language hashes the
+    same either side.
+    """
+    encoded = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _clean_manifest(raw):
+    """A peer's manifest, held to the shape ours has. It is untrusted input."""
+    raw = raw if isinstance(raw, dict) else {}
+    kinds, changes = {}, {}
+    source_kinds = raw.get("kinds") if isinstance(raw.get("kinds"), dict) else {}
+    source_changes = raw.get("changes") if isinstance(raw.get("changes"), dict) else {}
+    for kind in RECONCILE_KINDS:
+        entries = source_kinds.get(kind)
+        kinds[kind] = {str(name): str(digest)
+                       for name, digest in (entries or {}).items()
+                       if isinstance(name, str) and isinstance(digest, str)} \
+            if isinstance(entries, dict) else {}
+        ledger = source_changes.get(kind)
+        changes[kind] = {
+            str(name): {"at": max(0, int(entry.get("at") or 0)),
+                        "deleted": entry.get("deleted") is True}
+            for name, entry in (ledger or {}).items()
+            if isinstance(name, str) and isinstance(entry, dict)
+            and isinstance(entry.get("at"), int)
+        } if isinstance(ledger, dict) else {}
+    return {"node": str(raw.get("node") or ""), "kinds": kinds, "changes": changes}
+
+
+def _names(peers, kind):
+    """Every artifact name of one kind held anywhere in the cluster."""
+    found = set()
+    for peer in peers.values():
+        found |= set(peer["kinds"][kind])
+    return found
+
+
+def _changed_at(peer, kind, name):
+    """When a member last touched one artifact, or 0 if it has never said."""
+    return peer["changes"][kind].get(name, {}).get("at", 0)
 
 
 def _template_body(template):

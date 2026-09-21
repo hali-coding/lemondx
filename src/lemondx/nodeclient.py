@@ -275,6 +275,12 @@ class NodeClient:
     def delete_template(self, name):
         return self.request("DELETE", "/api/templates/%s" % _seg(name))
 
+    def save_stack(self, name, body):
+        return self.request("PUT", "/api/stacks/%s" % _seg(name), body)
+
+    def delete_stack(self, name):
+        return self.request("DELETE", "/api/stacks/%s" % _seg(name))
+
     def delete_profile(self, name):
         return self.request("DELETE", "/api/bootstrap-profiles/%s" % _seg(name))
 
@@ -287,10 +293,11 @@ class NodeClient:
     def profiles(self):
         return self.request("GET", "/api/bootstrap-profiles")
 
-    def launch(self, template, names, params=None, background=True):
-        return self.request("POST", "/api/templates/%s/launch" % _seg(template),
-                            {"names": names, "params": params or {},
-                             "background": background},
+    def launch(self, template, names, params=None, background=True, stack=None):
+        body = {"names": names, "params": params or {}, "background": background}
+        if stack:
+            body["stack"] = stack
+        return self.request("POST", "/api/templates/%s/launch" % _seg(template), body,
                             timeout=LONG_TIMEOUT)
 
     def template_runs(self):
@@ -335,6 +342,15 @@ class NodeClient:
 
     def members(self):
         return self.request("GET", "/api/cluster/members")
+
+    def manifest(self):
+        """A digest per shared artifact, for working out what differs here."""
+        return self.request("GET", "/api/cluster/manifest")
+
+    def artifacts(self, wanted):
+        """The bodies behind manifest entries this node wants a copy of."""
+        return self.request("POST", "/api/cluster/artifacts", {"items": wanted},
+                            timeout=LONG_TIMEOUT)
 
     def forget_member(self, name):
         return self.request("DELETE", "/api/cluster/members/%s" % _seg(name))

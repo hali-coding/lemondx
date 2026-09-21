@@ -21,6 +21,7 @@ from .lxd import LXDError
 from .nodeclient import NodeError
 from .service import ContainerService, LOCAL_STORAGE_DRIVERS, ServiceError
 from .server import DEFAULT_HOST, DEFAULT_PORT, serve
+from .stacks import StackService
 
 # ANSI colours, disabled when stdout is not a terminal or NO_COLOR is set.
 _COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
@@ -1034,6 +1035,224 @@ def cmd_launch(args, service):
     return 0 if result["ok"] else 1
 
 
+# -- stacks ----------------------------------------------------------------
+
+
+def stack_service(service):
+    return StackService(cluster_service(service))
+
+
+def describe_step(step):
+    if step["type"] == "sleep":
+        return "sleep %ds" % step["seconds"]
+    if step["type"] == "wait_healthy":
+        return "wait healthy (%ds)" % step["timeout_seconds"]
+    where = ", ".join(step["nodes"] + ["group " + g for g in step["groups"]])
+    return "%s: %s x%d%s%s" % (step["id"], step["template"], step["count"],
+                               "" if step["wait_bootstrap"] else " (no wait)",
+                               " on " + where if where else "")
+
+
+def describe_stack(stack):
+    return " → ".join(" | ".join(describe_step(s) for s in stage["steps"])
+                      for stage in stack["stages"])
+
+
+def cmd_stacks(args, service):
+    stacks = stack_service(service)
+    items = stacks.list_stacks()
+    running = stacks.stack_instances()
+    for item in items:
+        item["instances"] = running["stacks"].get(item["name"], [])
+    for problem in running["errors"]:
+        print(YELLOW("! %s did not answer; its instances are not counted: %s"
+                     % (problem["node"], problem["error"])), file=sys.stderr)
+    emit(args, items, lambda rows: table(
+        [[s["name"], describe_stack(s) or "-",
+          "%d (%d running)" % (len(s["instances"]), sum(
+              1 for i in s["instances"] if i["status"] == "Running"))
+          if s["instances"] else "-", s["description"] or "-"] for s in rows],
+        ["name", "stages", "instances", "description"]))
+    return 0
+
+
+def stack_members(stacks, name):
+    members = stacks.stack_instances()
+    if members["errors"]:
+        raise ServiceError("Cannot list the stack's instances: %s" % "; ".join(
+            "%s: %s" % (e["node"], e["error"]) for e in members["errors"]))
+    return members["stacks"].get(name, [])
+
+
+def describe_members(members):
+    nodes = {m["node"] for m in members}
+    return ", ".join(m["name"] if len(nodes) == 1 else "%s on %s" % (m["name"], m["node"])
+                     for m in members)
+
+
+def cmd_stack_state(args, service):
+    stacks = stack_service(service)
+    name = stacks.get_stack(args.name)["name"]
+    members = stack_members(stacks, name)
+    if not members:
+        raise ServiceError("Stack '%s' has no instances." % name)
+    result = stacks.stack_state(name, args.action, members)
+    emit(args, result, lambda r: "\n".join(
+        "%s %s%s" % (GREEN("+") if i["ok"] else RED("!"), BOLD(i["name"]),
+                     "" if i["ok"] else ": " + (i.get("error") or "failed"))
+        for i in r["instances"]))
+    return 0 if result["ok"] else 1
+
+
+def cmd_stack_destroy(args, service):
+    stacks = stack_service(service)
+    name = stacks.get_stack(args.name)["name"]
+    members = stack_members(stacks, name)
+    if not members:
+        raise ServiceError("Stack '%s' has no instances." % name)
+    if not args.json:
+        print("Instances of %s: %s" % (BOLD(name), describe_members(members)))
+    if not confirm("Destroy all %d? Their filesystems and snapshots are deleted."
+                   % len(members), args.yes):
+        print(DIM("nothing destroyed"))
+        return 1
+    run = stacks.destroy_stack(name, members)
+    emit(args, run, render_stack_run)
+    return 0 if run["ok"] else 1
+
+
+def cmd_stack_show(args, service):
+    stack = stack_service(service).get_stack(args.name)
+    # The definition is the useful output either way: it is what stack-save
+    # takes back, so show, edit and save is the round trip.
+    print(json.dumps({"description": stack["description"], "stages": stack["stages"]},
+                     indent=2))
+    return 0
+
+
+def cmd_stack_save(args, service):
+    try:
+        if args.file == "-":
+            raw = json.load(sys.stdin)
+        else:
+            with open(args.file, encoding="utf-8") as handle:
+                raw = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise ServiceError("Cannot read the stack definition: %s" % exc)
+    if isinstance(raw, list):
+        raw = {"stages": raw}
+    if not isinstance(raw, dict):
+        raise ServiceError("A stack definition is an object with 'stages', or a list of them.")
+    description = args.description if args.description is not None \
+        else raw.get("description", "")
+    stack = stack_service(service).save_stack(args.name, stages=raw.get("stages"),
+                                              description=description)
+    emit(args, stack, lambda s: "%s saved stack %s: %s%s" % (
+        GREEN("+"), BOLD(s["name"]), describe_stack(s), sync_note(s)))
+    return 0
+
+
+def cmd_stack_delete(args, service):
+    result = stack_service(service).delete_stack(args.name, everywhere=not args.local_only)
+    emit(args, result, lambda r: "%s deleted stack %s%s" % (
+        GREEN("+"), r["deleted"], sync_note(r)))
+    return 0
+
+
+STEP_MARK = {"done": GREEN("+"), "failed": RED("!"), "ready": CYAN("~"),
+             "skipped": DIM("-"), "cancelled": DIM("-")}
+
+
+def render_step(record):
+    what = record["id"]
+    if record["type"] == "launch":
+        what += " (%s x%d)" % (record["template"], record["count"])
+    elif record["type"] == "sleep":
+        what += " (sleep)"
+    elif record["type"] == "destroy":
+        what = "destroy %d existing" % record["count"]
+    else:
+        what += " (wait healthy)"
+    line = "%s %s %s" % (STEP_MARK.get(record["state"], DIM("·")), BOLD(what),
+                         DIM(record["state"]))
+    outputs = record.get("outputs")
+    if outputs and outputs["names"]:
+        line += ": " + ", ".join(
+            "%s%s" % (name, " " + DIM(ip) if ip else "")
+            for name, ip in zip(outputs["names"],
+                                outputs["ips"] + [""] * len(outputs["names"])))
+    if record["error"]:
+        line += "\n    " + RED(record["error"])
+    elif record["detail"] and record["state"] not in ("done", "ready"):
+        line += DIM(" -- %s" % record["detail"])
+    return line
+
+
+def render_stack_run(run):
+    lines = []
+    for index, stage in enumerate(run["stages"], 1):
+        lines.append(DIM("stage %d" % index))
+        lines.extend("  " + render_step(step) for step in stage["steps"])
+    what = "stack %s%s" % (run["stack"], "" if run["action"] == "launch"
+                           else " " + run["action"])
+    lines.append(GREEN("%s finished" % what) if run["ok"]
+                 else RED("%s %s" % (what, "cancelled" if run["cancelled"] else "failed")))
+    return "\n".join(lines)
+
+
+def cmd_stack_launch(args, service):
+    stacks = stack_service(service)
+    stack = next((s for s in stacks.list_stacks() if s["name"] == args.name), None) \
+        or stacks.get_stack(args.name)
+    params = parse_params(args.param)
+    templates = {t["name"]: t for t in service.list_templates()}
+    modules = [m for stage in stack["stages"] for step in stage["steps"]
+               if step["type"] == "launch" and step["template"] in templates
+               for m in templates[step["template"]]["bootstrap"]["modules"]]
+    fill_secrets(modules, params, service)
+    # Values the stack's own steps ask for with {{params.NAME}}: likely a
+    # password, so never echoed, and never needed on the command line.
+    for input_name in [n for n in stack["inputs"] if not params.get(n)]:
+        if os.environ.get(input_name):
+            params[input_name] = os.environ[input_name]
+        elif sys.stdin.isatty():
+            value = getpass.getpass("%s: " % input_name)
+            if value:
+                params[input_name] = value
+    replace = None
+    if args.relaunch:
+        replace = stack_members(stacks, stack["name"])
+        if replace and not args.json:
+            print("Instances of %s: %s" % (BOLD(stack["name"]), describe_members(replace)))
+        if replace and not confirm("Destroy all %d and launch the stack again?"
+                                   % len(replace), args.yes):
+            print(DIM("nothing changed"))
+            return 1
+    run = stacks.launch_stack(stack["name"], params=params, background=True,
+                              replace=replace)
+    seen = {}
+    try:
+        while run["finished_at"] is None:
+            if not args.json:
+                # Each step once per state it reaches, as it reaches it.
+                for stage in run["stages"]:
+                    for step in stage["steps"]:
+                        if step["state"] != "pending" and seen.get(step["id"]) != step["state"]:
+                            seen[step["id"]] = step["state"]
+                            print(render_step(step), flush=True)
+            time.sleep(1)
+            run = next(r for r in stacks.stack_runs() if r["stack"] == stack["name"])
+    except KeyboardInterrupt:
+        print(YELLOW("cancelling: nothing new starts; launches under way finish "
+                     "(Ctrl-C again to leave them)"), file=sys.stderr)
+        stacks.cancel_stack_run(stack["name"])
+        while run["finished_at"] is None:
+            time.sleep(1)
+            run = next(r for r in stacks.stack_runs() if r["stack"] == stack["name"])
+    emit(args, run, render_stack_run)
+    return 0 if run["ok"] else 1
+
+
 def fill_secrets(modules, params, service):
     """Supply secret parameters without putting them on the command line.
 
@@ -1504,6 +1723,41 @@ def cmd_cluster_refresh(args, service):
                                "" if row["ok"] else row["error"] or "unreachable")
                  for row in r["results"]]
         lines.append(DIM("%d member(s) known here" % len(r["members"])))
+        return "\n".join(lines)
+
+    emit(args, result, render)
+    return 0 if result["ok"] else 1
+
+
+def cmd_cluster_reconcile(args, service):
+    """Settle this node's shared definitions against the rest of the cluster."""
+    result = cluster_service(service).reconcile(apply=not args.dry_run)
+
+    def render(r):
+        lines = []
+        for row in r["unreachable"]:
+            lines.append("%s %s %s" % (RED("!"), BOLD(row["node"]), row["error"]))
+        for row in r["actions"]:
+            verb = {"pull": "pull", "push": "push", "delete": "delete"}[row["action"]]
+            where = "from %s" % row["from"] if row["action"] == "pull" else \
+                "on %s" % row["node"] if row["node"] != r.get("node") else "here"
+            mark = DIM("~") if not row["applied"] else \
+                GREEN("+") if row["ok"] else RED("!")
+            lines.append("%s %s %s %s%s" % (
+                mark, verb, BOLD("%s/%s" % (row["kind"], row["name"])), where,
+                "" if row["ok"] else DIM(" -- %s" % row["error"])))
+        for row in r["conflicts"]:
+            lines.append("%s %s differs on %s -- push the copy that is right with "
+                         "`lemondx cluster sync`"
+                         % (YELLOW("?"), BOLD("%s/%s" % (row["kind"], row["name"])),
+                            ", ".join(row["nodes"])))
+        if not lines:
+            return GREEN("+") + " every member holds the same definitions"
+        lines.append(DIM("%d change(s), %d conflict(s), against %s"
+                         % (len(r["actions"]), len(r["conflicts"]),
+                            ", ".join(r["nodes"]) or "nobody")))
+        if not r["applied"]:
+            lines.append(DIM("nothing was changed (--dry-run)"))
         return "\n".join(lines)
 
     emit(args, result, render)
@@ -2349,6 +2603,44 @@ def build_parser():
                    help="seconds allowed per instance (default: 300)")
     p.set_defaults(func=cmd_template_exec)
 
+    p = add("stacks", help="list saved stacks (templates launched in sequence)")
+    p.set_defaults(func=cmd_stacks)
+
+    p = add("stack-show", help="print a stack's definition as JSON, as stack-save takes it")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_stack_show)
+
+    p = add("stack-save", help="save a stack from a JSON definition")
+    p.add_argument("name")
+    p.add_argument("file", help="the definition (a file, or - for stdin); see docs/stacks.md")
+    p.add_argument("--description", help="what the stack is for (default: from the file)")
+    p.set_defaults(func=cmd_stack_save)
+
+    p = add("stack-delete", parents=[common, only_here], help="delete a stack")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_stack_delete)
+
+    p = add("stack-launch", help="run a stack, stage by stage, and wait for it")
+    p.add_argument("name")
+    p.add_argument("--param", action="append", metavar="KEY=VALUE",
+                   help="supply a secret, or a value every launch gets (repeatable)")
+    p.add_argument("--relaunch", action="store_true",
+                   help="destroy the stack's current instances first (asks unless -y)")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_stack_launch)
+
+    for action, text in (("start", "start every instance a stack launched"),
+                         ("stop", "stop every instance a stack launched"),
+                         ("restart", "restart every instance a stack launched")):
+        p = add("stack-%s" % action, help=text)
+        p.add_argument("name")
+        p.set_defaults(func=cmd_stack_state, action=action)
+
+    p = add("stack-destroy", help="stop and delete every instance a stack launched")
+    p.add_argument("name")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_stack_destroy)
+
     # -- cluster -----------------------------------------------------------
     cluster_p = add("cluster", help="federate with other lemondx nodes")
     cluster_sub = cluster_p.add_subparsers(dest="cluster_command", metavar="<command>")
@@ -2412,6 +2704,13 @@ def build_parser():
     p = cluster_sub.add_parser("refresh", parents=[common],
                                help="level the member list with every other node")
     p.set_defaults(func=cmd_cluster_refresh)
+
+    p = cluster_sub.add_parser("reconcile", parents=[common],
+                               help="settle this node's templates, modules, profiles, "
+                                    "stacks and groups against every member's")
+    p.add_argument("--dry-run", action="store_true",
+                   help="report what differs without changing anything")
+    p.set_defaults(func=cmd_cluster_reconcile)
 
     p = cluster_sub.add_parser("leave", parents=[common],
                                help="give up membership: every member is told to "

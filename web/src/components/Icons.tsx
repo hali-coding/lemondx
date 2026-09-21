@@ -159,3 +159,30 @@ export const ScalesIcon = ({ size = 15 }: Props) => (
     <path d="M19 8l2.5 5.5a3 3 0 0 1-5 0z" />
   </svg>
 )
+
+export const StackIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M12 3 3 7.5l9 4.5 9-4.5z" />
+    <path d="m3 12 9 4.5 9-4.5M3 16.5 12 21l9-4.5" />
+  </svg>
+)
+
+export const ClockIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <circle cx="12" cy="12" r="8.5" />
+    <path d="M12 7.5V12l3 2" />
+  </svg>
+)
+
+export const HeartIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M12 20s-7.5-4.6-7.5-10A4.3 4.3 0 0 1 12 7.3 4.3 4.3 0 0 1 19.5 10c0 5.4-7.5 10-7.5 10z" />
+    <path d="M7 12.5h2.5l1.2-2.2 2 4.2 1.3-2h3" />
+  </svg>
+)
+
+export const GripIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01" strokeWidth={3} />
+  </svg>
+)

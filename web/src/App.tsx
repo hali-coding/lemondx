@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError, api, hasToken, setToken } from './lib/api'
 import type {
   AuthInfo, CreateProgress, CreateRequest, HealthRecord, HealthStatus, InstanceRef,
-  ScopedContainer, StateAction, Status, TemplateRun,
+  ScopedContainer, StackRun, StateAction, Status, TemplateRun,
 } from './lib/types'
 import { keyOf } from './lib/instance'
 import { AuthContext } from './hooks/useAuth'
@@ -23,6 +23,7 @@ import { NodesView } from './components/NodesView'
 import { ResourcesView } from './components/ResourcesView'
 import { ScopePicker } from './components/ScopePicker'
 import { SetupBanner } from './components/SetupBanner'
+import { StacksView } from './components/StacksView'
 import { StorageView } from './components/StorageView'
 import { LoginGate } from './components/LoginGate'
 import { TemplatesView } from './components/TemplatesView'
@@ -30,7 +31,7 @@ import { Toasts } from './components/Toasts'
 
 const POLL_INTERVAL = 3000
 
-const VIEWS = ['containers', 'templates', 'nodes', 'resources', 'storage', 'network', 'modules', 'access'] as const
+const VIEWS = ['containers', 'templates', 'stacks', 'nodes', 'resources', 'storage', 'network', 'modules', 'access'] as const
 
 const STATE_VERB: Record<StateAction, string> = {
   start: 'Started', stop: 'Stopped', restart: 'Restarted',
@@ -52,6 +53,7 @@ export default function App() {
   const [scopeErrors, setScopeErrors] = useState<{ node: string; error: string }[]>([])
   const [creates, setCreates] = useState<CreateProgress[]>([])
   const [templateRuns, setTemplateRuns] = useState<TemplateRun[]>([])
+  const [stackRuns, setStackRuns] = useState<StackRun[]>([])
   const [health, setHealth] = useState<Record<string, HealthRecord>>({})
   // Nodes that check health at all, keyed as rows are ('' for this host
   // alone), so a running instance not yet checked there shows as pending.
@@ -90,6 +92,7 @@ export default function App() {
   // poll finding one finished reports it, exactly once.
   const watchedCreates = useRef(new Set<string>())
   const watchedRuns = useRef(new Set<string>())
+  const watchedStacks = useRef(new Set<string>())
   // The health status each instance had at this page's previous poll, so a
   // change is reported once, by the page that saw it happen -- and a page
   // opened on an instance that is already unhealthy says nothing.
@@ -157,6 +160,32 @@ export default function App() {
     }
   }, [notify])
 
+  const reportStacks = useCallback((runs: StackRun[]) => {
+    for (const run of runs) {
+      const key = `${run.stack}@${run.started_at}`
+      if (run.finished_at === null) {
+        watchedStacks.current.add(key)
+        continue
+      }
+      if (!watchedStacks.current.delete(key)) continue
+      const steps = run.stages.flatMap((s) => s.steps)
+      const made = steps.filter((s) => s.type === 'launch')
+        .reduce((sum, s) => sum + (s.instances?.filter((i) => i.ok).length ?? 0), 0)
+      if (run.ok && run.action === 'destroy') {
+        notify('success', `Destroyed stack “${run.stack}”`,
+          `${steps[0]?.count ?? 0} instance(s) removed.`)
+      } else if (run.ok) {
+        notify('success', `Stack “${run.stack}” is ${run.action === 'relaunch' ? 'up again' : 'up'}`,
+          `${made} instance(s) launched.`)
+      } else if (run.cancelled) {
+        notify('info', `Stack “${run.stack}” was cancelled`,
+          made ? `${made} instance(s) launched before it stopped are kept.` : undefined)
+      } else {
+        notify('error', `Stack “${run.stack}” failed`, run.error ?? undefined)
+      }
+    }
+  }, [notify])
+
   const reportHealth = useCallback((records: HealthRecord[]) => {
     const previous = seenHealth.current
     const next = new Map(records.map((r) => [keyOf(r), r.status] as [string, HealthStatus]))
@@ -179,7 +208,7 @@ export default function App() {
     const sequence = ++refreshSequence.current
     const epoch = authEpoch.current
     try {
-      const [nextStatus, nextContainers, nextCreates, nextRuns, nextHealth] = await Promise.all([
+      const [nextStatus, nextContainers, nextCreates, nextRuns, nextHealth, nextStacks] = await Promise.all([
         api.status(signal),
         // One fetch drives both the Containers and Templates tabs, so they can
         // never disagree about which hosts are in view.
@@ -195,6 +224,7 @@ export default function App() {
         // checks themselves run on the server's own interval. A wider scope
         // brings every node's own records along with its instances instead.
         scope.kind === 'local' ? api.health(signal).catch(() => null) : Promise.resolve(null),
+        api.stackRuns(signal).catch(() => null),
       ])
       if (sequence !== refreshSequence.current) return
       setStatus(nextStatus)
@@ -207,6 +237,10 @@ export default function App() {
       if (nextRuns) {
         setTemplateRuns(nextRuns)
         reportRuns(nextRuns)
+      }
+      if (nextStacks) {
+        setStackRuns(nextStacks)
+        reportStacks(nextStacks)
       }
       // Keyed as the rows are (keyOf), so a web-1 on two nodes keeps two dots.
       const records = nextContainers.health ?? nextHealth?.instances
@@ -237,7 +271,7 @@ export default function App() {
       }
       setConnectionError((cause as Error).message)
     }
-  }, [reportCreates, reportRuns, reportHealth, scope])
+  }, [reportCreates, reportRuns, reportStacks, reportHealth, scope])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -385,6 +419,13 @@ export default function App() {
     // New or disappearing rows should show up before the next regular poll.
     window.setTimeout(() => refresh(), 800)
   }, [refresh])
+
+  const stackRunStarted = useCallback((run: StackRun) => {
+    watchedStacks.current.add(`${run.stack}@${run.started_at}`)
+    setStackRuns((current) => [...current.filter((r) => r.stack !== run.stack), run])
+    notify('info', `Launching stack “${run.stack}”`, 'Progress shows on its card.')
+    window.setTimeout(() => refresh(), 800)
+  }, [notify, refresh])
 
   const confirmDelete = useCallback(async () => {
     const target = pendingDelete
@@ -551,6 +592,16 @@ export default function App() {
                 current && removed.includes(keyOf(current)) ? null : current))
               refresh()
             }}
+          />
+        ) : view === 'stacks' ? (
+          <StacksView
+            localNode={localNode}
+            ready={ready}
+            runs={stackRuns}
+            onRunStarted={stackRunStarted}
+            onNotify={notify}
+            onOpen={openInstance}
+            onChanged={() => refresh()}
           />
         ) : view === 'storage' ? (
           <>

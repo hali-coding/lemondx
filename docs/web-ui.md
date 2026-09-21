@@ -87,27 +87,46 @@ shown at all.
 
 ## Shared definitions sync themselves
 
-Saving a template, a module, a bootstrap profile or a node group on a clustered
+Saving a template, a module, a bootstrap profile, a node group or a [stack](stacks.md) on a clustered
 node pushes it to every other member as part of the save, and the toast says
 where it went — or names the node that missed it and points at Sync. Deleting
 one offers to remove it from the others too, ticked by default; untick it to
 leave their copies alone.
 
+A node that was switched off when something changed catches up on its own when
+it comes back: see [Nodes view](#nodes-view) and
+[A node that was switched off catches itself up](cluster.md#a-node-that-was-switched-off-catches-itself-up).
+
 ## Nodes view
 
 Only interesting once this lemondx is federated with another; on its own it
-shows this host and not much else. It has three parts:
+shows this host and not much else. It has four parts:
 
 - **This node** — the name, address and certificate fingerprint peers know it
   by, and a warning naming whatever is stopping another node from joining it.
+  **Leave cluster** takes this host out and has every member forget it.
 - **Nodes** — a card per node with its daemon, instance counts and groups, and
   a dot for reachable / not set up / unreachable. *Show instances* lists what is
   on a node without leaving the page. **Invite new node** issues a one-time join
   code (shown once — it is a credential), **Join cluster** redeems one issued elsewhere,
+  **Reconcile** settles this node's shared definitions against every member's,
   and **Sync** copies this node's templates, modules or bootstrap profiles over
   another's.
+- **Shared definitions** — what the last reconciliation found: what was taken
+  from a member, what was sent on, and anything two nodes disagree about. A
+  conflict is the one thing nothing puts right on its own, so it is listed
+  first and says which node to push from. The panel is shown even when
+  everything agrees — a panel that only appears with bad news is one you cannot
+  trust the absence of.
 - **Node groups** — a name for a set of nodes, so a launch or a sync can say
   "everywhere" once. A member that is not a node here is marked in red.
+
+Each of the four listings loads on its own, so a call that fails leaves the rest
+of the view working. That matters here more than anywhere: this is the tab a
+broken cluster is fixed from, and **Leave cluster** is the way out of one. A
+node whose credential is gone but which still lists peers shows a banner saying
+so, and the button reads **Clear cluster state** — see
+[Leaving a cluster that is already broken](cluster.md#leaving-a-cluster-that-is-already-broken).
 
 The listing contacts every node, so this view polls every 10 seconds rather than
 the 3 the rest of the UI uses, and the server caches each probe for a few seconds

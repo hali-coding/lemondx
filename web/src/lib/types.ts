@@ -31,6 +31,8 @@ export interface Container {
   snapshot_count: number
   /** The template this instance was launched from, if any. */
   template: string | null
+  /** The stack that launched it, if any; kept on the instance itself. */
+  stack: string | null
 }
 
 export interface Snapshot {
@@ -496,6 +498,119 @@ export interface TemplateRun {
   nodes: string[]
 }
 
+/* -- stacks --------------------------------------------------------------- */
+
+/** Launch a template; what it made is handed to the launches after it. */
+export interface StackLaunchStep {
+  /** Lowercase, unique in the stack; what `{{id.ips}}` placeholders name. */
+  id: string
+  type: 'launch'
+  template: string
+  count: number
+  /** Blank: the template's own prefix. */
+  prefix: string
+  /** False: the next stage starts once the instances run, bootstrap or not. */
+  wait_bootstrap: boolean
+  /** Parameter overrides; values may hold `{{step.field}}` placeholders. */
+  params: Record<string, string>
+  /** Both empty: this node. */
+  nodes: string[]
+  groups: string[]
+}
+
+export interface StackSleepStep {
+  id: string
+  type: 'sleep'
+  seconds: number
+}
+
+/** Wait until every instance an earlier stage launched is healthy. */
+export interface StackWaitStep {
+  id: string
+  type: 'wait_healthy'
+  timeout_seconds: number
+}
+
+export type StackStep = StackLaunchStep | StackSleepStep | StackWaitStep
+export type StackStepType = StackStep['type']
+
+/** Stages run in order; the steps inside one run side by side. */
+export interface StackStage {
+  steps: StackStep[]
+}
+
+export interface Stack {
+  name: string
+  description: string
+  stages: StackStage[]
+  /** Values a launch must be given, because a step says `{{params.NAME}}`. */
+  inputs: string[]
+}
+
+/** An instance a stack launched, found by its tag on whichever node holds it. */
+export interface StackInstance {
+  node: string
+  name: string
+  status: string
+  template: string | null
+  ipv4: string[]
+}
+
+export interface StackInstances {
+  stacks: Record<string, StackInstance[]>
+  /** Nodes that did not answer: their instances are missing from the lists. */
+  errors: { node: string; error: string }[]
+}
+
+export type StackStepState =
+  | 'pending' | 'running' | 'ready' | 'done' | 'failed' | 'skipped' | 'cancelled'
+
+/** What a finished launch hands on, one entry per instance, in name order. */
+export interface StackOutputs {
+  names: string[]
+  ips: string[]
+  ipv6: string[]
+  nodes: string[]
+}
+
+export interface StackStepRun {
+  /** `_teardown` for the destroy that starts a relaunch. */
+  id: string
+  type: StackStepType | 'destroy'
+  /** `ready`: running, with bootstrap still going in the background. */
+  state: StackStepState
+  started_at: number | null
+  finished_at: number | null
+  /** When a sleep ends, or a health wait gives up; Unix seconds. */
+  until: number | null
+  detail: string | null
+  error: string | null
+  // Launch steps only.
+  template?: string
+  count?: number
+  wait_bootstrap?: boolean
+  nodes?: string[]
+  /** `ipv4` is the instance's own, unlike the filtered list in `outputs`. */
+  instances?: {
+    name: string; node: string; ok: boolean | null; error: string | null
+    ipv4?: string | null
+  }[]
+  outputs?: StackOutputs | null
+}
+
+/** A stack the server is running or last ran. Held by the server process. */
+export interface StackRun {
+  stack: string
+  action: 'launch' | 'relaunch' | 'destroy'
+  started_at: number
+  finished_at: number | null
+  ok: boolean | null
+  error: string | null
+  cancelling: boolean
+  cancelled: boolean
+  stages: { steps: StackStepRun[] }[]
+}
+
 export interface ModuleSource {
   id: string
   builtin: boolean
@@ -838,6 +953,12 @@ export interface ClusterInfo {
   reachable_because: string
   fingerprint_pretty: string
   peers: number
+  /**
+   * Peer records or node groups with no credential to use them with: a cluster
+   * this node is in only from its own side, where nothing it calls will work.
+   * Leaving is what clears it, so the button is offered on this too.
+   */
+  leftovers: boolean
   /** Set only when an address was configured by hand rather than worked out. */
   configured_url: string
   settings_path: string
@@ -916,10 +1037,55 @@ export interface LeaveResult {
   told: NodeTold[]
   /** Members that could not be told, and so still list this node. */
   stale: string[]
+  /**
+   * False when this node had no cluster credential and was only clearing the
+   * records left behind — nobody could be told, so `told` is empty by design.
+   */
+  had_credential: boolean
   note: string
 }
 
-export type SyncKind = 'templates' | 'modules' | 'profiles' | 'groups' | 'users'
+/** What reconciliation may do to one artifact on one node. */
+export type ReconcileAction = 'pull' | 'push' | 'delete'
+
+export interface ReconcileRow {
+  /** The node acted on: this one for a pull or a local delete, else the member. */
+  node: string
+  /** Where the copy came from, for a pull. */
+  from: string | null
+  kind: SyncKind
+  name: string
+  action: ReconcileAction
+  /** False on a dry run: this is what would have happened. */
+  applied: boolean
+  ok: boolean
+  error: string | null
+}
+
+/**
+ * An artifact two nodes both hold and disagree about. Never resolved
+ * automatically — there is no shared clock and no version to decide with, so
+ * someone pushes whichever copy is right.
+ */
+export interface ReconcileConflict {
+  kind: SyncKind
+  name: string
+  nodes: string[]
+}
+
+export interface DriftReport {
+  ok: boolean
+  /** The node that ran the pass; every local action is attributed to it. */
+  node: string
+  applied: boolean
+  nodes: string[]
+  unreachable: { node: string; error: string }[]
+  actions: ReconcileRow[]
+  conflicts: ReconcileConflict[]
+  checked: number
+}
+
+export type SyncKind = 'templates' | 'modules' | 'profiles' | 'groups' | 'users' | 'stacks'
 
 export interface SyncOutcome {
   node: string

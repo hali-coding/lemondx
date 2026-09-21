@@ -2,8 +2,8 @@ import { useCallback, useEffect, useState } from 'react'
 import { useCanWrite } from '../hooks/useAuth'
 import { api } from '../lib/api'
 import type {
-  AutoGroupResult, ClusterInfo, ClusterNode, ClusterNodeDetail, EvictResult, JoinCode,
-  LeaveResult, NodeGroup, NodeTold, SyncKind, SyncResult,
+  AutoGroupResult, ClusterInfo, ClusterNode, ClusterNodeDetail, DriftReport, EvictResult,
+  JoinCode, LeaveResult, NodeGroup, NodeTold, ReconcileRow, SyncKind, SyncResult,
 } from '../lib/types'
 import { ConfirmDialog } from './ConfirmDialog'
 import { CopyButton } from './CopyButton'
@@ -33,6 +33,7 @@ const SYNC_KINDS: { id: SyncKind; label: string; hint: string; warn?: string }[]
   { id: 'modules', label: 'Modules', hint: 'uploaded ones; built-ins are everywhere already' },
   { id: 'profiles', label: 'Bootstrap profiles', hint: 'named module selections' },
   { id: 'groups', label: 'Node groups', hint: 'including the sized large and small' },
+  { id: 'stacks', label: 'Stacks', hint: 'with the templates they launch' },
   {
     id: 'users', label: 'Users', hint: 'local accounts, so the same logins work there',
     warn: 'Each account is copied with its password hash and role, replacing any '
@@ -92,8 +93,35 @@ function evictDetail(result: EvictResult) {
 function leaveDetail(result: LeaveResult) {
   const gone = result.left.length === 0 ? 'Nothing was federated.'
     : `Forgot ${result.left.join(', ')}.`
+  if (!result.had_credential) return `${gone} ${result.note}`
   return result.stale.length === 0 ? gone
     : `${gone} ${result.stale.join(', ')} could not be told and still lists this node.`
+}
+
+/** Reconciliation in one sentence, for a toast. */
+function driftDetail(report: DriftReport) {
+  const parts: string[] = []
+  const changed = report.actions.filter((row) => row.applied && row.ok)
+  if (changed.length > 0) parts.push(`${changed.length} definition(s) brought level.`)
+  const failed = report.actions.filter((row) => row.applied && !row.ok)
+  if (failed.length > 0) parts.push(`${failed.length} could not be applied.`)
+  if (report.conflicts.length > 0) {
+    parts.push(`${report.conflicts.length} differ on two nodes at once and were left alone — `
+      + 'push whichever copy is right with Sync.')
+  }
+  if (report.unreachable.length > 0) {
+    parts.push(`${report.unreachable.map((row) => row.node).join(', ')} could not be reached.`)
+  }
+  return parts.join(' ') || 'Nothing differed.'
+}
+
+/** One reconciliation row as a line of prose: what happened, and where. */
+function actionLine(row: ReconcileRow, local: string) {
+  const what = `${row.kind.replace(/s$/, '')} ${row.name}`
+  if (row.action === 'pull') return `Took ${what} from ${row.from}.`
+  if (row.action === 'push') return `Sent ${what} to ${row.node}.`
+  return row.node === local ? `Deleted ${what} here, as ${row.from} had.`
+    : `Deleted ${what} on ${row.node}.`
 }
 
 /** Nodes this lemondx federates with, the groups they form, and what spans them. */
@@ -108,21 +136,30 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
   const [pendingEvict, setPendingEvict] = useState<ClusterNode | null>(null)
   const [pendingLeave, setPendingLeave] = useState(false)
   const [pendingSize, setPendingSize] = useState(false)
+  const [drift, setDrift] = useState<DriftReport | null>(null)
   const [busy, setBusy] = useState(false)
 
+  /**
+   * Each call settled on its own rather than through Promise.all, because this
+   * is the tab a broken cluster is fixed from. One failing listing used to
+   * discard the other two, which meant a node whose own `/api/cluster` errored
+   * — a misconfigured address is enough — showed an error banner and no
+   * **Leave cluster** button, exactly when leaving is the way out.
+   */
   const load = useCallback(async (signal?: AbortSignal) => {
-    try {
-      const [nextInfo, nextNodes, nextGroups] = await Promise.all([
-        api.cluster(signal), api.nodes(signal), api.nodeGroups(signal),
-      ])
-      setInfo(nextInfo)
-      setNodes(nextNodes)
-      setGroups(nextGroups)
-      setError(null)
-    } catch (cause) {
-      if ((cause as Error).name === 'AbortError') return
-      setError((cause as Error).message)
-    }
+    const [nextInfo, nextNodes, nextGroups, nextDrift] = await Promise.allSettled([
+      api.cluster(signal), api.nodes(signal), api.nodeGroups(signal), api.drift(signal),
+    ])
+    if (signal?.aborted) return
+    if (nextInfo.status === 'fulfilled') setInfo(nextInfo.value)
+    if (nextNodes.status === 'fulfilled') setNodes(nextNodes.value)
+    if (nextGroups.status === 'fulfilled') setGroups(nextGroups.value)
+    if (nextDrift.status === 'fulfilled') setDrift(nextDrift.value)
+    const failed = [nextInfo, nextNodes, nextGroups, nextDrift]
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map((result) => (result.reason as Error))
+      .filter((reason) => reason.name !== 'AbortError')
+    setError(failed.length > 0 ? failed[0].message : null)
   }, [])
 
   useEffect(() => {
@@ -158,7 +195,8 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
     setBusy(true)
     try {
       const result = await api.leaveCluster()
-      onNotify(result.stale.length === 0 ? 'success' : 'info', 'Left the cluster',
+      onNotify(result.stale.length === 0 && result.had_credential ? 'success' : 'info',
+        result.had_credential ? 'Left the cluster' : 'Cleared the leftover cluster state',
         leaveDetail(result))
       onMembershipChanged()
       await load()
@@ -167,6 +205,22 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
     } finally {
       setBusy(false)
       setPendingLeave(false)
+    }
+  }
+
+  async function reconcile() {
+    setBusy(true)
+    try {
+      const report = await api.reconcile()
+      setDrift(report)
+      onNotify(report.ok ? 'success' : 'info',
+        report.ok ? 'Every member holds the same definitions' : 'Reconciled with what differed',
+        driftDetail(report))
+      await load()
+    } catch (cause) {
+      onNotify('error', 'Could not reconcile', (cause as Error).message)
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -228,6 +282,13 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
               aria-label="Refresh nodes">
               <RefreshIcon />
             </button>
+            <button className="btn btn-sm" disabled={!canWrite || peers.length === 0 || busy}
+              onClick={reconcile} title={peers.length === 0
+                ? 'Nothing to compare against yet'
+                : 'Compare templates, modules, profiles, stacks and groups with every '
+                  + 'member and settle what differs'}>
+              <ScalesIcon /> Reconcile
+            </button>
             <button className="btn btn-sm" disabled={!canWrite || peers.length === 0}
               onClick={() => setDialog('sync')} title={peers.length === 0
                 ? 'Nothing to sync to yet' : 'Copy templates and modules to other nodes'}>
@@ -269,6 +330,8 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
           </div>
         )}
       </section>
+
+      {drift && peers.length > 0 && <DriftPanel report={drift} />}
 
       <section className="card access-card">
         <header className="access-head">
@@ -398,9 +461,12 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
 
       {pendingLeave && info && (
         <ConfirmDialog
-          title={`Take ${info.node.name} out of the cluster?`}
-          message={`Every other member is told to forget this node, and this node gives up the cluster credential, its record of the ${peers.length} other node${peers.length === 1 ? '' : 's'} and its node groups. Instances, templates and modules stay exactly as they are; only federation stops. Rejoining needs a fresh join code.`}
-          confirmLabel="Leave cluster"
+          title={info.in_cluster ? `Take ${info.node.name} out of the cluster?`
+            : `Clear ${info.node.name}'s leftover cluster state?`}
+          message={info.in_cluster
+            ? `Every other member is told to forget this node, and this node gives up the cluster credential, its record of the ${peers.length} other node${peers.length === 1 ? '' : 's'} and its node groups. Instances, templates and modules stay exactly as they are; only federation stops. Rejoining needs a fresh join code.`
+            : `This node holds no cluster credential, so nothing can be told it is going — its record of the ${peers.length} other node${peers.length === 1 ? '' : 's'} and its node groups are simply dropped. Instances, templates and modules stay exactly as they are. Any node that still lists this one needs \`lemondx cluster evict ${info.node.name}\` run there.`}
+          confirmLabel={info.in_cluster ? 'Leave cluster' : 'Clear cluster state'}
           confirmText={info.node.name}
           danger
           busy={busy}
@@ -409,6 +475,70 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
         />
       )}
     </>
+  )
+}
+
+/**
+ * What the last reconciliation found. Shown whether or not anything was wrong,
+ * because "checked, and every member agrees" is the answer most of the time and
+ * a panel that only ever appears with bad news is one nobody trusts the absence
+ * of. Conflicts come first: they are the only part nothing will fix by itself.
+ */
+function DriftPanel({ report }: { report: DriftReport }) {
+  const conflicts = report.conflicts
+  const failed = report.actions.filter((row) => row.applied && !row.ok)
+  const done = report.actions.filter((row) => row.applied && row.ok)
+  const quiet = conflicts.length === 0 && failed.length === 0
+    && done.length === 0 && report.unreachable.length === 0
+
+  return (
+    <section className="card access-card">
+      <header className="access-head">
+        <h3>Shared definitions</h3>
+        <span className="faint">
+          templates, modules, profiles, stacks and groups, compared with every member
+          {' '}when this node started and hourly since
+        </span>
+        <span className="faint access-head-end" title={when(report.checked)}>
+          last checked {when(report.checked)}
+        </span>
+      </header>
+
+      {quiet ? (
+        <div className="empty">
+          <p>
+            Every member holds the same definitions. A node that has been switched off
+            catches up on its own when it comes back.
+          </p>
+        </div>
+      ) : (
+        <ul className="drift-list">
+          {conflicts.map((row) => (
+            <li key={`c-${row.kind}-${row.name}`} className="drift-conflict">
+              <strong>{row.kind.replace(/s$/, '')} {row.name}</strong> differs
+              {' '}here and on {row.nodes.join(', ')}. Nothing decides which copy is
+              {' '}right, so both were left alone — press <strong>Sync</strong> on the
+              {' '}node whose copy should win.
+            </li>
+          ))}
+          {report.unreachable.map((row) => (
+            <li key={`u-${row.node}`} className="drift-failed">
+              <strong>{row.node}</strong> could not be compared: {row.error}
+            </li>
+          ))}
+          {failed.map((row) => (
+            <li key={`f-${row.kind}-${row.name}-${row.node}`} className="drift-failed">
+              {actionLine(row, report.node)} Failed: {row.error}
+            </li>
+          ))}
+          {done.map((row) => (
+            <li key={`d-${row.kind}-${row.name}-${row.node}-${row.action}`}>
+              {actionLine(row, report.node)}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   )
 }
 
@@ -427,12 +557,17 @@ function ThisNode({ info, peers, canWrite, onLeave }: {
           <span className="badge badge-dim">this node</span>
           {/* Leaving lives here rather than on the node's card in the grid: it
               is the one action that acts on this host, and the grid's buttons
-              all act on somebody else. */}
-          {info.in_cluster && (
+              all act on somebody else. Offered on `leftovers` as well, which is
+              a cluster this node is in from its own side only — there is
+              nothing to press anywhere else, and clearing it is what leaving
+              does. */}
+          {(info.in_cluster || info.leftovers) && (
             <button className="btn btn-sm btn-danger node-self-leave" disabled={!canWrite}
               onClick={onLeave}
-              title="Take this node out of the cluster and have every member forget it">
-              <LogoutIcon /> Leave cluster
+              title={info.in_cluster
+                ? 'Take this node out of the cluster and have every member forget it'
+                : 'Clear the peer records and groups this node still holds'}>
+              <LogoutIcon /> {info.in_cluster ? 'Leave cluster' : 'Clear cluster state'}
             </button>
           )}
         </h3>
@@ -453,6 +588,20 @@ function ThisNode({ info, peers, canWrite, onLeave }: {
           </div>
         </dl>
       </div>
+      {info.leftovers && (
+        <div className="banner banner-error node-self-note">
+          <div className="banner-body">
+            <h3>This node is in a cluster only from its own side</h3>
+            <p>
+              It still lists {peers} other node{peers === 1 ? '' : 's'} but holds no
+              cluster credential, so every call it makes to them fails. Press
+              {' '}<strong>Clear cluster state</strong> to forget them. Any node that
+              still lists this one has to be told separately — run
+              {' '}<code>lemondx cluster evict {info.node.name}</code> there.
+            </p>
+          </div>
+        </div>
+      )}
       {info.reachable_because && (
         <div className="banner banner-warn node-self-note">
           <div className="banner-body">
