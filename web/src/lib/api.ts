@@ -11,6 +11,13 @@ import type {
   StateAction, Status, StorageOverview, StoragePoolDetail, StoragePoolRequest,
   StorageVolume, StorageVolumeRequest, TemplateRequest, TemplateRun,
   Stack, StackInstances, StackRun, StackStage, BulkStateResult as StackStateResult,
+  FabricStatus,
+  FabricPlan,
+  FabricApplyResult,
+  FabricOverview,
+  FabricCheck,
+  FabricChangeResult,
+  FabricDeleteResult,
 } from './types'
 
 /** Error carrying the HTTP status so callers can react to 401/409 specifically. */
@@ -229,6 +236,39 @@ export const api = {
 
   deleteNetwork: (name: string) =>
     request<{ deleted: string }>(`/networks/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  // Fabrics. `/fabrics` is the whole cluster and asks every member; `/fabric`
+  // is this node's half. Status and plan need no privilege on the host, so
+  // they answer even where routes cannot be programmed.
+  fabrics: (signal?: AbortSignal) => request<FabricOverview>('/fabrics', { signal }),
+
+  fabricCheck: (name: string, prefix: string, signal?: AbortSignal) => {
+    const query = new URLSearchParams({ name, prefix })
+    return request<FabricCheck>(`/fabrics/check?${query}`, { signal })
+  },
+
+  createFabric: (body: { name: string; prefix: string; nat: boolean }) =>
+    request<FabricChangeResult>('/fabrics', { method: 'POST', body }),
+
+  extendFabric: (name: string) =>
+    request<FabricChangeResult>(`/fabrics/${encodeURIComponent(name)}/extend`, { method: 'POST' }),
+
+  deleteFabric: (name: string) =>
+    request<FabricDeleteResult>(`/fabrics/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  fabric: (signal?: AbortSignal) => request<FabricStatus>('/fabric', { signal }),
+
+  fabricPlan: (signal?: AbortSignal) => request<FabricPlan>('/fabric/plan', { signal }),
+
+  fabricApply: () => request<FabricApplyResult>('/fabric/apply', { method: 'POST' }),
+
+  fabricAttach: (name: string, fabric?: string) =>
+    request<Container>(`/fabric/instances/${encodeURIComponent(name)}/attach`,
+      { method: 'POST', body: { fabric } }),
+
+  fabricDetach: (name: string, fabric?: string) =>
+    request<Container>(`/fabric/instances/${encodeURIComponent(name)}/detach`,
+      { method: 'POST', body: { fabric } }),
 
   // Bootstrapping a container runs modules on *its* node and installs keys
   // that node can see, so the pickers come from there too.

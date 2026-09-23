@@ -278,6 +278,11 @@ class LXDClient:
     def update_instance(self, name, config):
         return self._async("PATCH", "/1.0/instances/%s" % _seg(name), config)
 
+    def replace_instance(self, name, config):
+        """PUT the whole record. PATCH merges the maps, so removing a device
+        -- rather than adding or changing one -- has to go through here."""
+        return self._async("PUT", "/1.0/instances/%s" % _seg(name), config)
+
     def delete_instance(self, name):
         return self._async("DELETE", "/1.0/instances/%s" % _seg(name), timeout=120)
 

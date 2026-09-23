@@ -5,6 +5,10 @@
 lemondx manages the host it runs on. Federation lets one lemondx *also* reach
 others, so a single UI can list, launch on and sync to every host you run.
 
+Containers on different nodes cannot reach each other by default -- a managed
+bridge NATs its traffic. [Fabrics](networking.md) add routed networks shared by
+every node; they are opt-in and need the nodes on one L2 network.
+
 There is no leader, no quorum and no shared database. Every node is a complete
 lemondx that works on its own; a cluster only means each one knows how to call
 the others. A node that is down costs you that node and nothing else.
@@ -86,6 +90,8 @@ certificate. You need it when the guess is wrong — a DNS name rather than an I
 an address behind NAT, a port other than the one being served, or a certificate
 from your own CA. Saved values win over anything worked out, and `lemondx serve`
 uses the saved certificate unless `--tls-cert` or `--no-tls` says otherwise.
+`lemondx configure tls` edits that same certificate on its own, for HTTPS
+without federating.
 
 `lemondx cluster cert` writes a fresh self-signed certificate on demand. Any
 certificate works: federation pins the key rather than trusting an issuer, so
@@ -191,6 +197,8 @@ lemondx cluster group set edge --node nodeA --node nodeB
 lemondx cluster groups
 lemondx cluster group delete edge
 ```
+
+Deleting a group is refused (`409`) while a stack's launch step targets it.
 
 A group is just a list of names. It can name a node that is not enrolled yet —
 listings mark those as unknown rather than dropping them — but launching at a
@@ -364,6 +372,7 @@ asked for:
 | --- | --- | --- |
 | `pool` | no such storage pool | the default profile's root disk |
 | `network` | no such managed network | the default profile's NIC |
+| `fabric` | not on that fabric | one NIC, reachable only on its own host |
 | `profiles` | no such profile | the remaining profiles, else `default` |
 
 Every substitution is reported twice: on the run, where the UI shows it against
@@ -373,6 +382,7 @@ launch started from another node's UI is only visible there.
 ```
 ! nodeA: No storage pool 'fast-nvme' on this node; used the default profile's pool (default) instead.
 ! nodeB: No network 'dmz-br' on this node; used the default profile's network (lxdbr0) instead.
+! nodeC: This node is not on the fabric lemonfab1; launched without its NIC, so these instances can only be reached from this host.
 ```
 
 What a node cannot substitute — an image it cannot pull, no space, a module that

@@ -105,8 +105,12 @@ later. Keys given alongside `-P` are added to the profile's own. To save the
 image, limits and everything else as well, use an
 [instance template](templates.md).
 
-Deleting a module drops it from every profile that used it; a profile left with
-nothing to run is removed rather than kept as an empty shell.
+Deleting a module is refused (`409`) while a profile or a template still
+selects it; the error names them. Removing an upload that shadows a built-in
+is always allowed, since the built-in takes its place. When a delete arrives
+from another cluster member instead, it was checked there, and the module is
+dropped from every profile and template here that used it; a profile left
+with nothing to run is removed rather than kept as an empty shell.
 
 These are lemondx's own; they have nothing to do with LXD/Incus profiles, which
 configure devices and limits. The CLI flag is `-P/--bootstrap-profile`, because

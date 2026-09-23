@@ -5,7 +5,8 @@ import { api } from '../lib/api'
 import { bytes } from '../lib/format'
 import { displayAddress, subnetStatus } from '../lib/cidr'
 import type {
-  NetworkDetail, NetworkFamily, NetworkRequest, NetworkSummary, SubnetInUse,
+  FabricChangeResult, FabricCheck, FabricDeleteResult, FabricMember, FabricOverview,
+  FabricSummary, NetworkDetail, NetworkFamily, NetworkRequest, NetworkSummary, SubnetInUse,
 } from '../lib/types'
 import type { ToastKind } from '../hooks/useToasts'
 import { Modal } from './Modal'
@@ -99,6 +100,8 @@ export function NetworkView({ onNotify }: Props) {
       {error && (
         <div className="banner banner-error"><div className="banner-body"><p>{error}</p></div></div>
       )}
+
+      <FabricsSection onNotify={onNotify} onChanged={load} />
 
       <div className="storage-toolbar">
         <span className="faint" style={{ fontSize: 12.5 }}>
@@ -218,6 +221,521 @@ export function NetworkView({ onNotify }: Props) {
         />
       )}
     </>
+  )
+}
+
+/**
+ * Fabrics: routed networks shared by every node, each a /24 per node out of a
+ * prefix the cluster shares. Always shown, since this is where one is made;
+ * each fabric's table is every node's own report of its part, so a missing
+ * bridge or route on another host shows here rather than as silent loss.
+ */
+function FabricsSection({ onNotify, onChanged }: {
+  onNotify: (kind: ToastKind, title: string, detail?: string) => void
+  onChanged: () => void
+}) {
+  const canWrite = useCanWrite()
+  const [overview, setOverview] = useState<FabricOverview | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [plan, setPlan] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [creating, setCreating] = useState(false)
+  const [pendingDelete, setPendingDelete] = useState<FabricSummary | null>(null)
+  const busyRef = useRef(false)
+
+  const load = useCallback((signal?: AbortSignal) => {
+    return api.fabrics(signal)
+      .then((next) => { setOverview(next); setError(null) })
+      .catch((cause) => {
+        if ((cause as Error).name !== 'AbortError') setError((cause as Error).message)
+      })
+  }, [])
+
+  // Its own 10s interval rather than the tab's 5s one: every poll asks each
+  // member for its bridges and routes, and none of that moves that fast.
+  // A slow member can hold a poll past the next tick, so a tick is skipped
+  // while one is out rather than stacking requests behind it.
+  useEffect(() => {
+    const controller = new AbortController()
+    let polling = true
+    load(controller.signal).finally(() => { polling = false })
+    const timer = window.setInterval(() => {
+      if (busyRef.current || polling) return
+      polling = true
+      load(controller.signal).finally(() => { polling = false })
+    }, 10000)
+    return () => { controller.abort(); window.clearInterval(timer) }
+  }, [load])
+
+  const act = async <T,>(run: () => Promise<T>, report: (result: T) => void,
+    failure: string) => {
+    busyRef.current = true
+    setBusy(true)
+    try {
+      report(await run())
+      setCreating(false)
+      setPendingDelete(null)
+      setPlan(null)
+    } catch (err) {
+      onNotify('error', failure, (err as Error).message)
+    } finally {
+      await load()
+      // Creating or deleting a fabric adds or removes a bridge here, so the
+      // network list below is out of date too.
+      onChanged()
+      busyRef.current = false
+      setBusy(false)
+    }
+  }
+
+  const reportNodes = (verb: string, result: FabricChangeResult | FabricDeleteResult) => {
+    const failed = result.nodes.filter((n) => !n.ok)
+    if (failed.length === 0) {
+      onNotify('success', `Fabric ${result.name} ${verb}`,
+        `${result.nodes.length} node${result.nodes.length === 1 ? '' : 's'}`)
+    } else {
+      onNotify('error', `Fabric ${result.name} ${verb}, but not everywhere`,
+        failed.map((n) => `${n.node}: ${n.error}`).join('\n'))
+    }
+  }
+
+  if (!overview) {
+    return error ? (
+      <div className="banner banner-error"><div className="banner-body"><p>{error}</p></div></div>
+    ) : null
+  }
+
+  const local = overview.local
+  const silent = overview.nodes.filter((n) => !n.ok)
+
+  return (
+    <>
+      <section className="card net-card">
+        <header className="net-head">
+          <h3>Fabrics</h3>
+          <span className="faint net-desc">
+            routed between nodes · {overview.fabrics.length} fabric
+            {overview.fabrics.length === 1 ? '' : 's'} · {overview.nodes.length} node
+            {overview.nodes.length === 1 ? '' : 's'}
+          </span>
+          {!local.privileged && overview.fabrics.length > 0 && (
+            <span className="badge badge-dim"
+              title="lemondx cannot program routes here; the plan shows what to run">
+              no privilege here
+            </span>
+          )}
+          <span className="net-head-end">
+            {local.pending > 0 && canWrite && local.privileged && (
+              <button className="btn btn-sm" disabled={busy}
+                onClick={() => act(() => api.fabricApply(), (r) => r.ok
+                  ? onNotify('success', 'Fabric routes updated on this node')
+                  : onNotify('error', 'Some fabric commands failed',
+                    r.applied.filter((c) => !c.ok).map((c) => c.error).join('\n')),
+                'Could not apply the fabric')}>
+                Apply {local.pending} change{local.pending === 1 ? '' : 's'}
+              </button>
+            )}
+            {overview.fabrics.length > 0 && (
+              <button className="btn btn-sm" disabled={busy}
+                onClick={() => {
+                  if (plan !== null) { setPlan(null); return }
+                  api.fabricPlan().then((p) => setPlan(p.text || 'Nothing to do.'))
+                    .catch((err) => onNotify('error', 'Could not read the plan', err.message))
+                }}>
+                {plan !== null ? 'Hide plan' : 'Show plan'}
+              </button>
+            )}
+            <button className="btn btn-sm btn-primary"
+              disabled={busy || !canWrite || silent.length > 0}
+              title={silent.length > 0
+                ? `Every node must answer to create a fabric; ${silent.map((n) => n.node).join(', ')} does not`
+                : undefined}
+              onClick={() => setCreating(true)}>
+              <PlusIcon /> New fabric
+            </button>
+          </span>
+        </header>
+
+        <div className="net-section">
+          <p className="net-explain">
+            A fabric is one bridge on every node, each on its own /24 of a shared
+            prefix, with host routes between them. Its instances reach each other
+            across nodes by their own addresses, and nothing outside the fabric can
+            reach in. Traffic for anywhere else is NAT&apos;d behind the host,
+            unless the fabric was made without NAT.
+            {!overview.clustered && ' This node is not in a cluster, so a fabric here spans this host only.'}
+          </p>
+          {plan !== null && <pre className="net-plan">{plan}</pre>}
+        </div>
+
+        {silent.length > 0 && (
+          <div className="banner banner-warn"><div className="banner-body">
+            <p>
+              <strong>{silent.map((n) => n.node).join(', ')}</strong>{' '}
+              {silent.length === 1 ? 'is' : 'are'} not answering, so no fabric can be
+              created until {silent.length === 1 ? 'it is' : 'they are'} back: a fabric
+              is made on every node at once, and a node that cannot be asked what it
+              already uses cannot be given a subnet safely.
+            </p>
+            <p style={{ marginTop: 6 }}>
+              If {silent.length === 1 ? 'it is' : 'they are'} gone for good, evict{' '}
+              {silent.length === 1 ? 'it' : 'them'} on the <strong>Nodes</strong> tab.
+              Eviction works on a node that cannot be reached (the cluster credential
+              is rotated instead of the node being told). The rows below show{' '}
+              {silent.length === 1 ? 'its' : 'their'} last known claims meanwhile.
+            </p>
+          </div></div>
+        )}
+        {local.error && (
+          <div className="banner banner-error"><div className="banner-body"><p>{local.error}</p></div></div>
+        )}
+        {local.check && (
+          <div className="banner banner-warn"><div className="banner-body"><p>{local.check}</p></div></div>
+        )}
+        {local.firewall && !local.firewall.ok && (
+          <div className="banner banner-warn"><div className="banner-body"><p>
+            The fabric firewall is not in place on this node: {local.firewall.error}
+          </p></div></div>
+        )}
+        {local.warnings.map((warning) => (
+          <div className="banner banner-warn" key={warning}>
+            <div className="banner-body"><p style={{ whiteSpace: 'pre-wrap' }}>{warning}</p></div>
+          </div>
+        ))}
+      </section>
+
+      {overview.fabrics.map((fabric) => (
+        <FabricCard key={fabric.name} fabric={fabric} busy={busy} canWrite={canWrite}
+          onExtend={() => act(() => api.extendFabric(fabric.name),
+            (r) => reportNodes('extended', r), `Could not extend ${fabric.name}`)}
+          onDelete={() => setPendingDelete(fabric)} />
+      ))}
+
+      {creating && (
+        <FabricDialog busy={busy} onCancel={() => setCreating(false)}
+          onSubmit={(request) => act(() => api.createFabric(request),
+            (r) => reportNodes('created', r), 'Could not create the fabric')} />
+      )}
+
+      {pendingDelete && (
+        <FabricDeleteDialog fabric={pendingDelete} busy={busy}
+          onCancel={() => setPendingDelete(null)}
+          onConfirm={() => act(() => api.deleteFabric(pendingDelete.name),
+            (r) => reportNodes('deleted', r), `Could not delete ${pendingDelete.name}`)} />
+      )}
+    </>
+  )
+}
+
+const MEMBER_BADGE: Record<FabricMember['state'], string> = {
+  ok: 'badge-ok', absent: 'badge-dim', unknown: 'badge-warn', bridge: 'badge-warn',
+  routes: 'badge-warn', conflict: 'badge-danger',
+}
+
+const MEMBER_LABEL: Record<FabricMember['state'], string> = {
+  ok: 'ok', absent: 'not on it', unknown: 'no answer', bridge: 'no bridge',
+  routes: 'routes', conflict: 'conflict',
+}
+
+function FabricCard({ fabric, busy, canWrite, onExtend, onDelete }: {
+  fabric: FabricSummary
+  busy: boolean
+  canWrite: boolean
+  onExtend: () => void
+  onDelete: () => void
+}) {
+  const troubled = fabric.members.filter((m) => m.state !== 'ok')
+  const absent = fabric.members.filter((m) => m.state === 'absent')
+  return (
+    <section className="card net-card">
+      <header className="net-head">
+        <h3 className="mono">{fabric.name}</h3>
+        <span className="badge badge-info mono">{fabric.prefix}</span>
+        <span className={`badge ${fabric.nat ? 'badge-ok' : 'badge-dim'}`}
+          title={fabric.nat
+            ? "Traffic leaving the fabric is NAT'd behind its host"
+            : 'Nothing leaves the fabric: instances need another NIC for the internet'}>
+          NAT {fabric.nat ? 'on' : 'off'}
+        </span>
+        {troubled.length === 0 ? (
+          <span className="badge badge-ok">on every node</span>
+        ) : (
+          <span className={`badge ${fabric.conflict.length ? 'badge-danger' : 'badge-warn'}`}>
+            {troubled.length} of {fabric.members.length} node
+            {fabric.members.length === 1 ? '' : 's'} need attention
+          </span>
+        )}
+        <span className="faint net-desc">
+          {fabric.instances} instance{fabric.instances === 1 ? '' : 's'}
+        </span>
+        <span className="net-head-end">
+          {absent.length > 0 && (
+            <button className="btn btn-sm" disabled={busy || !canWrite}
+              title={`Allocate a /24 to ${absent.map((m) => m.node).join(', ')}`}
+              onClick={onExtend}>
+              Add missing node{absent.length === 1 ? '' : 's'}
+            </button>
+          )}
+          <button className="btn btn-sm btn-danger" disabled={busy || !canWrite}
+            onClick={onDelete}>Delete</button>
+        </span>
+      </header>
+      <div className="net-section">
+        <div className="table-scroll">
+          <table className="ctable net-table">
+            <thead>
+              <tr>
+                <th>Node</th><th>Subnet</th><th className="optional">Gateway</th>
+                <th>Routes</th><th>Instances</th><th>State</th>
+              </tr>
+            </thead>
+            <tbody>
+              {fabric.members.map((member) => (
+                <tr key={member.node}>
+                  <td>{member.node}</td>
+                  <td className="mono num">{member.subnet || '—'}</td>
+                  <td className="optional mono faint">{member.gateway || '—'}</td>
+                  <td className="num">
+                    {member.subnet && member.state !== 'unknown'
+                      ? `${member.routes_ok}/${member.routes_total}` : '—'}
+                  </td>
+                  <td className="dim">
+                    {member.instances.length ? member.instances.join(', ') : '—'}
+                  </td>
+                  <td>
+                    <span className={`badge ${MEMBER_BADGE[member.state]}`} title={member.detail}>
+                      {MEMBER_LABEL[member.state]}
+                    </span>
+                    {member.state !== 'ok' && member.state !== 'absent' && member.detail && (
+                      <div className="faint" style={{ fontSize: 11.5, marginTop: 3 }}>
+                        {member.detail}
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+/**
+ * Creating a fabric. The name and prefix start as the server's suggestions,
+ * and every edit is checked against every node -- interfaces and routes, not
+ * just this host's -- so the dialog shows each node's /24 before anything is
+ * made, and refuses exactly what the server would.
+ */
+function FabricDialog({ busy, onCancel, onSubmit }: {
+  busy: boolean
+  onCancel: () => void
+  onSubmit: (request: { name: string; prefix: string; nat: boolean }) => void
+}) {
+  const [name, setName] = useState('')
+  const [prefix, setPrefix] = useState('')
+  const [nat, setNat] = useState(true)
+  const [check, setCheck] = useState<FabricCheck | null>(null)
+  // The inputs the check in hand answers, so a stale one cannot enable Create.
+  const [checkedFor, setCheckedFor] = useState<string | null>(null)
+  const [checkError, setCheckError] = useState('')
+  const [started, setStarted] = useState(false)
+
+  // The first check asks for suggestions and fills both boxes with them.
+  useEffect(() => {
+    const controller = new AbortController()
+    api.fabricCheck('', '', controller.signal).then((result) => {
+      setName(result.name)
+      setPrefix(result.prefix)
+      setCheck(result)
+      setCheckedFor(`${result.name}|${result.prefix}`)
+      setStarted(true)
+    }).catch((cause) => {
+      if ((cause as Error).name !== 'AbortError') {
+        setCheckError((cause as Error).message)
+        setStarted(true)
+      }
+    })
+    return () => controller.abort()
+  }, [])
+
+  const key = `${name.trim()}|${prefix.trim()}`
+  useEffect(() => {
+    if (!started || key === checkedFor) return
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => {
+      api.fabricCheck(name.trim(), prefix.trim(), controller.signal).then((result) => {
+        setCheck(result)
+        setCheckedFor(key)
+        setCheckError('')
+      }).catch((cause) => {
+        if ((cause as Error).name !== 'AbortError') setCheckError((cause as Error).message)
+      })
+    }, 350)
+    return () => { controller.abort(); window.clearTimeout(timer) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, started])
+
+  const current = check !== null && checkedFor === key
+  const canSubmit = !busy && current && check.ok
+
+  function submit(event: FormEvent) {
+    event.preventDefault()
+    if (canSubmit) onSubmit({ name: name.trim(), prefix: check.prefix, nat })
+  }
+
+  const allocation = check ? Object.entries(check.allocation).sort(([a], [b]) => a.localeCompare(b)) : []
+
+  return (
+    <Modal
+      title="Create fabric"
+      subtitle="A bridge on every node, each on its own /24 of one prefix, routed between them. Every node in the cluster must be reachable."
+      onClose={busy ? () => {} : onCancel}
+      footer={
+        <>
+          <button type="button" className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
+          <button className="btn btn-primary" form="fabric-form" disabled={!canSubmit}>
+            {busy && <span className="spinner" />}
+            Create on {allocation.length || 'every'} node{allocation.length === 1 ? '' : 's'}
+          </button>
+        </>
+      }
+    >
+      <form id="fabric-form" className="storage-form" onSubmit={submit}>
+        <div className="grid-2">
+          <Field label="Name">
+            <input className="input mono" value={name} disabled={busy || !started}
+              maxLength={15} autoComplete="off" placeholder="lemonfab1"
+              onChange={(event) => setName(event.target.value)} />
+            <span className="hint">Also the bridge&apos;s name on every node.</span>
+            {current && check.name_error && <span className="field-error">{check.name_error}</span>}
+          </Field>
+          <Field label="Prefix">
+            <input className="input mono" value={prefix} disabled={busy || !started}
+              autoComplete="off" placeholder="10.101.0.0/16"
+              onChange={(event) => setPrefix(event.target.value)} />
+            <span className="hint">
+              A private /16 to /22; each node gets a /24.{' '}
+              {prefix.trim() !== '' && (
+                <button type="button" className="link-btn" disabled={busy}
+                  onClick={() => setPrefix('')}>Suggest a free one</button>
+              )}
+            </span>
+            {current && check.prefix_error && (
+              <span className="field-error">{check.prefix_error}</span>
+            )}
+          </Field>
+        </div>
+
+        <label className="check">
+          <input type="checkbox" checked={nat} disabled={busy}
+            onChange={(event) => setNat(event.target.checked)} />
+          <span>
+            NAT traffic that leaves the fabric
+            <span className="hint">
+              {nat
+                ? ' Instances can use the fabric as their only NIC and still reach the internet.'
+                : ' Instances reach only each other through it; nothing else is routed.'}
+            </span>
+          </span>
+        </label>
+
+        {checkError && (
+          <div className="banner banner-error"><div className="banner-body"><p>{checkError}</p></div></div>
+        )}
+        {current && check.unreachable_error && (
+          <div className="banner banner-error"><div className="banner-body"><p>
+            {check.unreachable_error}
+          </p></div></div>
+        )}
+
+        <div className="net-section" style={{ padding: 0 }}>
+          <h4>
+            What each node gets
+            {!current && started && <span className="faint"> · checking…</span>}
+          </h4>
+          {!started ? (
+            <div className="loading-wrap"><span className="spinner" /> Asking every node what it uses…</div>
+          ) : allocation.length === 0 ? (
+            <p className="hint">Nothing to show until the name and prefix fit.</p>
+          ) : (
+            <div className="table-scroll">
+              <table className="ctable net-table">
+                <thead><tr><th>Node</th><th>Subnet</th><th>Gateway</th></tr></thead>
+                <tbody>
+                  {allocation.map(([node, subnet]) => (
+                    <tr key={node} style={current ? undefined : { opacity: 0.5 }}>
+                      <td>{node}</td>
+                      <td className="mono num">{subnet}</td>
+                      <td className="mono faint">{subnet.replace(/\.0\/24$/, '.1')}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {current && check.ok && (
+            <p className="hint" style={{ marginTop: 8 }}>
+              Checked against every interface and route on {allocation.length} node
+              {allocation.length === 1 ? '' : 's'}; nothing overlaps.
+            </p>
+          )}
+        </div>
+      </form>
+    </Modal>
+  )
+}
+
+function FabricDeleteDialog({ fabric, busy, onCancel, onConfirm }: {
+  fabric: FabricSummary
+  busy: boolean
+  onCancel: () => void
+  onConfirm: () => void
+}) {
+  const inUse = fabric.members.filter((m) => m.instances.length > 0)
+  const silent = fabric.members.filter((m) => m.state === 'unknown')
+  const holding = fabric.members.filter((m) => m.state !== 'absent')
+  return (
+    <Modal
+      title={`Delete fabric ${fabric.name}?`}
+      onClose={busy ? () => {} : onCancel}
+      footer={
+        <>
+          <button className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
+          <button className="btn btn-danger" onClick={onConfirm}
+            disabled={busy || inUse.length > 0}>
+            {busy && <span className="spinner" />}
+            Delete everywhere
+          </button>
+        </>
+      }
+    >
+      {inUse.length > 0 ? (
+        <div className="pool-delete-dialog">
+          <p style={{ margin: 0 }}>
+            Detach or delete these instances first. lemondx does not do it for you:
+            an instance whose NIC is removed keeps running cut off, which is easy to miss.
+          </p>
+          {inUse.map((member) => (
+            <div className="pool-delete-group" key={member.node}>
+              <strong>{member.node}</strong>
+              <ul>{member.instances.map((i) => <li key={i} className="mono">{i}</li>)}</ul>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p style={{ margin: 0, fontSize: 13.5, lineHeight: 1.6 }}>
+          This removes the bridge <span className="mono">{fabric.name}</span>, its routes
+          and its firewall rules from {holding.map((m) => m.node).join(', ') || 'every node'},
+          and frees <span className="mono">{fabric.prefix}</span>.
+          {silent.length > 0 && (
+            <> {silent.map((m) => m.node).join(', ')} did not answer and will keep
+              {silent.length === 1 ? ' its' : ' their'} part until you delete again.</>
+          )}
+        </p>
+      )}
+    </Modal>
   )
 }
 

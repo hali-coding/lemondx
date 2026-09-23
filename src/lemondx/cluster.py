@@ -52,7 +52,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from . import store
 from .auth import ADMIN, TOKEN_PREFIX
-from .bootstrap import discover_modules, module_source
+from .bootstrap import discover_modules, module_source, normalise_module_id
 from .lxd import LXDError
 from .nodeclient import (DEFAULT_TIMEOUT, LONG_TIMEOUT, NodeClient, NodeError,
                          fingerprint_of,
@@ -381,7 +381,8 @@ def clean_member(record):
         return None                 # nothing to recognise it by; not a usable member
     return {"name": name, "url": url,
             "fingerprint": fingerprint if FINGERPRINT.match(fingerprint) else "",
-            "description": str(record.get("description") or "")[:200]}
+            "description": str(record.get("description") or "")[:200],
+            "fabric": store.clean_fabric(record.get("fabric"))}
 
 
 # -- the service -----------------------------------------------------------
@@ -411,6 +412,13 @@ class ClusterService:
         # taken and dropped around each small piece of shared state.
         self._reconcile_lock = threading.Lock()
         self._stacks = None          # set by StackService, for applying a pulled stack
+        self._fabric_service = None  # set by FabricService, for routes between nodes
+        self._serving_fingerprint = ""  # set by serve(), see note_serving()
+        # How a template's "put these on the fabric" becomes a device on this
+        # node: the service resolves the flag through here, so it never has to
+        # read fabric settings itself.
+        service.fabric_bridge = self._fabric_bridge
+        service.fabric_configure = self._fabric_configure
 
     # -- this node ---------------------------------------------------------
 
@@ -452,14 +460,39 @@ class ClusterService:
             return cert, key
         return None, None
 
+    def note_serving(self, host, port, cert):
+        """Record that this process serves this node's URL with ``cert``.
+
+        Then `local_fingerprint()` need not ask the network: this process *is*
+        the running server it would otherwise probe. The probe is worse than
+        redundant from here -- `serve()` reads the member list before its
+        accept loop runs, so a connection to its own bound-but-idle socket
+        waits out the whole timeout, once per call, and peers' handshakes
+        queue behind it for as long.
+        """
+        try:
+            scheme, url_host, url_port = parse_url(self.local_url())[:3]
+        except NodeError:
+            return
+        if scheme != "https" or int(url_port) != int(port):
+            return
+        if host not in ("0.0.0.0", "::", "") and host != url_host:
+            return      # serving somewhere else, e.g. only on loopback
+        try:
+            self._serving_fingerprint = certificate_fingerprint(cert)
+        except ClusterError:
+            pass
+
     def local_fingerprint(self):
         """What peers will pin this node by.
 
         The running server is the authority: whatever it presents is what a peer
         actually sees, which a certificate file on disk only predicts. Falling
         back to the file covers a node that is not serving yet -- the usual case
-        when setting one up.
+        when setting one up. When this process is that server, it already knows.
         """
+        if self._serving_fingerprint:
+            return self._serving_fingerprint
         url = self.local_url()
         if url:
             try:
@@ -476,13 +509,33 @@ class ClusterService:
 
     def local_node(self):
         """The record a peer keeps for this node."""
+        from . import fabric as fabric_mod
         return {
             "name": self.local_name(),
             "url": self.local_url(),
             "fingerprint": self.local_fingerprint(),
             "description": "",
             "added": 0,
+            # How peers learn where to route this node's containers, one claim
+            # per fabric. Empty on a node that is on none, which is how a mixed
+            # cluster works: a node without a fabric is one nobody routes to.
+            "fabric": fabric_mod.local_claim(self.local_route_address()),
         }
+
+    def local_route_address(self):
+        """The address peers should route this node's fabric subnet to.
+
+        The host of this node's own URL when that is an address, because it is
+        the one peers demonstrably reach it on -- a host with several addresses
+        on one interface (or one on a second interface) would otherwise
+        advertise whichever the kernel picks for a route to the internet, which
+        is not necessarily the one the cluster talks to.
+        """
+        try:
+            host = parse_url(self.local_url())[1]
+            return str(ipaddress.ip_address(host))
+        except (NodeError, ValueError):
+            return guess_local_address()
 
     def ensure_identity(self):
         """Give this node everything it needs to be a member, provisioning it.
@@ -730,15 +783,24 @@ class ClusterService:
         for _, peer in sorted(self._peers().items()):
             records.append({"name": peer["name"], "url": peer["url"],
                             "fingerprint": peer["fingerprint"],
-                            "description": peer["description"], "added": peer["added"]})
+                            "description": peer["description"], "added": peer["added"],
+                            "fabric": peer.get("fabric")})
         return records
 
-    def remember_members(self, records, source=""):
+    def remember_members(self, records, source="", authoritative=None):
         """Merge member records into the registry. Returns the names added.
 
         A member's own record wins for its own entry -- it is the only thing
-        that knows its address and certificate -- and this node's entry is never
-        taken from someone else's copy of it.
+        that knows its address, certificate and fabric subnet -- and this
+        node's entry is never taken from someone else's copy of it.
+
+        ``authoritative`` is the one node in ``records`` speaking for itself.
+        Everything else in the list is gossip: it may introduce a node we have
+        never heard of, but it may not overwrite one we already know, because
+        the peer handing it over may have a stale copy. That matters most for
+        something that changes at a moment: levelling with three peers pulls
+        three copies of every other node, and without this the last one read
+        wins over the node's own.
         """
         # Kept up to date as we go: one call is routinely handed the same node
         # twice -- a join gets the inviter both on its own and inside the member
@@ -750,9 +812,14 @@ class ClusterService:
             if member is None or member["name"] == self.local_name():
                 continue
             current = known.get(member["name"])
-            if current and (current["url"], current["fingerprint"]) == \
-                    (member["url"], member["fingerprint"]):
+            # The fabric claim is part of what a member's own record tells us:
+            # left out of this comparison, a node that was just given a subnet
+            # would never have it noticed here, and nothing would route to it.
+            if current and (current["url"], current["fingerprint"], current.get("fabric")) \
+                    == (member["url"], member["fingerprint"], member["fabric"]):
                 continue
+            if current and authoritative and member["name"] != authoritative:
+                continue        # second-hand, and we already have its own word
             saved = store.save_node(member["name"], dict(member, added=int(
                 (current or {}).get("added") or time.time())))
             (updated if current else added).append(member["name"])
@@ -766,6 +833,11 @@ class ClusterService:
                 self._probes.pop(member["name"], None)
         if notes:
             _log("membership from %s: %s" % (source or "a peer", ", ".join(notes)))
+        if added or updated:
+            # Membership changed, so the fabric's routes are now wrong. This is
+            # the choke point every path funnels through -- join, announce,
+            # sync_members -- so hooking it here covers them all at once.
+            self._fabric().reapply()
         return {"added": added, "updated": updated}
 
     def announce(self, body, peer_address=None):
@@ -784,7 +856,8 @@ class ClusterService:
                 "That node calls itself '%s', which is this node's own name. Give "
                 "one of them a different name with `lemondx configure cluster`."
                 % member["name"], 409)
-        self.remember_members([member], source=peer_address or member["name"])
+        self.remember_members([member], source=peer_address or member["name"],
+                              authoritative=member["name"])
         return {"registered": member["name"], "members": self.members()}
 
     def sync_members(self):
@@ -811,7 +884,8 @@ class ClusterService:
         for outcome in self._fanout(sorted(self._peers()), one):
             results.append({k: outcome[k] for k in ("node", "ok", "error")})
             if outcome["ok"]:
-                self.remember_members(outcome["members"], source=outcome["node"])
+                self.remember_members(outcome["members"], source=outcome["node"],
+                                      authoritative=outcome["node"])
         return {"ok": all(r["ok"] for r in results), "results": results,
                 "members": self.members()}
 
@@ -892,6 +966,9 @@ class ClusterService:
                     group, members=[m for m in group["members"] if m != name]))
         with self._lock:
             self._probes.pop(name, None)
+        # A forgotten node's subnet must stop being routed here, or its address
+        # space stays claimed on this host and a later member cannot be given it.
+        self._fabric().reapply()
 
     def _tell_peers(self, name):
         """Ask every remaining member to forget ``name``. Never raises."""
@@ -1017,6 +1094,21 @@ class ClusterService:
                 "cannot be %s by hand. Run `lemondx cluster group auto` to build "
                 "it again from the nodes as they are now." % (name, verb), 409)
 
+    @staticmethod
+    def refuse_in_use(kind, noun, name):
+        """Refuse a person's delete of something another record still names.
+
+        Only a person's: a member relaying a delete, or reconciliation settling
+        one, is carrying out a decision this check already met where it was
+        made, and refusing it here would leave the cluster disagreeing for good.
+        """
+        users = store.dependents(kind, name)
+        if users:
+            raise ClusterError(
+                "%s '%s' is used by %s. Change or delete %s first."
+                % (noun[:1].upper() + noun[1:], name, ", ".join(users),
+                   "it" if len(users) == 1 else "them"), 409)
+
     def save_group(self, name, members=None, description="", propagate=True,
                    managed=False):
         name = (name or "").strip()
@@ -1127,8 +1219,10 @@ class ClusterService:
         return {"groups": saved, "nodes": sized, "skipped": skipped,
                 "uniform": uniform}
 
-    def delete_group(self, name, everywhere=True, managed=False):
+    def delete_group(self, name, everywhere=True, managed=False, relayed=False):
         self._refuse_managed((name or "").strip(), managed, "deleted")
+        if not relayed:
+            self.refuse_in_use("groups", "node group", (name or "").strip())
         if not store.delete_node_group((name or "").strip()):
             raise ClusterError("No such node group '%s'." % name, 404)
         return self._with_sync({"deleted": name}, "groups", name, everywhere,
@@ -1342,7 +1436,8 @@ class ClusterService:
 
         # Recorded before answering, so this node knows the joiner even if the
         # joiner's own announcements never arrive.
-        self.remember_members([joiner], source=peer_address or joiner["name"])
+        self.remember_members([joiner], source=peer_address or joiner["name"],
+                              authoritative=joiner["name"])
         _log("node %s joined the cluster with code %s from %s"
              % (joiner["name"], invite_id, peer_address or "an unknown address"))
         return {
@@ -1350,7 +1445,18 @@ class ClusterService:
             "secret": self.cluster_secret(),
             "members": self.members(),
             "groups": [g["name"] for g in self.list_groups()],
+            # The joiner cannot allocate its own subnet -- nothing in two
+            # conflicting claims says which is right -- so the node admitting
+            # it picks one, the same way it hands over the credential.
+            "fabrics": self._enrolment_claims(joiner["name"]),
         }
+
+    def _enrolment_claims(self, joiner):
+        """[{name, prefix, subnet, nat}] for a node being admitted, one per fabric."""
+        try:
+            return self._fabric().enrolment_claims(joiner)
+        except Exception:                 # never fail a join over a fabric
+            return []
 
     # -- joining: the node redeeming the code ------------------------------
 
@@ -1431,7 +1537,13 @@ class ClusterService:
         # The fingerprint the operator carried is the one that counts: the
         # node's own answer cannot loosen what the code pinned.
         remote = dict(remote, fingerprint=fingerprint or remote.get("fingerprint") or "")
-        self.remember_members([remote] + list(answer.get("members") or []), source=name)
+        self.remember_members([remote] + list(answer.get("members") or []),
+                              source=name, authoritative=remote.get("name"))
+
+        # Take the subnet the cluster allocated before announcing, so the
+        # claim is on this node's record by the time peers read it and they
+        # route to it on the first pass rather than the next hourly one.
+        fabric_note = self._accept_enrolment(answer.get("fabrics"))
 
         # Now that we hold the credential, tell everyone else we exist. The node
         # that admitted us already knows; the rest learn here, or on the next
@@ -1445,7 +1557,32 @@ class ClusterService:
             "members": self.members(),
             "unreachable": [r["node"] for r in spread["results"] if not r["ok"]],
             "warning": warning,
+            "fabrics": fabric_note,
         }
+
+    def _accept_enrolment(self, offered):
+        """Take the fabric subnets the cluster allocated, one per fabric it has.
+
+        A refusal here is reported, not raised: the node has joined, and a
+        prefix that collides with this host's own network is a thing to fix
+        rather than a reason to undo a membership that otherwise works.
+        `fabric extend` is how it is put right once it is.
+        """
+        notes = []
+        for offer in offered if isinstance(offered, list) else []:
+            if not isinstance(offer, dict) or not offer.get("subnet"):
+                continue
+            note = {"name": str(offer.get("name") or ""), "subnet": offer["subnet"],
+                    "ok": True, "error": ""}
+            try:
+                self._fabric().accept_claim(offer.get("name"), offer["subnet"],
+                                            offer.get("prefix"), offer.get("nat") is not False)
+            except Exception as exc:
+                note.update(ok=False, error=getattr(exc, "message", str(exc)))
+                _log("joined, but could not take a subnet in fabric %s: %s"
+                     % (note["name"], note["error"]))
+            notes.append(note)
+        return notes
 
     def _stand_down(self):
         """Erase every trace of membership here: credential, peers, groups.
@@ -1481,6 +1618,10 @@ class ClusterService:
         store.update_auth("cluster", drop_secret)
         with self._lock:
             self._probes.clear()
+        # The fabric was this cluster's address space. Give the claim up with
+        # the credential, so the next cluster this node joins allocates it one
+        # rather than finding it already holding somebody else's subnet.
+        self._fabric().stand_down()
         return peers
 
     def leave(self):
@@ -2018,7 +2159,8 @@ class ClusterService:
         elif kind == "profiles":
             self.service.delete_bootstrap_profile(name)
         elif kind == "groups":
-            self.delete_group(name, everywhere=False, managed=name in SIZE_GROUPS)
+            self.delete_group(name, everywhere=False, managed=name in SIZE_GROUPS,
+                              relayed=True)
         elif kind == "stacks":
             self._stack_service().delete_stack(name, everywhere=False)
         else:
@@ -2034,6 +2176,36 @@ class ClusterService:
             from .stacks import StackService
             self._stacks = StackService(self)
         return self._stacks
+
+    def _fabric(self):
+        """The FabricService, for the routes that carry traffic between nodes.
+
+        Lazy for the same reason as stacks: fabric.py sits above this module
+        and reads the member list, so the dependency can only go this way at
+        runtime. Building it costs nothing on a node that never federates.
+        """
+        if self._fabric_service is None:
+            from .fabric import FabricService
+            self._fabric_service = FabricService(self)
+        return self._fabric_service
+
+    def fabric(self):
+        """The fabric, for the API and the CLI."""
+        return self._fabric()
+
+    def _fabric_configure(self, name, iface, bridge):
+        """Configure a new instance's fabric NIC. Never fails the launch."""
+        try:
+            return self._fabric().configure_guest(name, iface, bridge)
+        except Exception:
+            return None
+
+    def _fabric_bridge(self, wanted):
+        """This node's bridge for fabric ``wanted``, or "" when it is not on it."""
+        try:
+            return self._fabric().resolve(wanted)
+        except Exception:                 # never fail a launch over a fabric
+            return ""
 
     def _push(self, node_name, items, apply):
         rows = [{"node": node_name, "from": self.local_name(), "kind": kind,
@@ -2105,7 +2277,9 @@ class ClusterService:
         record = self.service.save_template(**kwargs)
         return self._with_sync(record, "templates", record["name"], propagate)
 
-    def delete_template(self, name, everywhere=True):
+    def delete_template(self, name, everywhere=True, relayed=False):
+        if not relayed:
+            self.refuse_in_use("templates", "template", name)
         record = self.service.delete_template(name)
         return self._with_sync(record, "templates", name, everywhere, deleted=True)
 
@@ -2113,7 +2287,14 @@ class ClusterService:
         record = self.service.upload_module(name, content, overwrite)
         return self._with_sync(record, "modules", record["id"], propagate)
 
-    def remove_module(self, module_id, everywhere=True):
+    def remove_module(self, module_id, everywhere=True, relayed=False):
+        module = discover_modules().get(normalise_module_id(module_id))
+        # Removing a shadow brings the built-in back under the same id, so
+        # nothing naming it is left without a module to run; a module that
+        # cannot be deleted at all is left to say why itself.
+        if not relayed and module and module["editable"] and not module["builtin"] \
+                and not module["shadows_builtin"]:
+            self.refuse_in_use("modules", "module", module["id"])
         record = self.service.remove_module(module_id)
         # A built-in that was only shadowed still exists everywhere, so the
         # upload coming off this node is what the others are told about.
@@ -2594,6 +2775,7 @@ def _template_body(template):
         "disk": template["disk"] or None,
         "pool": template["pool"] or None,
         "network": template["network"] or None,
+        "fabric": template.get("fabric") or "",
         "profiles": template["profiles"],
         "ephemeral": template["ephemeral"],
         "start": template["start"],

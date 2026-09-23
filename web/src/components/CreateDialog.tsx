@@ -121,6 +121,7 @@ export function CreateDialog({ onCancel, onCreate, onNotify }: Props) {
         disk: resolved.disk || undefined,
         pool: resolved.pool || undefined,
         network: resolved.network || undefined,
+        fabric: resolved.fabric || undefined,
         profiles: resolved.profiles.length > 0 ? resolved.profiles : undefined,
         ephemeral: resolved.ephemeral,
         start: resolved.start,

@@ -77,6 +77,20 @@ export function TemplateDialog({ template, onCancel, onSaved }: Props) {
     setError(null)
     const resolved = resolvedSpec(spec)
     try {
+      // The server refuses to delete a template a stack launches, which a
+      // rename would only discover after saving the copy -- so ask first.
+      if (template && template.name !== name.trim()) {
+        const users = (await api.stacks()).filter((stack) => stack.stages.some(
+          (stage) => stage.steps.some(
+            (step) => step.type === 'launch' && step.template === template.name)))
+        if (users.length) {
+          setError(`Stack${users.length > 1 ? 's' : ''} ${users.map((s) => `“${s.name}”`).join(', ')} `
+            + `launch${users.length > 1 ? '' : 'es'} “${template.name}”, so it cannot be renamed. `
+            + 'Point them at another template first.')
+          setBusy(false)
+          return
+        }
+      }
       const saved = await api.saveTemplate(name.trim(), {
         ...resolved,
         bootstrap: savableSelection(modules, resolved.bootstrap),

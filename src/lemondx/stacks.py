@@ -43,6 +43,7 @@ record *around* those, kept in memory like them (one per ``serve`` process).
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import sys
 import threading
@@ -696,13 +697,45 @@ class StackService:
                 break
             time.sleep(READY_POLL_SECONDS)
         ordered = sorted(found.values(), key=lambda c: _natural(c["name"]))
+        reachable = self._reachable_address
         return {
             "names": [c["name"] for c in ordered],
-            "ips": [c["ipv4"][0] for c in ordered if c.get("ipv4")],
+            "ips": [reachable(c) for c in ordered if reachable(c)],
             "ipv6": [c["ipv6"][0] for c in ordered if c.get("ipv6")],
             "nodes": sorted({c["node"] for c in ordered}),
-        }, {(c["node"], c["name"]): (c["ipv4"][0] if c.get("ipv4") else None)
-            for c in ordered}
+        }, {(c["node"], c["name"]): reachable(c) for c in ordered}
+
+    def _reachable_address(self, container):
+        """The address of an instance that a step on another node can reach.
+
+        An instance on the fabric has two: the NAT'd one on its own node's
+        bridge, which means nothing anywhere else, and one on the fabric. A
+        stack exists to let a later step talk to an earlier one, and a step may
+        land on any node, so the fabric address is the one worth handing on --
+        picking the first would hand on whichever the daemon happened to list
+        first and work only by luck.
+        """
+        addresses = container.get("ipv4") or []
+        prefixes = self._fabric_prefixes()
+        for address in addresses:
+            try:
+                if any(ipaddress.ip_address(address) in p for p in prefixes):
+                    return address
+            except ValueError:
+                continue
+        return addresses[0] if addresses else None
+
+    def _fabric_prefixes(self):
+        """Every fabric prefix this node is on; [] when it is on none.
+
+        Asked each time rather than kept: a fabric created after `serve`
+        started must count, and the settings behind it are already cached
+        until the file changes.
+        """
+        try:
+            return self.cluster.fabric().prefixes()
+        except Exception:
+            return []
 
     # -- the instances a stack is running ------------------------------------
 

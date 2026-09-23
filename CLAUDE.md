@@ -54,6 +54,7 @@ Four layers, one direction of dependency:
 
 ```
 lxd.py          transport: HTTP over the daemon's AF_UNIX socket, no shelling out
+hostnet.py      transport: the host's routing table, the one place that shells out
   ↓
 service.py      domain: ContainerService turns raw daemon records into lemondx shapes
   ↓
@@ -115,7 +116,9 @@ Never log a credential: `log_message()` masks `token=` and startup prints no tok
 `lemondx configure <section>` (`configure.py`) saves settings to
 `store.config_path(section)` for later launches. A section is a `Section` subclass
 decorated `@register`; the CLI builds its choices from `SECTIONS`, so a new section
-needs no parser change. Sections own prompts and presentation only -- validation
+needs no parser change. `tls` is the exception to one-file-per-section: it
+edits the cluster section's `tls_cert`/`tls_key`, which `serve` already
+defaults to, because a node serves one certificate and its peers pin it. Sections own prompts and presentation only -- validation
 lives with the consumer (`auth.clean_settings()`), so a hand-edited file and an
 answer meet the same rules. `serve` merges saved settings under its flags with
 `auth.build_config()`; every auth flag defaults to `None` so "not given" is
@@ -264,6 +267,12 @@ save has already happened and must not be undone because another host is off.
 What each node made of it rides back on the record as `synced`, which is also
 why those routes take `principal=True`. Deleting propagates because sync only
 ever pushes -- it cannot clear a copy the target has and this node does not.
+A person's delete is refused (409) while another record names the thing --
+a stack's step a template or group, a template or profile a module, a
+template a fabric -- via `store.dependents()` and
+`ClusterService.refuse_in_use()`; a delete a member relays, or reconciliation
+settles, passes `relayed=True` and skips it, because it was checked where it
+was decided and refusing it here would leave the cluster split for good.
 
 `ClusterService.change_state()` / `delete_containers()` / `template_action()`
 take `[{node, name}]`, group by node and fan out. Each takes the plain local
@@ -332,6 +341,68 @@ server.py, and again in `_forward()`, where a relayed call would otherwise reach
 the target wearing the cluster credential): a stack's local share never goes
 through the API at all, and a person naming a stack on an ordinary launch would
 be giving it instances to destroy later.
+
+### Fabrics
+
+`fabric.py` (`FabricService`) sits above `ClusterService` like `stacks.py` does,
+and for the same reason -- it needs the member list -- reached through a lazy
+`ClusterService._fabric()`. A cluster may have several fabrics; each is named
+after the bridge it puts on every node, has a private /16--/22 prefix, and
+gives each node a /24 of it, with a host route to every peer's /24. Instances
+get a NIC on it beside the profile's `eth0` (`fabric_nic()`, `FABRIC_NIC`), or
+as their only NIC by picking it as the network. `hostnet.py` is to the host's
+routing table and firewall what `lxd.py` is to the daemon, and is the only
+place lemondx shells out to a privileged command.
+
+There is no list of fabrics: a fabric is the set of members claiming a subnet
+in it, and the claims ride on each node's record (`store.clean_fabric`,
+`{via, fabrics: {name: {prefix, subnet, nat}}}`) and converge through
+`sync_members()` -- which is why `remember_members()` takes `authoritative=`.
+Allocation is coordinated, never reconciled: `create()` asks every member what
+it uses (`host_inventory()`: interfaces *and* host routes), refuses unless all
+answer, and pushes each its claim through a peers-only route. `check()` is the
+same computation without the push, and what the UI's create dialog calls.
+
+Things that are easy to get wrong here:
+
+**Routed within, NAT'd without, closed to everyone else.** The daemon's
+`ipv4.nat` stays off on fabric bridges -- it would masquerade traffic to the
+peers' /24s too. `hostnet.firewall_ruleset()` builds lemondx's own `ip lemondx`
+nftables table instead: masquerade except to the fabric's prefix, accept into a
+bridge only from its prefix (or replies), drop towards other fabrics. The
+table is replaced whole on every apply, and the helper builds it from saved
+settings, never stdin. On Docker hosts `docker_commands()` keeps tagged
+`DOCKER-USER` accepts, since Docker's FORWARD drop is final whatever our table
+says.
+
+**The gateway is offered only with NAT.** Without it, `raw.dnsmasq=dhcp-option=3`
+is set by `fabric.py` straight through `lxd.update_network()`, deliberately
+bypassing `BRIDGE_CONFIG` -- dnsmasq runs as root under the daemon, so
+`dhcp-script=` through the REST API would be host execution.
+
+**Attaching a NIC is not an address, and an address is not a route.** Almost
+every image configures `eth0` alone, so `configure_guest()` runs
+`_CONFIGURE_NIC` inside the instance to bring the interface up at boot *and*
+add a route to the whole prefix through it -- without that, traffic to a peer's
+/24 leaves by `eth0` and arrives NAT'd behind the host.
+
+**Privilege is one command, not one binary.** The sudoers rules name
+`lemondx fabric-helper` (`fabrichelper.py`), which takes the wanted state on
+stdin and decides what to run itself. `ip` cannot be granted -- `ip netns exec X
+sh` is a root shell -- and argument patterns do not confine portably, because
+Ubuntu 25.10's sudo-rs matches arguments literally and supports neither
+wildcards nor regexes while classic sudo supports both. So the confinement is
+Python: a /24 inside one of this node's fabric prefixes, via a
+directly-connected address. Route *removal* is held to ownership (proto 133)
+instead, so a deleted fabric's routes can be cleared once its prefix is gone.
+
+**Two processes, one settings file.** `FabricService.settings()` re-reads on an
+inode/mtime change, like `AuthService`: a fabric created from the CLI writes
+this node's claim, and a `serve` holding the old copy would route nothing for
+it.
+
+A stack spanning nodes works because `_reachable_address()` hands on the fabric
+address when there is one, so `{{step.ip}}` means something on another host.
 
 ### Health checks
 

@@ -1,0 +1,31 @@
+# lemondx fabric: routed, non-NAT networking between the containers of a cluster.
+#
+# Install with `systemd/install-service.sh --fabric`, which fills in the path
+# and the group for this host. See docs/networking.md.
+#
+# This grants one exact command. lemondx reads the routing table and /proc/sys
+# without privilege, so the only things it needs root for are writing routes
+# and the fabric firewall (its own nftables table, and accept rules in Docker's
+# DOCKER-USER chain where Docker is installed), and `lemondx fabric-helper` is
+# the only thing that does either.
+#
+# It is one command of our own rather than `ip` for a reason that is worth
+# knowing before you edit this file:
+#
+#   * `ip` cannot be granted safely. Without arguments it allows `ip netns exec
+#     X sh`, which is a root shell. With arguments it cannot be confined
+#     portably -- Ubuntu 25.10 ships sudo-rs, which matches command arguments
+#     literally and supports neither wildcards nor regular expressions, while
+#     classic sudo supports both. A pattern that confines on Debian is wide
+#     open or simply broken on Ubuntu.
+#   * So the confinement lives in the helper instead, where it is code: it
+#     takes a description of the wanted state on stdin, never a command, and
+#     refuses any route that is not a /24 inside one of this node's fabric
+#     prefixes reached through a directly-connected network, and builds the
+#     firewall from the saved fabric settings, never from stdin.
+#
+# The group is the daemon's own admin group, which docs/security.md already
+# treats as root-equivalent -- creating a container on this host is enough to
+# become root on it. This adds no access that group did not already have.
+
+%@GROUP@ ALL=(root) NOPASSWD: @HELPER@ fabric-helper

@@ -55,6 +55,8 @@ fills the form from a template, for a one-off variation.
 ```
 
 `launch` exits 1 if any instance failed, and `--json` prints the full result.
+Deleting a template is refused (`409`) while a [stack](stacks.md) launches it;
+the error names the stacks.
 
 ```bash
 ./lemondx template-exec "Web server" -- apt-get -y upgrade

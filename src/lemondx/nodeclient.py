@@ -363,6 +363,22 @@ class NodeClient:
         """Hand a peer a rotated cluster credential, authenticated with the old one."""
         return self.request("PUT", "/api/cluster/secret", {"secret": secret})
 
+    def set_fabric_claim(self, name, subnet, prefix, nat=True):
+        """Tell a peer which subnet it holds in fabric ``name``."""
+        return self.request("PUT", "/api/fabric/claims/%s" % _seg(name),
+                            {"subnet": subnet, "prefix": prefix, "nat": bool(nat)})
+
+    def drop_fabric_claim(self, name):
+        """Tell a peer fabric ``name`` is being deleted, so it leaves it."""
+        return self.request("DELETE", "/api/fabric/claims/%s" % _seg(name))
+
+    def fabric_status(self):
+        return self.request("GET", "/api/fabric")
+
+    def fabric_host(self):
+        """What a peer's host already uses, for choosing a free prefix."""
+        return self.request("GET", "/api/fabric/host")
+
     def health(self):
         return self.request("GET", "/api/health")
 

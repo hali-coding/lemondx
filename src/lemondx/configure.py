@@ -19,6 +19,7 @@ import secrets
 import sys
 
 from . import auth, cluster, pam, store
+from . import fabric as fabric_net
 from . import health as health_checks
 
 
@@ -501,50 +502,14 @@ class ClusterSection(Section):
         p.say("A node is recognised by the TLS certificate it serves, which peers pin "
               "when they join -- so it has to serve HTTPS. One is generated on first "
               "use if you have none.")
-        s["tls_cert"], s["tls_key"] = self._prompt_tls(p, s)
+        s["tls_cert"], s["tls_key"] = _prompt_tls(
+            p, s, "decide later -- one is generated when this node federates")
 
         p.say()
         s["allow_enrollment"] = p.yes_no(
             "Let nodes join this cluster through this node, with a valid join code?",
             s["allow_enrollment"])
         return s
-
-    def _prompt_tls(self, p, s):
-        if s["tls_cert"] and os.path.exists(s["tls_cert"]):
-            p.say("  Currently %s" % s["tls_cert"])
-            if not p.yes_no("Replace it?", False):
-                return s["tls_cert"], s["tls_key"]
-        elif s["tls_cert"]:
-            p.say("  ! %s no longer exists." % s["tls_cert"])
-
-        choice = p.choose_one("Certificate", [
-            ("generate", "generate a self-signed one now (needs openssl)"),
-            ("existing", "use a certificate I already have"),
-            ("none", "decide later -- one is generated when this node federates"),
-        ], default="none")
-        if choice == "none":
-            return None, None
-        if choice == "existing":
-            cert = p.ask("Certificate file (PEM)", default=s["tls_cert"],
-                         validate=_readable_file)
-            key = p.ask("Private key file (PEM)", default=s["tls_key"],
-                        validate=_readable_file)
-            try:
-                p.say("  Fingerprint %s"
-                      % cluster.pretty_fingerprint(cluster.certificate_fingerprint(cert)))
-            except cluster.ClusterError as exc:
-                p.say("  ! %s" % exc.message)
-            return cert, key
-
-        host = _host_of(s["url"]) or cluster.guess_local_address() or "localhost"
-        host = p.ask("Address to name in the certificate", default=host)
-        try:
-            made = cluster.generate_certificate(host)
-        except cluster.ClusterError as exc:
-            raise ConfigureError(exc.message, exc.code)
-        p.say("  + wrote %s" % made["cert"])
-        p.say("  Fingerprint %s" % cluster.pretty_fingerprint(made["fingerprint"]))
-        return made["cert"], made["key"]
 
     def describe(self, s):
         rows = [("node name", s["name"] or "%s (this host)" % cluster.default_node_name()),
@@ -572,6 +537,161 @@ class ClusterSection(Section):
               "set up first.")
 
 
+@register
+class TlsSection(Section):
+    """HTTPS for `serve`, without federating.
+
+    Deliberately not a file of its own: it edits the certificate the cluster
+    section names, which is what `serve` already defaults to. A node serves one
+    certificate and its peers pin that one, so two saved answers to "which
+    certificate" could only ever disagree.
+    """
+
+    name = "tls"
+    help = "serve HTTPS: the certificate `lemondx serve` uses by default"
+
+    def path(self):
+        return store.config_path(cluster.SETTINGS_SECTION)
+
+    def _cluster(self):
+        try:
+            raw = store.load_config(cluster.SETTINGS_SECTION)
+            return cluster.clean_settings(raw) if raw is not None else None
+        except (ValueError, cluster.ClusterError) as exc:
+            raise ConfigureError(getattr(exc, "message", str(exc)))
+
+    def configured(self):
+        try:
+            return bool((self._cluster() or {}).get("tls_cert"))
+        except ConfigureError:
+            return False
+
+    def load(self):
+        current = self._cluster()
+        if not current or not current["tls_cert"]:
+            return None
+        return {"tls_cert": current["tls_cert"], "tls_key": current["tls_key"]}
+
+    def defaults(self):
+        return {"tls_cert": None, "tls_key": None}
+
+    def prompt(self, p, current):
+        s = self.defaults()
+        s.update(current or {})
+        p.say("The certificate `lemondx serve` uses for HTTPS unless told otherwise "
+              "(--tls-cert, or --no-tls behind a proxy that terminates TLS).")
+        if _in_cluster():
+            p.say("! This node is in a cluster, and its peers pin the certificate it "
+                  "serves: replacing it cuts them off until each is told the new "
+                  "fingerprint.")
+        p.say()
+        s["tls_cert"], s["tls_key"] = _prompt_tls(
+            p, s, None if _in_cluster() else "no certificate -- serve plain HTTP",
+            default="generate")
+        return s
+
+    def save(self, settings):
+        if not settings.get("tls_cert") and _in_cluster():
+            raise ConfigureError("Not saved: this node is in a cluster, whose members "
+                                 "only speak HTTPS to it.", 409)
+        merged = self._cluster() or dict(cluster.DEFAULT_SETTINGS)
+        merged.update(tls_cert=settings.get("tls_cert"), tls_key=settings.get("tls_key"))
+        try:
+            saved = cluster.save_settings(merged)
+        except cluster.ClusterError as exc:
+            raise ConfigureError("Not saved: %s" % exc.message, exc.code)
+        return {"tls_cert": saved["tls_cert"], "tls_key": saved["tls_key"]}
+
+    def reset(self):
+        current = self._cluster()
+        if not current or not current["tls_cert"]:
+            return False
+        if _in_cluster():
+            raise ConfigureError(
+                "This node is in a cluster, whose members only speak HTTPS to it; "
+                "its certificate stays. `lemondx configure tls` replaces it.", 409)
+        cluster.save_settings(dict(current, tls_cert=None, tls_key=None))
+        return True
+
+    def describe(self, s):
+        if not s["tls_cert"]:
+            return [("https", "off -- `lemondx serve` serves plain HTTP")]
+        rows = [("https", "on by default")]
+        try:
+            rows.append(("fingerprint", cluster.pretty_fingerprint(
+                cluster.certificate_fingerprint(s["tls_cert"]))))
+        except cluster.ClusterError as exc:
+            rows.append(("fingerprint", "! %s" % exc.message))
+        rows += [("certificate", s["tls_cert"]), ("key", s["tls_key"] or "")]
+        return rows
+
+    def after_save(self, p, s):
+        p.say()
+        if s["tls_cert"]:
+            p.say("`lemondx serve` serves HTTPS with this certificate from its next "
+                  "start; --no-tls serves plain HTTP for one run. A self-signed "
+                  "certificate makes browsers warn once -- compare the fingerprint.")
+        else:
+            p.say("`lemondx serve` serves plain HTTP.")
+
+
+@register
+class FabricSection(Section):
+    name = "fabric"
+    help = "routed, non-NAT networking between the containers of a cluster"
+
+    def load(self):
+        try:
+            raw = store.load_config(self.name)
+            return None if raw is None else fabric_net.clean_settings(raw)
+        except (ValueError, fabric_net.FabricError) as exc:
+            raise ConfigureError(getattr(exc, "message", str(exc)))
+
+    def defaults(self):
+        return {"via": "", "fabrics": {}}
+
+    def save(self, settings):
+        try:
+            return fabric_net.save_settings(settings)
+        except fabric_net.FabricError as exc:
+            raise ConfigureError("Not saved: %s" % exc.message, exc.code)
+
+    def reset(self):
+        return fabric_net.reset_settings()
+
+    def prompt(self, p, current):
+        s = self.defaults()
+        s.update(current or {})
+        p.say("Fabrics give each node a subnet of its own in a shared prefix and "
+              "route between the hosts, so a container can reach one on another "
+              "node directly. They are created for the whole cluster with "
+              "`lemondx fabric create` or from the Network tab; the one thing "
+              "set per node is the address peers route to.")
+        p.say()
+        s["via"] = p.ask(
+            "Address peers route this node's containers to (blank: work it out)",
+            default=s["via"], allow_empty=True, validate=_optional_ip) or ""
+        # The fabrics themselves are not asked for: each one is a subnet the
+        # cluster allocated, and taking one by hand is how two nodes end up on
+        # the same range. They are kept as they were.
+        return s
+
+    def describe(self, s):
+        rows = [("this node routes to",
+                 s["via"] or "the address its cluster URL names")]
+        for name, fabric in sorted((s.get("fabrics") or {}).items()):
+            rows.append(("fabric %s" % name, "%s in %s%s" % (
+                fabric["subnet"], fabric["prefix"], "" if fabric["nat"] else ", no NAT")))
+        if not s.get("fabrics"):
+            rows.append(("fabrics", "none on this node"))
+        return rows
+
+    def after_save(self, p, s):
+        p.say()
+        p.say("`lemondx fabric list` shows every fabric in the cluster; "
+              "`lemondx fabric status` what is missing on this node.")
+
+
 # -- validators ------------------------------------------------------------
 
 
@@ -590,6 +710,50 @@ def _node_url(answer):
         return cluster.normalize_url(answer)
     except cluster.NodeError as exc:
         raise ValueError(exc.message)
+
+
+def _prompt_tls(p, s, none_label, default="none"):
+    """``(cert, key)`` from generating, naming or (given ``none_label``) skipping one."""
+    if s["tls_cert"] and os.path.exists(s["tls_cert"]):
+        p.say("  Currently %s" % s["tls_cert"])
+        if not p.yes_no("Replace it?", False):
+            return s["tls_cert"], s["tls_key"]
+    elif s["tls_cert"]:
+        p.say("  ! %s no longer exists." % s["tls_cert"])
+
+    choices = [("generate", "generate a self-signed one now (needs openssl)"),
+               ("existing", "use a certificate I already have")]
+    if none_label:
+        choices.append(("none", none_label))
+    choice = p.choose_one("Certificate", choices, default=default)
+    if choice == "none":
+        return None, None
+    if choice == "existing":
+        cert = p.ask("Certificate file (PEM)", default=s["tls_cert"],
+                     validate=_readable_file)
+        key = p.ask("Private key file (PEM)", default=s["tls_key"],
+                    validate=_readable_file)
+        try:
+            p.say("  Fingerprint %s"
+                  % cluster.pretty_fingerprint(cluster.certificate_fingerprint(cert)))
+        except cluster.ClusterError as exc:
+            p.say("  ! %s" % exc.message)
+        return cert, key
+
+    host = _host_of(s.get("url") or "") or cluster.guess_local_address() or "localhost"
+    host = p.ask("Address to name in the certificate", default=host)
+    try:
+        made = cluster.generate_certificate(host)
+    except cluster.ClusterError as exc:
+        raise ConfigureError(exc.message, exc.code)
+    p.say("  + wrote %s" % made["cert"])
+    p.say("  Fingerprint %s" % cluster.pretty_fingerprint(made["fingerprint"]))
+    return made["cert"], made["key"]
+
+
+def _in_cluster():
+    """Whether this node holds a cluster credential, read straight from disk."""
+    return bool((store.load_auth("cluster").get("secret") or {}).get("token"))
 
 
 def _default_node_url():
@@ -674,3 +838,11 @@ def _token_file(prompter, answer):
         out.write(secrets.token_urlsafe(32) + "\n")
     prompter.say("  + wrote a new token to %s" % path)
     return path
+
+
+def _optional_ip(answer):
+    import ipaddress
+    try:
+        return str(ipaddress.ip_address((answer or "").strip()))
+    except ValueError:
+        raise ValueError("Enter an IP address.")
