@@ -159,7 +159,8 @@ def cmd_serve(args, _service):
           open_browser=args.open, auth_config=config,
           tls_cert=tls_cert, tls_key=tls_key,
           auth_source=auth.settings_path() if settings is not None else None,
-          health_settings=health_settings, cluster_settings=cluster_settings)
+          health_settings=health_settings, cluster_settings=cluster_settings,
+          suggest_tls=not args.no_tls)
     return 0
 
 
@@ -191,7 +192,7 @@ def cmd_configure(args, _service):
         removed = section.reset()
         emit(args, {"section": section.name, "path": section.path(), "removed": removed},
              lambda r: "%s %s" % (GREEN("+") if r["removed"] else DIM("-"),
-                                  "removed %s" % r["path"] if r["removed"]
+                                  "reset %s (%s)" % (r["section"], r["path"]) if r["removed"]
                                   else "%s was not configured" % r["section"]))
         return 0
 
@@ -383,9 +384,9 @@ def cmd_status(args, service):
     try:
         state = _fabric(service).status()
         if state["enabled"]:
-            fabric_line = "%s on %s, %d peer route(s)%s" % (
-                state["subnet"], state["bridge"],
-                sum(1 for r in state["routes"] if r["state"] == "ok"),
+            fabric_line = "%s, %d peer route(s)%s" % (
+                ", ".join("%s %s" % (f["name"], f["subnet"]) for f in state["fabrics"]),
+                sum(1 for f in state["fabrics"] for r in f["routes"] if r["state"] == "ok"),
                 "" if state["privileged"] else YELLOW(" -- cannot program routes"))
             status = dict(status, fabric=state)
     except Exception:                       # status must never fail over this
@@ -501,7 +502,7 @@ def cmd_create(args, service):
         instance_type="virtual-machine" if args.vm else "container",
         profiles=args.profile or None, cpu=args.cpu, memory=args.memory,
         disk=args.disk, pool=args.pool, network=args.network,
-        fabric=_fabric_bridge(service) if args.fabric else None,
+        fabric=_fabric_bridge(service, args.fabric) if args.fabric else None,
         description=args.description, ephemeral=args.ephemeral,
         start=not args.no_start, secureboot=not args.no_secureboot, bootstrap=bootstrap,
     )
@@ -902,7 +903,11 @@ def cmd_template_save(args, service):
         name=args.name, image=args.image or service.default_image(),
         instance_type="virtual-machine" if args.vm else "container",
         cpu=args.cpu, memory=args.memory, disk=args.disk, pool=args.pool,
-        network=args.network, fabric=args.fabric, profiles=args.profile,
+        network=args.network, profiles=args.profile,
+        # Bare `--fabric` is "the one I am on", which a template cannot keep
+        # meaning once it is pushed to nodes on others, so it is named now.
+        fabric=(_fabric_bridge(service, True) if args.fabric is True
+                else args.fabric or ""),
         ephemeral=args.ephemeral,
         start=not args.no_start, secureboot=not args.no_secureboot,
         bootstrap={"modules": modules, "params": params, "ssh_keys": ssh_keys},
@@ -1999,20 +2004,42 @@ def _fabric(service):
     return cluster_service(service).fabric()
 
 
-def _fabric_bridge(service):
-    """This node's fabric bridge, refusing if the fabric is not on here."""
-    fabric = _fabric(service)
-    if not fabric.enabled():
-        raise FabricError(
-            "This node is not on the fabric, so an instance cannot join it. "
-            "Run `lemondx fabric enable`.", 409)
-    return fabric.bridge()
+def _fabric_bridge(service, wanted):
+    """This node's bridge for fabric ``wanted`` (True: the one it is on)."""
+    return _fabric(service).require(wanted)
 
 
-def _fabric_state(state):
-    if not state["enabled"]:
-        return YELLOW("off")
-    return GREEN("on")
+_FABRIC_STATE = {"ok": GREEN, "absent": DIM, "unknown": YELLOW, "bridge": YELLOW,
+                 "routes": YELLOW, "conflict": RED}
+
+
+def cmd_fabric_list(args, service):
+    overview = _fabric(service).overview()
+
+    def render(o):
+        if not o["fabrics"]:
+            return ("No fabrics. `lemondx fabric create` makes one on every node "
+                    "(`lemondx fabric check` shows what it would pick).")
+        blocks = []
+        for f in o["fabrics"]:
+            head = "%s  %s  %s%s" % (
+                BOLD(f["name"]), f["prefix"], "NAT" if f["nat"] else "no NAT",
+                RED("  prefix disagrees on %s" % ", ".join(f["conflict"]))
+                if f["conflict"] else "")
+            rows = [[m["node"], m["subnet"] or DIM("-"),
+                     "%d/%d" % (m["routes_ok"], m["routes_total"]) if m["subnet"] else "",
+                     str(len(m["instances"])) if m["instances"] else "",
+                     _FABRIC_STATE.get(m["state"], YELLOW)(m["state"]), DIM(m["detail"])]
+                    for m in f["members"]]
+            blocks.append(head + "\n" + table(
+                rows, ["node", "subnet", "routes", "instances", "state", ""]))
+        for node in o["nodes"]:
+            if not node["ok"]:
+                blocks.append(YELLOW("! %s did not answer: %s" % (node["node"], node["error"])))
+        return "\n\n".join(blocks)
+
+    emit(args, overview, render)
+    return 0
 
 
 def cmd_fabric_status(args, service):
@@ -2020,21 +2047,24 @@ def cmd_fabric_status(args, service):
 
     def render(s):
         lines = [
-            "%s  %s" % (DIM("fabric "), _fabric_state(s)),
-            "%s  %s" % (DIM("subnet "), s["subnet"] or DIM("not allocated")),
-            "%s  %s" % (DIM("bridge "), "%s%s" % (
-                s["bridge"], "" if s["bridge_ready"] else YELLOW(" (not created yet)"))),
-            "%s  %s" % (DIM("space  "), s["prefix"]),
+            "%s  %s" % (DIM("node   "), s["node"]),
+            "%s  %s" % (DIM("via    "), s["via"] or DIM("-")),
             "%s  %s" % (DIM("routes "), GREEN("can program") if s["privileged"]
                         else YELLOW("no privilege -- see `lemondx fabric plan`")),
         ]
-        if s["routes"]:
-            colour = {"ok": GREEN, "missing": YELLOW, "wrong": YELLOW, "unreachable": RED}
+        if not s["fabrics"]:
+            lines.append(DIM("This node is on no fabric."))
+        colour = {"ok": GREEN, "missing": YELLOW, "wrong": YELLOW, "unreachable": RED}
+        for f in s["fabrics"]:
             lines.append("")
-            lines.append(table(
-                [[BOLD(r["node"]), r["subnet"], r["via"],
-                  colour[r["state"]](r["state"])] for r in s["routes"]],
-                ["node", "subnet", "via", "route"]))
+            lines.append("%s  %s in %s, %s%s" % (
+                BOLD(f["name"]), f["subnet"], f["prefix"],
+                "NAT" if f["nat"] else "no NAT",
+                "" if f["bridge_ready"] else YELLOW(" (bridge not ready)")))
+            if f["routes"]:
+                lines.append(table(
+                    [[r["node"], r["subnet"], r["via"], colour[r["state"]](r["state"])]
+                     for r in f["routes"]], ["node", "subnet", "via", "route"]))
         if s["pending"]:
             lines.append(YELLOW("  %d command(s) to run: `lemondx fabric apply`"
                                 % s["pending"]))
@@ -2047,7 +2077,7 @@ def cmd_fabric_status(args, service):
         return "\n".join(lines)
 
     emit(args, status, render)
-    return 0 if status["enabled"] and not status["check"] else 1
+    return 0 if not status["check"] and not status["error"] else 1
 
 
 def cmd_fabric_helper(args, service):
@@ -2065,7 +2095,7 @@ def cmd_fabric_plan(args, service):
         lines = ["These run on %s:" % BOLD(p["node"]), ""]
         for command in p["commands"]:
             lines.append("  %s" % DIM("# " + command["why"]))
-            lines.append("  %s" % command["command"])
+            lines.append("  %s" % command["command"].replace("\n", "\n  "))
         if not p["privileged"]:
             lines.append("")
             lines.append(YELLOW("lemondx cannot run these itself; see docs/networking.md."))
@@ -2082,7 +2112,7 @@ def cmd_fabric_apply(args, service):
         lines = []
         for step in r["applied"]:
             mark = GREEN("+") if step["ok"] else RED("!")
-            lines.append("%s %s" % (mark, step["command"]))
+            lines.append("%s %s" % (mark, step["command"].split("\n")[0]))
             if not step["ok"]:
                 lines.append(RED("  %s" % step["error"]))
         if not lines:
@@ -2095,41 +2125,91 @@ def cmd_fabric_apply(args, service):
     return 0 if result["ok"] else 1
 
 
-def cmd_fabric_enable(args, service):
-    result = _fabric(service).enable(prefix=args.prefix)
+def cmd_fabric_check(args, service):
+    report = _fabric(service).check(name=args.name or "", prefix=args.prefix or "")
 
     def render(r):
-        lines = ["%s fabric on, %s split between %d node(s)"
-                 % (GREEN("+"), BOLD(r["prefix"]), len(r["assigned"]))]
-        for node, subnet in sorted(r["assigned"].items()):
-            lines.append("  %-20s %s" % (node, subnet))
-        for peer in r["peers"]:
-            if not peer["ok"]:
-                lines.append(RED("! %s was not told: %s" % (peer["node"], peer["error"])))
-        if r["status"]["check"]:
-            lines.append(YELLOW("! " + r["status"]["check"]))
+        lines = ["%s  %s%s" % (DIM("name  "), BOLD(r["name"]),
+                               DIM(" (suggested)") if r["suggested_name"] else ""),
+                 "%s  %s%s" % (DIM("prefix"), r["prefix"] or DIM("-"),
+                               DIM(" (suggested)") if r["suggested_prefix"] else "")]
+        for key in ("name_error", "prefix_error", "unreachable_error"):
+            if r[key]:
+                lines.append(RED("! " + r[key]))
+        if r["allocation"]:
+            lines.append("")
+            lines.append(table([[n, s] for n, s in sorted(r["allocation"].items())],
+                               ["node", "subnet"]))
+        if r["ok"]:
+            lines.append(GREEN("+ fits on every node: `lemondx fabric create %s --prefix %s`"
+                               % (r["name"], r["prefix"])))
+        return "\n".join(lines)
+
+    emit(args, report, render)
+    return 0 if report["ok"] else 1
+
+
+def _render_handout(verb):
+    def render(r):
+        lines = ["%s %s %s (%s)" % (GREEN("+") if r["ok"] else YELLOW("!"), BOLD(r["name"]),
+                                    verb, r["prefix"])]
+        for node in r["nodes"]:
+            if node["ok"]:
+                lines.append("  %-20s %s" % (node["node"], node["subnet"]))
+            else:
+                lines.append(RED("  %-20s %s" % (node["node"], node["error"])))
+        return "\n".join(lines)
+    return render
+
+
+def cmd_fabric_create(args, service):
+    result = _fabric(service).create(name=args.name or "", prefix=args.prefix or "",
+                                     nat=not args.no_nat)
+    emit(args, result, _render_handout("created"))
+    return 0 if result["ok"] else 1
+
+
+def cmd_fabric_extend(args, service):
+    result = _fabric(service).extend(args.name)
+    emit(args, result, _render_handout("extended to every member"))
+    return 0 if result["ok"] else 1
+
+
+def cmd_fabric_delete(args, service):
+    result = _fabric(service).delete(args.name)
+
+    def render(r):
+        lines = ["%s %s deleted" % (GREEN("+") if r["ok"] else YELLOW("!"), BOLD(r["name"]))]
+        for node in r["nodes"]:
+            if not node["ok"]:
+                lines.append(RED("  %s kept it: %s" % (node["node"], node["error"])))
         return "\n".join(lines)
 
     emit(args, result, render)
-    return 0
+    return 0 if result["ok"] else 1
 
 
-def cmd_fabric_disable(args, service):
-    result = _fabric(service).disable()
-    emit(args, result, lambda r: "%s fabric off on %s; %d route(s) removed. The "
-         "bridge %s was left alone." % (GREEN("+"), BOLD(r["node"]),
-                                        len(r["removed"]), r["bridge"]))
+def cmd_fabric_leave(args, service):
+    fabric = _fabric(service)
+    if args.name:
+        result = fabric.leave(args.name, remove_bridge=not args.keep_bridge)
+        emit(args, result, lambda r: "%s left %s on %s; bridge %s." % (
+            GREEN("+"), BOLD(r["name"]), r["node"], r["bridge"] or "absent"))
+    else:
+        result = fabric.disable()
+        emit(args, result, lambda r: "%s %s left %d fabric(s); bridges kept." % (
+            GREEN("+"), r["node"], len(r["left"])))
     return 0
 
 
 def cmd_fabric_attach(args, service):
-    container = _fabric(service).attach(args.name)
+    container = _fabric(service).attach(args.name, args.fabric or True)
     emit(args, container, lambda c: "%s %s is on the fabric." % (GREEN("+"), BOLD(args.name)))
     return 0
 
 
 def cmd_fabric_detach(args, service):
-    container = _fabric(service).detach(args.name)
+    container = _fabric(service).detach(args.name, args.fabric or None)
     emit(args, container, lambda c: "%s %s is off the fabric." % (GREEN("+"), BOLD(args.name)))
     return 0
 
@@ -2254,7 +2334,7 @@ def cmd_cluster_cert(args, _service):
             DIM("  %s" % m["key"]),
             "  fingerprint %s" % cluster_mod.pretty_fingerprint(m["fingerprint"]),
             "",
-            DIM("Run `lemondx configure cluster` to use it, or serve with "
+            DIM("Run `lemondx configure tls` to use it, or serve with "
                 "--tls-cert/--tls-key."),
         ])
 
@@ -2379,7 +2459,7 @@ def build_parser():
     g.add_argument("--tls-cert", metavar="PATH", help="serve HTTPS with this certificate (PEM)")
     g.add_argument("--tls-key", metavar="PATH", help="private key for --tls-cert (PEM)")
     g.add_argument("--no-tls", action="store_true",
-                   help="serve plain HTTP even though `configure cluster` saved a "
+                   help="serve plain HTTP even though `configure tls` saved a "
                         "certificate, e.g. behind a proxy that terminates TLS")
     p.set_defaults(func=cmd_serve, needs_service=False)
 
@@ -2595,9 +2675,9 @@ def build_parser():
     spec.add_argument("-d", "--disk", help="root disk size, e.g. 10GiB")
     spec.add_argument("--pool", help="storage pool for the root disk")
     spec.add_argument("--network", help="network for eth0 (default: the default profile's)")
-    spec.add_argument("--fabric", action="store_true",
-                      help="also give it a NIC on the fabric, so it can reach "
-                           "instances on other nodes")
+    spec.add_argument("--fabric", nargs="?", const=True, metavar="NAME",
+                      help="also give it a NIC on fabric NAME (bare: the one this "
+                           "node is on), so it can reach instances on other nodes")
     spec.add_argument("--profile", action="append", help="profile to apply (repeatable)")
     spec.add_argument("--vm", action="store_true", help="create a virtual machine instead")
     spec.add_argument("--no-secureboot", action="store_true",
@@ -2894,36 +2974,64 @@ def build_parser():
         "fabric", help="routed, non-NAT networking between the containers of a cluster")
     fabric_sub = fabric_p.add_subparsers(dest="fabric_command", metavar="<command>")
 
+    p = fabric_sub.add_parser("list", parents=[common],
+                              help="every fabric in the cluster, and each node's part in it")
+    p.set_defaults(func=cmd_fabric_list)
+
     p = fabric_sub.add_parser("status", parents=[common],
-                              help="this node's subnet, bridge and routes")
+                              help="this node's subnets, bridges and routes")
     p.set_defaults(func=cmd_fabric_status)
+
+    p = fabric_sub.add_parser("check", parents=[common],
+                              help="would a fabric fit on every node? (blank: suggest one)")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--prefix", metavar="CIDR", help="a private /16 to /22")
+    p.set_defaults(func=cmd_fabric_check)
+
+    p = fabric_sub.add_parser("create", parents=[common],
+                              help="create a fabric on every node of the cluster")
+    p.add_argument("name", nargs="?", help="also the bridge's name (default: lemonfabN)")
+    p.add_argument("--prefix", metavar="CIDR",
+                   help="a private /16 to /22 (default: the first one free on every node)")
+    p.add_argument("--no-nat", action="store_true",
+                   help="route only within the fabric; no internet through it")
+    p.set_defaults(func=cmd_fabric_create)
+
+    p = fabric_sub.add_parser("extend", parents=[common],
+                              help="give every member that lacks one a subnet in a fabric")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_fabric_extend)
+
+    p = fabric_sub.add_parser("delete", parents=[common],
+                              help="delete a fabric from every node")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_fabric_delete)
 
     p = fabric_sub.add_parser("plan", parents=[common],
                               help="the host commands that would bring routes up to date")
     p.set_defaults(func=cmd_fabric_plan)
 
     p = fabric_sub.add_parser("apply", parents=[common],
-                              help="create the bridge and program the routes")
+                              help="create the bridges and program the routes")
     p.set_defaults(func=cmd_fabric_apply)
 
-    p = fabric_sub.add_parser("enable", parents=[common],
-                              help="allocate a subnet to every member and turn the fabric on")
-    p.add_argument("--prefix", metavar="CIDR",
-                   help="address space for the cluster, a /16 (default: 10.100.0.0/16)")
-    p.set_defaults(func=cmd_fabric_enable)
-
-    p = fabric_sub.add_parser("disable", parents=[common],
-                              help="stop routing here and give up this node's subnet")
-    p.set_defaults(func=cmd_fabric_disable)
+    p = fabric_sub.add_parser("leave", parents=[common],
+                              help="this node only: leave one fabric, or every one")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--keep-bridge", action="store_true",
+                   help="leave the bridge in place (always so without a name)")
+    p.set_defaults(func=cmd_fabric_leave)
 
     p = fabric_sub.add_parser("attach", parents=[common],
-                              help="give an existing instance a NIC on the fabric")
+                              help="give an existing instance a NIC on a fabric")
     p.add_argument("name")
+    p.add_argument("--fabric", metavar="NAME", help="which fabric (default: the only one)")
     p.set_defaults(func=cmd_fabric_attach)
 
     p = fabric_sub.add_parser("detach", parents=[common],
                               help="take an instance's fabric NIC away")
     p.add_argument("name")
+    p.add_argument("--fabric", metavar="NAME", help="which fabric (default: all)")
     p.set_defaults(func=cmd_fabric_detach)
 
     p = cluster_sub.add_parser("groups", parents=[common], help="list node groups")

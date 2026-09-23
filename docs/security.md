@@ -165,6 +165,16 @@ cookies `Secure`.
 ## TLS
 
 ```bash
+lemondx configure tls           # generate a self-signed certificate, or name your own
+lemondx configure tls --show    # which one, and its fingerprint
+lemondx configure tls --reset   # back to plain HTTP (refused on a cluster member)
+```
+
+Once one is saved, `serve` uses HTTPS by default; until then it serves plain
+HTTP and says so at startup, suggesting the command above. For one run,
+certificate files can also be given directly:
+
+```bash
 ./lemondx serve --host 0.0.0.0 --auth local \
   --tls-cert /etc/lemondx/cert.pem --tls-key /etc/lemondx/key.pem
 ```
@@ -173,9 +183,12 @@ TLS 1.2 or newer, with the handshake done per connection so a client that
 stalls cannot block others. A TLS-terminating reverse proxy works just as well;
 either way, do not send passwords or tokens across a network in the clear.
 
-`lemondx configure cluster` saves a certificate for federation, and `serve` then
-uses it without being told to; `--tls-cert` overrides it and `--no-tls` declines
-it, for a node behind a proxy that terminates TLS.
+`configure tls` and `configure cluster` edit the same saved certificate (in
+`config/cluster.json`): a node serves one certificate, and its peers pin that
+one. Joining a cluster generates it if neither was run. `--tls-cert` overrides
+it and `--no-tls` declines it, for a node behind a proxy that terminates TLS.
+On a cluster member, `configure tls` warns before replacing it, since every
+peer pins the old fingerprint.
 
 The static UI files are served without authentication — they contain no data.
 Only `/api/*` is gated.
@@ -197,9 +210,12 @@ Two things bound what that means:
 
 - **The helper takes data, not commands.** stdin carries subnets and the host
   each belongs to; the helper decides what to run. It refuses any route that is
-  not a /24 inside this cluster's fabric prefix, reached through a
+  not a /24 inside one of this node's fabric prefixes, reached through a
   directly-connected network -- so the default route and the host's own LAN
-  cannot be expressed through it at all.
+  cannot be expressed through it at all. The firewall it installs (its own
+  `ip lemondx` nftables table, plus accept rules in Docker's `DOCKER-USER`
+  where that exists) is built from the saved fabric settings, never from
+  stdin.
 - **The group is already root-equivalent.** As above, creating a container is
   enough to become root on the host, which is why `lxd`/`incus-admin` is
   treated that way throughout. The fabric grants that group nothing it did not

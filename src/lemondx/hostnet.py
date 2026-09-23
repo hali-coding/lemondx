@@ -64,15 +64,19 @@ class HostNetError(Exception):
 class Command:
     """One host command, with the reason it is in the plan."""
 
-    def __init__(self, argv, why, privileged=True):
+    def __init__(self, argv, why, privileged=True, stdin=None):
         self.argv = list(argv)
         self.why = why
         self.privileged = privileged
+        self.stdin = stdin
 
     def shell(self):
         """The command as a person would type it, for the copyable plan."""
         parts = ["sudo"] if self.privileged else []
-        return " ".join(parts + self.argv)
+        line = " ".join(parts + self.argv)
+        if self.stdin is not None:
+            line += " <<'EOF'\n%sEOF" % self.stdin
+        return line
 
     def record(self):
         return {"command": self.shell(), "why": self.why}
@@ -95,14 +99,19 @@ def sysctl_binary():
     return _binary("sysctl")
 
 
-def _run(argv, timeout=_COMMAND_TIMEOUT):
+def nft_binary():
+    return _binary("nft")
+
+
+def _run(argv, timeout=_COMMAND_TIMEOUT, stdin=None):
     """Run a command, returning (returncode, stdout, stderr).
 
     Never raises for a non-zero exit -- a command that ran and failed is a
     result, the same way a failed exec in `lxd.py` is.
     """
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                              input=stdin)
     except FileNotFoundError:
         raise HostNetError("%s is not installed." % argv[0], 503)
     except subprocess.SubprocessError as exc:
@@ -137,8 +146,8 @@ def current_routes():
         fields = line.split()
         if not fields:
             continue
-        gateway = fields[fields.index("via") + 1] if "via" in fields else ""
-        routes[fields[0]] = gateway
+        after = fields[fields.index("via") + 1:] if "via" in fields else []
+        routes[fields[0]] = after[0] if after else ""
     return routes
 
 
@@ -179,6 +188,42 @@ def link_subnets():
     return subnets
 
 
+def host_routes():
+    """[(where, subnet)] for every IPv4 route on the host that is not ours.
+
+    What the daemon cannot see: a VPN, a static route to another site, a
+    network reached through a router on the LAN. A fabric placed over any of
+    them would shadow it -- the /24 routes are more specific -- so choosing a
+    free block has to know about them as well as about interfaces. Default
+    routes are left out; they overlap everything and mean nothing here.
+    """
+    try:
+        code, out, _ = _run([ip_binary(), "-j", "-4", "route", "show"])
+    except HostNetError:
+        return []
+    found = []
+    if code != 0:
+        return found
+    try:
+        entries = json.loads(out or "[]")
+    except ValueError:
+        return found
+    for entry in entries:
+        destination = entry.get("dst", "")
+        if destination in ("", "default") or str(entry.get("protocol")) in (
+                ROUTE_PROTO, "133"):
+            continue
+        try:
+            network = ipaddress.ip_network(destination, strict=False)
+        except ValueError:
+            continue
+        where = entry.get("dev") or ""
+        if entry.get("gateway"):
+            where = "route via %s" % entry["gateway"]
+        found.append((where or "a host route", network))
+    return found
+
+
 def reaches(address):
     """Is this address on a directly-connected subnet?"""
     try:
@@ -191,18 +236,24 @@ def reaches(address):
 # -- building a plan -------------------------------------------------------
 
 
-def route_commands(desired, current, prefix):
+def route_commands(desired, current, prefixes):
     """Commands to turn `current` into `desired`. Both are {destination: gateway}.
 
-    Every destination is checked against the fabric prefix before it reaches
-    argv. The sudoers rules refuse anything outside it too, but that file may
-    be the older glob form on an older sudo, so the check lives here as well.
+    Every route added is checked against the fabric prefixes before it reaches
+    argv; the helper refuses anything outside them too, but a check here means
+    a plan printed for a person to run holds to the same rule.
+
+    Removal is not held to the prefixes, only to ownership: `current` is read
+    by our own protocol number, so every route in it is one lemondx put there.
+    That has to be so for a fabric to be deleted -- once it is gone from the
+    settings its prefix is no longer one of ours, and a check against the
+    remaining ones would strand its routes in the table for good.
     """
     binary = ip_binary()
     commands = []
     for destination in sorted(desired):
         gateway = desired[destination]
-        _inside(destination, prefix)
+        _inside(destination, prefixes)
         if current.get(destination) == gateway:
             continue  # already programmed, and pointing at the right node
         commands.append(Command(
@@ -212,44 +263,170 @@ def route_commands(desired, current, prefix):
     for destination in sorted(current):
         if destination in desired:
             continue
-        _inside(destination, prefix)
+        _subnet(destination)
         commands.append(Command(
             [binary, "route", "del", destination, "proto", ROUTE_PROTO],
-            "drop the route to %s, which is no longer a member's" % destination))
+            "drop the route to %s, which no fabric member holds any more"
+            % destination))
     return commands
 
 
-def forwarding_commands(bridge):
+def forwarding_commands(bridges):
     """Turn forwarding on, but only where it is actually off.
 
     On a host that already runs containers this is usually a no-op, which
     keeps sudo out of the common path entirely.
     """
     binary = sysctl_binary()
-    state = forwarding(bridge)
     commands = []
-    if state["ip_forward"] is False:
+    if _sysctl_on("net/ipv4/ip_forward") is False:
         commands.append(Command([binary, "-w", "net.ipv4.ip_forward=1"],
                                 "IPv4 forwarding is off, so nothing would cross hosts"))
-    if state["bridge"] is False:
-        commands.append(Command(
-            [binary, "-w", "net.ipv4.conf.%s.forwarding=1" % bridge],
-            "forwarding is off on %s" % bridge))
+    for bridge in bridges:
+        if forwarding(bridge)["bridge"] is False:
+            commands.append(Command(
+                [binary, "-w", "net.ipv4.conf.%s.forwarding=1" % bridge],
+                "forwarding is off on %s" % bridge))
     return commands
 
 
-def _inside(destination, prefix):
+# The nftables table lemondx owns. Its own table, beside the daemon's `inet
+# lxd` or `inet incus`, so it is replaced whole on every apply and never
+# edited rule by rule -- and so the daemon, which rewrites its own table
+# whenever a network changes, never touches ours.
+FIREWALL_TABLE = "lemondx"
+
+
+def firewall_ruleset(fabrics):
+    """The whole `ip lemondx` table for ``fabrics``, as nft input.
+
+    ``fabrics`` is [{"bridge", "prefix", "subnet", "nat"}], one per fabric this
+    node is on. Two things, per fabric:
+
+    * **Routed only within the fabric.** Into the bridge, only from the
+      fabric's own prefix -- or a reply to something the instance started.
+      Out of it, never to another fabric's prefix, and with NAT off never
+      anywhere but its own. That is what makes two fabrics two networks
+      rather than one with two names, and keeps a LAN host from reaching in.
+    * **NAT'd everywhere else.** The daemon's own `ipv4.nat` cannot do this:
+      it masquerades everything leaving the bridge's subnet, peers' /24s
+      included, so a peer would see this host's address instead of the
+      instance's. lemondx masquerades itself, excluding the prefix, and
+      leaves the daemon's NAT off on fabric bridges.
+
+    Replaced whole in one transaction: declaring the table first makes the
+    delete safe when it does not exist yet.
+    """
+    lines = ["table ip %s" % FIREWALL_TABLE, "delete table ip %s" % FIREWALL_TABLE]
+    if not fabrics:
+        return "\n".join(lines) + "\n"
+    forward, postrouting = [], []
+    for fabric in fabrics:
+        bridge, prefix = fabric["bridge"], fabric["prefix"]
+        others = [f["prefix"] for f in fabrics if f["bridge"] != bridge]
+        forward.append('oifname "%s" ct state established,related accept' % bridge)
+        forward.append('oifname "%s" ip saddr != %s drop' % (bridge, prefix))
+        if not fabric["nat"]:
+            forward.append('iifname "%s" ip daddr != %s drop' % (bridge, prefix))
+        elif others:
+            forward.append('iifname "%s" ip daddr { %s } drop'
+                           % (bridge, ", ".join(others)))
+        if fabric["nat"]:
+            postrouting.append('ip saddr %s ip daddr != %s oifname != "%s" masquerade'
+                               % (fabric["subnet"], prefix, bridge))
+    lines.append("table ip %s {" % FIREWALL_TABLE)
+    lines.append("  chain forward {")
+    lines.append("    type filter hook forward priority filter; policy accept;")
+    lines.extend("    " + rule for rule in forward)
+    lines.append("  }")
+    if postrouting:
+        lines.append("  chain postrouting {")
+        lines.append("    type nat hook postrouting priority srcnat; policy accept;")
+        lines.extend("    " + rule for rule in postrouting)
+        lines.append("  }")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def firewall_commands(fabrics):
+    """The one command that puts the fabric firewall in place.
+
+    Always in the plan, never compared against what is loaded: reading an
+    nftables table needs the same privilege as writing one, so an
+    unprivileged `status()` cannot know, and replacing the table with itself
+    is harmless.
+    """
+    return [Command([nft_binary(), "-f", "-"],
+                    "isolate %d fabric(s) from each other and NAT what leaves them"
+                    % len(fabrics) if fabrics else "remove lemondx's fabric firewall",
+                    stdin=firewall_ruleset(fabrics))]
+
+
+# Docker sets the FORWARD policy to DROP and gives users one chain to open it
+# with. A drop there is final whatever our own table says, so on a Docker host
+# a fabric carries nothing until its bridge is let through -- a failure that
+# looks exactly like a working fabric. Accepting here does not undo the
+# isolation above: our table is a base chain of its own, and a drop in it
+# still drops. The comment is how our rules are told from anyone else's.
+DOCKER_CHAIN = "DOCKER-USER"
+DOCKER_TAG = "lemondx-fabric"
+
+
+def docker_commands(bridges):
+    """Keep DOCKER-USER letting ``bridges`` through, and nothing that is gone.
+
+    Root only: listing an iptables chain needs the privilege changing one
+    does, so this is computed by the helper rather than in the plan, and a
+    host without Docker's chain gets nothing at all.
+    """
     try:
-        network = ipaddress.ip_network(destination, strict=False)
+        iptables = _binary("iptables")
+    except HostNetError:
+        return []
+    code, out, _ = _run([iptables, "-S", DOCKER_CHAIN])
+    if code != 0:
+        return []
+    have = set()
+    commands = []
+    for line in out.splitlines():
+        fields = line.split()
+        if DOCKER_TAG not in fields or fields[:2] != ["-A", DOCKER_CHAIN]:
+            continue
+        way = next((f for f in fields if f in ("-i", "-o")), None)
+        if way is None:
+            continue
+        bridge = fields[fields.index(way) + 1]
+        if bridge in bridges:
+            have.add((way, bridge))
+        else:
+            commands.append(Command([iptables, "-D", DOCKER_CHAIN] + fields[2:],
+                                    "stop letting %s through Docker's FORWARD drop; "
+                                    "it is no longer a fabric" % bridge))
+    for bridge in bridges:
+        for way in ("-i", "-o"):
+            if (way, bridge) not in have:
+                commands.append(Command(
+                    [iptables, "-I", DOCKER_CHAIN, way, bridge, "-m", "comment",
+                     "--comment", DOCKER_TAG, "-j", "ACCEPT"],
+                    "let %s through Docker's FORWARD drop" % bridge))
+    return commands
+
+
+def _subnet(destination):
+    try:
+        return ipaddress.ip_network(destination, strict=False)
     except ValueError:
         raise HostNetError("%s is not a subnet." % destination, 400)
-    if not prefix:
-        return
-    if not network.subnet_of(prefix):
+
+
+def _inside(destination, prefixes):
+    network = _subnet(destination)
+    if not any(network.version == prefix.version and network.subnet_of(prefix)
+               for prefix in prefixes):
         raise HostNetError(
-            "Refusing to touch the route to %s: it is outside the fabric's "
-            "%s, and lemondx only manages routes inside it." % (destination, prefix),
-            400)
+            "Refusing to route %s: it is outside every fabric on this node (%s), "
+            "and lemondx only adds routes inside them."
+            % (destination, ", ".join(str(p) for p in prefixes) or "none"), 400)
 
 
 def describe(commands):
@@ -272,7 +449,7 @@ def apply(commands):
     """
     results = []
     for command in commands:
-        code, _, err = _run(command.argv)
+        code, _, err = _run(command.argv, stdin=command.stdin)
         results.append({"command": command.shell(), "why": command.why,
                         "ok": code == 0, "error": err.strip()[-300:] if code else ""})
         if code != 0:
@@ -320,7 +497,7 @@ def delegate(payload, timeout=120):
                            "not JSON: %s" % (done.stdout or "")[:200], 500)
 
 
-def available(prefix=""):
+def available():
     """Can this process program a fabric route right now?
 
     Asks sudo whether the helper is permitted rather than running it: `sudo -l`
@@ -340,7 +517,7 @@ def available(prefix=""):
     return code == 0
 
 
-def diagnose(prefix="", bridge=""):
+def diagnose(bridges=()):
     """Warnings about this host's ability to carry fabric traffic, for startup.
 
     Follows `pam.diagnose()`: a list of plain sentences, never an exception,
@@ -354,7 +531,7 @@ def diagnose(prefix="", bridge=""):
     if not shutil.which("sudo"):
         return ["sudo is not installed, so lemondx cannot program host routes. "
                 "`lemondx fabric plan` prints the commands to run yourself."]
-    if not available(prefix):
+    if not available():
         if _no_new_privs():
             warnings.append(
                 "NoNewPrivileges is set on this process, which stops sudo from "
@@ -366,23 +543,23 @@ def diagnose(prefix="", bridge=""):
                 "routes cannot be programmed. Install the rules from "
                 "systemd/lemondx-fabric.sudoers (see docs/networking.md), or "
                 "run `lemondx fabric plan` and apply it yourself.")
-    state = forwarding(bridge) if bridge else {"ip_forward": _sysctl_on("net/ipv4/ip_forward"),
-                                               "bridge": None}
-    if state["ip_forward"] is False:
+    if _sysctl_on("net/ipv4/ip_forward") is False:
         warnings.append("IPv4 forwarding is off on this host; `lemondx fabric apply` "
                         "turns it on.")
     # A host-wide FORWARD DROP is the one failure that looks like a working
-    # fabric until traffic is tried. Reading the policy needs root, which the
-    # sudoers rules deliberately do not grant, so flag the usual cause instead
-    # -- the same trade bootstrap.py makes for lxdbr0.
-    if shutil.which("docker") or os.path.exists("/var/run/docker.sock"):
+    # fabric until traffic is tried. With the helper it is handled
+    # (`docker_commands()`); without it, reading the policy needs root, so
+    # flag the usual cause instead -- the same trade bootstrap.py makes for
+    # lxdbr0.
+    if (shutil.which("docker") or os.path.exists("/var/run/docker.sock")) \
+            and not available():
         warnings.append(
             "Docker is installed here. It sets the FORWARD policy to DROP, which "
             "blocks traffic between nodes. If the fabric does not carry traffic, "
-            "check `sudo iptables -S FORWARD | head -1` and allow the bridge:\n"
-            "  sudo iptables -I DOCKER-USER -i %s -j ACCEPT\n"
-            "  sudo iptables -I DOCKER-USER -o %s -j ACCEPT"
-            % (bridge or "lemonfab0", bridge or "lemonfab0"))
+            "check `sudo iptables -S FORWARD | head -1` and allow the bridge%s:\n%s"
+            % ("s" if len(bridges) > 1 else "",
+               "\n".join("  sudo iptables -I DOCKER-USER -%s %s -j ACCEPT" % (way, bridge)
+                         for bridge in (bridges or ["lemonfab0"]) for way in "io")))
     return warnings
 
 

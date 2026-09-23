@@ -13,8 +13,11 @@ read and tested rather than in a glob:
   * stdin carries a *wanted state* -- subnets and the host each belongs to --
     never a command. Nothing the caller sends is executed; this decides what to
     run from the state it was asked for.
-  * every destination must be a /24 inside the fabric prefix, which is read
-    from the invoking user's own configuration, not from stdin.
+  * every destination must be a /24 inside one of the fabric prefixes, which
+    are read from the invoking user's own configuration, not from stdin, and
+    every bridge named must be one of those fabrics' own.
+  * the firewall -- what may cross into and out of each fabric, and what is
+    NAT'd -- is built from that same configuration. stdin cannot add a rule.
   * every gateway must be an address on a directly-connected subnet, which is
     the same-L2 precondition the fabric is built on anyway.
 
@@ -42,8 +45,8 @@ def _fail(message, code=1):
     return code
 
 
-def _caller_prefix():
-    """The fabric prefix, read as the user who invoked sudo.
+def _caller_settings():
+    """The fabric settings, read as the user who invoked sudo.
 
     Read from their configuration rather than taken from stdin, so the bound
     on what may be routed is not set by the same request it is bounding.
@@ -76,26 +79,34 @@ def main(argv=None):
         return _fail("stdin must be a JSON object.")
 
     try:
-        settings = _caller_prefix()
-        prefix = ipaddress.ip_network(settings["prefix"])
+        fabrics = _caller_settings()["fabrics"]
+        prefixes = [ipaddress.ip_network(f["prefix"]) for f in fabrics.values()]
     except Exception as exc:                    # noqa: BLE001
         return _fail("Cannot read the fabric settings: %s"
                      % getattr(exc, "message", str(exc)))
 
-    bridge = str(wanted.get("bridge") or settings["bridge"])
-    if bridge != settings["bridge"]:
-        return _fail("Refusing to touch '%s': this node's fabric bridge is '%s'."
-                     % (bridge, settings["bridge"]))
+    bridges = wanted.get("bridges") or []
+    if not isinstance(bridges, list):
+        return _fail("'bridges' must be a list of names.")
+    stray = [str(b) for b in bridges if str(b) not in fabrics]
+    if stray:
+        return _fail("Refusing to touch %s: not a fabric bridge on this node (%s)."
+                     % (", ".join(stray), ", ".join(sorted(fabrics)) or "none"))
 
     try:
-        routes = _clean_routes(wanted.get("routes"), prefix)
+        routes = _clean_routes(wanted.get("routes"), prefixes)
     except ValueError as exc:
         return _fail(str(exc))
 
     try:
         current = hostnet.current_routes()
-        commands = hostnet.route_commands(routes, current, prefix)
-        commands += hostnet.forwarding_commands(bridge)
+        commands = hostnet.route_commands(routes, current, prefixes)
+        commands += hostnet.forwarding_commands([str(b) for b in bridges])
+        # Built from the settings alone, like the prefixes: nothing on stdin
+        # has a say in what the firewall lets through.
+        from .fabric import firewall_spec
+        commands += hostnet.firewall_commands(firewall_spec(fabrics))
+        commands += hostnet.docker_commands(sorted(fabrics))
         applied = hostnet.apply(commands)
     except hostnet.HostNetError as exc:
         return _fail(exc.message)
@@ -106,8 +117,8 @@ def main(argv=None):
     return 1 if failed else 0
 
 
-def _clean_routes(raw, prefix):
-    """{subnet: gateway}, every one of them inside the fabric and reachable."""
+def _clean_routes(raw, prefixes):
+    """{subnet: gateway}, every one of them inside a fabric and reachable."""
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -123,10 +134,10 @@ def _clean_routes(raw, prefix):
             raise ValueError("'%s' is not a subnet." % destination)
         if network.version != 4 or network.prefixlen != 24:
             raise ValueError("%s is not an IPv4 /24." % network)
-        if not network.subnet_of(prefix):
+        if not any(network.subnet_of(prefix) for prefix in prefixes):
             raise ValueError(
-                "Refusing to route %s: it is outside this cluster's fabric (%s)."
-                % (network, prefix))
+                "Refusing to route %s: it is outside every fabric on this node (%s)."
+                % (network, ", ".join(str(p) for p in prefixes) or "none"))
         try:
             address = ipaddress.ip_address(str(gateway))
         except ValueError:

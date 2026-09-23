@@ -4,8 +4,10 @@
 # and the group for this host. See docs/networking.md.
 #
 # This grants one exact command. lemondx reads the routing table and /proc/sys
-# without privilege, so the only thing it needs root for is writing a route,
-# and `lemondx fabric-helper` is the only thing that does.
+# without privilege, so the only things it needs root for are writing routes
+# and the fabric firewall (its own nftables table, and accept rules in Docker's
+# DOCKER-USER chain where Docker is installed), and `lemondx fabric-helper` is
+# the only thing that does either.
 #
 # It is one command of our own rather than `ip` for a reason that is worth
 # knowing before you edit this file:
@@ -18,8 +20,9 @@
 #     open or simply broken on Ubuntu.
 #   * So the confinement lives in the helper instead, where it is code: it
 #     takes a description of the wanted state on stdin, never a command, and
-#     refuses any route that is not a /24 inside this cluster's fabric prefix
-#     reached through a directly-connected network.
+#     refuses any route that is not a /24 inside one of this node's fabric
+#     prefixes reached through a directly-connected network, and builds the
+#     firewall from the saved fabric settings, never from stdin.
 #
 # The group is the daemon's own admin group, which docs/security.md already
 # treats as root-equivalent -- creating a container on this host is enough to

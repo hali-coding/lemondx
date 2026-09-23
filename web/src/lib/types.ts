@@ -163,8 +163,8 @@ export interface CreateRequest {
   pool?: string
   /** Replaces the profiles' NIC; the default profile's network when omitted. */
   network?: string
-  /** Adds a second NIC on this node's fabric bridge, beside the NAT'd one. */
-  fabric?: boolean
+  /** Adds a second NIC on this fabric's bridge, beside the profile's one. */
+  fabric?: string
   /** LXD/Incus profiles; the daemon's default when omitted. */
   profiles?: string[]
   description?: string
@@ -396,10 +396,11 @@ export interface InstanceSpec {
   /** Blank means the network the default profile's NIC joins. */
   network: string
   /**
-   * A second NIC on the fabric, so instances can reach those on other nodes.
-   * A node that is not on the fabric launches without it and says so.
+   * The fabric instances get a second NIC on, so they can reach those on
+   * other nodes; blank for none. A node not on it launches without it and
+   * says so.
    */
-  fabric: boolean
+  fabric: string
   /** LXD/Incus profiles, not bootstrap ones. */
   profiles: string[]
   ephemeral: boolean
@@ -894,10 +895,19 @@ export interface NodeState {
   running: number
 }
 
-/** One node's slice of the fabric: the subnet it holds and where to route it. */
-export interface FabricClaim {
+/** One fabric a node is on: the prefix everyone shares and the /24 it holds. */
+export interface FabricHolding {
+  prefix: string
   subnet: string
+  /** Whether what leaves the fabric for anywhere else is NAT'd. */
+  nat: boolean
+}
+
+/** A node's fabric claims, as its member record carries them. */
+export interface FabricClaim {
+  /** The address peers route this node's subnets to. */
   via: string
+  fabrics: Record<string, FabricHolding>
 }
 
 /** One peer's route as this node sees it. `ok` means programmed and reachable. */
@@ -913,27 +923,99 @@ export interface FabricCommand {
   why: string
 }
 
-/** What `GET /api/fabric` serves: this node's half of the fabric. */
-export interface FabricStatus {
-  /** On *and* holding a subnet. `configured` without this means half set up. */
-  enabled: boolean
-  configured: boolean
-  node: string
-  /** The cluster-wide address space, always a /16. */
-  prefix: string
-  bridge: string
-  subnet: string
-  via: string
+/** One fabric from this node's side. */
+export interface FabricLocal extends FabricHolding {
+  name: string
+  gateway: string
   bridge_ready: boolean
+  /** Instances on this node with a NIC on the fabric's bridge. */
+  instances: string[]
+  routes: FabricRoute[]
+}
+
+/** What `GET /api/fabric` serves: this node's half of every fabric. */
+export interface FabricStatus {
+  node: string
+  /** On at least one fabric. */
+  enabled: boolean
+  via: string
+  fabrics: FabricLocal[]
   /** Whether routes can be programmed here; false means the plan is advisory. */
   privileged: boolean
-  routes: FabricRoute[]
-  /** How many commands `apply` would run. */
+  /** How many route commands `apply` would run. */
   pending: number
+  /** What the last apply made of the firewall; null until this server has applied once. */
+  firewall: { ok: boolean; error: string; at: number } | null
   error: string
   /** One sentence on why traffic will not flow, or blank. */
   check: string
   warnings: string[]
+}
+
+/**
+ * One node's part in one fabric. `absent`: not on it; `unknown`: did not
+ * answer (subnet from its claim); `bridge`/`routes`: on it but not carrying
+ * traffic yet; `conflict`: holds it under another prefix.
+ */
+export interface FabricMember {
+  node: string
+  state: 'ok' | 'absent' | 'unknown' | 'bridge' | 'routes' | 'conflict'
+  detail: string
+  subnet: string
+  prefix: string
+  gateway: string
+  bridge_ready: boolean
+  routes_ok: number
+  routes_total: number
+  instances: string[]
+}
+
+export interface FabricSummary {
+  name: string
+  prefix: string
+  nat: boolean
+  /** Nodes holding it under a different prefix. */
+  conflict: string[]
+  /** Instances attached across every node. */
+  instances: number
+  members: FabricMember[]
+}
+
+export interface FabricNodeState {
+  node: string
+  self: boolean
+  /** Answered; false means its row in every fabric is from its claims. */
+  ok: boolean
+  error: string
+  privileged: boolean
+  pending: number
+  check: string
+  via: string
+}
+
+/** What `GET /api/fabrics` serves: every fabric in the cluster, asked of every member. */
+export interface FabricOverview {
+  node: string
+  clustered: boolean
+  local: FabricStatus
+  nodes: FabricNodeState[]
+  fabrics: FabricSummary[]
+}
+
+/** What `GET /api/fabrics/check` serves: would this name and prefix fit on every node? */
+export interface FabricCheck {
+  name: string
+  suggested_name: boolean
+  name_error: string
+  prefix: string
+  suggested_prefix: boolean
+  prefix_error: string
+  conflicts: { node: string; interface: string; subnet: string }[]
+  unreachable: { node: string; error: string }[]
+  unreachable_error: string
+  /** node -> the /24 it would be given. */
+  allocation: Record<string, string>
+  ok: boolean
 }
 
 export interface FabricPlan {
@@ -958,12 +1040,19 @@ export interface FabricApplyResult {
   status: FabricStatus
 }
 
-export interface FabricEnableResult {
+/** What creating or extending a fabric did, node by node. */
+export interface FabricChangeResult {
+  name: string
   prefix: string
-  /** node name -> the /24 it was given. */
   assigned: Record<string, string>
-  peers: { node: string; subnet: string; ok: boolean; error: string }[]
-  status: FabricStatus
+  nodes: { node: string; subnet: string; ok: boolean; error: string }[]
+  ok: boolean
+}
+
+export interface FabricDeleteResult {
+  name: string
+  nodes: { node: string; ok: boolean; error: string }[]
+  ok: boolean
 }
 
 export interface ClusterNode {

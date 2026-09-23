@@ -110,8 +110,6 @@ class StackService:
         # Stack runs in progress or last finished, by stack name.
         self._runs = {}
         self._lock = threading.Lock()
-        # The fabric prefix, worked out once: False when there is none.
-        self._prefix = None
 
     # -- definitions -------------------------------------------------------
 
@@ -718,25 +716,26 @@ class StackService:
         first and work only by luck.
         """
         addresses = container.get("ipv4") or []
-        prefix = self._fabric_prefix()
-        if prefix:
-            for address in addresses:
-                try:
-                    if ipaddress.ip_address(address) in prefix:
-                        return address
-                except ValueError:
-                    continue
+        prefixes = self._fabric_prefixes()
+        for address in addresses:
+            try:
+                if any(ipaddress.ip_address(address) in p for p in prefixes):
+                    return address
+            except ValueError:
+                continue
         return addresses[0] if addresses else None
 
-    def _fabric_prefix(self):
-        """The cluster's fabric prefix, or None when the fabric is off here."""
-        if self._prefix is None:
-            try:
-                fabric = self.cluster.fabric()
-                self._prefix = fabric.prefix() if fabric.enabled() else False
-            except Exception:
-                self._prefix = False
-        return self._prefix or None
+    def _fabric_prefixes(self):
+        """Every fabric prefix this node is on; [] when it is on none.
+
+        Asked each time rather than kept: a fabric created after `serve`
+        started must count, and the settings behind it are already cached
+        until the file changes.
+        """
+        try:
+            return self.cluster.fabric().prefixes()
+        except Exception:
+            return []
 
     # -- the instances a stack is running ------------------------------------
 

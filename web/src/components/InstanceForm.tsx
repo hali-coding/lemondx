@@ -4,13 +4,18 @@ import { keyModules, savableSelection } from '../lib/bootstrap'
 import { subnetStatus } from '../lib/cidr'
 import { DEFAULT_CPU, DEFAULT_MEMORY, specProblems } from '../lib/instance'
 import type {
-  BootstrapModule, BootstrapProfile, BootstrapSelection, Images, InstanceSpec, NetworkSummary,
+  BootstrapModule, BootstrapProfile, BootstrapSelection, FabricLocal, Images,
+  InstanceSpec, NetworkSummary,
   SshKey, Status, SubnetInUse,
 } from '../lib/types'
 import { BootstrapPicker } from './BootstrapPicker'
 import { SubnetField } from './SubnetField'
 import { ImageBrowser } from './ImageBrowser'
 import { SshKeyPicker } from './SshKeyPicker'
+
+// How a fabric is told from a network in the one picker; a network name
+// cannot contain a colon.
+const FABRIC_CHOICE = 'fabric:'
 
 interface Props {
   value: InstanceSpec
@@ -50,12 +55,17 @@ export function InstanceForm({
   const [creatingNetwork, setCreatingNetwork] = useState(false)
   const [networkError, setNetworkError] = useState('')
   const [subnets, setSubnets] = useState<SubnetInUse[] | null>(null)
+  // This node's fabrics. Every member holds the same ones once a fabric is
+  // created, so this node's list is the cluster's in all but a broken case.
+  const [fabrics, setFabrics] = useState<FabricLocal[]>([])
 
   useEffect(() => {
     const controller = new AbortController()
     api.images(controller.signal).then(setImages).catch(() => {})
     api.status(controller.signal).then(setStatus).catch(() => {})
     api.networks(controller.signal).then(setNetworks).catch(() => {})
+    api.fabric(controller.signal)
+      .then((state) => setFabrics(state.fabrics)).catch(() => {})
     api.browseImages({}, controller.signal)
       .then((browse) => setCachedAliases(
         new Set(browse.entries.filter((e) => e.cached).map((e) => e.full_alias))))
@@ -108,10 +118,31 @@ export function InstanceForm({
 
   // Same rule as the pool: the default is stored as blank, so a template
   // follows whatever network the default profile uses where it launches.
-  const attachable = (networks ?? []).filter((n) => n.attachable)
+  // A fabric's bridge is a managed network like any other, but it is offered
+  // once, in its own group: listed twice it reads as two different choices.
+  const fabricNames = new Set(fabrics.map((f) => f.name))
+  const attachable = (networks ?? []).filter((n) => n.attachable && !fabricNames.has(n.name))
   const defaultNetworkName = networks?.find((n) => n.default)?.name ?? ''
+  // One picker for both fields. A NAT'd fabric is stored as the network --
+  // the instance's only NIC, which it can be because the bridge has the
+  // fabric's name on every node -- and one without NAT as `fabric`, a second
+  // NIC beside the default network, since it carries nothing but the fabric.
+  const chosenFabric = value.fabric || (fabricNames.has(value.network) ? value.network : '')
   const selectedNetworkName = value.network || defaultNetworkName
-  const selectedNetwork = networks?.find((n) => n.name === selectedNetworkName) ?? null
+  const selectedChoice = chosenFabric ? `${FABRIC_CHOICE}${chosenFabric}` : selectedNetworkName
+  const selectedNetwork = chosenFabric ? null
+    : networks?.find((n) => n.name === selectedNetworkName) ?? null
+  const selectedFabric = fabrics.find((f) => f.name === chosenFabric) ?? null
+
+  function choose(choice: string) {
+    if (!choice.startsWith(FABRIC_CHOICE)) {
+      set({ network: choice === defaultNetworkName ? '' : choice, fabric: '' })
+      return
+    }
+    const name = choice.slice(FABRIC_CHOICE.length)
+    const fabric = fabrics.find((f) => f.name === name)
+    set(fabric && !fabric.nat ? { network: '', fabric: name } : { network: name, fabric: '' })
+  }
 
   const newSubnet = newNetwork ? subnetStatus(newNetwork.ipv4, 4, subnets) : null
 
@@ -217,12 +248,15 @@ export function InstanceForm({
         </div>
         <div className="field">
           <label htmlFor="c-network">Network</label>
-          <select id="c-network" className="select" value={selectedNetworkName}
+          <select id="c-network" className="select" value={selectedChoice}
             disabled={disabled || attachable.length === 0}
-            onChange={(event) => set({
-              network: event.target.value === defaultNetworkName ? '' : event.target.value })}>
-            {value.network && networks && !attachable.some((n) => n.name === value.network) && (
+            onChange={(event) => choose(event.target.value)}>
+            {!chosenFabric && value.network && networks
+              && !attachable.some((n) => n.name === value.network) && (
               <option value={value.network}>{value.network} (not on this host)</option>
+            )}
+            {chosenFabric && !selectedFabric && (
+              <option value={selectedChoice}>{chosenFabric} (fabric not on this node)</option>
             )}
             {attachable.length === 0 && <option value="">{networks ? 'No networks' : 'Loading…'}</option>}
             <optgroup label="Managed networks">
@@ -240,26 +274,43 @@ export function InstanceForm({
                 ))}
               </optgroup>
             )}
+            {fabrics.length > 0 && (
+              <optgroup label="Fabrics — span every node">
+                {fabrics.map((f) => (
+                  <option key={f.name} value={`${FABRIC_CHOICE}${f.name}`}>
+                    {f.name} ({f.prefix}{f.nat ? '' : ', no NAT'})
+                  </option>
+                ))}
+              </optgroup>
+            )}
           </select>
         </div>
       </div>
+      {chosenFabric && (
+        <span className="hint" style={{ marginTop: -8 }}>
+          {value.fabric ? (
+            <>
+              Two NICs: <span className="mono">{value.network || defaultNetworkName || 'the default network'}</span>{' '}
+              for the internet, and <span className="mono">{chosenFabric}</span> to reach
+              its instances on other nodes directly
+              {selectedFabric && !selectedFabric.nat && ', which carries nothing else'}.
+            </>
+          ) : (
+            <>
+              One NIC on <span className="mono">{chosenFabric}</span>: the instance reaches
+              the fabric&apos;s instances on every node directly, and the internet through
+              the fabric&apos;s NAT.
+            </>
+          )}
+          {' '}A node not on the fabric launches it on its default network instead.
+        </span>
+      )}
       {selectedNetwork && !selectedNetwork.managed && (
         <span className="hint" style={{ marginTop: -8, color: 'var(--warn)' }}>
           <span className="mono">{selectedNetwork.name}</span> is a host bridge: the instance
           gets its address from whatever serves that network, not from the daemon.
         </span>
       )}
-      <label className="check" style={{ marginTop: -4 }}>
-        <input type="checkbox" checked={value.fabric} disabled={disabled}
-          onChange={(event) => set({ fabric: event.target.checked })} />
-        <span>
-          Join the fabric
-          <span className="hint">
-            A second NIC, so this instance can reach instances on other nodes
-            directly. A node that is not on the fabric launches without it.
-          </span>
-        </span>
-      </label>
       {newNetwork === null && (
         <button type="button" className="btn btn-ghost btn-sm"
           style={{ alignSelf: 'flex-start', marginTop: -8 }} disabled={disabled}

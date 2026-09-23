@@ -305,6 +305,35 @@ Host interfaces the daemon does not manage (`docker0`, physical NICs) are
 listed separately so it is clear what is and is not under its control, with
 host bridges marked as ones a new instance can join.
 
+### Fabrics
+
+The top of the tab is **Fabrics**: routed networks that span every node (see
+[networking.md](networking.md)). Each fabric has a card with its prefix,
+whether it NATs, and one row per node: the /24 that node holds, its gateway,
+how many of its routes to the other nodes are in place, which instances are
+attached, and a state (*ok*, *no bridge*, *routes*, *not on it*, *no answer*).
+Each row is the node's own report, fetched from it, so a missing bridge or
+route on another host shows up here rather than as lost packets. The card
+polls every 10 seconds, because every poll asks each member.
+
+**New fabric** opens a dialog pre-filled with the first free name and /16,
+checked against every interface and route on every node. Editing either field
+checks again, shows the /24 each node would get, and names the node and
+interface that any overlap is with. The fabric is created on every node at
+once, so every node must be reachable: while one is not, **New fabric** is
+disabled and the section says which node it is and that the way on without it
+is to evict it on the Nodes tab.
+**Add missing nodes** gives a subnet to members that lack one, and **Delete**
+removes the fabric everywhere once no instance is attached to it. **Apply**
+and **Show plan** act on this node's routes and firewall.
+
+In the create and template dialogs, fabrics are a group of their own in the
+**Network** picker, so there is one choice to make. A fabric with NAT becomes
+the instance's only NIC: it reaches the fabric on every node directly and the
+internet through the NAT. A fabric without NAT cannot carry internet traffic,
+so it is added as a second NIC beside the default network. The hint under the
+picker says which of the two you get.
+
 ### Managing networks
 
 **New network** creates a managed bridge. Each address family is *Pick a free

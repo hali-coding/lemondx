@@ -340,9 +340,9 @@ def _clean_template(stored, name):
         "disk": _text(stored.get("disk"), 32),
         "pool": _text(stored.get("pool"), 64),
         "network": _text(stored.get("network"), 64),
-        # Whether instances also get a NIC on this node's fabric bridge, so
-        # they can reach instances of the same stack on other nodes.
-        "fabric": stored.get("fabric") is True,
+        # The fabric instances also get a NIC on, so they can reach instances
+        # of the same stack on other nodes; blank for none.
+        "fabric": clean_fabric_name(stored.get("fabric")),
         "profiles": _strings(stored.get("profiles")),
         "ephemeral": stored.get("ephemeral") is True,
         # Absent means start: an instance that never boots cannot be bootstrapped.
@@ -531,29 +531,73 @@ def _clean_node(stored, name):
     }
 
 
+# A fabric is named after the bridge it puts on every node, so its name obeys
+# the kernel's interface-name rule. The same pattern as service.py's
+# VALID_NETWORK_NAME, repeated because this layer sits below that one.
+_FABRIC_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,14}$")
+
+# What `fabric: true` meant before fabrics had names: the one fabric, whose
+# bridge was lemonfab0 unless someone had configured otherwise. Kept so a
+# template or node record written then still reads as what it was.
+LEGACY_FABRIC = "lemonfab0"
+_LEGACY_PREFIX_BITS = 16
+
+
+def clean_fabric_name(value):
+    """A template's fabric: a fabric name, or '' for none."""
+    if value is True:
+        return LEGACY_FABRIC
+    value = _text(value, 15)
+    return value if _FABRIC_NAME.match(value) else ""
+
+
 def clean_fabric(stored):
-    """A node's fabric claim: the subnet its containers use, and how to reach it.
+    """A node's fabric claims: the subnet it holds in each fabric, and how to reach it.
 
     This rides on the node record rather than being an artifact of its own
     because a claim is not something reconciliation could ever settle: two
     nodes holding overlapping subnets is a two-sided difference, which
     `_conflicts()` reports and refuses to resolve. Allocation is coordinated
-    instead, and this is only how the answer travels.
+    instead, and this is only how the answer travels. The claims are also the
+    only record of which fabrics exist: a fabric is the set of nodes claiming
+    a subnet in it, so there is no second list to fall out of step with.
 
-    An unparseable half is dropped rather than failing the record -- a node
-    with no usable claim is simply not on the fabric yet.
+    An unparseable claim is dropped rather than failing the record -- a node
+    with no usable claim is simply not on that fabric.
     """
+    empty = {"via": "", "fabrics": {}}
     if not isinstance(stored, dict):
-        return {"subnet": "", "via": ""}
-    try:
-        subnet = str(ipaddress.ip_network(_text(stored.get("subnet"), 43), strict=False))
-    except ValueError:
-        subnet = ""
+        return empty
     try:
         via = str(ipaddress.ip_address(_text(stored.get("via"), 45)))
     except ValueError:
         via = ""
-    return {"subnet": subnet, "via": via}
+    raw = stored.get("fabrics")
+    if raw is None and stored.get("subnet"):
+        # A record from before fabrics were named: one claim, in the one
+        # fabric, whose prefix was always the /16 around it.
+        try:
+            subnet = ipaddress.ip_network(_text(stored.get("subnet"), 43), strict=False)
+            raw = {LEGACY_FABRIC: {
+                "subnet": str(subnet), "nat": False,
+                "prefix": str(subnet.supernet(new_prefix=_LEGACY_PREFIX_BITS))}}
+        except ValueError:
+            raw = {}
+    fabrics = {}
+    for name, claim in (raw if isinstance(raw, dict) else {}).items():
+        if not isinstance(name, str) or not _FABRIC_NAME.match(name) \
+                or not isinstance(claim, dict) or len(fabrics) >= 64:
+            continue
+        try:
+            prefix = ipaddress.ip_network(_text(claim.get("prefix"), 43), strict=False)
+            subnet = ipaddress.ip_network(_text(claim.get("subnet"), 43), strict=False)
+        except ValueError:
+            continue
+        if prefix.version != 4 or subnet.version != 4 or not subnet.subnet_of(prefix):
+            continue
+        fabrics[name] = {"prefix": str(prefix), "subnet": str(subnet),
+                         "nat": claim.get("nat") is not False}
+    return {"via": via, "fabrics": fabrics}
 
 
 def _clean_node_group(stored, name):
@@ -725,6 +769,38 @@ def prune_module(module_id):
         if module_id in bootstrap["modules"]:
             save_template(name, dict(record, bootstrap=dict(
                 bootstrap, modules=[m for m in bootstrap["modules"] if m != module_id])))
+
+
+def dependents(kind, name):
+    """The saved records that name ``name`` of ``kind``, as "stack 'x'" labels.
+
+    What a person's delete is refused over: a stack whose step names a template
+    that is gone fails at launch, possibly stages in, and a template naming a
+    fabric that is gone launches without the NIC and says so only in a note.
+    Read from this node's records, which sync keeps level with every member's.
+    """
+    def label(what, names):
+        return ["%s '%s'" % (what, n) for n in sorted(set(names))]
+
+    if kind == "templates":
+        return label("stack", (stack_name for _, stack_name, stack in _stacks.scan()
+                               for stage in stack["stages"] for step in stage["steps"]
+                               if step["type"] == "launch" and step["template"] == name))
+    if kind == "groups":
+        return label("stack", (stack_name for _, stack_name, stack in _stacks.scan()
+                               for stage in stack["stages"] for step in stage["steps"]
+                               if step["type"] == "launch" and name in step["groups"]))
+    if kind == "modules":
+        return (label("template", (t for _, t, record in _templates.scan()
+                                   if name in record["bootstrap"]["modules"]))
+                + label("profile", (p for _, p, record in _profiles.scan()
+                                    if name in record["modules"])))
+    if kind == "fabrics":
+        # A fabric is the bridge of the same name, so naming it as the network
+        # (the instance's only NIC) uses it as much as the extra NIC does.
+        return label("template", (t for _, t, record in _templates.scan()
+                                  if name in (record["fabric"], record["network"])))
+    raise ValueError("unknown kind %r" % kind)
 
 
 # -- users and API tokens --------------------------------------------------

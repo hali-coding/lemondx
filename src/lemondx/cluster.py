@@ -52,7 +52,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from . import store
 from .auth import ADMIN, TOKEN_PREFIX
-from .bootstrap import discover_modules, module_source
+from .bootstrap import discover_modules, module_source, normalise_module_id
 from .lxd import LXDError
 from .nodeclient import (DEFAULT_TIMEOUT, LONG_TIMEOUT, NodeClient, NodeError,
                          fingerprint_of,
@@ -413,6 +413,7 @@ class ClusterService:
         self._reconcile_lock = threading.Lock()
         self._stacks = None          # set by StackService, for applying a pulled stack
         self._fabric_service = None  # set by FabricService, for routes between nodes
+        self._serving_fingerprint = ""  # set by serve(), see note_serving()
         # How a template's "put these on the fabric" becomes a device on this
         # node: the service resolves the flag through here, so it never has to
         # read fabric settings itself.
@@ -459,14 +460,39 @@ class ClusterService:
             return cert, key
         return None, None
 
+    def note_serving(self, host, port, cert):
+        """Record that this process serves this node's URL with ``cert``.
+
+        Then `local_fingerprint()` need not ask the network: this process *is*
+        the running server it would otherwise probe. The probe is worse than
+        redundant from here -- `serve()` reads the member list before its
+        accept loop runs, so a connection to its own bound-but-idle socket
+        waits out the whole timeout, once per call, and peers' handshakes
+        queue behind it for as long.
+        """
+        try:
+            scheme, url_host, url_port = parse_url(self.local_url())[:3]
+        except NodeError:
+            return
+        if scheme != "https" or int(url_port) != int(port):
+            return
+        if host not in ("0.0.0.0", "::", "") and host != url_host:
+            return      # serving somewhere else, e.g. only on loopback
+        try:
+            self._serving_fingerprint = certificate_fingerprint(cert)
+        except ClusterError:
+            pass
+
     def local_fingerprint(self):
         """What peers will pin this node by.
 
         The running server is the authority: whatever it presents is what a peer
         actually sees, which a certificate file on disk only predicts. Falling
         back to the file covers a node that is not serving yet -- the usual case
-        when setting one up.
+        when setting one up. When this process is that server, it already knows.
         """
+        if self._serving_fingerprint:
+            return self._serving_fingerprint
         url = self.local_url()
         if url:
             try:
@@ -490,9 +516,9 @@ class ClusterService:
             "fingerprint": self.local_fingerprint(),
             "description": "",
             "added": 0,
-            # How peers learn where to route this node's containers. Blank
-            # unless the fabric is on here, which is how a mixed cluster works:
-            # a node without it is simply one nobody routes to.
+            # How peers learn where to route this node's containers, one claim
+            # per fabric. Empty on a node that is on none, which is how a mixed
+            # cluster works: a node without a fabric is one nobody routes to.
             "fabric": fabric_mod.local_claim(self.local_route_address()),
         }
 
@@ -1068,6 +1094,21 @@ class ClusterService:
                 "cannot be %s by hand. Run `lemondx cluster group auto` to build "
                 "it again from the nodes as they are now." % (name, verb), 409)
 
+    @staticmethod
+    def refuse_in_use(kind, noun, name):
+        """Refuse a person's delete of something another record still names.
+
+        Only a person's: a member relaying a delete, or reconciliation settling
+        one, is carrying out a decision this check already met where it was
+        made, and refusing it here would leave the cluster disagreeing for good.
+        """
+        users = store.dependents(kind, name)
+        if users:
+            raise ClusterError(
+                "%s '%s' is used by %s. Change or delete %s first."
+                % (noun[:1].upper() + noun[1:], name, ", ".join(users),
+                   "it" if len(users) == 1 else "them"), 409)
+
     def save_group(self, name, members=None, description="", propagate=True,
                    managed=False):
         name = (name or "").strip()
@@ -1178,8 +1219,10 @@ class ClusterService:
         return {"groups": saved, "nodes": sized, "skipped": skipped,
                 "uniform": uniform}
 
-    def delete_group(self, name, everywhere=True, managed=False):
+    def delete_group(self, name, everywhere=True, managed=False, relayed=False):
         self._refuse_managed((name or "").strip(), managed, "deleted")
+        if not relayed:
+            self.refuse_in_use("groups", "node group", (name or "").strip())
         if not store.delete_node_group((name or "").strip()):
             raise ClusterError("No such node group '%s'." % name, 404)
         return self._with_sync({"deleted": name}, "groups", name, everywhere,
@@ -1405,22 +1448,15 @@ class ClusterService:
             # The joiner cannot allocate its own subnet -- nothing in two
             # conflicting claims says which is right -- so the node admitting
             # it picks one, the same way it hands over the credential.
-            "fabric": self._enrolment_claim(joiner["name"]),
+            "fabrics": self._enrolment_claims(joiner["name"]),
         }
 
-    def _enrolment_claim(self, joiner):
-        """The fabric prefix and subnet for a node being admitted, or None."""
-        fabric = self._fabric()
-        if not fabric.enabled():
-            return None
+    def _enrolment_claims(self, joiner):
+        """[{name, prefix, subnet, nat}] for a node being admitted, one per fabric."""
         try:
-            assignment = fabric.allocate()
-        except Exception:                 # never fail a join over the fabric
-            return None
-        subnet = assignment.get(joiner)
-        if not subnet:
-            return None
-        return {"prefix": str(fabric.prefix()), "subnet": subnet}
+            return self._fabric().enrolment_claims(joiner)
+        except Exception:                 # never fail a join over a fabric
+            return []
 
     # -- joining: the node redeeming the code ------------------------------
 
@@ -1507,7 +1543,7 @@ class ClusterService:
         # Take the subnet the cluster allocated before announcing, so the
         # claim is on this node's record by the time peers read it and they
         # route to it on the first pass rather than the next hourly one.
-        fabric_note = self._accept_enrolment(answer.get("fabric"))
+        fabric_note = self._accept_enrolment(answer.get("fabrics"))
 
         # Now that we hold the credential, tell everyone else we exist. The node
         # that admitted us already knows; the rest learn here, or on the next
@@ -1521,25 +1557,32 @@ class ClusterService:
             "members": self.members(),
             "unreachable": [r["node"] for r in spread["results"] if not r["ok"]],
             "warning": warning,
-            "fabric": fabric_note,
+            "fabrics": fabric_note,
         }
 
     def _accept_enrolment(self, offered):
-        """Take the fabric subnet the cluster allocated, if it offered one.
+        """Take the fabric subnets the cluster allocated, one per fabric it has.
 
         A refusal here is reported, not raised: the node has joined, and a
         prefix that collides with this host's own network is a thing to fix
         rather than a reason to undo a membership that otherwise works.
+        `fabric extend` is how it is put right once it is.
         """
-        if not isinstance(offered, dict) or not offered.get("subnet"):
-            return None
-        try:
-            self._fabric().accept_claim(offered["subnet"], offered.get("prefix"))
-        except Exception as exc:
-            message = getattr(exc, "message", str(exc))
-            _log("joined, but could not take the fabric subnet: %s" % message)
-            return {"ok": False, "subnet": offered["subnet"], "error": message}
-        return {"ok": True, "subnet": offered["subnet"], "error": ""}
+        notes = []
+        for offer in offered if isinstance(offered, list) else []:
+            if not isinstance(offer, dict) or not offer.get("subnet"):
+                continue
+            note = {"name": str(offer.get("name") or ""), "subnet": offer["subnet"],
+                    "ok": True, "error": ""}
+            try:
+                self._fabric().accept_claim(offer.get("name"), offer["subnet"],
+                                            offer.get("prefix"), offer.get("nat") is not False)
+            except Exception as exc:
+                note.update(ok=False, error=getattr(exc, "message", str(exc)))
+                _log("joined, but could not take a subnet in fabric %s: %s"
+                     % (note["name"], note["error"]))
+            notes.append(note)
+        return notes
 
     def _stand_down(self):
         """Erase every trace of membership here: credential, peers, groups.
@@ -2116,7 +2159,8 @@ class ClusterService:
         elif kind == "profiles":
             self.service.delete_bootstrap_profile(name)
         elif kind == "groups":
-            self.delete_group(name, everywhere=False, managed=name in SIZE_GROUPS)
+            self.delete_group(name, everywhere=False, managed=name in SIZE_GROUPS,
+                              relayed=True)
         elif kind == "stacks":
             self._stack_service().delete_stack(name, everywhere=False)
         else:
@@ -2149,19 +2193,18 @@ class ClusterService:
         """The fabric, for the API and the CLI."""
         return self._fabric()
 
-    def _fabric_configure(self, name, iface):
+    def _fabric_configure(self, name, iface, bridge):
         """Configure a new instance's fabric NIC. Never fails the launch."""
         try:
-            return self._fabric().configure_guest(name, iface)
+            return self._fabric().configure_guest(name, iface, bridge)
         except Exception:
             return None
 
-    def _fabric_bridge(self):
-        """This node's fabric bridge, or "" when it is not on the fabric."""
+    def _fabric_bridge(self, wanted):
+        """This node's bridge for fabric ``wanted``, or "" when it is not on it."""
         try:
-            fabric = self._fabric()
-            return fabric.bridge() if fabric.enabled() else ""
-        except Exception:                 # never fail a launch over the fabric
+            return self._fabric().resolve(wanted)
+        except Exception:                 # never fail a launch over a fabric
             return ""
 
     def _push(self, node_name, items, apply):
@@ -2234,7 +2277,9 @@ class ClusterService:
         record = self.service.save_template(**kwargs)
         return self._with_sync(record, "templates", record["name"], propagate)
 
-    def delete_template(self, name, everywhere=True):
+    def delete_template(self, name, everywhere=True, relayed=False):
+        if not relayed:
+            self.refuse_in_use("templates", "template", name)
         record = self.service.delete_template(name)
         return self._with_sync(record, "templates", name, everywhere, deleted=True)
 
@@ -2242,7 +2287,14 @@ class ClusterService:
         record = self.service.upload_module(name, content, overwrite)
         return self._with_sync(record, "modules", record["id"], propagate)
 
-    def remove_module(self, module_id, everywhere=True):
+    def remove_module(self, module_id, everywhere=True, relayed=False):
+        module = discover_modules().get(normalise_module_id(module_id))
+        # Removing a shadow brings the built-in back under the same id, so
+        # nothing naming it is left without a module to run; a module that
+        # cannot be deleted at all is left to say why itself.
+        if not relayed and module and module["editable"] and not module["builtin"] \
+                and not module["shadows_builtin"]:
+            self.refuse_in_use("modules", "module", module["id"])
         record = self.service.remove_module(module_id)
         # A built-in that was only shadowed still exists everywhere, so the
         # upload coming off this node is what the others are told about.
@@ -2723,7 +2775,7 @@ def _template_body(template):
         "disk": template["disk"] or None,
         "pool": template["pool"] or None,
         "network": template["network"] or None,
-        "fabric": template.get("fabric", False),
+        "fabric": template.get("fabric") or "",
         "profiles": template["profiles"],
         "ephemeral": template["ephemeral"],
         "start": template["start"],

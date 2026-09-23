@@ -84,7 +84,7 @@ Want it running all the time? See [Running as a service](docs/service.md).
 ./lemondx storage pools          # local pools, capacity and management status
 ./lemondx storage volumes        # custom, instance and image volumes
 ./lemondx network ls             # networks; network create|set|delete manage bridges
-./lemondx fabric status          # routed, non-NAT networking between nodes
+./lemondx fabric list            # fabrics: routed networks between nodes
 ./lemondx create NAME -i ubuntu:24.04 -c 2 -m 2GiB -d 10GiB
                                  # -i defaults to Ubuntu LTS for this daemon
                                  # --pool and --network pick where it lands
@@ -140,7 +140,7 @@ pass to `-i`.
 | [Instance templates](docs/templates.md) | saving a full instance setup and launching one or many from it |
 | [Stacks](docs/stacks.md) | launching several templates in sequence, handing names and addresses along, with health gates |
 | [Nodes and federation](docs/cluster.md) | joining nodes securely, node groups, launching and syncing across them |
-| [Networking between nodes](docs/networking.md) | the fabric: routed, non-NAT connectivity so containers on different nodes can talk |
+| [Networking between nodes](docs/networking.md) | fabrics: routed networks shared by every node, so containers on different nodes can talk |
 | [REST API](docs/api.md) | every endpoint, request/response shapes, curl examples |
 | [Daemons, images and storage](docs/daemons-and-storage.md) | LXD vs Incus, socket discovery, image remotes, disk quotas, units |
 | [Web UI tour](docs/web-ui.md) | the Resources and Network views, the full image browser |
@@ -154,7 +154,7 @@ pass to `-i`.
 can reach the port controls your containers. Run `lemondx configure auth` to
 turn on logins — local users, PAM, a trusted proxy or API tokens, with read-only
 and admin roles — or pass `--auth` flags to `serve`, and
-use `--tls-cert`/`--tls-key` or a TLS proxy before exposing it; see
+run `lemondx configure tls` (or use a TLS proxy) before exposing it; see
 [Security](docs/security.md).
 
 ![Network view](docs/screenshot3.png)

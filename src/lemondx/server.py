@@ -240,7 +240,8 @@ def build_router(service, auth=None, cluster=None, stacks=None):
               mid, params=body.get("params"), is_default=body.get("is_default")))
     r.add("DELETE", r"/api/modules/%s" % NAME,
           lambda body, q, who, mid: cluster.remove_module(
-              mid, everywhere=_everywhere(body, q, who)), principal=True)
+              mid, everywhere=_everywhere(body, q, who),
+              relayed=from_peer(who)), principal=True)
 
     r.add("GET", r"/api/bootstrap-profiles",
           lambda body, q: service.list_bootstrap_profiles())
@@ -262,7 +263,7 @@ def build_router(service, auth=None, cluster=None, stacks=None):
               instance_type=body.get("type", "container"),
               cpu=body.get("cpu"), memory=body.get("memory"), disk=body.get("disk"),
               pool=body.get("pool"), network=body.get("network"),
-              fabric=bool(body.get("fabric", False)),
+              fabric=body.get("fabric") or "",
               profiles=body.get("profiles"),
               ephemeral=bool(body.get("ephemeral", False)),
               start=bool(body.get("start", True)),
@@ -273,7 +274,8 @@ def build_router(service, auth=None, cluster=None, stacks=None):
               app_check=body.get("app_check")), principal=True)
     r.add("DELETE", r"/api/templates/%s" % NAME,
           lambda body, q, who, name: cluster.delete_template(
-              name, everywhere=_everywhere(body, q, who)), principal=True)
+              name, everywhere=_everywhere(body, q, who),
+              relayed=from_peer(who)), principal=True)
     # Launching names nodes or groups; with neither it is this node alone, so
     # an older client -- or a script that has never heard of federation -- gets
     # exactly the behaviour it had before. `names` is how a coordinating node
@@ -436,28 +438,42 @@ def build_router(service, auth=None, cluster=None, stacks=None):
           lambda body, q: cluster.delete_containers(
               body.get("instances"), force=bool(body.get("force"))))
 
-    # The fabric: routed, non-NAT networking between the containers of a
-    # cluster. Reading it needs no privilege on the host, so status answers
-    # everywhere and only apply can fail for want of the sudoers rules.
+    # Fabrics: routed networks between the containers of a cluster. Reading
+    # one needs no privilege on the host, so status answers everywhere and
+    # only apply can fail for want of the sudoers rules. `/api/fabrics` is the
+    # cluster (it asks every member); `/api/fabric` is this node's half.
+    r.add("GET", r"/api/fabrics", lambda body, q: cluster.fabric().overview())
+    r.add("GET", r"/api/fabrics/check", lambda body, q: cluster.fabric().check(
+        name=q.get("name") or "", prefix=q.get("prefix") or ""))
+    r.add("POST", r"/api/fabrics", lambda body, q: cluster.fabric().create(
+        name=body.get("name") or "", prefix=body.get("prefix") or "",
+        nat=body.get("nat") is not False))
+    r.add("POST", r"/api/fabrics/%s/extend" % NAME,
+          lambda body, q, name: cluster.fabric().extend(name))
+    r.add("DELETE", r"/api/fabrics/%s" % NAME,
+          lambda body, q, name: cluster.fabric().delete(name))
     r.add("GET", r"/api/fabric", lambda body, q: cluster.fabric().status())
+    r.add("GET", r"/api/fabric/host", lambda body, q: cluster.fabric().host_inventory())
     r.add("GET", r"/api/fabric/plan", lambda body, q: cluster.fabric().plan())
     r.add("POST", r"/api/fabric/apply", lambda body, q: cluster.fabric().apply())
-    r.add("POST", r"/api/fabric/enable",
-          lambda body, q: cluster.fabric().enable(prefix=body.get("prefix")))
-    r.add("POST", r"/api/fabric/disable", lambda body, q: cluster.fabric().disable())
-    # Members only, and narrower than admin on purpose: a person turning the
-    # fabric on uses `enable`, which allocates for the whole cluster. Setting
-    # one node's subnet by hand is only ever a member relaying that allocation,
-    # and letting an admin do it directly is how two nodes end up on one range.
-    r.add("PUT", r"/api/fabric/claim",
-          lambda body, q, who: _peers_only(who, "Only a cluster member allocates a "
-                                           "fabric subnet; use /api/fabric/enable.")
-          or cluster.fabric().accept_claim(body.get("subnet"), body.get("prefix")),
+    # Members only, and narrower than admin on purpose: a person creates or
+    # deletes a fabric with `/api/fabrics`, which allocates for the whole
+    # cluster. Setting one node's subnet by hand is only ever a member relaying
+    # that allocation, and letting an admin do it directly is how two nodes
+    # end up on one range.
+    r.add("PUT", r"/api/fabric/claims/%s" % NAME,
+          lambda body, q, who, name: _peers_only(who, _FABRIC_CLAIM)
+          or cluster.fabric().accept_claim(name, body.get("subnet"), body.get("prefix"),
+                                           body.get("nat") is not False),
+          principal=True, peers=True)
+    r.add("DELETE", r"/api/fabric/claims/%s" % NAME,
+          lambda body, q, who, name: _peers_only(who, _FABRIC_CLAIM)
+          or cluster.fabric().leave(name),
           principal=True, peers=True)
     r.add("POST", r"/api/fabric/instances/%s/attach" % NAME,
-          lambda body, q, name: cluster.fabric().attach(name))
+          lambda body, q, name: cluster.fabric().attach(name, body.get("fabric") or True))
     r.add("POST", r"/api/fabric/instances/%s/detach" % NAME,
-          lambda body, q, name: cluster.fabric().detach(name))
+          lambda body, q, name: cluster.fabric().detach(name, body.get("fabric") or None))
 
     r.add("GET", r"/api/cluster/groups", lambda body, q: cluster.list_groups())
     # `large` and `small` are the cluster's own reading of itself, so a person
@@ -472,7 +488,7 @@ def build_router(service, auth=None, cluster=None, stacks=None):
     r.add("DELETE", r"/api/cluster/groups/%s" % NAME,
           lambda body, q, who, name: cluster.delete_group(
               name, everywhere=_everywhere(body, q, who),
-              managed=from_peer(who)), principal=True)
+              managed=from_peer(who), relayed=from_peer(who)), principal=True)
 
     # Issuing a join code is handing out the right to federate with this node,
     # so it is admin-only like every other mutation -- and a read-only user
@@ -1024,6 +1040,9 @@ _COMPARED = ("Only a cluster member compares what this node holds. Run `lemondx 
              "rest; what the last pass found is on the Nodes tab and at "
              "GET /api/cluster/drift.")
 
+_FABRIC_CLAIM = ("Only a cluster member hands out or takes back a fabric subnet. "
+                 "Create or delete the fabric with /api/fabrics, which does it "
+                 "for every node.")
 
 _CLAIMED = ("A stack tag says which stack launched an instance, so it is set by "
             "that stack and not by the caller. Run the stack (`lemondx "
@@ -1047,20 +1066,15 @@ def _stack_tag(body, principal):
 
 
 def _fabric_bridge(cluster, wanted):
-    """Turn a create request's `fabric: true` into this node's bridge name.
+    """Turn a create request's `fabric` into this node's bridge name.
 
     Resolved here rather than in the service, which knows nothing about fabric
-    settings: a request asks for "the fabric", and which bridge that is depends
-    on the node the instance lands on.
+    settings: a request names a fabric (or says `true`, for "the one this node
+    is on"), and whether that is here depends on the node it lands on.
     """
     if not wanted:
         return None
-    fabric = cluster.fabric()
-    if not fabric.enabled():
-        raise FabricError(
-            "This node is not on the fabric, so an instance cannot join it. "
-            "Run `lemondx fabric enable`.", 409)
-    return fabric.bridge()
+    return cluster.fabric().require(wanted)
 
 
 def _peers_only(principal, message):
@@ -1207,7 +1221,7 @@ def make_server(host=DEFAULT_HOST, port=DEFAULT_PORT, service=None, token=None,
 
 def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=False,
           open_browser=False, auth_config=None, tls_cert=None, tls_key=None, auth_source=None,
-          health_settings=None, cluster_settings=None):
+          health_settings=None, cluster_settings=None, suggest_tls=False):
     allow_origin = "*" if dev else None
     auth = AuthService(auth_config or AuthConfig(static_token=token))
     tls = None
@@ -1233,9 +1247,15 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
             )
         raise SystemExit("Cannot listen on %s:%d: %s" % (host, port, exc))
 
+    if tls:
+        cluster.note_serving(host, port, tls_cert)
     url = "%s://%s:%d" % ("https" if tls else "http",
                           "localhost" if host in ("0.0.0.0", "127.0.0.1") else host, port)
     print("lemondx API + UI listening on %s" % url)
+    if not tls and suggest_tls:
+        # Not with --no-tls: that is someone who has already decided.
+        print("Note: serving plain HTTP. `lemondx configure tls` sets up a "
+              "certificate, and serve uses HTTPS by default from then on.")
     # So `lemondx cluster invite` in another process can advertise the port and
     # scheme actually being served, rather than guessing at the default.
     store.write_runtime({"host": host, "port": port, "tls": tls is not None})
@@ -1254,7 +1274,7 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
     if config.password_login and not tls and not _is_loopback(host) \
             and not config.allow_insecure_login and not config.trusted_proxies:
         print("Note: password logins from other hosts are refused over plain HTTP; "
-              "use --tls-cert/--tls-key or a TLS proxy.")
+              "run `lemondx configure tls`, or use a TLS proxy.")
     for warning in auth.startup_warnings():
         print("WARNING: %s" % warning)
 
@@ -1275,8 +1295,9 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
 
     fabric = cluster.fabric()
     if fabric.enabled():
-        print("Fabric: %s on %s, routing to %d peer(s)"
-              % (fabric.settings()["subnet"], fabric.bridge(),
+        print("Fabrics: %s, routing to %d peer subnet(s)"
+              % (", ".join("%s (%s)" % (name, f["subnet"])
+                           for name, f in sorted(fabric.fabrics().items())),
                  len(fabric.desired_routes())))
         # The routes are kernel state and do not survive a reboot, so standing
         # them back up at startup is not a repair but the normal path.

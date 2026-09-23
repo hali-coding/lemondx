@@ -64,7 +64,7 @@ little access `403`, too many failed logins `429`.
 | `POST` | `/api/cluster/containers/delete` | delete instances that sit on several nodes |
 | *any* | `/api/nodes/{node}/{path}` | make that call against one node's own API and return its answer |
 | `GET` | `/api/cluster/groups` | node groups |
-| `PUT`/`DELETE` | `/api/cluster/groups/{name}` | create or replace / delete a group (`large` and `small` are refused: they are sized, not written) |
+| `PUT`/`DELETE` | `/api/cluster/groups/{name}` | create or replace / delete a group (`large` and `small` are refused: they are sized, not written; `409` deleting one a stack targets) |
 | `GET`/`POST` | `/api/cluster/invites` | unredeemed join codes / issue one |
 | `DELETE` | `/api/cluster/invites/{id}` | withdraw a join code |
 | `POST` | `/api/cluster/sync` | push templates, modules or profiles to other nodes |
@@ -77,13 +77,13 @@ little access `403`, too many failed logins `429`.
 | `POST` | `/api/modules` | upload a module |
 | `GET` | `/api/modules/{id}/source` | the module's script |
 | `PUT` | `/api/modules/{id}/settings` | save its defaults / pre-select it |
-| `DELETE` | `/api/modules/{id}` | remove an uploaded module |
+| `DELETE` | `/api/modules/{id}` | remove an uploaded module (`409` while a template or profile selects it) |
 | `GET` | `/api/bootstrap-profiles` | saved module selections |
 | `PUT` | `/api/bootstrap-profiles/{name}` | create or replace one |
 | `DELETE` | `/api/bootstrap-profiles/{name}` | delete one |
 | `GET` | `/api/templates` | saved instance templates |
 | `PUT` | `/api/templates/{name}` | create or replace one |
-| `DELETE` | `/api/templates/{name}` | delete one |
+| `DELETE` | `/api/templates/{name}` | delete one (`409` while a stack launches it) |
 | `POST` | `/api/templates/{name}/launch` | `{"count":3}` → create instances from it; `nodes`/`groups` spread it across a cluster |
 | `GET` | `/api/templates/{name}/instances` | names of the instances launched from it |
 | `POST` | `/api/templates/{name}/exec` | `{"command":"uptime","instances":[...]}` → run on each, with output |
@@ -192,20 +192,24 @@ See also [Nodes and federation](cluster.md) for `/api/cluster`,
 [Web UI tour](web-ui.md) for `/api/resources`, `/api/networks` and
 `/api/images/browse`.
 
-## Fabric
+## Fabrics
 
 | Endpoint | What it does |
 | --- | --- |
-| `GET /api/fabric` | this node's fabric: subnet, bridge, per-peer routes |
-| `GET /api/fabric/plan` | the host commands that would bring routes up to date |
-| `POST /api/fabric/apply` | create the bridge and program the routes |
-| `POST /api/fabric/enable` | allocate a subnet to every member and turn the fabric on |
-| `POST /api/fabric/disable` | stop routing here and give this node's subnet back |
-| `POST /api/fabric/instances/{name}/attach` | give an instance a NIC on the fabric (`detach` removes it) |
+| `GET /api/fabrics` | every fabric in the cluster, and each node's own report of its part (asks every member) |
+| `GET /api/fabrics/check?name=&prefix=` | would this fabric fit on every node? Blank fields are filled with the first free name and /16 |
+| `POST /api/fabrics` | create a fabric on every node: `{name, prefix, nat}`, any of them may be omitted |
+| `POST /api/fabrics/{name}/extend` | give every member that lacks one a subnet in it |
+| `DELETE /api/fabrics/{name}` | remove it from every node; refused while a template names it or any instance is attached |
+| `GET /api/fabric` | this node's half: its subnet, bridge and per-peer routes in each fabric |
+| `GET /api/fabric/host` | what this host already uses, which `check` asks each member for |
+| `GET /api/fabric/plan` | the host commands that would bring routes and firewall up to date |
+| `POST /api/fabric/apply` | create the bridges, program the routes and the firewall |
+| `POST /api/fabric/instances/{name}/attach` | give an instance a NIC on a fabric, `{fabric}` (`detach` removes it) |
 
-`PUT /api/fabric/claim` exists too, but is members-only: it is how the node
-running `enable` tells each peer which subnet it was allocated. A person turns
-the fabric on with `enable`, which allocates for the whole cluster — setting one
-node's subnet by hand is how two nodes end up holding the same range.
+`PUT` and `DELETE /api/fabric/claims/{name}` exist too, but are members-only:
+they are how the node a fabric is created or deleted on tells each peer.
+Setting one node's subnet by hand is how two nodes end up holding the same
+range.
 
 See [Networking between nodes](networking.md).

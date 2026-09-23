@@ -195,7 +195,7 @@ install_fabric() {
     echo "  and nothing else. That group already grants root on this host via"
     echo "  the daemon, so this adds no access it did not have."
     echo
-    echo "Next: lemondx fabric enable   (on one node; it allocates for the cluster)"
+    echo "Next: lemondx fabric create   (on one node, or New fabric in the Network tab)"
     if [ "$mode" = user ] && [ -f "$HOME/.config/systemd/user/lemondx.service" ]; then
         echo
         echo "Note: the unit sets NoNewPrivileges=yes, which stops sudo from raising"
