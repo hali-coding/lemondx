@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.0](https://github.com/hali-coding/lemondx/compare/v0.6.0...v0.7.0) (2026-09-23)
+
+
+### Features
+
+* adds a concept of very simple network fabrics ([20b9f17](https://github.com/hali-coding/lemondx/commit/20b9f1744257889989a80ea8497ef41ac81ba025))
+* adds a concept of very simple network fabrics ([7cc0015](https://github.com/hali-coding/lemondx/commit/7cc001530995901fcc79fe8d029253739fe1c9da))
+* routed, non-NAT networking between the containers of a cluster ([90ce2b0](https://github.com/hali-coding/lemondx/commit/90ce2b0bdb5ea9599ccf50a494e5d2f50d42e3a2))
+
 ## [0.6.0](https://github.com/hali-coding/lemondx/compare/v0.5.0...v0.6.0) (2026-09-21)
 
 
