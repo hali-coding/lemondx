@@ -1,11 +1,28 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useAuthInfo } from '../hooks/useAuth'
-import { api } from '../lib/api'
+import { roleAtLeast, useAuthInfo } from '../hooks/useAuth'
+import { api, calls } from '../lib/api'
 import type { ApiToken, CreatedApiToken, LocalUser, Role } from '../lib/types'
 import { ConfirmDialog } from './ConfirmDialog'
 import { CopyButton } from './CopyButton'
 import { PlusIcon, TrashIcon } from './Icons'
 import { Modal } from './Modal'
+
+const ROLE_LABELS: [Role, string][] = [
+  ['read', 'Read-only'],
+  // Runs, stops and destroys what exists; edits no definition or setting.
+  ['operator', 'Operator'],
+  ['admin', 'Admin'],
+]
+
+/** The roles as options, up to `upTo`: nobody hands out more than they hold. */
+function RoleOptions({ upTo = 'admin' }: { upTo?: Role }) {
+  return <>{ROLE_LABELS.filter(([role]) => roleAtLeast(upTo, role))
+    .map(([role, label]) => <option key={role} value={role}>{label}</option>)}</>
+}
+
+const ROLE_BADGE: Record<Role, string> = {
+  read: 'badge-dim', operator: 'badge-info', admin: 'badge-warn',
+}
 
 interface Props {
   onNotify: (kind: 'success' | 'error' | 'info', title: string, detail?: string) => void
@@ -63,7 +80,7 @@ export function AccessView({ onNotify }: Props) {
             <code> lemondx tokens</code> on the host.</p>
         </div></div>
       ) : (
-        <TokensCard onNotify={onNotify} canGrantAdmin={isAdmin} showOwner={isAdmin} />
+        <TokensCard onNotify={onNotify} grantable={principal?.role ?? 'admin'} showOwner={isAdmin} />
       )}
 
       {isAdmin && !viaToken && <UsersCard onNotify={onNotify} localEnabled={!!info?.methods.includes('local')} />}
@@ -71,8 +88,8 @@ export function AccessView({ onNotify }: Props) {
   )
 }
 
-function TokensCard({ onNotify, canGrantAdmin, showOwner }: Props & {
-  canGrantAdmin: boolean
+function TokensCard({ onNotify, grantable, showOwner }: Props & {
+  grantable: Role
   showOwner: boolean
 }) {
   const [tokens, setTokens] = useState<ApiToken[] | null>(null)
@@ -145,8 +162,7 @@ function TokensCard({ onNotify, canGrantAdmin, showOwner }: Props & {
           <label htmlFor="token-role">Access</label>
           <select id="token-role" className="select" value={role}
             onChange={(event) => setRole(event.target.value as Role)}>
-            <option value="read">Read-only</option>
-            {canGrantAdmin && <option value="admin">Admin</option>}
+            <RoleOptions upTo={grantable} />
           </select>
         </div>
         <div className="field">
@@ -180,7 +196,7 @@ function TokensCard({ onNotify, canGrantAdmin, showOwner }: Props & {
               <tr key={token.id}>
                 <td><strong>{token.name}</strong><div className="res-sub mono">{token.id}</div></td>
                 {showOwner && <td>{token.owner}</td>}
-                <td><span className={`badge ${token.role === 'admin' ? 'badge-warn' : 'badge-dim'}`}>
+                <td><span className={`badge ${ROLE_BADGE[token.role] ?? 'badge-dim'}`}>
                   {token.role}</span></td>
                 <td className="dim">{when(token.created)}</td>
                 <td>{token.expired
@@ -252,7 +268,8 @@ function UsersCard({ onNotify, localEnabled }: Props & { localEnabled: boolean }
     setBusy(true)
     try {
       await api.saveUser(user.name, { role })
-      onNotify('success', `${user.name} is now ${role === 'admin' ? 'an admin' : 'read-only'}`)
+      onNotify('success', `${user.name} is now ${
+        role === 'admin' ? 'an admin' : role === 'operator' ? 'an operator' : 'read-only'}`)
       await load()
     } catch (cause) {
       onNotify('error', `Could not change ${user.name}`, (cause as Error).message)
@@ -308,8 +325,7 @@ function UsersCard({ onNotify, localEnabled }: Props & { localEnabled: boolean }
                   <select className="select" value={user.role} disabled={busy}
                     aria-label={`Access for ${user.name}`}
                     onChange={(event) => changeRole(user, event.target.value as Role)}>
-                    <option value="read">Read-only</option>
-                    <option value="admin">Admin</option>
+                    <RoleOptions />
                   </select>
                 </td>
                 <td className="dim">{when(user.created)}</td>
@@ -366,6 +382,8 @@ function UserDialog({ user, onCancel, onSaved }: {
 
   const mismatch = again.length > 0 && again !== password
   const canSave = !!name.trim() && password.length >= 8 && password === again && !busy
+  // Changing a password leaves the role alone; only a new user is given one.
+  const body = user ? { password } : { password, role }
 
   async function save(event: React.FormEvent) {
     event.preventDefault()
@@ -373,7 +391,7 @@ function UserDialog({ user, onCancel, onSaved }: {
     setBusy(true)
     setError(null)
     try {
-      await api.saveUser(name.trim(), user ? { password } : { password, role })
+      await api.saveUser(name.trim(), body)
       onSaved(user ? `Changed the password for ${user.name}` : `Added ${name.trim()}`)
     } catch (cause) {
       setError((cause as Error).message)
@@ -384,6 +402,7 @@ function UserDialog({ user, onCancel, onSaved }: {
   return (
     <Modal title={user ? `Set password for ${user.name}` : 'Add local user'}
       subtitle={user ? 'Their current sessions end when the password changes.' : undefined}
+      api={{ ...calls.saveUser(name.trim(), body), secrets: ['password'] }}
       onClose={busy ? () => {} : onCancel}
       footer={<>
         <button type="button" className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
@@ -404,8 +423,7 @@ function UserDialog({ user, onCancel, onSaved }: {
               <label htmlFor="user-role">Access</label>
               <select id="user-role" className="select" value={role}
                 onChange={(event) => setRole(event.target.value as Role)}>
-                <option value="read">Read-only</option>
-                <option value="admin">Admin</option>
+                <RoleOptions />
               </select>
             </div>
           </div>

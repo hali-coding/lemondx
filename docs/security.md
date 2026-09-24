@@ -46,10 +46,23 @@ lemondx user-add alice --role admin          # asks for a password
 
 ## Roles
 
-There are two: `admin` may do anything, `read` may only look. Every `GET` is
-`read`; every other request, and opening a terminal, is `admin`. The UI hides
-nothing from a read-only user but disables what they cannot do, and the
-server refuses it regardless with `403`.
+There are three, each able to do everything the one before it can:
+
+- `read` may only look. Every `GET` is `read`.
+- `operator` runs what exists without changing what it is: start, stop,
+  restart, pause and delete instances; launch, recreate and destroy from a
+  saved template; launch, relaunch, stop, start and destroy a stack, and cancel
+  its runs; run commands (`exec`, a template's **Run command**, a terminal) and
+  bootstrap modules in an instance. An operator's bootstrap run does not save
+  its parameters as the modules' defaults, as an admin's does.
+- `admin` may do anything, including everything that creates a new resource
+  from scratch or edits one: containers' limits, names and snapshots,
+  templates, stacks, modules, profiles, storage, networks, fabrics, the
+  cluster, users.
+
+Every non-`GET` request is `admin` unless its route says otherwise. The UI
+disables what a user's role cannot do, and the server refuses it regardless
+with `403`.
 
 ## Without auth
 
@@ -95,7 +108,7 @@ masked in the request log. Tokens can also be made and revoked from the
 Only a SHA-256 of each token is stored, in `~/.local/share/lemondx/auth/`
 (`0700`, files `0600`). Revocation applies on the next request, no restart. A
 token cannot create more tokens (that would let it outlive its own expiry),
-and a read-only user cannot mint an admin one.
+and nobody can mint a token with more access than they have.
 
 For the static token, prefer `--token-file PATH` or the `LEMONDX_TOKEN`
 environment variable over `--token`, which any local user can read in `ps`.
@@ -103,8 +116,8 @@ environment variable over `--token`, which any local user can read in `ps`.
 ## Local users
 
 ```bash
-lemondx user-add bob                   # read-only unless --role admin
-lemondx user-set bob --role admin
+lemondx user-add bob                   # read-only unless --role operator/admin
+lemondx user-set bob --role operator
 lemondx user-set bob --password
 lemondx user-remove bob
 ```
@@ -117,8 +130,9 @@ users from the **Access** tab.
 
 `--auth pam` checks host passwords through libpam. Membership decides the role:
 `--pam-admin-group` (default: `lxd` and/or `incus-admin`, whichever exist) gives
-admin, `--pam-read-group` gives read, anyone else is refused even with the right
-password.
+admin, `--pam-operator-group` gives operator, `--pam-read-group` gives read, and
+anyone else is refused even with the right password. The first match in that
+order wins.
 
 lemondx uses the PAM service named by `--pam-service` (default `lemondx`).
 Create it, or PAM falls back to `other`, which denies everything on some
@@ -151,7 +165,8 @@ lemondx pam-test "$USER"                  # asks for the password
 ```bash
 ./lemondx serve --auth proxy --trust-proxy 127.0.0.1 \
   --proxy-user-header X-Forwarded-User \
-  --proxy-groups-header X-Forwarded-Groups --proxy-admin-group ops --proxy-read-group dev
+  --proxy-groups-header X-Forwarded-Groups --proxy-admin-group ops \
+  --proxy-operator-group oncall --proxy-read-group dev
 ```
 
 The user header is believed only from `--trust-proxy` addresses (IPs or CIDRs);
@@ -281,16 +296,22 @@ clear about:
   of this one, and `PUT /api/auth/users/{name}/record` refuses any caller that
   is not a member. It replaces an account of the same name on the target, so it
   can change an administrator's password on another host: that is the point of
-  it, and the reason it is never automatic. Nothing else sync carries is a
+  it, and the reason it is never automatic -- joining copies accounts too, but
+  only ones the joiner lacks (below). Nothing else sync carries is a
   credential.
 
 **A member demands a credential from other hosts even with authentication off.**
 Joining a cluster means accepting API calls from elsewhere, and a node cannot do
 that while treating whoever reaches its port as an admin. So membership alone
-turns on "callers from other hosts must present a token", which is why joining
-needs no auth setup and does not quietly open the node up either. Loopback is
-deliberately untouched: the person at that host keeps the anonymous-admin UI they
-had. Configure real authentication if anyone else uses that node directly.
+turns on "callers from other hosts must present a credential", which is why
+joining needs no auth setup and does not quietly open the node up either. The
+credential can be an API token or a password for one of the local accounts the
+node took from the cluster when it joined: the member that admitted it sends
+its accounts (hashes, as `sync --kind users` would) with the cluster credential,
+which already makes the joiner an admin of that member, so nothing new is
+exposed. The joiner adds only accounts it does not have. Loopback is
+deliberately untouched: the person at that host keeps the anonymous-admin UI
+they had. Configure real authentication if anyone else uses that node directly.
 
 **Secrets stay out of copyable records.** `nodes/*.json` holds only a name, URL
 and fingerprint, so it can be copied between machines the way profiles and

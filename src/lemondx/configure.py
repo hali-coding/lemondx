@@ -290,11 +290,15 @@ class AuthSection(Section):
         # stays right if this host moves from LXD to Incus.
         s["pam_admin_groups"] = None if answer == detected and s["pam_admin_groups"] is None \
             else (answer or [])
+        s["pam_operator_groups"] = p.ask(
+            "Groups whose members get operator access (run, stop and destroy; change no "
+            "settings)", default=", ".join(s["pam_operator_groups"]),
+            allow_empty=True, validate=_groups(p)) or []
         s["pam_read_groups"] = p.ask("Groups whose members get read-only access",
                                      default=", ".join(s["pam_read_groups"]),
                                      allow_empty=True, validate=_groups(p)) or []
         if not (s["pam_admin_groups"] if s["pam_admin_groups"] is not None else detected) \
-                and not s["pam_read_groups"]:
+                and not s["pam_operator_groups"] and not s["pam_read_groups"]:
             p.say("  ! With no groups, PAM will refuse every login.")
 
     def _prompt_proxy(self, p, s):
@@ -312,10 +316,13 @@ class AuthSection(Section):
         if groups_header:
             s["proxy_admin_group"] = p.ask("Group granted admin", default=s["proxy_admin_group"],
                                            allow_empty=True) or None
+            s["proxy_operator_group"] = p.ask("Group granted operator access",
+                                              default=s["proxy_operator_group"],
+                                              allow_empty=True) or None
             s["proxy_read_group"] = p.ask("Group granted read-only access",
                                           default=s["proxy_read_group"], allow_empty=True) or None
         else:
-            s["proxy_admin_group"] = s["proxy_read_group"] = None
+            s["proxy_admin_group"] = s["proxy_operator_group"] = s["proxy_read_group"] = None
 
     def after_save(self, p, s):
         service = auth.AuthService()
@@ -334,8 +341,9 @@ class AuthSection(Section):
             p.say()
             if p.yes_no("Create an API token now?", False):
                 name = p.ask("Token name", default="cli")
-                role = p.choose_one("Access", [(auth.ADMIN, "admin"), (auth.READ, "read-only")],
-                                    default=auth.ADMIN)
+                role = p.choose_one("Access", [(auth.ADMIN, "admin"),
+                                               (auth.OPERATOR, "operator"),
+                                               (auth.READ, "read-only")], default=auth.ADMIN)
                 days = p.ask("Expires after (e.g. 30d, 12h; blank for never)", allow_empty=True,
                              validate=_duration)
                 try:
@@ -364,6 +372,7 @@ class AuthSection(Section):
                          if s["pam_admin_groups"] is not None
                          else "the daemon's group (%s)"
                          % (", ".join(auth.default_pam_admin_groups()) or "none on this host")))
+            rows.append(("pam operator groups", ", ".join(s["pam_operator_groups"]) or "none"))
             rows.append(("pam read groups", ", ".join(s["pam_read_groups"]) or "none"))
         if "proxy" in methods:
             rows.append(("trusted proxies", ", ".join(s["trusted_proxies"])))
@@ -371,6 +380,7 @@ class AuthSection(Section):
             if s["proxy_groups_header"]:
                 rows.append(("proxy groups header", s["proxy_groups_header"]))
                 rows.append(("proxy admin group", s["proxy_admin_group"] or "none"))
+                rows.append(("proxy operator group", s["proxy_operator_group"] or "none"))
                 rows.append(("proxy read group", s["proxy_read_group"] or "none"))
         rows.append(("static token file", s["token_file"] or "none"))
         return rows

@@ -18,6 +18,7 @@ import type {
   FabricCheck,
   FabricChangeResult,
   FabricDeleteResult,
+  MaintenanceResult,
 } from './types'
 
 /** Error carrying the HTTP status so callers can react to 401/409 specifically. */
@@ -98,6 +99,26 @@ async function request<T>(
 }
 
 /**
+ * One request, described rather than made. The dialogs that change something
+ * build theirs from these so the API explorer can show exactly what pressing
+ * the button sends -- the same builder `api` uses, so the two cannot drift.
+ * `path` is under `/api`.
+ */
+export interface ApiCall {
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+  path: string
+  body?: unknown
+  /** Dotted body paths the explorer shows as placeholders, never as typed. */
+  secrets?: string[]
+}
+
+function send<T>(call: ApiCall) {
+  return request<T>(call.path, { method: call.method, body: call.body })
+}
+
+const seg = encodeURIComponent
+
+/**
  * A path on one node's own API. Undefined means this node, and the plain path;
  * any other name goes through the proxy, which checks the caller's access
  * against the same endpoint's role before forwarding. That is what lets the
@@ -105,6 +126,107 @@ async function request<T>(
  */
 function on(node: string | undefined, path: string) {
   return node ? `/nodes/${encodeURIComponent(node)}${path}` : path
+}
+
+/** The requests behind the create and edit dialogs; see `ApiCall`. */
+export const calls = {
+  /**
+   * The UI asks for `background` so the create outlives the page that started
+   * it; a script leaving it out gets a call that answers when the create is done.
+   */
+  createContainer: (body: CreateRequest): ApiCall =>
+    ({ method: 'POST', path: '/containers', body: { ...body, background: true } }),
+
+  createStoragePool: (body: StoragePoolRequest): ApiCall =>
+    ({ method: 'POST', path: '/storage/pools', body }),
+
+  updateStoragePool: (name: string, body: StoragePoolRequest): ApiCall =>
+    ({ method: 'PATCH', path: `/storage/pools/${seg(name)}`, body }),
+
+  deleteStoragePool: (name: string, force = false,
+                      expectedPlan?: StoragePoolDetail['delete_plan']): ApiCall =>
+    ({ method: 'DELETE', path: `/storage/pools/${seg(name)}?force=${force}`,
+       body: force ? { force, confirmation: name, expected_plan: expectedPlan } : undefined }),
+
+  createStorageVolume: (pool: string, body: StorageVolumeRequest): ApiCall =>
+    ({ method: 'POST', path: `/storage/pools/${seg(pool)}/volumes`, body }),
+
+  updateStorageVolume: (pool: string, name: string, body: StorageVolumeRequest): ApiCall =>
+    ({ method: 'PATCH', path: `/storage/pools/${seg(pool)}/volumes/custom/${seg(name)}`, body }),
+
+  deleteStorageVolume: (pool: string, name: string): ApiCall =>
+    ({ method: 'DELETE', path: `/storage/pools/${seg(pool)}/volumes/custom/${seg(name)}` }),
+
+  createNetwork: (body: NetworkRequest): ApiCall =>
+    ({ method: 'POST', path: '/networks', body }),
+
+  updateNetwork: (name: string, body: NetworkRequest): ApiCall =>
+    ({ method: 'PATCH', path: `/networks/${seg(name)}`, body }),
+
+  deleteNetwork: (name: string): ApiCall =>
+    ({ method: 'DELETE', path: `/networks/${seg(name)}` }),
+
+  createFabric: (body: { name: string; prefix: string; nat: boolean }): ApiCall =>
+    ({ method: 'POST', path: '/fabrics', body }),
+
+  deleteFabric: (name: string): ApiCall =>
+    ({ method: 'DELETE', path: `/fabrics/${seg(name)}` }),
+
+  uploadModule: (name: string, content: string, overwrite = false): ApiCall =>
+    ({ method: 'POST', path: '/modules', body: { name, content, overwrite } }),
+
+  saveTemplate: (name: string, body: TemplateRequest): ApiCall =>
+    ({ method: 'PUT', path: `/templates/${seg(name)}`, body }),
+
+  launchTemplate: (name: string, body: {
+    count: number; prefix?: string; params?: Record<string, string>
+    nodes?: string[]; groups?: string[]
+  }): ApiCall =>
+    ({ method: 'POST', path: `/templates/${seg(name)}/launch`,
+       body: { ...body, background: true } }),
+
+  execTemplateInstances: (name: string, command: string,
+                          instances: (string | InstanceRef)[], timeout?: number): ApiCall =>
+    ({ method: 'POST', path: `/templates/${seg(name)}/exec`,
+       body: { command, instances, timeout, background: true } }),
+
+  destroyTemplateInstances: (name: string, instances: (string | InstanceRef)[]): ApiCall =>
+    ({ method: 'POST', path: `/templates/${seg(name)}/destroy`,
+       body: { instances, background: true } }),
+
+  /** `stale`: `instances` are the stale ones only, and are checked as such. */
+  recreateTemplateInstances: (name: string, instances: (string | InstanceRef)[],
+                              params?: Record<string, string>, stale = false): ApiCall =>
+    ({ method: 'POST', path: `/templates/${seg(name)}/recreate`,
+       body: { instances, params, background: true, ...(stale ? { stale: true } : {}) } }),
+
+  launchStack: (name: string, params: Record<string, string>,
+                replace?: InstanceRef[]): ApiCall =>
+    ({ method: 'POST', path: `/stacks/${seg(name)}/launch`,
+       body: { params, replace, background: true } }),
+
+  createApiToken: (body: { name: string; role: Role; expires_days: number | null }): ApiCall =>
+    ({ method: 'POST', path: '/auth/tokens', body }),
+
+  saveUser: (name: string, body: { password?: string; role?: Role }): ApiCall =>
+    ({ method: 'PUT', path: `/auth/users/${seg(name)}`, body }),
+
+  joinNode: (code: string, description?: string): ApiCall =>
+    ({ method: 'POST', path: '/cluster/nodes', body: { code, description } }),
+
+  createInvite: (body: { expires_minutes: number; note?: string }): ApiCall =>
+    ({ method: 'POST', path: '/cluster/invites', body }),
+
+  saveNodeGroup: (name: string, body: { members: string[]; description?: string }): ApiCall =>
+    ({ method: 'PUT', path: `/cluster/groups/${seg(name)}`, body }),
+
+  syncToNodes: (body: {
+    kinds: SyncKind[]; names?: string[]; nodes?: string[]; groups?: string[]
+  }): ApiCall => ({ method: 'POST', path: '/cluster/sync', body }),
+
+  /** Asked of the node itself: only its own word counts for its record. */
+  setMaintenance: (node: string | undefined, body: { enabled: boolean; reason?: string }):
+    ApiCall => ({ method: 'PUT', path: on(node, '/cluster/maintenance'), body }),
 }
 
 export const api = {
@@ -131,7 +253,7 @@ export const api = {
    * `creates()`. Nothing about the create depends on this page afterwards.
    */
   createContainer: (body: CreateRequest) =>
-    request<CreateProgress>('/containers', { method: 'POST', body: { ...body, background: true } }),
+    send<CreateProgress>(calls.createContainer(body)),
 
   deleteContainer: (name: string, force = false) =>
     request<{ deleted: string }>(
@@ -192,33 +314,24 @@ export const api = {
   storage: (signal?: AbortSignal) => request<StorageOverview>('/storage', { signal }),
 
   createStoragePool: (body: StoragePoolRequest) =>
-    request<StoragePoolDetail>('/storage/pools', { method: 'POST', body }),
+    send<StoragePoolDetail>(calls.createStoragePool(body)),
 
   updateStoragePool: (name: string, body: StoragePoolRequest) =>
-    request<StoragePoolDetail>(`/storage/pools/${encodeURIComponent(name)}`,
-      { method: 'PATCH', body }),
+    send<StoragePoolDetail>(calls.updateStoragePool(name, body)),
 
   deleteStoragePool: (name: string, force = false,
                       expectedPlan?: StoragePoolDetail['delete_plan']) =>
-    request<{ deleted: string; detached: boolean }>(
-      `/storage/pools/${encodeURIComponent(name)}?force=${force}`,
-      { method: 'DELETE', body: force
-        ? { force, confirmation: name, expected_plan: expectedPlan }
-        : undefined }),
+    send<{ deleted: string; detached: boolean }>(
+      calls.deleteStoragePool(name, force, expectedPlan)),
 
   createStorageVolume: (pool: string, body: StorageVolumeRequest) =>
-    request<StorageVolume>(`/storage/pools/${encodeURIComponent(pool)}/volumes`,
-      { method: 'POST', body }),
+    send<StorageVolume>(calls.createStorageVolume(pool, body)),
 
   updateStorageVolume: (pool: string, name: string, body: StorageVolumeRequest) =>
-    request<StorageVolume>(
-      `/storage/pools/${encodeURIComponent(pool)}/volumes/custom/${encodeURIComponent(name)}`,
-      { method: 'PATCH', body }),
+    send<StorageVolume>(calls.updateStorageVolume(pool, name, body)),
 
   deleteStorageVolume: (pool: string, name: string) =>
-    request<{ deleted: string; pool: string }>(
-      `/storage/pools/${encodeURIComponent(pool)}/volumes/custom/${encodeURIComponent(name)}`,
-      { method: 'DELETE' }),
+    send<{ deleted: string; pool: string }>(calls.deleteStorageVolume(pool, name)),
 
   networks: (signal?: AbortSignal) =>
     request<NetworkSummary[]>('/networks', { signal }),
@@ -229,13 +342,13 @@ export const api = {
   subnets: (signal?: AbortSignal) => request<SubnetInUse[]>('/subnets', { signal }),
 
   createNetwork: (body: NetworkRequest) =>
-    request<NetworkDetail>('/networks', { method: 'POST', body }),
+    send<NetworkDetail>(calls.createNetwork(body)),
 
   updateNetwork: (name: string, body: NetworkRequest) =>
-    request<NetworkDetail>(`/networks/${encodeURIComponent(name)}`, { method: 'PATCH', body }),
+    send<NetworkDetail>(calls.updateNetwork(name, body)),
 
   deleteNetwork: (name: string) =>
-    request<{ deleted: string }>(`/networks/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+    send<{ deleted: string }>(calls.deleteNetwork(name)),
 
   // Fabrics. `/fabrics` is the whole cluster and asks every member; `/fabric`
   // is this node's half. Status and plan need no privilege on the host, so
@@ -248,13 +361,13 @@ export const api = {
   },
 
   createFabric: (body: { name: string; prefix: string; nat: boolean }) =>
-    request<FabricChangeResult>('/fabrics', { method: 'POST', body }),
+    send<FabricChangeResult>(calls.createFabric(body)),
 
   extendFabric: (name: string) =>
     request<FabricChangeResult>(`/fabrics/${encodeURIComponent(name)}/extend`, { method: 'POST' }),
 
   deleteFabric: (name: string) =>
-    request<FabricDeleteResult>(`/fabrics/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+    send<FabricDeleteResult>(calls.deleteFabric(name)),
 
   fabric: (signal?: AbortSignal) => request<FabricStatus>('/fabric', { signal }),
 
@@ -276,8 +389,7 @@ export const api = {
     request<BootstrapModule[]>(on(node, '/modules'), { signal }),
 
   uploadModule: (name: string, content: string, overwrite = false) =>
-    request<Synced<BootstrapModule>>('/modules',
-      { method: 'POST', body: { name, content, overwrite } }),
+    send<Synced<BootstrapModule>>(calls.uploadModule(name, content, overwrite)),
 
   moduleSource: (id: string, signal?: AbortSignal) =>
     request<ModuleSource>(`/modules/${encodeURIComponent(id)}/source`, { signal }),
@@ -312,8 +424,7 @@ export const api = {
   // member, and deleting removes it from them unless `everywhere` says not to.
   // The answer carries `synced` saying what each node made of it.
   saveTemplate: (name: string, body: TemplateRequest) =>
-    request<Synced<InstanceTemplate>>(`/templates/${encodeURIComponent(name)}`,
-      { method: 'PUT', body }),
+    send<Synced<InstanceTemplate>>(calls.saveTemplate(name, body)),
 
   deleteTemplate: (name: string, everywhere = true) =>
     request<Synced<{ deleted: string }>>(
@@ -329,8 +440,7 @@ export const api = {
                      count: number; prefix?: string; params?: Record<string, string>
                      nodes?: string[]; groups?: string[]
                    }) =>
-    request<TemplateRun>(`/templates/${encodeURIComponent(name)}/launch`,
-      { method: 'POST', body: { ...body, background: true } }),
+    send<TemplateRun>(calls.launchTemplate(name, body)),
 
   templateRuns: (signal?: AbortSignal) =>
     request<TemplateRun[]>('/template-runs', { signal }),
@@ -346,17 +456,14 @@ export const api = {
   // view spans the cluster; the server hands each node its own share.
   execTemplateInstances: (name: string, command: string,
                           instances: (string | InstanceRef)[], timeout?: number) =>
-    request<TemplateRun>(`/templates/${encodeURIComponent(name)}/exec`,
-      { method: 'POST', body: { command, instances, timeout, background: true } }),
+    send<TemplateRun>(calls.execTemplateInstances(name, command, instances, timeout)),
 
   destroyTemplateInstances: (name: string, instances: (string | InstanceRef)[]) =>
-    request<TemplateRun>(`/templates/${encodeURIComponent(name)}/destroy`,
-      { method: 'POST', body: { instances, background: true } }),
+    send<TemplateRun>(calls.destroyTemplateInstances(name, instances)),
 
   recreateTemplateInstances: (name: string, instances: (string | InstanceRef)[],
-                              params?: Record<string, string>) =>
-    request<TemplateRun>(`/templates/${encodeURIComponent(name)}/recreate`,
-      { method: 'POST', body: { instances, params, background: true } }),
+                              params?: Record<string, string>, stale = false) =>
+    send<TemplateRun>(calls.recreateTemplateInstances(name, instances, params, stale)),
 
   stacks: (signal?: AbortSignal) =>
     request<Stack[]>('/stacks', { signal }),
@@ -376,8 +483,7 @@ export const api = {
    * user confirmed them, are destroyed first.
    */
   launchStack: (name: string, params: Record<string, string>, replace?: InstanceRef[]) =>
-    request<StackRun>(`/stacks/${encodeURIComponent(name)}/launch`,
-      { method: 'POST', body: { params, replace, background: true } }),
+    send<StackRun>(calls.launchStack(name, params, replace)),
 
   /** What every stack is running, by the tags on the instances, across the cluster. */
   stackInstances: (signal?: AbortSignal) =>
@@ -425,7 +531,7 @@ export const api = {
   apiTokens: (signal?: AbortSignal) => request<ApiToken[]>('/auth/tokens', { signal }),
 
   createApiToken: (body: { name: string; role: Role; expires_days: number | null }) =>
-    request<CreatedApiToken>('/auth/tokens', { method: 'POST', body }),
+    send<CreatedApiToken>(calls.createApiToken(body)),
 
   revokeApiToken: (id: string) =>
     request<{ revoked: string }>(`/auth/tokens/${encodeURIComponent(id)}`, { method: 'DELETE' }),
@@ -441,7 +547,7 @@ export const api = {
 
   /** Redeems a join code issued by the node being joined. */
   joinNode: (code: string, description?: string) =>
-    request<JoinResult>('/cluster/nodes', { method: 'POST', body: { code, description } }),
+    send<JoinResult>(calls.joinNode(code, description)),
 
   /**
    * Puts a node out of the cluster: it is told to stand down, every other
@@ -453,6 +559,9 @@ export const api = {
     request<EvictResult>(
       `/cluster/nodes/${encodeURIComponent(name)}`
       + (rotate === undefined ? '' : `?rotate=${rotate}`), { method: 'DELETE' }),
+
+  setMaintenance: (node: string | undefined, body: { enabled: boolean; reason?: string }) =>
+    send<MaintenanceResult>(calls.setMaintenance(node, body)),
 
   /** Pull every peer's member list and push ours, so membership converges. */
   refreshMembers: () => request<MemberSync>('/cluster/refresh', { method: 'POST' }),
@@ -509,8 +618,7 @@ export const api = {
   autoGroups: () => request<AutoGroupResult>('/cluster/groups/auto', { method: 'POST' }),
 
   saveNodeGroup: (name: string, body: { members: string[]; description?: string }) =>
-    request<Synced<NodeGroup>>(`/cluster/groups/${encodeURIComponent(name)}`,
-      { method: 'PUT', body }),
+    send<Synced<NodeGroup>>(calls.saveNodeGroup(name, body)),
 
   deleteNodeGroup: (name: string, everywhere = true) =>
     request<Synced<{ deleted: string }>>(
@@ -522,7 +630,7 @@ export const api = {
 
   /** The code comes back once and is never retrievable again. */
   createInvite: (body: { expires_minutes: number; note?: string }) =>
-    request<JoinCode>('/cluster/invites', { method: 'POST', body }),
+    send<JoinCode>(calls.createInvite(body)),
 
   revokeInvite: (id: string) =>
     request<{ revoked: string }>(`/cluster/invites/${encodeURIComponent(id)}`,
@@ -530,14 +638,13 @@ export const api = {
 
   syncToNodes: (body: {
     kinds: SyncKind[]; names?: string[]; nodes?: string[]; groups?: string[]
-  }) => request<SyncResult>('/cluster/sync', { method: 'POST', body }),
+  }) => send<SyncResult>(calls.syncToNodes(body)),
 
   users: (signal?: AbortSignal) => request<LocalUser[]>('/auth/users', { signal }),
 
   /** Creates the user, or changes an existing one's password and/or role. */
   saveUser: (name: string, body: { password?: string; role?: Role }) =>
-    request<{ name: string; role: Role; created: boolean }>(
-      `/auth/users/${encodeURIComponent(name)}`, { method: 'PUT', body }),
+    send<{ name: string; role: Role; created: boolean }>(calls.saveUser(name, body)),
 
   removeUser: (name: string) =>
     request<{ removed: string }>(`/auth/users/${encodeURIComponent(name)}`, { method: 'DELETE' }),

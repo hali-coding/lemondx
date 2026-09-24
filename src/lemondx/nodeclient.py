@@ -308,10 +308,13 @@ class NodeClient:
                             {"instances": instances, "background": background},
                             timeout=LONG_TIMEOUT)
 
-    def recreate(self, template, instances, params=None, background=True):
-        return self.request("POST", "/api/templates/%s/recreate" % _seg(template),
-                            {"instances": instances, "params": params or {},
-                             "background": background},
+    def recreate(self, template, instances, params=None, background=True, stale=False):
+        # `stale` only when asked, so a member on an older lemondx is sent
+        # exactly the request it always understood for a plain recreate.
+        body = {"instances": instances, "params": params or {}, "background": background}
+        if stale:
+            body["stale"] = True
+        return self.request("POST", "/api/templates/%s/recreate" % _seg(template), body,
                             timeout=LONG_TIMEOUT)
 
     def exec_instances(self, template, command, instances, timeout=300, background=True):

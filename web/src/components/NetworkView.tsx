@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useCanWrite } from '../hooks/useAuth'
 import type { FormEvent, ReactNode } from 'react'
-import { api } from '../lib/api'
+import { api, calls } from '../lib/api'
+import type { ApiCall } from '../lib/api'
 import { bytes } from '../lib/format'
 import { displayAddress, subnetStatus } from '../lib/cidr'
 import type {
@@ -592,6 +593,9 @@ function FabricDialog({ busy, onCancel, onSubmit }: {
       title="Create fabric"
       subtitle="A bridge on every node, each on its own /24 of one prefix, routed between them. Every node in the cluster must be reachable."
       onClose={busy ? () => {} : onCancel}
+      // The server's check normalises the prefix, and that is what is sent.
+      api={calls.createFabric({
+        name: name.trim(), prefix: current ? check.prefix : prefix.trim(), nat })}
       footer={
         <>
           <button type="button" className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
@@ -643,6 +647,11 @@ function FabricDialog({ busy, onCancel, onSubmit }: {
 
         {checkError && (
           <div className="banner banner-error"><div className="banner-body"><p>{checkError}</p></div></div>
+        )}
+        {current && check.maintenance_error && (
+          <div className="banner banner-warn"><div className="banner-body"><p>
+            {check.maintenance_error}
+          </p></div></div>
         )}
         {current && check.unreachable_error && (
           <div className="banner banner-error"><div className="banner-body"><p>
@@ -700,6 +709,7 @@ function FabricDeleteDialog({ fabric, busy, onCancel, onConfirm }: {
     <Modal
       title={`Delete fabric ${fabric.name}?`}
       onClose={busy ? () => {} : onCancel}
+      api={calls.deleteFabric(fabric.name)}
       footer={
         <>
           <button className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
@@ -911,29 +921,37 @@ function NetworkDialog({ network, busy, onCancel, onSubmit }: {
     return { ...config, ...extra }
   }
 
-  function submit(event: FormEvent) {
-    event.preventDefault()
-    let config: Record<string, string>
-    try {
-      config = desired()
-    } catch (cause) {
-      setFormError((cause as Error).message)
-      return
-    }
+  /** Throws while the advanced options do not parse. */
+  function request(): NetworkRequest {
+    const config = desired()
     if (!network) {
-      onSubmit({
+      return {
         name: name.trim(),
         description: description.trim(),
         config: Object.fromEntries(Object.entries(config).filter(([, value]) => value !== '')),
-      })
-      return
+      }
     }
     // Only what changed: re-sending keys the daemon has but lemondx does not
     // allow (set with the daemon's own CLI, say) would be refused.
     const changes = Object.fromEntries(Object.entries(config).filter(([key, value]) =>
       value !== (current[key] ?? IMPLICIT[key] ?? '')))
-    onSubmit({ description: description.trim(), config: changes })
+    return { description: description.trim(), config: changes }
   }
+
+  function submit(event: FormEvent) {
+    event.preventDefault()
+    try {
+      onSubmit(request())
+    } catch (cause) {
+      setFormError((cause as Error).message)
+    }
+  }
+
+  let call: ApiCall | null = null
+  try {
+    call = network ? calls.updateNetwork(network.name, request())
+      : calls.createNetwork(request())
+  } catch { /* shown as "fill in the form" until the options parse */ }
 
   const canSubmit = !busy && (network || name.trim())
     && !v4Status.error && !v6Status.error
@@ -944,6 +962,7 @@ function NetworkDialog({ network, busy, onCancel, onSubmit }: {
       subtitle={network ? undefined
         : 'A managed bridge: the daemon runs DHCP and DNS on it and can NAT it behind the host.'}
       onClose={busy ? () => {} : onCancel}
+      api={call}
       footer={
         <>
           <button type="button" className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
@@ -1049,6 +1068,7 @@ function NetworkDeleteDialog({ network, busy, onCancel, onConfirm }: {
     <Modal
       title={`Delete network ${network.name}?`}
       onClose={busy ? () => {} : onCancel}
+      api={calls.deleteNetwork(network.name)}
       footer={
         <>
           <button className="btn" onClick={onCancel} disabled={busy}>Cancel</button>

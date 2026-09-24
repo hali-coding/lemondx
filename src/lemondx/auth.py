@@ -33,9 +33,14 @@ from . import pam, store
 from .lxd import ADMIN_GROUP
 
 READ = "read"
+# Runs what exists without changing what it is: starts, stops, destroys and
+# relaunches instances, templates and stacks, and runs commands in them, but
+# edits no definition or setting. Ranked between the two, so every check that
+# asks "at least X" places it without knowing it exists.
+OPERATOR = "operator"
 ADMIN = "admin"
-ROLES = (READ, ADMIN)
-_RANK = {READ: 1, ADMIN: 2}
+ROLES = (READ, OPERATOR, ADMIN)
+_RANK = {READ: 1, OPERATOR: 2, ADMIN: 3}
 
 METHODS = ("local", "pam", "proxy", "token")
 PASSWORD_METHODS = ("local", "pam")
@@ -84,7 +89,7 @@ class Principal:
         self.via = via
 
     def can(self, role):
-        return _RANK.get(self.role, 0) >= _RANK.get(role or ADMIN, 2)
+        return _RANK.get(self.role, 0) >= _RANK.get(role or ADMIN, _RANK[ADMIN])
 
     def to_dict(self):
         return {"name": self.name, "role": self.role, "via": self.via}
@@ -103,10 +108,10 @@ class AuthConfig:
     """What ``serve`` was asked to enforce. Plain values; built by the CLI."""
 
     def __init__(self, methods=(), static_token=None, pam_service="lemondx",
-                 pam_admin_groups=None, pam_read_groups=(), trusted_proxies=(),
-                 proxy_user_header="X-Forwarded-User", proxy_groups_header=None,
-                 proxy_admin_group=None, proxy_read_group=None, session_hours=12,
-                 allow_insecure_login=False):
+                 pam_admin_groups=None, pam_operator_groups=(), pam_read_groups=(),
+                 trusted_proxies=(), proxy_user_header="X-Forwarded-User",
+                 proxy_groups_header=None, proxy_admin_group=None, proxy_operator_group=None,
+                 proxy_read_group=None, session_hours=12, allow_insecure_login=False):
         unknown = [m for m in methods if m not in METHODS]
         if unknown:
             raise AuthError("Unknown auth method: %s" % ", ".join(unknown), 400)
@@ -122,6 +127,7 @@ class AuthConfig:
         if pam_admin_groups is None:
             pam_admin_groups = default_pam_admin_groups()
         self.pam_admin_groups = list(pam_admin_groups)
+        self.pam_operator_groups = list(pam_operator_groups or ())
         self.pam_read_groups = list(pam_read_groups or ())
         self.trusted_proxies = [_network(p) for p in trusted_proxies or ()]
         if "proxy" in self.methods and not self.trusted_proxies:
@@ -130,6 +136,7 @@ class AuthConfig:
         self.proxy_user_header = proxy_user_header
         self.proxy_groups_header = proxy_groups_header
         self.proxy_admin_group = proxy_admin_group
+        self.proxy_operator_group = proxy_operator_group
         self.proxy_read_group = proxy_read_group
         self.session_seconds = max(1, int(float(session_hours) * 3600))
         self.allow_insecure_login = bool(allow_insecure_login)
@@ -137,6 +144,11 @@ class AuthConfig:
     @property
     def enabled(self):
         return bool(self.methods or self.static_token)
+
+    @property
+    def pam_groups(self):
+        """Every group that lets a PAM user in, for messages."""
+        return self.pam_admin_groups + self.pam_operator_groups + self.pam_read_groups
 
     @property
     def password_login(self):
@@ -221,6 +233,12 @@ class AuthService:
         self._last_used = {}         # token id -> time seen in memory
         local = local_principal()
         self._anonymous = Principal(local.name, ADMIN, "none")
+        # Set by ClusterService. A member with auth off still refuses remote
+        # callers without a credential, and the cluster's own accounts --
+        # adopted at join -- are the one kind a person can get without a
+        # shell on this host. Without them a node joined from the UI could
+        # only be browsed from itself.
+        self.member_login = lambda: False
 
     # -- records -----------------------------------------------------------
 
@@ -238,13 +256,23 @@ class AuthService:
     # -- status ------------------------------------------------------------
 
     def info(self, principal):
+        methods = list(self.config.methods)
+        methods += [m for m in self.password_methods() if m not in methods]
+        if self.config.static_token and "token" not in methods:
+            methods.append("token")
         return {
             "enabled": self.config.enabled,
-            "methods": list(self.config.methods) + (
-                ["token"] if self.config.static_token and "token" not in self.config.methods else []),
-            "password_login": self.config.password_login,
+            "methods": methods,
+            "password_login": bool(self.password_methods()),
             "principal": principal.to_dict() if principal else None,
         }
+
+    def password_methods(self):
+        """The password backends a login may use here, in order."""
+        methods = [m for m in self.config.methods if m in PASSWORD_METHODS]
+        if not self.config.enabled and self.member_login() and self._records("users"):
+            methods = ["local"]
+        return methods
 
     def anonymous(self):
         """The principal every request gets when auth is off."""
@@ -459,7 +487,7 @@ class AuthService:
         if cleaned is None:
             raise AuthError(
                 "That is not a usable user record for '%s': it needs a valid name, "
-                "a role of %s, and a password hash." % (name, " or ".join(ROLES)), 400)
+                "a role (one of %s), and a password hash." % (name, ", ".join(ROLES)), 400)
 
         def mutate(records):
             existing = records.get(name)
@@ -477,7 +505,8 @@ class AuthService:
         ``client`` keys the throttle. ``secure_transport`` is the server's
         judgement that the password did not cross a network in the clear.
         """
-        if not self.config.password_login:
+        methods = self.password_methods()
+        if not methods:
             raise AuthError("Password login is not enabled on this server.", 404)
         if not secure_transport and not self.config.allow_insecure_login:
             raise AuthError("Refusing a password over plain HTTP from another host. "
@@ -492,7 +521,7 @@ class AuthService:
         self._check_throttle(keys)
 
         principal, method = None, None
-        for candidate in self.config.methods:
+        for candidate in methods:
             if candidate == "local":
                 principal = self._login_local(username, password)
             elif candidate == "pam":
@@ -538,7 +567,7 @@ class AuthService:
             return None
         if not role:
             _log("PAM accepted %s, but they are in none of the groups %s"
-                 % (username, ", ".join(self.config.pam_admin_groups + self.config.pam_read_groups)
+                 % (username, ", ".join(self.config.pam_groups)
                     or "(none configured)"))
             return None
         return Principal(username, role, "pam")
@@ -549,6 +578,8 @@ class AuthService:
             return None
         if groups & set(self.config.pam_admin_groups):
             return ADMIN
+        if groups & set(self.config.pam_operator_groups):
+            return OPERATOR
         if groups & set(self.config.pam_read_groups):
             return READ
         return None
@@ -574,7 +605,7 @@ class AuthService:
     def _current_role(self, session, now):
         """The session's role as its source sees it now; None ends the session."""
         if session["method"] == "local":
-            if "local" not in self.config.methods:
+            if "local" not in self.password_methods():
                 return None
             record = self._records("users").get(session["name"])
             if not record or record["hash"] != session["credential"]:
@@ -641,13 +672,16 @@ class AuthService:
         name = (headers.get(self.config.proxy_user_header) or "").strip()
         if not name or len(name) > 256 or _has_control(name):
             return None
-        wanted = [g for g in (self.config.proxy_admin_group, self.config.proxy_read_group) if g]
+        wanted = [g for g in (self.config.proxy_admin_group, self.config.proxy_operator_group,
+                              self.config.proxy_read_group) if g]
         if not wanted:
             return Principal(name, ADMIN, "proxy")
         raw = headers.get(self.config.proxy_groups_header or "") or ""
         groups = set(g for g in re.split(r"[,\s]+", raw) if g)
         if self.config.proxy_admin_group and self.config.proxy_admin_group in groups:
             return Principal(name, ADMIN, "proxy")
+        if self.config.proxy_operator_group and self.config.proxy_operator_group in groups:
+            return Principal(name, OPERATOR, "proxy")
         if self.config.proxy_read_group and self.config.proxy_read_group in groups:
             return Principal(name, READ, "proxy")
         return None
@@ -658,7 +692,7 @@ class AuthService:
         warnings = []
         if "pam" in self.config.methods:
             warnings.extend(pam.diagnose(self.config.pam_service))
-            if not (self.config.pam_admin_groups or self.config.pam_read_groups):
+            if not self.config.pam_groups:
                 warnings.append("No --pam-admin-group given and neither 'lxd' nor "
                                 "'incus-admin' exists, so no PAM user may log in.")
         if "local" in self.config.methods and not self._records("users"):
@@ -762,11 +796,13 @@ DEFAULT_SETTINGS = {
     "allow_insecure_login": False,
     "pam_service": "lemondx",
     "pam_admin_groups": None,        # None: the daemon's admin group(s) on this host
+    "pam_operator_groups": [],
     "pam_read_groups": [],
     "trusted_proxies": [],
     "proxy_user_header": "X-Forwarded-User",
     "proxy_groups_header": None,
     "proxy_admin_group": None,
+    "proxy_operator_group": None,
     "proxy_read_group": None,
 }
 
@@ -834,7 +870,7 @@ def _clean_setting(key, value):
         return value
     if key == "pam_admin_groups":
         return None if value is None else _string_list(key, value, _GROUP)
-    if key == "pam_read_groups":
+    if key in ("pam_operator_groups", "pam_read_groups"):
         return _string_list(key, value, _GROUP)
     if key == "trusted_proxies":
         proxies = _string_list(key, value)
@@ -850,7 +886,7 @@ def _clean_setting(key, value):
         return value
     if key == "proxy_groups_header":
         return _optional_string(key, value, _HEADER)
-    if key in ("proxy_admin_group", "proxy_read_group"):
+    if key in ("proxy_admin_group", "proxy_operator_group", "proxy_read_group"):
         return _optional_string(key, value, _GROUP)
     raise _setting_error(key, "unknown setting")
 

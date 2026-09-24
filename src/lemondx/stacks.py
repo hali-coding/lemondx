@@ -347,7 +347,9 @@ class StackService:
                 self.service._launch_bootstrap(template, dict(
                     params, **{k: v or "-" for k, v in step["params"].items()}))
                 try:
-                    self.cluster.resolve_targets(step["nodes"], step["groups"])
+                    # Maintenance included: a relaunch refused here has not
+                    # torn anything down yet.
+                    self.cluster.launch_targets(step["nodes"], step["groups"])
                 except ClusterError as exc:
                     raise ServiceError("Step '%s': %s" % (step["id"], exc.message), exc.code)
 
@@ -539,7 +541,8 @@ class StackService:
             done = dict(context)
         values = dict(_exports(run["stack"], done), **params)
         values.update({k: _render(v, done, params) for k, v in step["params"].items()})
-        targets = self.cluster.resolve_targets(step["nodes"], step["groups"])
+        # Where it will actually go: a group member in maintenance is skipped.
+        targets, _ = self.cluster.launch_targets(step["nodes"], step["groups"])
         before = self._template_keys(name, targets)
         self._update(record, nodes=targets, detail="Launching %d on %s" % (
             step["count"], ", ".join(targets)))
@@ -751,7 +754,8 @@ class StackService:
             if c.get("stack"):
                 stacks.setdefault(c["stack"], []).append({
                     "node": c["node"], "name": c["name"], "status": c["status"],
-                    "template": c.get("template"), "ipv4": c.get("ipv4") or []})
+                    "template": c.get("template"), "ipv4": c.get("ipv4") or [],
+                    "stale": c.get("stale") or []})
         for members in stacks.values():
             members.sort(key=lambda c: (_natural(c["name"]), c["node"]))
         return {"stacks": stacks, "errors": listing["errors"]}

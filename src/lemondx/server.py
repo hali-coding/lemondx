@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 
 from . import store, websocket
-from .auth import ADMIN, READ, SESSION_COOKIE, AuthConfig, AuthError, AuthService
+from .auth import ADMIN, OPERATOR, READ, SESSION_COOKIE, AuthConfig, AuthError, AuthService
 from .cluster import ClusterError, ClusterService, from_peer
 from .fabric import FabricError
 from .hostnet import HostNetError
@@ -58,7 +58,10 @@ class Router:
 
     Every route has a role. Reads default to ``read`` and everything else to
     ``admin``, so a new mutating route is admin-only unless someone decides
-    otherwise; pass ``role=`` only where the method gets it wrong. A route
+    otherwise; pass ``role=`` only where the method gets it wrong. ``operator``
+    is that decision for running what exists -- state changes, destroys,
+    launches of saved definitions, commands in an instance -- and never for
+    anything that edits a definition or a setting. A route
     with ``principal=True`` receives the caller after the query, for the few
     handlers whose answer depends on who is asking. ``peers=True`` marks a
     route only members call each other on; the handler still guards it with
@@ -107,7 +110,9 @@ def build_router(service, auth=None, cluster=None, stacks=None):
     ))
 
     r.add("GET", r"/api/containers", lambda body, q: service.list_containers())
-    r.add("POST", r"/api/containers", lambda body, q: service.create_container(
+    # A node in maintenance takes no new instances, however they are asked for.
+    r.add("POST", r"/api/containers", lambda body, q: cluster.refuse_maintenance(
+        [cluster.local_name()], "create instances here") or service.create_container(
         name=body.get("name"),
         image=body.get("image"),
         instance_type=body.get("type", "container"),
@@ -137,7 +142,7 @@ def build_router(service, auth=None, cluster=None, stacks=None):
               description=body.get("description")))
     r.add("DELETE", r"/api/containers/%s" % NAME,
           lambda body, q, name: service.delete_container(
-              name, force=_flag(q.get("force")) or bool(body.get("force"))))
+              name, force=_flag(q.get("force")) or bool(body.get("force"))), role=OPERATOR)
 
     # One action over several containers at once. Distinct from the per-name
     # route by path length, and POST /api/containers is the create, so nothing
@@ -145,17 +150,18 @@ def build_router(service, auth=None, cluster=None, stacks=None):
     r.add("POST", r"/api/containers/state",
           lambda body, q: service.change_state_many(
               body.get("names"), body.get("action", ""), force=bool(body.get("force")),
-              timeout=int(body.get("timeout", 60))))
+              timeout=int(body.get("timeout", 60))), role=OPERATOR)
 
     r.add("POST", r"/api/containers/%s/state" % NAME,
           lambda body, q, name: service.change_state(
               name, body.get("action", ""), force=bool(body.get("force")),
-              timeout=int(body.get("timeout", 60))))
+              timeout=int(body.get("timeout", 60))), role=OPERATOR)
     r.add("POST", r"/api/containers/%s/rename" % NAME,
           lambda body, q, name: service.rename_container(name, body.get("name")))
     r.add("POST", r"/api/containers/%s/exec" % NAME,
           lambda body, q, name: service.exec_command(
-              name, body.get("command"), timeout=int(body.get("timeout", 60))))
+              name, body.get("command"), timeout=int(body.get("timeout", 60))),
+          role=OPERATOR)
 
     # The latest app check run in full; health records carry only its first line.
     r.add("GET", r"/api/containers/%s/app-check" % NAME,
@@ -287,10 +293,11 @@ def build_router(service, auth=None, cluster=None, stacks=None):
               params=body.get("params"), nodes=body.get("nodes"),
               groups=body.get("groups"), names=body.get("names"),
               stack=_stack_tag(body, who),
-              background=bool(body.get("background", False))), principal=True)
+              background=bool(body.get("background", False))),
+          role=OPERATOR, principal=True)
     r.add("GET", r"/api/template-runs", lambda body, q: service.template_runs())
     r.add("DELETE", r"/api/template-runs/%s" % NAME,
-          lambda body, q, name: service.dismiss_template_run(name))
+          lambda body, q, name: service.dismiss_template_run(name), role=OPERATOR)
     r.add("GET", r"/api/templates/%s/instances" % NAME,
           lambda body, q, name: service.template_instances(name))
     # `instances` is either plain names (this node, as always) or
@@ -301,16 +308,17 @@ def build_router(service, auth=None, cluster=None, stacks=None):
     r.add("POST", r"/api/templates/%s/destroy" % NAME,
           lambda body, q, name: cluster.template_action(
               name, "destroy", body.get("instances"),
-              background=bool(body.get("background", False))))
+              background=bool(body.get("background", False))), role=OPERATOR)
     r.add("POST", r"/api/templates/%s/exec" % NAME,
           lambda body, q, name: cluster.template_action(
               name, "exec", body.get("instances"), command=body.get("command"),
               timeout=body.get("timeout", 300),
-              background=bool(body.get("background", False))))
+              background=bool(body.get("background", False))), role=OPERATOR)
     r.add("POST", r"/api/templates/%s/recreate" % NAME,
           lambda body, q, name: cluster.template_action(
               name, "recreate", body.get("instances"), params=body.get("params"),
-              background=bool(body.get("background", False))))
+              background=bool(body.get("background", False)),
+              stale=bool(body.get("stale"))), role=OPERATOR)
 
     # Stacks are kept level across the cluster like templates, and a launch is
     # a run held by this process like a template's -- see stacks.py.
@@ -327,32 +335,39 @@ def build_router(service, auth=None, cluster=None, stacks=None):
     r.add("POST", r"/api/stacks/%s/launch" % NAME,
           lambda body, q, name: stacks.launch_stack(
               name, params=body.get("params"), replace=body.get("replace"),
-              background=bool(body.get("background", False))))
+              background=bool(body.get("background", False))), role=OPERATOR)
     # What each stack is running, read from the instances' own tags on every node.
     r.add("GET", r"/api/stack-instances", lambda body, q: stacks.stack_instances())
     r.add("POST", r"/api/stacks/%s/state" % NAME,
           lambda body, q, name: stacks.stack_state(
-              name, body.get("action", ""), body.get("instances")))
+              name, body.get("action", ""), body.get("instances")), role=OPERATOR)
     r.add("POST", r"/api/stacks/%s/destroy" % NAME,
           lambda body, q, name: stacks.destroy_stack(
-              name, body.get("instances"), background=bool(body.get("background", False))))
+              name, body.get("instances"), background=bool(body.get("background", False))),
+          role=OPERATOR)
     r.add("GET", r"/api/stack-runs", lambda body, q: stacks.stack_runs())
     r.add("POST", r"/api/stack-runs/%s/cancel" % NAME,
-          lambda body, q, name: stacks.cancel_stack_run(name))
+          lambda body, q, name: stacks.cancel_stack_run(name), role=OPERATOR)
     r.add("DELETE", r"/api/stack-runs/%s" % NAME,
-          lambda body, q, name: stacks.dismiss_stack_run(name))
+          lambda body, q, name: stacks.dismiss_stack_run(name), role=OPERATOR)
 
     r.add("GET", r"/api/ssh-keys", lambda body, q: service.list_ssh_keys())
     # Parses a key the caller pasted; changes nothing.
     r.add("POST", r"/api/ssh-keys/validate",
           lambda body, q: service.validate_ssh_key(body.get("key", "")), role=READ)
+    # A successful run remembers its params as the modules' defaults, which is
+    # a settings change -- so an operator's run uses them and saves nothing.
+    # `remember: false` is how _forward() carries that to another member, where
+    # the call arrives under the cluster credential and would pass as admin.
     r.add("POST", r"/api/containers/%s/bootstrap" % NAME,
-          lambda body, q, name: service.bootstrap(
+          lambda body, q, who, name: service.bootstrap(
               name,
               modules=body.get("modules") or [],
               params=body.get("params"),
               ssh_keys=body.get("ssh_keys"),
-              timeout=int(body.get("timeout", 900))))
+              timeout=int(body.get("timeout", 900)),
+              remember=who.can(ADMIN) and body.get("remember") is not False),
+          role=OPERATOR, principal=True)
 
     r.add("GET", r"/api/images", lambda body, q: service.list_images())
     r.add("GET", r"/api/profiles", lambda body, q: service.list_profiles())
@@ -400,6 +415,13 @@ def build_router(service, auth=None, cluster=None, stacks=None):
           lambda body, q, who: (cluster.in_cluster() and _peers_only(who, _RELAYED))
           or cluster.evicted(), principal=True, peers=True)
     r.add("POST", r"/api/cluster/refresh", lambda body, q: cluster.sync_members())
+    # This node's own mark; another node's is set through /api/nodes/<node>/,
+    # since only a node's own record counts for it.
+    # `by` is taken from the body only from a member, which is how a relayed
+    # call says who asked; from anyone else it is who they are.
+    r.add("PUT", r"/api/cluster/maintenance", lambda body, q, who: cluster.set_maintenance(
+        body.get("enabled") is not False, reason=body.get("reason", ""),
+        by=body.get("by") if from_peer(who) else who.name), principal=True)
     # Reconciliation, the pull half of keeping shared definitions level: a node
     # that has been off missed every push made while it was away and, sync
     # being push-only, has no other way to find out. The two member-only routes
@@ -433,10 +455,10 @@ def build_router(service, auth=None, cluster=None, stacks=None):
     # Containers tab while it is scoped wider than this host.
     r.add("POST", r"/api/cluster/containers/state", lambda body, q: cluster.change_state(
         body.get("instances"), body.get("action", ""), force=bool(body.get("force")),
-        timeout=int(body.get("timeout", 60))))
+        timeout=int(body.get("timeout", 60))), role=OPERATOR)
     r.add("POST", r"/api/cluster/containers/delete",
           lambda body, q: cluster.delete_containers(
-              body.get("instances"), force=bool(body.get("force"))))
+              body.get("instances"), force=bool(body.get("force"))), role=OPERATOR)
 
     # Fabrics: routed networks between the containers of a cluster. Reading
     # one needs no privilege on the host, so status answers everywhere and
@@ -468,6 +490,7 @@ def build_router(service, auth=None, cluster=None, stacks=None):
           principal=True, peers=True)
     r.add("DELETE", r"/api/fabric/claims/%s" % NAME,
           lambda body, q, who, name: _peers_only(who, _FABRIC_CLAIM)
+          or cluster.fabric().refuse_here("drop a fabric on this node")
           or cluster.fabric().leave(name),
           principal=True, peers=True)
     r.add("POST", r"/api/fabric/instances/%s/attach" % NAME,
@@ -653,7 +676,8 @@ class LemondxHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "No such endpoint: %s" % path}, 404)
                 return
             if not principal.can(role):
-                self._send_json({"error": "Forbidden: %s access is read-only" % principal.name}, 403)
+                self._send_json({"error": "Forbidden: this needs %s access, and %s has %s"
+                                 % (role, principal.name, principal.role)}, 403)
                 return
             body = self._read_body()
             if wants_principal:
@@ -692,8 +716,10 @@ class LemondxHandler(BaseHTTPRequestHandler):
         if not explicit and not self._same_origin():
             self._send_json({"error": "Cross-origin WebSocket refused"}, 403)
             return
-        if not principal.can(ADMIN):
-            self._send_json({"error": "Forbidden: terminals need admin access"}, 403)
+        # A shell is running commands in the instance, which is what exec
+        # already lets an operator do.
+        if not principal.can(OPERATOR):
+            self._send_json({"error": "Forbidden: terminals need operator access"}, 403)
             return
 
         name, kind = unquote(match.group(1)), match.group(2)
@@ -1106,7 +1132,8 @@ def _forward(router, cluster, method, principal, node, rest, body, query):
         raise ClusterError("A proxied call cannot be proxied again.", 400)
     handler, args, role, wants = router.resolve(method, path)
     if not principal.can(role):
-        raise AuthError("Forbidden: %s access is read-only" % principal.name, 403)
+        raise AuthError("Forbidden: this needs %s access, and %s has %s"
+                        % (role, principal.name, principal.role), 403)
     if node != cluster.local_name() and handler in router.peer_routes \
             and not from_peer(principal):
         # A relayed call reaches the member under the cluster credential, so
@@ -1119,6 +1146,12 @@ def _forward(router, cluster, method, principal, node, rest, body, query):
     # but the launch reads a `stack` from the body, so this costs them nothing.
     if isinstance(body, dict):
         _stack_tag(body, principal)
+        # Likewise what a bootstrap may save: only the bootstrap reads it.
+        if not principal.can(ADMIN):
+            body = dict(body, remember=False)
+        # And who is asking, for the one route that records it (maintenance).
+        if not from_peer(principal):
+            body = dict(body, by=principal.name)
     if node == cluster.local_name():
         # Addressing this node by name is the same request without the prefix;
         # answering it here keeps the front end from having to special-case it.

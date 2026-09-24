@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useCanWrite } from '../hooks/useAuth'
+import { useCanOperate, useCanWrite } from '../hooks/useAuth'
 import { api } from '../lib/api'
 import { absoluteTime, bytes, cpuTime, relativeTime, secondsAgo } from '../lib/format'
 import type { ContainerDetail, HealthRecord, StateAction } from '../lib/types'
@@ -8,6 +8,7 @@ import { BootstrapPanel } from './BootstrapPanel'
 import { ExecConsole } from './ExecConsole'
 import { AppCheckLabel, HealthLabel } from './HealthDot'
 import { StatusBadge } from './StatusBadge'
+import { staleSummary } from '../lib/stale'
 
 type Tab = 'overview' | 'snapshots' | 'bootstrap' | 'console'
 
@@ -37,6 +38,7 @@ export function ContainerDrawer({
   name, node, health, healthPending, busy, onClose, onAction, onDelete, onNotify, onShowAppCheck, refreshToken,
 }: Props) {
   const canWrite = useCanWrite()
+  const canOperate = useCanOperate()
   const [detail, setDetail] = useState<ContainerDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [tab, setTab] = useState<Tab>('overview')
@@ -184,6 +186,16 @@ export function ContainerDrawer({
 
           {detail && tab === 'overview' && (
             <>
+              {detail.stale?.length > 0 && (
+                <div className="banner banner-warn">
+                  <div className="banner-body">
+                    <h3>Stale</h3>
+                    <p style={{ margin: 0 }}>
+                      {staleSummary(detail.stale, detail.template, detail.stack)}
+                    </p>
+                  </div>
+                </div>
+              )}
               {!health && healthPending && detail.status === 'Running' && (
                 <div className="panel">
                   <h3>Health</h3>
@@ -455,25 +467,25 @@ export function ContainerDrawer({
         <div className="drawer-actions">
           {running || frozen ? (
             <>
-              <button className="btn" disabled={busy || !canWrite} onClick={() => onAction(name, 'stop')}>
+              <button className="btn" disabled={busy || !canOperate} onClick={() => onAction(name, 'stop')}>
                 <StopIcon /> Stop
               </button>
-              <button className="btn" disabled={busy || !canWrite} onClick={() => onAction(name, 'restart')}>
+              <button className="btn" disabled={busy || !canOperate} onClick={() => onAction(name, 'restart')}>
                 <RestartIcon /> Restart
               </button>
-              <button className="btn" disabled={busy || !canWrite}
+              <button className="btn" disabled={busy || !canOperate}
                 onClick={() => onAction(name, frozen ? 'unfreeze' : 'freeze')}>
                 {frozen ? <PlayIcon /> : <PauseIcon />} {frozen ? 'Resume' : 'Pause'}
               </button>
             </>
           ) : (
-            <button className="btn btn-primary" disabled={busy || !canWrite}
+            <button className="btn btn-primary" disabled={busy || !canOperate}
               onClick={() => onAction(name, 'start')}>
               <PlayIcon /> Start
             </button>
           )}
           <div style={{ flex: 1 }} />
-          <button className="btn btn-danger" disabled={busy || !canWrite} onClick={() => onDelete(name)}>
+          <button className="btn btn-danger" disabled={busy || !canOperate} onClick={() => onDelete(name)}>
             <TrashIcon /> Delete
           </button>
         </div>

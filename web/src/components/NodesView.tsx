@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useCanWrite } from '../hooks/useAuth'
-import { api } from '../lib/api'
+import { api, calls } from '../lib/api'
 import type {
   AutoGroupResult, ClusterInfo, ClusterNode, ClusterNodeDetail, DriftReport, EvictResult,
-  JoinCode, LeaveResult, NodeGroup, NodeTold, ReconcileRow, SyncKind, SyncResult,
+  JoinCode, LeaveResult, MaintenanceResult, NodeGroup, NodeTold, ReconcileRow, SyncKind, SyncResult,
 } from '../lib/types'
 import { ConfirmDialog } from './ConfirmDialog'
 import { CopyButton } from './CopyButton'
 import {
   EjectIcon, KeyIcon, LogoutIcon, PlusIcon, RefreshIcon, ScalesIcon, ServerIcon, TrashIcon,
-  UploadIcon,
+  UploadIcon, WrenchIcon,
 } from './Icons'
 import { Modal } from './Modal'
 
@@ -134,6 +134,7 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
   const [dialog, setDialog] = useState<'join' | 'invite' | 'sync' | null>(null)
   const [editingGroup, setEditingGroup] = useState<NodeGroup | 'new' | null>(null)
   const [pendingEvict, setPendingEvict] = useState<ClusterNode | null>(null)
+  const [maintaining, setMaintaining] = useState<ClusterNode | null>(null)
   const [pendingLeave, setPendingLeave] = useState(false)
   const [pendingSize, setPendingSize] = useState(false)
   const [drift, setDrift] = useState<DriftReport | null>(null)
@@ -166,12 +167,36 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
     const controller = new AbortController()
     // oxlint-disable-next-line react/set-state-in-effect -- async fetch, not a sync setState
     load(controller.signal)
-    const timer = window.setInterval(() => load(), POLL_INTERVAL)
+    const timer = window.setInterval(() => load(controller.signal), POLL_INTERVAL)
     return () => {
       controller.abort()
       window.clearInterval(timer)
     }
   }, [load])
+
+  /** Says what happened, and who has not heard yet -- they learn at the next sync. */
+  function reportMaintenance(result: MaintenanceResult) {
+    // The launch pickers read the node list App holds, so it has to hear too.
+    onMembershipChanged()
+    const missed = result.told.filter((t) => !t.ok).map((t) => t.node)
+    onNotify(result.maintenance ? 'info' : 'success',
+      result.maintenance ? `${result.node} is in maintenance` : `${result.node} is out of maintenance`,
+      missed.length ? `Not told yet: ${missed.join(', ')}. They pick it up at the next member sync.`
+        : result.maintenance ? 'No new instances or fabric changes there until it ends.' : undefined)
+  }
+
+  async function endMaintenance(node: ClusterNode) {
+    setBusy(true)
+    try {
+      reportMaintenance(await api.setMaintenance(node.self ? undefined : node.name,
+        { enabled: false }))
+      await load()
+    } catch (cause) {
+      onNotify('error', `Could not end maintenance on ${node.name}`, (cause as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
 
   async function evictNode() {
     if (!pendingEvict) return
@@ -267,8 +292,7 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
       )}
 
       {info && (
-        <ThisNode info={info} peers={peers.length} canWrite={canWrite}
-          onLeave={() => setPendingLeave(true)} />
+        <ThisNode info={info} peers={peers.length} />
       )}
 
       <section className="card access-card">
@@ -299,11 +323,25 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
               title="Make a code for another host to join this cluster with">
               <KeyIcon /> Invite new node
             </button>
-            <button className="btn btn-sm btn-primary" disabled={!canWrite}
-              onClick={() => setDialog('join')}
-              title="Paste a code from another node to make this host a member">
-              <PlusIcon /> Join cluster
-            </button>
+            {/* Join and leave share a slot because exactly one of them applies:
+                `join()` refuses a member with a 409, and `leftovers` are cleared
+                by leaving too -- joining on top of them would keep the stale
+                peers and groups around. */}
+            {info && (info.in_cluster || info.leftovers) ? (
+              <button className="btn btn-sm btn-danger" disabled={!canWrite}
+                onClick={() => setPendingLeave(true)}
+                title={info.in_cluster
+                  ? 'Take this node out of the cluster and have every member forget it'
+                  : 'Clear the peer records and groups this node still holds'}>
+                <LogoutIcon /> {info.in_cluster ? 'Leave cluster' : 'Clear cluster state'}
+              </button>
+            ) : (
+              <button className="btn btn-sm btn-primary" disabled={!canWrite || !info}
+                onClick={() => setDialog('join')}
+                title="Paste a code from another node to make this host a member">
+                <PlusIcon /> Join cluster
+              </button>
+            )}
           </div>
         </header>
 
@@ -313,7 +351,9 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
           <div className="node-list">
             {(nodes ?? []).map((node) => (
               <NodeCard key={node.name} node={node} canWrite={canWrite}
-                onEvict={() => setPendingEvict(node)} onNotify={onNotify} />
+                onEvict={() => setPendingEvict(node)} onNotify={onNotify}
+                onMaintenance={() => setMaintaining(node)}
+                onEndMaintenance={() => endMaintenance(node)} />
             ))}
           </div>
         )}
@@ -435,6 +475,15 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
           }} />
       )}
 
+      {maintaining && (
+        <MaintenanceDialog node={maintaining} onCancel={() => setMaintaining(null)}
+          onDone={(result) => {
+            setMaintaining(null)
+            reportMaintenance(result)
+            load()
+          }} />
+      )}
+
       {pendingEvict && (
         <ConfirmDialog
           title={`Evict ${pendingEvict.name} from the cluster?`}
@@ -543,11 +592,9 @@ function DriftPanel({ report }: { report: DriftReport }) {
 }
 
 /** What this node looks like to the others, and whether anything can join it. */
-function ThisNode({ info, peers, canWrite, onLeave }: {
+function ThisNode({ info, peers }: {
   info: ClusterInfo
   peers: number
-  canWrite: boolean
-  onLeave: () => void
 }) {
   return (
     <section className="card node-self">
@@ -555,21 +602,6 @@ function ThisNode({ info, peers, canWrite, onLeave }: {
         <h3>
           <ServerIcon size={16} /> {info.node.name}
           <span className="badge badge-dim">this node</span>
-          {/* Leaving lives here rather than on the node's card in the grid: it
-              is the one action that acts on this host, and the grid's buttons
-              all act on somebody else. Offered on `leftovers` as well, which is
-              a cluster this node is in from its own side only — there is
-              nothing to press anywhere else, and clearing it is what leaving
-              does. */}
-          {(info.in_cluster || info.leftovers) && (
-            <button className="btn btn-sm btn-danger node-self-leave" disabled={!canWrite}
-              onClick={onLeave}
-              title={info.in_cluster
-                ? 'Take this node out of the cluster and have every member forget it'
-                : 'Clear the peer records and groups this node still holds'}>
-              <LogoutIcon /> {info.in_cluster ? 'Leave cluster' : 'Clear cluster state'}
-            </button>
-          )}
         </h3>
         <dl className="node-facts">
           <div><dt>Address</dt><dd>{info.node.url || <span className="dim">not advertised</span>}</dd></div>
@@ -613,11 +645,13 @@ function ThisNode({ info, peers, canWrite, onLeave }: {
       {info.remote_requires_token && (
         <div className="banner node-self-note">
           <div className="banner-body">
-            <h3>Requests from other hosts need an API token</h3>
+            <h3>Requests from other hosts need a login</h3>
             <p>
               Authentication is off here, and a cluster member cannot treat whoever reaches
-              its port as an admin. Peers use the cluster credential; anyone else needs a
-              token. Browsing from this host is unaffected.
+              its port as an admin. Peers use the cluster credential; anyone else logs in
+              with one of the cluster's accounts (taken when this node joined, or sent
+              with <code>lemondx cluster sync users</code>) or an API token. Browsing from
+              this host is unaffected.
             </p>
           </div>
         </div>
@@ -626,11 +660,70 @@ function ThisNode({ info, peers, canWrite, onLeave }: {
   )
 }
 
-function NodeCard({ node, canWrite, onEvict, onNotify }: {
+/** Put one node into maintenance, with a reason everyone refused by it will read. */
+function MaintenanceDialog({ node, onCancel, onDone }: {
+  node: ClusterNode
+  onCancel: () => void
+  onDone: (result: MaintenanceResult) => void
+}) {
+  const [reason, setReason] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const target = node.self ? undefined : node.name
+  const body = { enabled: true, reason: reason.trim() }
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault()
+    setBusy(true)
+    setError(null)
+    try {
+      onDone(await api.setMaintenance(target, body))
+    } catch (cause) {
+      setError((cause as Error).message)
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal title={`Put ${node.name} into maintenance?`}
+      subtitle="Its instances keep running and can still be started, stopped and destroyed."
+      onClose={busy ? () => {} : onCancel}
+      api={calls.setMaintenance(target, body)}
+      footer={<>
+        <button type="button" className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
+        <button type="submit" form="maintenance-form" className="btn btn-primary" disabled={busy}>
+          {busy && <span className="spinner" />}Start maintenance
+        </button>
+      </>}>
+      <form id="maintenance-form" onSubmit={submit} style={{ display: 'grid', gap: 14 }}>
+        <ul className="maintenance-effects">
+          <li><strong>No new instances</strong> — creates, template and stack launches, and
+            recreates are refused there. A launch to a group skips it instead.</li>
+          <li><strong>No fabric changes</strong> — creating, extending or deleting a fabric
+            waits until it is back, and its own routes are left as they are.</li>
+          <li><strong>Definitions still sync</strong> — templates, stacks and modules are
+            pushed to it as usual, so it comes back up to date.</li>
+        </ul>
+        <div className="field">
+          <label htmlFor="maintenance-reason">Reason</label>
+          <input id="maintenance-reason" className="input" value={reason} maxLength={200}
+            placeholder="kernel upgrade, disk swap…" disabled={busy}
+            onChange={(event) => setReason(event.target.value)} />
+          <span className="hint">Shown on the node, and in every refusal it causes.</span>
+        </div>
+        {error && <span className="field-error" role="alert">{error}</span>}
+      </form>
+    </Modal>
+  )
+}
+
+function NodeCard({ node, canWrite, onEvict, onNotify, onMaintenance, onEndMaintenance }: {
   node: ClusterNode
   canWrite: boolean
   onEvict: () => void
   onNotify: Props['onNotify']
+  onMaintenance: () => void
+  onEndMaintenance: () => void
 }) {
   const [detail, setDetail] = useState<ClusterNodeDetail | null>(null)
   const [open, setOpen] = useState(false)
@@ -657,9 +750,17 @@ function NodeCard({ node, canWrite, onEvict, onNotify }: {
             : status === 'unreachable' ? 'down' : 'warn'}`} aria-hidden />
           {node.name}
           {node.self && <span className="badge badge-dim">this node</span>}
+          {node.maintenance && <span className="badge badge-warn">maintenance</span>}
         </h4>
         <p className="node-url mono">{node.url || <span className="dim">local</span>}</p>
         {state?.error && <p className="node-error">{state.error}</p>}
+        {node.maintenance && (
+          <p className="node-maintenance">
+            No new instances or fabric changes since {when(node.maintenance.since)}
+            {node.maintenance.by && ` (${node.maintenance.by})`}
+            {node.maintenance.reason && <>: <em>{node.maintenance.reason}</em></>}
+          </p>
+        )}
       </header>
 
       <dl className="node-facts">
@@ -689,6 +790,18 @@ function NodeCard({ node, canWrite, onEvict, onNotify }: {
           disabled={!!state && !state.reachable}>
           {open ? 'Hide instances' : 'Show instances'}
         </button>
+        {node.maintenance ? (
+          <button className="btn btn-sm" disabled={!canWrite || (!!state && !state.reachable)}
+            onClick={onEndMaintenance}>
+            <WrenchIcon /> End maintenance
+          </button>
+        ) : (
+          <button className="btn btn-sm" disabled={!canWrite || (!!state && !state.reachable)}
+            onClick={onMaintenance}
+            title="Stop new instances and fabric changes on this node">
+            <WrenchIcon /> Maintenance
+          </button>
+        )}
         {!node.self && (
           <button className="btn btn-sm btn-danger" disabled={!canWrite} onClick={onEvict}
             title={`Put ${node.name} out of the cluster`}>
@@ -735,10 +848,13 @@ function JoinDialog({ onCancel, onDone }: {
     setError(null)
     try {
       const result = await api.joinNode(code.trim(), description.trim() || undefined)
-      const detail = result.warning
+      const accounts = result.users.adopted.length > 0
+        ? ` Its accounts (${result.users.adopted.join(', ')}) can now log in here from other hosts.`
+        : ''
+      const detail = (result.warning
         || (result.unreachable.length > 0
           ? `${result.unreachable.join(', ')} could not be told about this node yet.`
-          : `Now a member alongside ${result.members.length - 1} other node(s).`)
+          : `Now a member alongside ${result.members.length - 1} other node(s).`)) + accounts
       onDone(`Joined the cluster through ${result.node.name}`, detail)
     } catch (cause) {
       setError((cause as Error).message)
@@ -750,6 +866,9 @@ function JoinDialog({ onCancel, onDone }: {
     <Modal title="Join a cluster"
       subtitle="Paste a join code from any node in the cluster. This host works out its own name, address and certificate; nothing needs configuring first."
       onClose={busy ? () => {} : onCancel}
+      // The code is a credential, one paste away from admin on every member.
+      api={{ ...calls.joinNode(code.trim(), description.trim() || undefined),
+        secrets: ['code'] }}
       footer={<>
         <button type="button" className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
         <button type="submit" form="join-form" className="btn btn-primary"
@@ -842,6 +961,8 @@ function InviteDialog({ info, onClose }: { info: ClusterInfo | null; onClose: ()
     <Modal title="Invite a new node"
       subtitle="Makes a one-time code another lemondx redeems to federate with this one."
       onClose={busy ? () => {} : onClose}
+      api={blocked ? undefined
+        : calls.createInvite({ expires_minutes: minutes, note: note.trim() })}
       footer={<>
         <button type="button" className="btn" onClick={onClose} disabled={busy}>Cancel</button>
         <button type="submit" form="invite-form" className="btn btn-primary"
@@ -926,6 +1047,7 @@ function GroupDialog({ group, nodes, onCancel, onSaved }: {
     <Modal title={group ? `Edit ${group.name}` : 'New node group'}
       subtitle="A group is just a list of names; launching or syncing to it means all of them."
       onClose={busy ? () => {} : onCancel}
+      api={calls.saveNodeGroup(name.trim(), { members, description: description.trim() })}
       footer={<>
         <button type="button" className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
         <button type="submit" form="group-form" className="btn btn-primary"
@@ -986,6 +1108,11 @@ function SyncDialog({ nodes, groups, onCancel, onNotify }: {
 
   const chosen = group ? [] : targets
   const canSync = kinds.length > 0 && (group !== '' || targets.length > 0) && !busy
+  const body = {
+    kinds,
+    nodes: chosen.length ? chosen : undefined,
+    groups: group ? [group] : undefined,
+  }
 
   async function run(event: React.FormEvent) {
     event.preventDefault()
@@ -993,11 +1120,7 @@ function SyncDialog({ nodes, groups, onCancel, onNotify }: {
     setBusy(true)
     setError(null)
     try {
-      const outcome = await api.syncToNodes({
-        kinds,
-        nodes: chosen.length ? chosen : undefined,
-        groups: group ? [group] : undefined,
-      })
+      const outcome = await api.syncToNodes(body)
       setResult(outcome)
       if (outcome.ok) {
         onNotify('success', `Synced ${outcome.items} item(s)`,
@@ -1018,6 +1141,7 @@ function SyncDialog({ nodes, groups, onCancel, onNotify }: {
     <Modal title="Sync to other nodes"
       subtitle="Copies this node's copy over theirs. There is no merge: what is here wins."
       onClose={busy ? () => {} : onCancel}
+      api={calls.syncToNodes(body)}
       footer={<>
         <button type="button" className="btn" onClick={onCancel} disabled={busy}>
           {result ? 'Close' : 'Cancel'}

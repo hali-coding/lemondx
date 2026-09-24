@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { api } from '../lib/api'
-import { savableSelection } from '../lib/bootstrap'
+import { api, calls } from '../lib/api'
+import { savableSelection, secretParamNames } from '../lib/bootstrap'
 import type { CreateRequest, InstanceSpec, InstanceTemplate } from '../lib/types'
 import { useBootstrapData } from '../hooks/useBootstrapData'
 import { blankSpec, resolvedSpec, specOf, specProblems } from '../lib/instance'
@@ -105,29 +105,33 @@ export function CreateDialog({ onCancel, onCreate, onNotify }: Props) {
   const canSubmit = nameValid && !busy && !problems.blocked
   const selected = value.bootstrap.modules.length
 
+  function createRequest(): CreateRequest {
+    const resolved = resolvedSpec(value)
+    return {
+      name: name.trim(),
+      image: resolved.image,
+      type: resolved.type,
+      cpu: resolved.cpu,
+      memory: resolved.memory,
+      disk: resolved.disk || undefined,
+      pool: resolved.pool || undefined,
+      network: resolved.network || undefined,
+      fabric: resolved.fabric || undefined,
+      profiles: resolved.profiles.length > 0 ? resolved.profiles : undefined,
+      ephemeral: resolved.ephemeral,
+      start: resolved.start,
+      secureboot: resolved.secureboot,
+      bootstrap: selected > 0 ? resolved.bootstrap : undefined,
+    }
+  }
+
   async function submit(event: React.FormEvent) {
     event.preventDefault()
     if (!canSubmit) return
     setBusy(true)
     setError(null)
-    const resolved = resolvedSpec(value)
     try {
-      await onCreate({
-        name: name.trim(),
-        image: resolved.image,
-        type: resolved.type,
-        cpu: resolved.cpu,
-        memory: resolved.memory,
-        disk: resolved.disk || undefined,
-        pool: resolved.pool || undefined,
-        network: resolved.network || undefined,
-        fabric: resolved.fabric || undefined,
-        profiles: resolved.profiles.length > 0 ? resolved.profiles : undefined,
-        ephemeral: resolved.ephemeral,
-        start: resolved.start,
-        secureboot: resolved.secureboot,
-        bootstrap: selected > 0 ? resolved.bootstrap : undefined,
-      })
+      await onCreate(createRequest())
       // Accepted: the create runs on the server from here, and the list shows it.
       if (mounted.current) onCancel()
     } catch (cause) {
@@ -145,6 +149,11 @@ export function CreateDialog({ onCancel, onCreate, onNotify }: Props) {
       title="New container"
       subtitle="The image is downloaded on first use, which can take a minute."
       onClose={onCancel}
+      api={{
+        ...calls.createContainer(createRequest()),
+        secrets: secretParamNames(modules, value.bootstrap)
+          .map((param) => `bootstrap.params.${param}`),
+      }}
       footer={
         <>
           <button type="button" className="btn btn-ghost" style={{ marginRight: 'auto' }}

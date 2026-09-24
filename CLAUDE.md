@@ -74,7 +74,9 @@ to the daemon, transport and nothing else. The dependency only goes one way:
 API and the CLI cannot drift. **Adding a feature means: a method on `ContainerService`,
 then a route in `build_router()` (`server.py:85`) and a subcommand in `build_parser()`
 (`cli.py:1653`).** A route's role defaults to `read` for `GET` and `admin` otherwise;
-pass `role=` to `Router.add()` only where that is wrong, and `principal=True` when
+pass `role=` to `Router.add()` only where that is wrong -- `role=OPERATOR`
+for a route that runs what exists (state, destroy, launching a saved
+definition, commands in an instance) and edits no definition or setting, and `principal=True` when
 the answer depends on the caller. A route handler is a one-line lambda that unpacks the JSON body and calls
 the service; a CLI command calls the same method and passes the result to `emit()` with a
 human renderer. Because `emit()` prints the service payload verbatim under `--json`, the
@@ -250,6 +252,16 @@ which copy is right. `RECONCILE_KINDS` leaves `users` out on purpose -- it
 carries password hashes and only an explicit `cluster sync` should move it.
 `_stand_down()` drops the tombstones (`store.drop_tombstones()`) so deletions
 decided by one cluster are not carried into the next.
+
+**Maintenance is the node's own word**, like its fabric claims:
+`store.load_maintenance()` on the node, carried to peers on its member record
+(`local_node()`, compared in `remember_members()`), so marking another node
+goes through the proxy to that node. It stops new instances
+(`launch_targets()` -- refused when named, skipped when only in a group -- the
+create route, recreate) and fabric changes (`FabricService.refuse_here()` on
+the node, `_refuse_members()` from a coordinator), never definition sync.
+Coordinator and node both check, so a stale copy of the record still stops at
+the node.
 
 `leave()` also clears the half-state a broken cluster leaves behind -- peer
 records and groups with no credential to use them with. Refusing that as "not
@@ -439,7 +451,12 @@ round, never copied onto the instance; a template save or delete (including a
 peer's push) also swaps it into the scheduler at once
 (`AppChecker.update_template()`). `_template_body()` must carry `app_check`:
 a push is a whole-record PUT, so a field it omits is deleted on the peer. A
-running instance with no check reports app `ok`, never null. A run's full
+running instance with no check reports app `ok`, never null. A round that
+does not list an instance as running keeps its check (unrun) for
+`AppChecker.GRACE_ROUNDS` before dropping it -- a daemon that briefly cannot
+read an instance's state reports it as something else, and dropping it at once
+made the check vanish for a whole interval -- and `_why_no_app_check()` asks
+the daemon which reason applies when there is none. A run's full
 stdout/stderr (`APP_DETAIL_KEYS`) stays in the checker and is stripped from
 records by `_app_status()`; `app_check_output()` serves it on request.
 
@@ -545,6 +562,15 @@ Recreate and destroy take the instance list the user confirmed and refuse with
 process) and refuses a second one on the same template, so the UI reads
 progress from `/api/template-runs` rather than holding it in component state
 that unmounting would lose.
+
+An instance records the revision of its template and stack
+(`TEMPLATE_REVISION_KEY`/`STACK_REVISION_KEY`: a digest, `template_revision()`
+and `stack_revision()` in service.py, never a timestamp -- sync re-saves
+unchanged records all the time), and `_mark_stale()` compares them with this
+node's copies on every listing. `_NOT_INFRA` is what a template edit may change
+without making instances stale; a field added to templates that is baked into
+an instance must not go there. Recreate keeps the old stack revision, because
+it applies the template, not the stack.
 
 `_migrate()` runs once per process, is best-effort (an `OSError` must never
 stop lemondx from starting) and handles both older layouts: adopting

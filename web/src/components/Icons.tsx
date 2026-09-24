@@ -110,6 +110,10 @@ export const TerminalIcon = ({ size = 15 }: Props) => (
   </svg>
 )
 
+export const CodeIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M13.5 5l-3 14" /></svg>
+)
+
 export const ServerIcon = ({ size = 15 }: Props) => (
   <svg {...base(size)}>
     <rect x="3" y="4" width="18" height="7" rx="1.5" />
@@ -184,5 +188,74 @@ export const HeartIcon = ({ size = 15 }: Props) => (
 export const GripIcon = ({ size = 15 }: Props) => (
   <svg {...base(size)}>
     <path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01" strokeWidth={3} />
+  </svg>
+)
+
+export const TemplateIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <rect x="3" y="3" width="18" height="18" rx="2" />
+    <path d="M3 9h18M9 21V9" />
+  </svg>
+)
+
+export const GaugeIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M3.5 17a9 9 0 1 1 17 0" />
+    <path d="M12 13l4-5" />
+    <circle cx="12" cy="14" r="1.5" />
+  </svg>
+)
+
+export const DatabaseIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <ellipse cx="12" cy="5.5" rx="8" ry="3" />
+    <path d="M4 5.5v13c0 1.66 3.58 3 8 3s8-1.34 8-3v-13" />
+    <path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3" />
+  </svg>
+)
+
+export const NetworkIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <rect x="9" y="2.5" width="6" height="5" rx="1" />
+    <rect x="2.5" y="16.5" width="6" height="5" rx="1" />
+    <rect x="15.5" y="16.5" width="6" height="5" rx="1" />
+    <path d="M12 7.5v4.5M5.5 16.5V12h13v4.5" />
+  </svg>
+)
+
+export const PuzzleIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M9 4.5a2 2 0 1 1 4 0V6h4a1 1 0 0 1 1 1v4h-1.5a2 2 0 1 0 0 4H18v4a1 1 0 0 1-1 1h-4v-1.5a2 2 0 1 0-4 0V20H5a1 1 0 0 1-1-1v-4h1.5a2 2 0 1 0 0-4H4V7a1 1 0 0 1 1-1h4z" />
+  </svg>
+)
+
+export const ShieldIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M12 3l8 3v6c0 4.5-3.4 8.2-8 9-4.6-.8-8-4.5-8-9V6z" />
+    <path d="M9 12l2 2 4-4" />
+  </svg>
+)
+
+export const MenuIcon = ({ size = 16 }: Props) => (
+  <svg {...base(size)}><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+)
+
+export const HelpIcon = ({ size = 13 }: Props) => (
+  <svg {...base(size)}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M9.5 9.5a2.5 2.5 0 0 1 4.8.9c0 1.6-2.3 2.2-2.3 3.6M12 17h.01" />
+  </svg>
+)
+
+export const HomeIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M3.5 10.5 12 4l8.5 6.5" />
+    <path d="M5.5 9v10.5h13V9M10 19.5v-5h4v5" />
+  </svg>
+)
+
+export const WrenchIcon = ({ size = 13 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9z" />
   </svg>
 )

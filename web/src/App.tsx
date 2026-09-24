@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import { ApiError, api, hasToken, setToken } from './lib/api'
 import type {
   AuthInfo, CreateProgress, CreateRequest, HealthRecord, HealthStatus, InstanceRef,
@@ -16,22 +17,83 @@ import { ConfirmDialog } from './components/ConfirmDialog'
 import { ContainerDrawer } from './components/ContainerDrawer'
 import { ContainerTable } from './components/ContainerTable'
 import { CreateDialog } from './components/CreateDialog'
-import { MoonIcon, PlusIcon, RefreshIcon, SunIcon } from './components/Icons'
+import {
+  BoxIcon, DatabaseIcon, HelpIcon, HomeIcon, MenuIcon, MoonIcon, NetworkIcon, PlusIcon, PuzzleIcon,
+  RefreshIcon, ServerIcon, ShieldIcon, StackIcon, SunIcon, TemplateIcon,
+} from './components/Icons'
 import { ModulesView } from './components/ModulesView'
 import { NetworkView } from './components/NetworkView'
 import { NodesView } from './components/NodesView'
-import { ResourcesView } from './components/ResourcesView'
+import { HomeView } from './components/HomeView'
 import { ScopePicker } from './components/ScopePicker'
 import { SetupBanner } from './components/SetupBanner'
 import { StacksView } from './components/StacksView'
 import { StorageView } from './components/StorageView'
 import { LoginGate } from './components/LoginGate'
 import { TemplatesView } from './components/TemplatesView'
+import { Modal } from './components/Modal'
 import { Toasts } from './components/Toasts'
 
 const POLL_INTERVAL = 3000
 
-const VIEWS = ['containers', 'templates', 'stacks', 'nodes', 'resources', 'storage', 'network', 'modules', 'access'] as const
+type View = 'home' | 'containers' | 'templates' | 'stacks' | 'nodes' | 'storage'
+  | 'network' | 'modules' | 'access'
+
+// Grouped by what a person comes to do: run things, or look after the hosts
+// they run on and who may reach them.
+const NAV: {
+  label: string
+  /** The explanation behind the ? beside the group's label. */
+  help: {
+    intro: string
+    /** The order the parts are explained in, when it differs from the menu's. */
+    order: View[]
+    /** Whether each part builds on the one before, so the overview draws arrows. */
+    chain: boolean
+  }
+  items: { id: View; label: string; icon: ReactNode; about: string }[]
+}[] = [
+  { label: 'Workloads',
+    help: {
+      intro: 'Everything here ends in containers, and each part builds on the one before it.',
+      order: ['modules', 'templates', 'stacks', 'containers'],
+      chain: true,
+    },
+    items: [
+      { id: 'containers', label: 'Containers', icon: <BoxIcon size={16} />,
+        about: 'The running instances, whichever node they are on. Create one by hand, or '
+          + 'let a template or stack make them.' },
+      { id: 'templates', label: 'Templates', icon: <TemplateIcon size={16} />,
+        about: 'A saved recipe — image, size, storage, network and modules — that launches '
+          + 'one or many containers, and can recreate or destroy them together.' },
+      { id: 'stacks', label: 'Stacks', icon: <StackIcon size={16} />,
+        about: 'Templates run in stages, so a database is up before the app that needs it. '
+          + 'Each step can hand its addresses and values to the next.' },
+      { id: 'modules', label: 'Modules', icon: <PuzzleIcon size={16} />,
+        about: 'Shell scripts that set up a container once it starts: install packages, add '
+          + 'SSH keys, start services. Templates pick which ones run.' },
+    ] },
+  { label: 'Infrastructure',
+    help: {
+      intro: 'Where containers run, what they run on, and who may reach them.',
+      order: ['nodes', 'storage', 'network', 'access'],
+      chain: false,
+    },
+    items: [
+      { id: 'nodes', label: 'Nodes', icon: <ServerIcon size={16} />,
+        about: 'The hosts running lemondx, each with its own LXD or Incus. Joined into a '
+          + 'cluster they share templates, stacks and modules, and launches can spread '
+          + 'across them.' },
+      { id: 'storage', label: 'Storage', icon: <DatabaseIcon size={16} />,
+        about: 'Pools that hold containers’ disks, and extra volumes to attach to them.' },
+      { id: 'network', label: 'Network', icon: <NetworkIcon size={16} />,
+        about: 'Bridges that connect containers on one host. A fabric links them across '
+          + 'nodes, so containers on different hosts reach each other directly.' },
+      { id: 'access', label: 'Access', icon: <ShieldIcon size={16} />,
+        about: 'Users and API tokens, and whether each may only look, operate what exists, '
+          + 'or change everything.' },
+    ] },
+]
 
 const STATE_VERB: Record<StateAction, string> = {
   start: 'Started', stop: 'Stopped', restart: 'Restarted',
@@ -43,6 +105,8 @@ export default function App() {
   const { scope, choose: chooseScope, nodes, groups, federated, reload: reloadCluster } = useScope()
   // Where this lemondx sits, so a row here can be told apart from one elsewhere.
   const localNode = nodes.find((n) => n.self)?.name ?? ''
+  // Refused by the server anyway; said up front so nobody fills in a create first.
+  const localMaintenance = nodes.find((n) => n.self)?.maintenance ?? null
   const nodeUrls = Object.fromEntries(nodes.map((n) => [n.name, n.url]))
   const { toasts, push, dismiss } = useToasts()
 
@@ -72,7 +136,19 @@ export default function App() {
   const [authInfo, setAuthInfo] = useState<AuthInfo | null>(null)
   // Set while the server refuses us; holds what it accepts instead.
   const [gate, setGate] = useState<AuthInfo | null>(null)
-  const [view, setView] = useState<(typeof VIEWS)[number]>('containers')
+  const [view, setView] = useState<View>('home')
+  // Only matters on a narrow screen, where the menu slides over the page.
+  const [navOpen, setNavOpen] = useState(false)
+  // Which group's explanation is open, if any.
+  const [helpFor, setHelpFor] = useState<string | null>(null)
+  useEffect(() => {
+    if (!navOpen) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setNavOpen(false)
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [navOpen])
 
   // Any in-flight mutation pauses polling so it cannot clobber optimistic state.
   // That stops new polls only; refreshSequence drops a response once a newer
@@ -476,37 +552,82 @@ export default function App() {
   return (
     <AuthContext.Provider value={authInfo}>
     <div className="app">
-      <header className="topbar">
+      <aside className={`sidebar${navOpen ? ' sidebar-open' : ''}`} aria-label="Main menu">
         <div className="brand">
           <img src="/lemon.svg" alt="" />
           <span>lemondx</span>
         </div>
+        <nav className="sidebar-nav" aria-label="Views">
+          <button className="sidebar-item"
+            aria-current={view === 'home' ? 'page' : undefined}
+            onClick={() => {
+              setView('home')
+              setNavOpen(false)
+            }}>
+            <HomeIcon size={16} /><span>Home</span>
+          </button>
+          {NAV.map((group) => (
+            <div key={group.label} className="sidebar-group">
+              <div className="sidebar-label">
+                {group.label}
+                <button type="button" className="sidebar-help-toggle"
+                  aria-haspopup="dialog"
+                  aria-label={`How ${group.label.toLowerCase()} fit together`}
+                  title={`How ${group.label.toLowerCase()} fit together`}
+                  onClick={() => setHelpFor(group.label)}>
+                  <HelpIcon />
+                </button>
+              </div>
+              {group.items.map((item) => (
+                <button
+                  key={item.id}
+                  className="sidebar-item"
+                  aria-current={view === item.id ? 'page' : undefined}
+                  onClick={() => {
+                    setView(item.id)
+                    setNavOpen(false)
+                  }}
+                >
+                  {item.icon}
+                  <span>{item.label}</span>
+                  {item.id === 'containers' && containers && containers.length > 0 && (
+                    <span className="sidebar-count"
+                      title={`${running} of ${containers.length} running`}>
+                      {running}/{containers.length}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          ))}
+        </nav>
         {status && (
-          <div className="topbar-meta">
+          <div className="sidebar-foot">
             <span>{status.product} {status.server_version}</span>
-            <span className="faint">·</span>
-            <span>{containers?.length ?? 0} container{containers?.length === 1 ? '' : 's'}</span>
-            {running > 0 && (
-              <>
-                <span className="faint">·</span>
-                <span style={{ color: 'var(--ok)' }}>{running} running</span>
-              </>
-            )}
+            {localNode && <span className="faint">on {localNode}</span>}
           </div>
         )}
-        <nav className="topbar-nav" aria-label="Views">
-          {VIEWS
-            .map((id) => (
-              <button
-                key={id}
-                className="topbar-nav-item"
-                aria-current={view === id}
-                onClick={() => setView(id)}
-              >
-                {id[0].toUpperCase() + id.slice(1)}
-              </button>
+      </aside>
+      {navOpen && <div className="sidebar-scrim" onClick={() => setNavOpen(false)} />}
+
+      <div className="app-body">
+      <header className="topbar">
+        <button className="btn btn-ghost btn-icon topbar-menu" onClick={() => setNavOpen(true)}
+          aria-label="Open the menu" aria-expanded={navOpen}>
+          <MenuIcon />
+        </button>
+        <div className="topbar-title">
+          {view === 'home' && <strong>Home</strong>}
+          {NAV.flatMap((g) => g.items.map((item) => ({ ...item, group: g.label })))
+            .filter((item) => item.id === view)
+            .map((item) => (
+              <span key={item.id}>
+                <span className="faint">{item.group}</span>
+                <span className="faint"> / </span>
+                <strong>{item.label}</strong>
+              </span>
             ))}
-        </nav>
+        </div>
 
         <div className="topbar-spacer" />
         <div className="topbar-actions">
@@ -522,7 +643,11 @@ export default function App() {
           {principal && (
             <span className="topbar-user" title={`Signed in via ${principal.via}`}>
               <span>{principal.name}</span>
-              {principal.role !== 'admin' && <span className="badge badge-dim">read-only</span>}
+              {principal.role !== 'admin' && (
+                <span className="badge badge-dim">
+                  {principal.role === 'operator' ? 'operator' : 'read-only'}
+                </span>
+              )}
               {/* Proxy identity is not ours to end; the proxy owns that session. */}
               {principal.via !== 'proxy' && (
                 <button className="btn btn-ghost btn-sm" onClick={logout}>Log out</button>
@@ -531,7 +656,8 @@ export default function App() {
           )}
           {view === 'containers' && (
             <button className="btn btn-primary" onClick={() => setShowCreate(true)}
-              disabled={!ready || !canWrite}>
+              disabled={!ready || !canWrite || !!localMaintenance}
+              title={localMaintenance ? 'This node is in maintenance' : undefined}>
               <PlusIcon /> New
             </button>
           )}
@@ -550,13 +676,38 @@ export default function App() {
           </div>
         )}
 
+        {localMaintenance && (
+          <div className="banner banner-warn">
+            <div className="banner-body">
+              <h3>{localNode || 'This node'} is in maintenance</h3>
+              <p style={{ margin: 0 }}>
+                No new instances or fabric changes here until it ends
+                {localMaintenance.reason ? ` — ${localMaintenance.reason}` : ''}. Running
+                instances can still be started, stopped and destroyed. End it on the Nodes tab.
+              </p>
+            </div>
+          </div>
+        )}
+
         {principal && !canWrite && (
           <div className="banner">
             <div className="banner-body">
-              <h3>Read-only access</h3>
-              <p style={{ margin: 0 }}>
-                You can look around, but {principal.name} cannot make changes here.
-              </p>
+              {principal.role === 'operator' ? (
+                <>
+                  <h3>Operator access</h3>
+                  <p style={{ margin: 0 }}>
+                    {principal.name} can start, stop, destroy and launch instances, templates
+                    and stacks and run commands in them, but cannot change any settings.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <h3>Read-only access</h3>
+                  <p style={{ margin: 0 }}>
+                    You can look around, but {principal.name} cannot make changes here.
+                  </p>
+                </>
+              )}
             </div>
           </div>
         )}
@@ -613,15 +764,15 @@ export default function App() {
             </div>
             <StorageView onNotify={notify} />
           </>
-        ) : view === 'resources' ? (
+        ) : view === 'home' ? (
           <>
             <div className="section-head">
-              <h2>Resources</h2>
+              <h2>Home</h2>
               <span className="faint" style={{ fontSize: 12.5 }}>
-                what instances have claimed against what this host has
+                what the cluster is running, and how this node is doing
               </span>
             </div>
-            <ResourcesView />
+            <HomeView templateRuns={templateRuns} stackRuns={stackRuns} onNavigate={setView} />
           </>
         ) : view === 'network' ? (
           <>
@@ -693,6 +844,7 @@ export default function App() {
         </>
         )}
       </main>
+      </div>
 
       {selected && (
         <ContainerDrawer
@@ -748,6 +900,30 @@ export default function App() {
           onCancel={() => setPendingDelete(null)}
         />
       )}
+
+      {NAV.filter((group) => group.label === helpFor).map((group) => (
+        <Modal key={group.label} title={`How ${group.label.toLowerCase()} fit together`}
+          subtitle={group.help.intro} onClose={() => setHelpFor(null)}
+          footer={<button className="btn btn-primary" onClick={() => setHelpFor(null)}>Got it</button>}>
+          <ol className={`nav-help${group.help.chain ? ' nav-help-chain' : ''}`}>
+            {group.help.order.map((id) => group.items.find((item) => item.id === id)!)
+              .map((item) => (
+                <li key={item.id}>
+                  <span className="nav-help-icon">{item.icon}</span>
+                  <div>
+                    {/* Opens the view it describes, which is usually the next question. */}
+                    <button type="button" className="nav-help-name" onClick={() => {
+                      setView(item.id)
+                      setHelpFor(null)
+                      setNavOpen(false)
+                    }}>{item.label}</button>
+                    <p>{item.about}</p>
+                  </div>
+                </li>
+              ))}
+          </ol>
+        </Modal>
+      ))}
 
       <Toasts toasts={toasts} onDismiss={dismiss} />
     </div>

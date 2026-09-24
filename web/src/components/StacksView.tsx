@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useCanWrite } from '../hooks/useAuth'
-import { api } from '../lib/api'
+import { useCanOperate, useCanWrite } from '../hooks/useAuth'
+import { api, calls } from '../lib/api'
 import { syncDetail, syncKind } from '../lib/sync'
 import type {
   BootstrapModule, ClusterNode, InstanceTemplate, NodeGroup, Stack, StackInstance,
@@ -14,6 +14,7 @@ import {
 import { Modal } from './Modal'
 import { StackEditor } from './StackEditor'
 import { StatusBadge } from './StatusBadge'
+import { StaleBadge } from './StaleBadge'
 
 interface Props {
   localNode: string
@@ -125,6 +126,7 @@ function remaining(until: number | null) {
 export function StacksView({ localNode, ready, runs: runList, onRunStarted, onNotify, onOpen,
                              onChanged }: Props) {
   const canWrite = useCanWrite()
+  const canOperate = useCanOperate()
   const [stacks, setStacks] = useState<Stack[] | null>(null)
   const [templates, setTemplates] = useState<InstanceTemplate[]>([])
   const [modules, setModules] = useState<BootstrapModule[]>([])
@@ -134,7 +136,8 @@ export function StacksView({ localNode, ready, runs: runList, onRunStarted, onNo
   const [editing, setEditing] = useState<Stack | 'new' | null>(null)
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   const [deleteEverywhere, setDeleteEverywhere] = useState(true)
-  const [asking, setAsking] = useState<{ stack: Stack; relaunch: boolean } | null>(null)
+  // `stale`: a relaunch asked for to replace stale instances, which says why.
+  const [asking, setAsking] = useState<{ stack: Stack; relaunch: boolean; stale?: boolean } | null>(null)
   const [destroying, setDestroying] = useState<Stack | null>(null)
   const [instances, setInstances] = useState<StackInstances | null>(null)
   const [acting, setActing] = useState<Record<string, string>>({})
@@ -215,10 +218,10 @@ export function StacksView({ localNode, ready, runs: runList, onRunStarted, onNo
     }
   }
 
-  function requestLaunch(stack: Stack, relaunch = false) {
+  function requestLaunch(stack: Stack, relaunch = false, stale = false) {
     // A relaunch always asks: it destroys what is there, which is worth a look.
     if (relaunch || stackAsks(stack, templates, modules).length > 0) {
-      setAsking({ stack, relaunch })
+      setAsking({ stack, relaunch, stale })
     } else {
       launch(stack, {})
     }
@@ -343,6 +346,7 @@ export function StacksView({ localNode, ready, runs: runList, onRunStarted, onNo
             const busy = running || !!starting[stack.name] || !!acting[stack.name]
             const members = membersOf(stack)
             const up = members.filter((m) => m.status === 'Running').length
+            const staleCount = members.filter((m) => m.stale?.length).length
             const spread = new Set(members.map((m) => m.node)).size > 1
               || members.some((m) => m.node !== localNode)
             const missing = launches(stack).filter((s) => s.type === 'launch'
@@ -380,6 +384,9 @@ export function StacksView({ localNode, ready, runs: runList, onRunStarted, onNo
                     <div className="stack-members">
                       <span className="faint">
                         {members.length} instance{members.length === 1 ? '' : 's'} · {up} running
+                        {staleCount > 0 && (
+                          <span className="stale-hint"> · {staleCount} stale — relaunch to update</span>
+                        )}
                       </span>
                       <span className="template-members">
                         {members.map((m) => (
@@ -389,6 +396,8 @@ export function StacksView({ localNode, ready, runs: runList, onRunStarted, onNo
                             onClick={() => onOpen(m.name, m.node)}>
                             <span className={`dot${m.status === 'Running' ? ' dot-ok' : ''}`} />
                             {m.name}
+                            <StaleBadge stale={m.stale ?? []} template={m.template}
+                              stack={stack.name} />
                             {m.ipv4[0] && <span className="faint">{m.ipv4[0]}</span>}
                             {spread && <span className="badge badge-dim">{m.node}</span>}
                           </button>
@@ -406,14 +415,14 @@ export function StacksView({ localNode, ready, runs: runList, onRunStarted, onNo
 
                   <div className="stack-card-actions">
                     {running ? (
-                      <button className="btn btn-danger btn-sm" disabled={!canWrite || run.cancelling}
+                      <button className="btn btn-danger btn-sm" disabled={!canOperate || run.cancelling}
                         onClick={() => cancel(stack.name)}
                         title="Start nothing new; launches under way finish">
                         <StopIcon size={13} /> {run.cancelling ? 'Cancelling…' : 'Cancel'}
                       </button>
                     ) : members.length === 0 ? (
                       <button className="btn btn-primary"
-                        disabled={!ready || !canWrite || busy || missing.length > 0}
+                        disabled={!ready || !canOperate || busy || missing.length > 0}
                         onClick={() => requestLaunch(stack)}>
                         {starting[stack.name] ? <span className="spinner" /> : <PlayIcon size={13} />}
                         Launch stack
@@ -422,26 +431,34 @@ export function StacksView({ localNode, ready, runs: runList, onRunStarted, onNo
                       <>
                         <button className="btn btn-primary"
                           title="Destroy every instance of this stack and launch it again"
-                          disabled={!ready || !canWrite || busy || missing.length > 0}
+                          disabled={!ready || !canOperate || busy || missing.length > 0}
                           onClick={() => requestLaunch(stack, true)}>
                           {starting[stack.name] ? <span className="spinner" /> : <RestartIcon size={13} />}
                           Relaunch
                         </button>
+                        {staleCount > 0 && (
+                          <button className="btn btn-sm btn-warn"
+                            title="Some instances were made from an older version of this stack or its templates"
+                            disabled={!ready || !canOperate || busy || missing.length > 0}
+                            onClick={() => requestLaunch(stack, true, true)}>
+                            <RestartIcon size={13} /> Replace {staleCount} stale
+                          </button>
+                        )}
                         {up > 0 ? (
-                          <button className="btn btn-sm" disabled={!canWrite || busy}
+                          <button className="btn btn-sm" disabled={!canOperate || busy}
                             onClick={() => setState(stack, 'stop')}>
                             {acting[stack.name] === 'stop' ? <span className="spinner" /> : <StopIcon size={13} />}
                             Stop all
                           </button>
                         ) : null}
                         {up < members.length ? (
-                          <button className="btn btn-sm" disabled={!canWrite || busy}
+                          <button className="btn btn-sm" disabled={!canOperate || busy}
                             onClick={() => setState(stack, 'start')}>
                             {acting[stack.name] === 'start' ? <span className="spinner" /> : <PlayIcon size={13} />}
                             Start all
                           </button>
                         ) : null}
-                        <button className="btn btn-sm btn-danger" disabled={!canWrite || busy}
+                        <button className="btn btn-sm btn-danger" disabled={!canOperate || busy}
                           onClick={() => setDestroying(stack)}>
                           <TrashIcon size={13} /> Destroy
                         </button>
@@ -496,6 +513,7 @@ export function StacksView({ localNode, ready, runs: runList, onRunStarted, onNo
         <LaunchDialog stack={asking.stack} asks={stackAsks(asking.stack, templates, modules)}
           // Live, so what the dialog lists is what gets destroyed.
           replace={asking.relaunch ? membersOf(asking.stack) : null}
+          stale={asking.stale ? membersOf(asking.stack).filter((m) => m.stale?.length).length : 0}
           localNode={localNode}
           onCancel={() => setAsking(null)}
           onConfirm={(values, replace) => {
@@ -679,10 +697,12 @@ function MemberList({ members, localNode }: { members: StackInstance[]; localNod
  * inputs, which go to this run and nowhere else -- and, for a relaunch, lists
  * exactly which instances are destroyed first.
  */
-function LaunchDialog({ stack, asks, replace, localNode, onCancel, onConfirm }: {
+function LaunchDialog({ stack, asks, replace, stale = 0, localNode, onCancel, onConfirm }: {
   stack: Stack
   asks: Ask[]
   replace: StackInstance[] | null
+  /** How many are stale, when the relaunch was asked for to replace them. */
+  stale?: number
   localNode: string
   onCancel: () => void
   onConfirm: (values: Record<string, string>, replace: StackInstance[] | null) => void
@@ -692,11 +712,18 @@ function LaunchDialog({ stack, asks, replace, localNode, onCancel, onConfirm }: 
   const relaunch = replace !== null
   return (
     <Modal
-      title={relaunch ? `Relaunch “${stack.name}”?` : `Launch “${stack.name}”`}
-      subtitle={relaunch
-        ? 'These are stopped and deleted first, with everything inside them, then the stack runs again from the start.'
-        : 'Secrets are never saved, so they are entered for each launch. Every step that needs one gets the same value.'}
+      title={stale ? `Replace stale instances of “${stack.name}”?`
+        : relaunch ? `Relaunch “${stack.name}”?` : `Launch “${stack.name}”`}
+      subtitle={stale && relaunch
+        ? `${stale} of ${replace.length} are stale. A stack is replaced as a whole, because its steps hand addresses and values to each other — so all ${replace.length} are stopped and deleted, with everything inside them, and the stack runs again from the start.`
+        : relaunch
+          ? 'These are stopped and deleted first, with everything inside them, then the stack runs again from the start.'
+          : 'Secrets are never saved, so they are entered for each launch. Every step that needs one gets the same value.'}
       onClose={onCancel}
+      api={{
+        ...calls.launchStack(stack.name, values, replace?.map(refOf)),
+        secrets: asks.filter((p) => p.secret).map((p) => `params.${p.name}`),
+      }}
       footer={
         <>
           <button type="button" className="btn" onClick={onCancel}>Cancel</button>

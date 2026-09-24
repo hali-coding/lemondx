@@ -108,6 +108,34 @@ destroying an instance someone launched after you looked, the request carries
 the list of instances you confirmed; if the template's instances no longer
 match it, nothing happens and the request fails with `409`.
 
+## Stale instances
+
+Each instance records which version of its template it was made from. Edit
+the template afterwards and every instance made before the edit is marked
+**stale**: a badge on its row in the Containers tab and on the template's
+card, a note in its drawer, a count on Home, and `stale: template` in
+`lemondx list`. **Replace N stale** on the card (or `lemondx template-recreate
+--stale`) recreates just those, leaving current instances alone; **Recreate
+all** does every one. Either uses the template as it is now.
+
+Replace stale leaves out instances a stack launched: they carry values the
+stack rendered for them (another step's address, say), which a recreate from
+the template would drop. The stack's own **Replace stale** is the way to
+refresh those. The server checks the set it is given against the stale set,
+as it checks a full recreate against every instance, and refuses (409) if
+anything changed since you looked.
+
+Only what shapes the instance counts -- image, type, size, storage, network,
+fabric, profiles, boot options and the bootstrap selection. Changing the
+description, the instance-name prefix or the app check does not make anything
+stale: none of those is baked into an instance.
+
+Each node judges its own instances against its own copy of the template,
+which sync keeps level with everyone's. Instances made before lemondx kept
+revisions carry none and are never marked, since there is nothing to compare;
+recreating them starts tracking. The API reports it as `stale` (a list of
+`template` and/or `stack`) and `revisions` on every container.
+
 ## App health checks
 
 The built-in [health check](web-ui.md#health-checks) judges an instance as a

@@ -446,6 +446,12 @@ class AppChecker:
 
     TICK_SECONDS = 1.0
     WORKERS = 4
+    # Rounds an instance may be missing from before its check is dropped. One
+    # round not listing it as running is not proof it stopped: a daemon that
+    # cannot read an instance's state for a moment (a slow network device is
+    # enough) reports it as something else, and dropping it then made the
+    # check "not running" for a whole interval. Kept, it is not run meanwhile.
+    GRACE_ROUNDS = 1
 
     def __init__(self, run, on_result=None):
         self._run = run
@@ -454,6 +460,7 @@ class AppChecker:
         self._targets = {}      # name -> app_check
         self._results = {}      # name -> latest result, with checked_at and streak
         self._due = {}          # name -> when to run next
+        self._missed = {}       # name -> rounds in a row it was not in
         self._running = set()
 
     def set_targets(self, targets):
@@ -461,19 +468,34 @@ class AppChecker:
 
         A new instance, or one whose template changed its check, is due at
         once, so the round that introduced it is followed by a result rather
-        than a full interval of nothing.
+        than a full interval of nothing. One missing from this round is kept,
+        unscheduled, for ``GRACE_ROUNDS`` -- see there.
         """
         with self._lock:
+            kept = {}
+            for name, app_check in self._targets.items():
+                if name in targets:
+                    continue
+                missed = self._missed.get(name, 0) + 1
+                if missed <= self.GRACE_ROUNDS:
+                    self._missed[name] = missed
+                    kept[name] = app_check
+            self._missed = {n: m for n, m in self._missed.items() if n in kept}
             for name in list(self._results):
-                if name not in targets:
+                if name not in targets and name not in kept:
                     del self._results[name]
             for name in list(self._due):
                 if name not in targets or targets[name] != self._targets.get(name):
                     del self._due[name]
-            self._targets = dict(targets)
+            self._targets = dict(kept, **targets)
             now = time.time()
             for name in targets:
                 self._due.setdefault(name, now)
+
+    def missed(self, name):
+        """Rounds in a row that did not see ``name`` running; 0 if the last one did."""
+        with self._lock:
+            return self._missed.get(name, 0)
 
     def update_template(self, template, app_check):
         """A template's check was saved or deleted: apply it now, not next round.

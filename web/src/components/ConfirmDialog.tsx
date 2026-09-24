@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from 'react'
+import type { ApiCall } from '../lib/api'
 import { Modal } from './Modal'
 
 interface Props {
@@ -18,10 +19,12 @@ interface Props {
   confirmText?: string
   /** An extra choice the confirmation itself offers, under the message. */
   children?: ReactNode
+  /** The request confirming makes, for the API explorer. */
+  api?: ApiCall
 }
 
 export function ConfirmDialog({
-  title, message, confirmLabel, danger, busy, onConfirm, onCancel, confirmText, children,
+  title, message, confirmLabel, danger, busy, onConfirm, onCancel, confirmText, children, api,
 }: Props) {
   const [typed, setTyped] = useState('')
   const blocked = confirmText !== undefined && typed.trim() !== confirmText
@@ -30,6 +33,7 @@ export function ConfirmDialog({
     <Modal
       title={title}
       onClose={busy ? () => {} : onCancel}
+      api={api}
       footer={
         <>
           <button className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
