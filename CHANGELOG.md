@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.0](https://github.com/hali-coding/lemondx/compare/v0.7.0...v0.8.0) (2026-09-24)
+
+
+### Features
+
+* adds initial API explorer feature ([6fe047e](https://github.com/hali-coding/lemondx/commit/6fe047e7177a4e7b88331ba07d7b4778c8c33623))
+* adds initial API explorer feature ([10c3992](https://github.com/hali-coding/lemondx/commit/10c39922977e5d594eb518d38ef299766d434748))
+
 ## [0.7.0](https://github.com/hali-coding/lemondx/compare/v0.6.0...v0.7.0) (2026-09-23)
 
 
