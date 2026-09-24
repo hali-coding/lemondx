@@ -1002,26 +1002,34 @@ def render_template_run(result):
     return "\n".join(lines)
 
 
-def confirm_template_instances(args, service, verb, stale=False):
-    """The instances to act on, after the user has seen and accepted them."""
-    names = service.template_instances(args.template, stale=stale)
+def confirm_template_instances(args, service, verb, stale=False, members=None):
+    """The instances to act on, after the user has seen and accepted them.
+
+    ``[{node, name, status}]`` from every member: the UI acts on a template's
+    instances wherever they are, and a command that quietly covered only this
+    node would report nothing to destroy while the template's instances ran
+    elsewhere.
+    """
+    if members is None:
+        members = cluster_service(service).template_instances(args.template, stale=stale)
     what = "stale instances" if stale else "instances"
-    if not names:
+    if not members:
         raise ServiceError("No %s from template '%s'." % (what, args.template))
     if not args.json:
-        print("%s from %s: %s" % (what.capitalize(), BOLD(args.template), ", ".join(names)))
+        print("%s from %s: %s" % (what.capitalize(), BOLD(args.template),
+                                  describe_members(members)))
     if not confirm("%s %s %d? Their filesystems and snapshots are deleted."
-                   % (verb, "these" if stale else "all", len(names)), args.yes):
+                   % (verb, "these" if stale else "all", len(members)), args.yes):
         return None
-    return names
+    return members
 
 
 def cmd_template_destroy(args, service):
-    names = confirm_template_instances(args, service, "Destroy")
-    if names is None:
+    members = confirm_template_instances(args, service, "Destroy")
+    if members is None:
         print(DIM("nothing destroyed"))
         return 1
-    result = service.destroy_template_instances(args.template, names)
+    result = cluster_service(service).template_action(args.template, "destroy", members)
     emit(args, result, render_template_run)
     return 0 if result["ok"] else 1
 
@@ -1029,21 +1037,25 @@ def cmd_template_destroy(args, service):
 def cmd_template_recreate(args, service):
     template = find_template(service, args.template)
     args.template = template["name"]
-    # A recreate is a delete and a fresh create: refuse before anything is
-    # deleted, as cluster.template_action() does for the API.
+    # A recreate is a delete and a fresh create: template_action() refuses a
+    # node in maintenance before deleting anything, but asking first would
+    # have the user confirm a run that is then refused.
     cluster = cluster_service(service)
-    cluster.refuse_maintenance([cluster.local_name()], "recreate instances here")
+    members = cluster.template_instances(template["name"], stale=args.stale)
+    cluster.refuse_maintenance(sorted({m["node"] for m in members}),
+                               "recreate instances there")
     params = parse_params(args.param)
-    names = confirm_template_instances(args, service, "Recreate", stale=args.stale)
-    if names is None:
+    members = confirm_template_instances(args, service, "Recreate", stale=args.stale,
+                                         members=members)
+    if members is None:
         print(DIM("nothing recreated"))
         return 1
     fill_secrets(template["bootstrap"]["modules"], params, service)
     if not args.json:
-        print(DIM("Recreating %d instance(s) from %s..." % (len(names), template["name"])),
+        print(DIM("Recreating %d instance(s) from %s..." % (len(members), template["name"])),
               flush=True)
-    result = service.recreate_template_instances(template["name"], names, params=params,
-                                                 stale=args.stale)
+    result = cluster.template_action(template["name"], "recreate", members, params=params,
+                                     stale=args.stale)
     emit(args, result, render_template_run)
     return 0 if result["ok"] else 1
 
@@ -1052,33 +1064,38 @@ def cmd_template_exec(args, service):
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         raise ServiceError("Give a command to run, e.g. `lemondx template-exec web -- uptime`.")
-    members = [c for c in service.list_containers() if c["template"] == args.template]
+    cluster = cluster_service(service)
+    members = cluster.template_instances(args.template)
     if not members:
         raise ServiceError("No instances were launched from template '%s'." % args.template)
-    names = [c["name"] for c in members if c["status"] == "Running"]
-    skipped = [c["name"] for c in members if c["status"] != "Running"]
-    if not names:
+    running = [m for m in members if m["status"] == "Running"]
+    skipped = [m for m in members if m["status"] != "Running"]
+    if not running:
         raise ServiceError("None of the instances from '%s' are running." % args.template)
     if skipped and not args.json:
-        print(DIM("skipping %s (not running)" % ", ".join(skipped)), file=sys.stderr)
+        print(DIM("skipping %s (not running)" % describe_members(skipped)), file=sys.stderr)
 
     # One string, run by sh -c on each: quoting keeps the words as they were
     # typed, so `-- echo "a b"` means the same here as in a local shell.
-    result = service.exec_template_instances(
-        args.template, command[0] if len(command) == 1 else shlex.join(command),
-        names, timeout=args.timeout)
+    result = cluster.template_action(
+        args.template, "exec", running,
+        command=command[0] if len(command) == 1 else shlex.join(command),
+        timeout=args.timeout)
 
     def render(r):
         lines = []
         for instance in r["instances"]:
-            outcome = instance["exec"]
+            # A node that failed its whole share reports no exec at all.
+            outcome = instance.get("exec")
+            where = CYAN(" on %s" % instance["node"]) if instance.get("node") else ""
             if instance["error"]:
-                lines.append("%s %s: %s" % (RED("!"), BOLD(instance["name"]), instance["error"]))
+                lines.append("%s %s%s: %s" % (RED("!"), BOLD(instance["name"]), where,
+                                              instance["error"]))
                 continue
             code = outcome["exit_code"]
-            lines.append("%s %s %s" % (GREEN("+") if code == 0 else RED("!"),
-                                       BOLD(instance["name"]),
-                                       DIM("exit %d" % code)))
+            lines.append("%s %s%s %s" % (GREEN("+") if code == 0 else RED("!"),
+                                         BOLD(instance["name"]), where,
+                                         DIM("exit %d" % code)))
             for stream, colour in (("stdout", str), ("stderr", RED)):
                 for line in (outcome[stream] or "").splitlines():
                     lines.append("    " + colour(line))

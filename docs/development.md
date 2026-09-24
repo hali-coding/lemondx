@@ -57,7 +57,7 @@ The flow, all in `.github/workflows/release.yml`:
    `lemondx-<version>.tar.gz`, `.zip` and `SHA256SUMS`.
 
 The archive is the runnable tree — launcher, `src/`, the built `web/dist`,
-`modules/`, `systemd/` and the docs — so a user needs only Python 3.9+. Build
+`modules/`, `systemd/` and the docs — so a user needs only Python 3.10+. Build
 the same thing locally to see what a release will contain:
 
 ```bash

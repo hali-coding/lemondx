@@ -108,6 +108,17 @@ destroying an instance someone launched after you looked, the request carries
 the list of instances you confirmed; if the template's instances no longer
 match it, nothing happens and the request fails with `409`.
 
+In a [cluster](cluster.md), `template-exec`, `template-recreate` and
+`template-destroy` cover the template's instances on every member, as the UI
+does when the Containers tab is widened, and name the node beside each one.
+If a member cannot be listed the command refuses rather than acting on the
+ones it could see. Before a destroy or recreate deletes anything, every node's
+instances are listed again and compared with what you confirmed; a difference
+on any of them refuses the whole run (`409`), so one node changing cannot
+leave the others half done. There is no lock across nodes, so this narrows
+the window to one listing rather than closing it — each node still checks its
+own share as it starts.
+
 ## Stale instances
 
 Each instance records which version of its template it was made from. Edit

@@ -115,7 +115,7 @@ jobs:
           ./lemondx serve --open
           \`\`\`
 
-          Python 3.9+ and a running LXD or Incus daemon are the only
+          Python 3.10+ and a running LXD or Incus daemon are the only
           requirements -- the archive already contains the built web UI, so
           no Node toolchain is needed. Checksums: \`SHA256SUMS\`.
           NOTE

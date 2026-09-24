@@ -1982,8 +1982,19 @@ class ContainerService:
         stack rendered for them, which recreating from the template would drop,
         so the stack is what replaces those.
         """
-        return sorted(c["name"] for c in self.list_containers() if c["template"] == name
-                      and (not stale or ("template" in c["stale"] and not c["stack"])))
+        return sorted(c["name"] for c in self.list_containers()
+                      if self.of_template(c, name, stale))
+
+    @staticmethod
+    def of_template(container, name, stale=False):
+        """Whether a listed instance counts as one of template ``name``'s.
+
+        Shared with ``ClusterService.template_instances()``, which applies it
+        to every node's listing: each node then checks its share against its
+        own tagged set, so the two must agree on what that set is.
+        """
+        return container["template"] == name and (
+            not stale or ("template" in container["stale"] and not container["stack"]))
 
     def _confirmed_instances(self, name, confirmed, stale=False):
         """The template's instances, provided they are exactly what was confirmed.

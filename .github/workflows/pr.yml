@@ -24,10 +24,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The floor from pyproject.toml's requires-python, and a recent one --
+        # The floor from pyproject.toml's requires-python and the two newest --
         # `from __future__ import annotations` is what keeps every module
-        # syntax-valid on 3.9, and compileall below is what actually checks it.
-        python-version: ["3.9", "3.13"]
+        # syntax-valid on 3.10, and compileall below is what actually checks it.
+        python-version: ["3.10", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
 
@@ -35,7 +35,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Syntax check (no post-3.9 syntax; see CLAUDE.md "Hard constraints")
+      - name: Syntax check (no post-3.10 syntax; see CLAUDE.md "Hard constraints")
         run: python3 -m compileall -q src/lemondx
 
       - name: Import every module
