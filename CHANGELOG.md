@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.1](https://github.com/hali-coding/lemondx/compare/v0.8.0...v0.8.1) (2026-09-24)
+
+
+### Bug fixes
+
+* fixes after cluster firedrill ([6fa46d1](https://github.com/hali-coding/lemondx/commit/6fa46d1819a47ef2abd822ac8ba5b6a09355680f))
+* fixes after cluster firedrill ([9dac337](https://github.com/hali-coding/lemondx/commit/9dac337e2f789fa6f3ea1699b19e53b5106636ab))
+
 ## [0.8.0](https://github.com/hali-coding/lemondx/compare/v0.7.0...v0.8.0) (2026-09-24)
 
 
