@@ -528,7 +528,31 @@ def _clean_node(stored, name):
         "description": _text(stored.get("description"), 200),
         "added": _epoch(stored.get("added")),
         "fabric": clean_fabric(stored.get("fabric")),
+        "maintenance": clean_maintenance(stored.get("maintenance")),
     }
+
+
+def clean_maintenance(stored):
+    """A node's maintenance mark, or None when it is not in maintenance.
+
+    Rides on the node record like a fabric claim, and for the same reason: it
+    is a fact about one node that only that node can state, so peers learn it
+    from the node's own record rather than from anyone's copy. Anything that
+    does not parse reads as "not in maintenance" -- the mark only ever stops
+    things, so a garbled one failing open costs an operator a refusal they
+    expected, never an action they did not.
+    """
+    if not isinstance(stored, dict):
+        return None
+    # A dict is not enough: `{}` is truthy, and every caller asks "is there a
+    # mark?" by truthiness. set_maintenance() always stamps a start, so one
+    # without is garbled, not a mark.
+    since = _epoch(stored.get("since"))
+    if not since:
+        return None
+    return {"since": since,
+            "reason": _text(stored.get("reason"), 200),
+            "by": _text(stored.get("by"), 64)}
 
 
 # A fabric is named after the bridge it puts on every node, so its name obeys
@@ -895,6 +919,33 @@ def read_runtime():
     except (OSError, ValueError):
         return {}
     return stored if isinstance(stored, dict) else {}
+
+
+def maintenance_path():
+    return os.path.join(data_dir(), "maintenance.json")
+
+
+def load_maintenance():
+    """This node's own maintenance mark, or None. Peers' marks are on their records."""
+    try:
+        with open(maintenance_path(), encoding="utf-8") as handle:
+            return clean_maintenance(json.load(handle))
+    except (OSError, ValueError):
+        return None
+
+
+def save_maintenance(record):
+    """Set this node's mark, or clear it with None (or one that does not clean)."""
+    if record is not None:
+        record = clean_maintenance(record)
+    if record is None:
+        try:
+            os.unlink(maintenance_path())
+        except FileNotFoundError:
+            pass
+        return None
+    _write_json(maintenance_path(), record)
+    return record
 
 
 def clear_runtime():

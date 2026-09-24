@@ -48,7 +48,7 @@ export function ResourcesView() {
   useEffect(() => {
     const controller = new AbortController()
     load(controller.signal)
-    const timer = window.setInterval(() => load(), POLL_INTERVAL)
+    const timer = window.setInterval(() => load(controller.signal), POLL_INTERVAL)
     return () => { controller.abort(); window.clearInterval(timer) }
   }, [load])
 

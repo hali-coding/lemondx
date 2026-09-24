@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useCanWrite } from '../hooks/useAuth'
+import { useCanOperate } from '../hooks/useAuth'
 import { api } from '../lib/api'
 import { missingSecrets } from '../lib/bootstrap'
 import { useBootstrapData } from '../hooks/useBootstrapData'
@@ -18,7 +18,7 @@ interface Props {
 
 /** Run bootstrap modules against a container that already exists. */
 export function BootstrapPanel({ name, node, running, onFinished }: Props) {
-  const canWrite = useCanWrite()
+  const canOperate = useCanOperate()
   const { modules, hostKeys, loading } = useBootstrapData(node)
   const [selection, setSelection] = useState<BootstrapSelection>(
     { modules: [], params: {}, ssh_keys: [] })
@@ -93,7 +93,7 @@ export function BootstrapPanel({ name, node, running, onFinished }: Props) {
         className="btn btn-primary"
         style={{ marginTop: 12 }}
         onClick={run}
-        disabled={busy || !canWrite || selection.modules.length === 0 || keysMissing
+        disabled={busy || !canOperate || selection.modules.length === 0 || keysMissing
           || secretsMissing.length > 0}
       >
         {busy && <span className="spinner" />}

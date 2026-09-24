@@ -3,7 +3,7 @@
 [← back to README](../README.md)
 
 Parts of the web UI that are easy to miss: bulk start and stop, health checks,
-the Resources, Storage, Network and Access views, and the full image browser.
+the Home, Storage, Network and Access views, and the full image browser.
 
 ## Starting and stopping several at once
 
@@ -61,6 +61,23 @@ the systemd unit, or killing the process, abandons it straight away.
 Only the `serve` process's own creates are tracked: one started with
 `lemondx create` in a terminal appears in the list once the daemon has it,
 without a stage.
+
+## API explorer
+
+The web UI does nothing the [REST API](api.md) cannot, and the dialogs that
+create, change or delete something show how. The **API** button at the top
+right of such a dialog (new container, templates, stacks, modules, storage,
+networks, fabrics, users, node groups, invites, sync) opens a panel beside the
+form with the request its main button would send, as curl, JavaScript or
+Python, and it follows the form while you fill it in. It is built from the same
+code that sends the real request, so the two cannot differ.
+
+Secrets typed into the form (bootstrap secrets, passwords, a join code) are
+shown as `<name>` placeholders rather than their values. With authentication
+on, the examples read a token from `LEMONDX_API_TOKEN`; make one on the Access
+tab. Requests the UI sends with `background: true` answer at once with a run
+record; leave it out in a script and the call waits until the work is done.
+Whether the panel is open, and which language, is remembered in the browser.
 
 ## Showing one node or the whole cluster
 
@@ -224,9 +241,21 @@ without running a check:
    "processes": 7, "failures": 0}]}
 ```
 
-## Resources view
+## Home
 
-The **Resources** tab sets what instances have claimed against what the host
+**Home** is the first screen. Across the top, one tile each for nodes
+answering, containers running, instances whose health check says degraded or
+unhealthy, stacks running and templates in use; each opens the view behind it.
+Below them, every saved stack and template with what it is running across the
+whole cluster: how many instances, on which nodes, the least healthy of them,
+and any launch, recreate or destroy under way. In a cluster a node table
+follows, with each member's state, daemon and running instances. Home asks
+every member, so it refreshes every ten seconds rather than every three, and
+a node that does not answer is named rather than silently left out.
+
+### This node
+
+The bottom of **Home** sets what instances have claimed against what this host
 has — CPU threads, memory, and space on each storage pool — with the host's
 processor, thread count and memory above it and a per-instance table below.
 

@@ -33,7 +33,14 @@ export interface Container {
   template: string | null
   /** The stack that launched it, if any; kept on the instance itself. */
   stack: string | null
+  /** Which version of each it was made from; blank when made before this was kept. */
+  revisions: { template: string; stack: string }
+  /** Which of its template and stack have changed since it was made. */
+  stale: StaleKind[]
 }
+
+/** What an instance can be behind: the template it came from, or its stack. */
+export type StaleKind = 'template' | 'stack'
 
 export interface Snapshot {
   name: string
@@ -562,6 +569,7 @@ export interface StackInstance {
   status: string
   template: string | null
   ipv4: string[]
+  stale: StaleKind[]
 }
 
 export interface StackInstances {
@@ -758,7 +766,7 @@ export interface StorageVolumeRequest {
 
 // -- authentication (auth.py) ------------------------------------------------
 
-export type Role = 'read' | 'admin'
+export type Role = 'read' | 'operator' | 'admin'
 
 /** Who a request ran as. `via` is `none` when the server has auth off. */
 export interface Principal {
@@ -845,6 +853,8 @@ export interface AppCheckOutput {
   script: string
   interval_seconds: number
   timeout_seconds: number
+  /** Health rounds in a row that did not see it running; its check is paused meanwhile. */
+  missed_rounds?: number
   /** Null until the first run finishes. */
   result: (Omit<AppCheckResult, 'configured' | 'template'> & {
     stdout: string
@@ -1013,6 +1023,8 @@ export interface FabricCheck {
   conflicts: { node: string; interface: string; subnet: string }[]
   unreachable: { node: string; error: string }[]
   unreachable_error: string
+  /** Set when a member is in maintenance, which stops a fabric being made. */
+  maintenance_error: string
   /** node -> the /24 it would be given. */
   allocation: Record<string, string>
   ok: boolean
@@ -1069,6 +1081,22 @@ export interface ClusterNode {
   groups: string[]
   /** Null when the listing was asked not to contact anyone. */
   state: NodeState | null
+  /** Set while the node takes no new instances and no fabric changes. */
+  maintenance: Maintenance | null
+}
+
+/** A node's maintenance mark: when it began, why, and who set it. */
+export interface Maintenance {
+  since: number
+  reason: string
+  by: string
+}
+
+export interface MaintenanceResult {
+  node: string
+  maintenance: Maintenance | null
+  /** Each member told about it; one that missed it learns at the next sync. */
+  told: { node: string; ok: boolean; error: string | null }[]
 }
 
 export interface ClusterNodeDetail extends ClusterNode {
@@ -1166,6 +1194,8 @@ export interface JoinResult {
   unreachable: string[]
   /** Set when peers would not actually be able to reach this node. */
   warning: string
+  /** The cluster's accounts: taken, or left alone because this node had its own. */
+  users: { adopted: string[]; kept: string[]; failed: string[] }
 }
 
 export interface MemberSync {

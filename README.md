@@ -75,7 +75,7 @@ Want it running all the time? See [Running as a service](docs/service.md).
 ## CLI
 
 ```
-./lemondx status                 # which daemon, version, readiness
+./lemondx status                 # daemon, readiness, cluster membership, instance counts
 ./lemondx init                   # create storage pool + bridge, wire up default profile
 ./lemondx ls                     # list containers
 ./lemondx info NAME              # details, limits, network, snapshots
@@ -143,7 +143,7 @@ pass to `-i`.
 | [Networking between nodes](docs/networking.md) | fabrics: routed networks shared by every node, so containers on different nodes can talk |
 | [REST API](docs/api.md) | every endpoint, request/response shapes, curl examples |
 | [Daemons, images and storage](docs/daemons-and-storage.md) | LXD vs Incus, socket discovery, image remotes, disk quotas, units |
-| [Web UI tour](docs/web-ui.md) | the Resources and Network views, the full image browser |
+| [Web UI tour](docs/web-ui.md) | the Home and Network views, the full image browser |
 | [Running as a service](docs/service.md) | systemd units, user vs system install |
 | [Security](docs/security.md) | logins (local users, PAM, proxy), roles, API tokens, TLS |
 | [Development](docs/development.md) | Vite dev server, building `web/dist`, how releases are cut |

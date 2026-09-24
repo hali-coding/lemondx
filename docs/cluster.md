@@ -80,7 +80,7 @@ This node
   fingerprint     0e:9a:f0:b4:43:6f:b4:ff:…
   cluster         member of 3 node(s)
   new members     accepted
-  authentication  off for this host, API token required from others
+  authentication  off for this host, login or API token required from others
 ```
 
 ### Overriding what it worked out
@@ -125,8 +125,14 @@ What happens:
    not the same as the node you were invited to.
 3. It presents the code along with its own name, address and fingerprint. The
    other node redeems it — constant-time, single use, expiring — and answers with
-   the cluster credential and the full member list.
-4. The joiner announces itself to every member it just learned about.
+   the cluster credential, the full member list and its local accounts.
+4. The joiner takes those accounts, keeping any of the same name it already
+   had. With authentication off it will not let callers from other hosts in
+   without a credential once it is a member (loopback is exempt), and the
+   accounts are how you log in to it from your own machine without first
+   running `lemondx token-create` there. An account added later reaches it
+   with `lemondx cluster sync --kind users`.
+5. The joiner announces itself to every member it just learned about.
 
 So joining *any* member joins the cluster. A member that was down when you
 joined finds out later, from `lemondx cluster refresh` on either side.
@@ -276,6 +282,39 @@ be run on its own afterwards.
 
 Under the UI's **Evict** and **Leave cluster** buttons is exactly this, and both
 ask you to type the node's name first.
+
+## Maintenance
+
+A node can be put into maintenance before you work on the host:
+
+```bash
+lemondx cluster maintenance on --reason "kernel upgrade"        # this node
+lemondx cluster maintenance on --node prdev2 --reason "disk swap"
+lemondx cluster maintenance off --node prdev2
+```
+
+or with **Maintenance** / **End maintenance** on its card in the Nodes tab.
+While it lasts:
+
+- **No new instances there.** Creating a container, launching a template or a
+  stack, and recreating a template's instances are refused (`409`, with the
+  reason). A launch that names the node is refused; a launch to a *group* skips
+  it and says so in the run's notes, and is refused only if nothing in the
+  group is left. A stack checks this before its first stage, so a relaunch is
+  refused before anything is torn down.
+- **No fabric changes.** Creating, extending or deleting a fabric that would
+  touch it waits until it is back, and on the node itself fabric claims,
+  `fabric apply`, attaching and detaching are refused. Its own routes are left
+  exactly as they were, and brought up to date when maintenance ends.
+- **Definitions still sync.** Templates, stacks, modules, profiles and groups
+  are pushed to it as usual, so it comes back level with everyone.
+- Its running instances can still be started, stopped and destroyed.
+
+The mark belongs to the node, like its fabric claims: it is kept in the node's
+own data directory and reaches the others on its member record, so marking
+another node means asking that node, and it has to be reachable. Every member
+checks its own copy before sending work, and the node refuses as well, so one
+whose copy is out of date is still stopped at the node.
 
 ## Seeing the cluster in the Containers tab
 

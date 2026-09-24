@@ -8,8 +8,12 @@ with a matching HTTP status.
 When the server runs with `--auth` (see [Security](security.md)), requests need
 a session cookie from `/api/auth/login` or `Authorization: Bearer <token>`.
 Every `GET` needs `read` access and everything else `admin`, except where the
-auth table below says otherwise. Missing or bad credentials get `401`, too
-little access `403`, too many failed logins `429`.
+auth table below says otherwise and these, which need `operator`: container
+`state` (single and bulk, and `/api/cluster/containers/state` and `/delete`),
+`DELETE /api/containers/{name}`, container `exec` and `bootstrap`, template
+`launch`, `exec`, `recreate` and `destroy`, stack `launch`, `state` and
+`destroy`, and cancelling or dismissing a template or stack run. Missing or bad
+credentials get `401`, too little access `403`, too many failed logins `429`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -53,6 +57,7 @@ little access `403`, too many failed logins `429`.
 | `DELETE` | `/api/cluster/members/{name}` | a peer saying a node has left — cluster members only |
 | `POST` | `/api/cluster/evicted` | a peer saying this node was evicted, so it stands down — cluster members only |
 | `POST` | `/api/cluster/refresh` | pull every peer's member list and push ours |
+| `PUT` | `/api/cluster/maintenance` | `{"enabled":true,"reason":"..."}` → put this node into maintenance, or take it out; another node's through `/api/nodes/{node}/cluster/maintenance` |
 | `POST` | `/api/cluster/reconcile` | settle this node's shared definitions against every member's (`{"apply": false}` reports without changing) |
 | `GET` | `/api/cluster/drift` | what the last reconciliation found; `null` until one has run in this `serve` |
 | `GET` | `/api/cluster/manifest` | a digest per shared artifact, with this node's change ledger — cluster members only |
@@ -88,7 +93,7 @@ little access `403`, too many failed logins `429`.
 | `GET` | `/api/templates/{name}/instances` | names of the instances launched from it |
 | `POST` | `/api/templates/{name}/exec` | `{"command":"uptime","instances":[...]}` → run on each, with output |
 | | | `instances` entries may be `{"node","name"}`, spreading destroy/recreate/exec over a cluster |
-| `POST` | `/api/templates/{name}/recreate` | `{"instances":[...]}` → delete and recreate each, same names |
+| `POST` | `/api/templates/{name}/recreate` | `{"instances":[...]}` → delete and recreate each, same names; with `"stale":true`, `instances` must be exactly the stale ones no stack launched |
 | `POST` | `/api/templates/{name}/destroy` | `{"instances":[...]}` → stop and delete each |
 | `GET` | `/api/template-runs` | launches/recreates/destroys in progress, or last finished, per template |
 | `DELETE` | `/api/template-runs/{name}` | dismiss a finished run |

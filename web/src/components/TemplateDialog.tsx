@@ -1,7 +1,7 @@
 import { useState } from 'react'
-import { api } from '../lib/api'
+import { api, calls } from '../lib/api'
 import { savableSelection } from '../lib/bootstrap'
-import type { InstanceSpec, InstanceTemplate, Synced } from '../lib/types'
+import type { InstanceSpec, InstanceTemplate, Synced, TemplateRequest } from '../lib/types'
 import { useBootstrapData } from '../hooks/useBootstrapData'
 import { blankSpec, resolvedSpec, specOf, specProblems } from '../lib/instance'
 import { InstanceForm } from './InstanceForm'
@@ -70,12 +70,24 @@ export function TemplateDialog({ template, onCancel, onSaved }: Props) {
   const canSubmit = nameValid && prefixValid && !busy && !problems.blocked && !checkProblem
   const shownPrefix = prefix.trim() || defaultPrefix(name.trim() || 'instance')
 
+  function templateRequest(): TemplateRequest {
+    const resolved = resolvedSpec(spec)
+    return {
+      ...resolved,
+      bootstrap: savableSelection(modules, resolved.bootstrap),
+      description: description.trim(),
+      name_prefix: prefix.trim() || undefined,
+      app_check: hasCheck
+        ? { script: checkScript, interval_seconds: interval ?? 0, timeout_seconds: timeout ?? 0 }
+        : null,
+    }
+  }
+
   async function submit(event: React.FormEvent) {
     event.preventDefault()
     if (!canSubmit) return
     setBusy(true)
     setError(null)
-    const resolved = resolvedSpec(spec)
     try {
       // The server refuses to delete a template a stack launches, which a
       // rename would only discover after saving the copy -- so ask first.
@@ -91,15 +103,7 @@ export function TemplateDialog({ template, onCancel, onSaved }: Props) {
           return
         }
       }
-      const saved = await api.saveTemplate(name.trim(), {
-        ...resolved,
-        bootstrap: savableSelection(modules, resolved.bootstrap),
-        description: description.trim(),
-        name_prefix: prefix.trim() || undefined,
-        app_check: hasCheck
-          ? { script: checkScript, interval_seconds: interval!, timeout_seconds: timeout! }
-          : null,
-      })
+      const saved = await api.saveTemplate(name.trim(), templateRequest())
       // Saving is keyed by name, so a rename is a new record and the old one
       // has to go -- after the save, so a failure cannot lose both.
       if (template && template.name !== saved.name) {
@@ -117,6 +121,7 @@ export function TemplateDialog({ template, onCancel, onSaved }: Props) {
       title={template ? `Edit “${template.name}”` : 'New template'}
       subtitle="Everything about an instance except its name, ready to launch in one click."
       onClose={busy ? () => {} : onCancel}
+      api={calls.saveTemplate(name.trim(), templateRequest())}
       footer={
         <>
           <button type="button" className="btn" onClick={onCancel} disabled={busy}>

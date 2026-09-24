@@ -115,6 +115,19 @@ the rest. Both dialogs say so and list what would be left, so destroy the
 instances first if they should go with the name. This is the template tag's
 behaviour too, and for the same reason: the instance is the record.
 
+### Stale instances
+
+A stack's instances also record which version of the stack made them. Edit
+the stack and every one of them is marked **stale** -- on its card, its rows
+and on Home -- until a **Relaunch**. The whole stack counts, not only the step
+that made an instance, because a step's parameters can come from any earlier
+one. A template change marks them stale too, as it does any template's
+instances; recreating from the template clears that, but not a stack change,
+which only a relaunch applies. **Replace N stale** on the stack's card is a
+relaunch that says why: a stack is replaced as a whole, since its steps hand
+addresses and values to each other, so every instance is destroyed and the
+stack runs again, not just the stale ones.
+
 ## Waiting for bootstrap, or not
 
 Each launch step has a **Wait for bootstrap modules** switch, on by default. On,
@@ -300,7 +313,7 @@ is accepted in place of the object.
 | `PUT` | `/api/stacks/{name}` | `{"description", "stages"}`: create or replace one |
 | `DELETE` | `/api/stacks/{name}` | delete one (`?everywhere=false` keeps other nodes' copies) |
 | `POST` | `/api/stacks/{name}/launch` | `{"params": {...}, "background": true}`: run it; `"replace": [{"node","name"}...]` destroys those, as confirmed, first (a relaunch) |
-| `GET` | `/api/stack-instances` | `{"stacks": {name: [{"node","name","status","template","ipv4"}]}, "errors"}`, by the instances' tags on every node |
+| `GET` | `/api/stack-instances` | `{"stacks": {name: [{"node","name","status","template","ipv4","stale"}]}, "errors"}`, by the instances' tags on every node |
 | `POST` | `/api/stacks/{name}/state` | `{"action": "start"\|"stop"\|"restart", "instances": [...]}` |
 | `POST` | `/api/stacks/{name}/destroy` | `{"instances": [...], "background": true}`: stop and delete them, as a run |
 | `GET` | `/api/stack-runs` | runs in progress, or last finished, per stack |

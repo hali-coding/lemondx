@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useCanWrite } from '../hooks/useAuth'
 import type { FormEvent } from 'react'
-import { api } from '../lib/api'
+import { api, calls } from '../lib/api'
+import type { ApiCall } from '../lib/api'
 import { bytes } from '../lib/format'
 import type {
   StorageOverview, StoragePoolDetail, StoragePoolRequest, StorageVolume,
@@ -173,6 +174,7 @@ export function StorageView({ onNotify }: Props) {
           title={`Delete volume ${pendingDelete.volume.name}?`}
           message={`This permanently removes ${pendingDelete.volume.pool}/${pendingDelete.volume.name}. Attached volumes cannot be deleted.`}
           confirmLabel="Delete volume" danger busy={busy}
+          api={calls.deleteStorageVolume(pendingDelete.volume.pool, pendingDelete.volume.name)}
           onCancel={() => setPendingDelete(null)}
           onConfirm={() => run(
             () => api.deleteStorageVolume(pendingDelete.volume.pool, pendingDelete.volume.name),
@@ -264,6 +266,7 @@ function PoolDeleteDialog({ pool, busy, onCancel, onConfirm }: {
 
   return (
     <Modal title={`${isZfs ? 'Remove' : 'Delete'} pool ${pool.name}?`} onClose={busy ? () => {} : onCancel}
+      api={calls.deleteStoragePool(pool.name, true, plan)}
       footer={<><button className="btn" onClick={onCancel} disabled={busy}>Cancel</button><button className="btn btn-danger" disabled={busy || unsupported || confirmation !== pool.name} onClick={onConfirm}>{busy && <span className="spinner" />}{isZfs ? 'Remove from LXD' : count > 0 ? 'Delete everything' : 'Delete pool'}</button></>}>
       <div className="pool-delete-dialog">
         <p>{count > 0
@@ -349,18 +352,22 @@ function PoolDialog({ pool, drivers, busy, onCancel, onSubmit }: {
   const [description, setDescription] = useState(pool?.description ?? '')
   const [config, setConfig] = useState('')
   const [configError, setConfigError] = useState('')
+  const request = (): StoragePoolRequest => ({ name, driver, source: source || undefined,
+    size: !pool && source ? undefined : size || undefined,
+    description, config: parseConfig(config) })
   const submit = (event: FormEvent) => {
     event.preventDefault()
     try {
-      onSubmit({ name, driver, source: source || undefined,
-        size: !pool && source ? undefined : size || undefined,
-        description, config: parseConfig(config) })
+      onSubmit(request())
     } catch (cause) {
       setConfigError((cause as Error).message)
     }
   }
   return (
     <Modal title={pool ? `Edit ${pool.name}` : 'Create storage pool'} onClose={onCancel}
+      api={attempt(() => pool
+        ? calls.updateStoragePool(pool.name, request())
+        : calls.createStoragePool(request()))}
       footer={<><button className="btn" onClick={onCancel} disabled={busy}>Cancel</button><button className="btn btn-primary" form="storage-pool-form" disabled={busy}>{busy && <span className="spinner" />}{pool ? 'Save changes' : 'Create pool'}</button></>}>
       <form id="storage-pool-form" className="storage-form" onSubmit={submit}>
         <div className="grid-2"><Field label="Name"><input className="input" required value={name} disabled={!!pool} onChange={(event) => setName(event.target.value)} /></Field><Field label="Driver"><select className="select" value={driver} disabled={!!pool} onChange={(event) => setDriver(event.target.value)}>{drivers.map((item) => <option key={item}>{item}</option>)}</select></Field></div>
@@ -388,17 +395,21 @@ function VolumeDialog({ volume, pools, busy, onCancel, onSubmit }: {
   const [description, setDescription] = useState(volume?.description ?? '')
   const [config, setConfig] = useState('')
   const [configError, setConfigError] = useState('')
+  const request = (): StorageVolumeRequest => ({ name, content_type: contentType,
+    size: size || undefined, description, config: parseConfig(config) })
   const submit = (event: FormEvent) => {
     event.preventDefault()
     try {
-      onSubmit(pool, { name, content_type: contentType, size: size || undefined,
-        description, config: parseConfig(config) })
+      onSubmit(pool, request())
     } catch (cause) {
       setConfigError((cause as Error).message)
     }
   }
   return (
     <Modal title={volume ? `Edit ${volume.name}` : 'Create custom volume'} onClose={onCancel}
+      api={attempt(() => volume
+        ? calls.updateStorageVolume(pool, volume.name, request())
+        : calls.createStorageVolume(pool, request()))}
       footer={<><button className="btn" onClick={onCancel} disabled={busy}>Cancel</button><button className="btn btn-primary" form="storage-volume-form" disabled={busy}>{busy && <span className="spinner" />}{volume ? 'Save changes' : 'Create volume'}</button></>}>
       <form id="storage-volume-form" className="storage-form" onSubmit={submit}>
         <div className="grid-2"><Field label="Pool"><select className="select" value={pool} disabled={!!volume} onChange={(event) => setPool(event.target.value)}>{pools.map((item) => <option key={item.name}>{item.name}</option>)}</select></Field><Field label="Name"><input className="input" required value={name} disabled={!!volume} onChange={(event) => setName(event.target.value)} /></Field></div>
@@ -409,6 +420,15 @@ function VolumeDialog({ volume, pools, busy, onCancel, onSubmit }: {
       </form>
     </Modal>
   )
+}
+
+/** The request, or null while the advanced options do not parse. */
+function attempt(build: () => ApiCall): ApiCall | null {
+  try {
+    return build()
+  } catch {
+    return null
+  }
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {

@@ -68,6 +68,17 @@ export function AppCheckDialog({ name, node, onClose }: Props) {
         </div>
       )}
 
+      {!!data?.missed_rounds && (
+        <div className="banner banner-warn" style={{ margin: 0, padding: '10px 12px' }}>
+          <div className="banner-body">
+            <p style={{ margin: 0 }}>
+              The last health round did not see {name} running, so its check is paused and
+              this result may be out of date. It resumes when a round sees it again.
+            </p>
+          </div>
+        </div>
+      )}
+
       {data && !result && (
         <p className="hint">The check has not finished its first run yet. Refresh in a moment.</p>
       )}

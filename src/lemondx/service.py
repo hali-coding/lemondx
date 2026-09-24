@@ -6,6 +6,7 @@ front ends can never drift apart in behaviour.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import os
@@ -36,6 +37,16 @@ TEMPLATE_CONFIG_KEY = "user.lemondx.template"
 # of what a stack is running, as the template tag is for a template, so it
 # survives a restart and needs no reconciling with a file. See stacks.py.
 STACK_CONFIG_KEY = "user.lemondx.stack"
+# Which version of the template and stack an instance was made from, so one
+# made before an edit can be called stale. A digest rather than a time: saves
+# arrive from peers and from reconciliation, often unchanged, and a timestamp
+# would call every instance stale after any of them.
+TEMPLATE_REVISION_KEY = "user.lemondx.template-revision"
+STACK_REVISION_KEY = "user.lemondx.stack-revision"
+# What a template can change without its instances being any different: its
+# label, how new instances are named, and the app check, which is read from
+# the template every round rather than baked into the instance.
+_NOT_INFRA = ("name", "description", "name_prefix", "app_check")
 # A shell the caller asks for by path. Deliberately narrow: it is handed to the
 # daemon as argv[0], and an absolute path with no metacharacters cannot become
 # anything else on the way.
@@ -526,11 +537,11 @@ class ContainerService:
     # -- listing -----------------------------------------------------------
 
     def list_containers(self):
-        return [_summarize(i) for i in self.lxd.list_instances()]
+        return self._mark_stale([_summarize(i) for i in self.lxd.list_instances()])
 
     def get_container(self, name):
         instance = self.lxd.get_instance(name)
-        summary = _summarize(instance)
+        summary = self._mark_stale([_summarize(instance)])[0]
         summary["config"] = {
             k: v for k, v in (instance.get("config") or {}).items()
             if not k.startswith("volatile.")
@@ -969,9 +980,7 @@ class ContainerService:
                                "this process keeps no results.", 409)
         target = checker.target(name)
         if target is None:
-            raise ServiceError(
-                "'%s' has no app check running: it is not running, its template has "
-                "none, or it is still being created." % name, 404)
+            raise ServiceError(self._why_no_app_check(name), 404)
         result = checker.result(name)
         return {
             "name": name,
@@ -980,7 +989,45 @@ class ContainerService:
             "interval_seconds": target["interval_seconds"],
             "timeout_seconds": target["timeout_seconds"],
             "result": result,
+            # Rounds in a row that did not see it running: the check is kept
+            # through a missed round, and this says the result may be old.
+            "missed_rounds": checker.missed(name),
         }
+
+    def _why_no_app_check(self, name):
+        """Which of the reasons an instance has no check running actually applies.
+
+        Asked of the daemon now, so the answer is the real one rather than a
+        list of possibilities -- the last of which, an instance that is
+        running but was not seen by the last rounds, is the daemon failing to
+        report its state and is otherwise indistinguishable from the rest.
+        """
+        try:
+            instance = self.lxd.get_instance(name)
+        except LXDError as exc:
+            if exc.code == 404:
+                return "There is no instance called '%s' on this node." % name
+            return ("Cannot tell why '%s' has no app check: the daemon did not answer "
+                    "(%s)." % (name, exc))
+        config = instance.get("expanded_config") or instance.get("config") or {}
+        status = instance.get("status") or "Unknown"
+        template = config.get(TEMPLATE_CONFIG_KEY)
+        if not template:
+            return "'%s' was not launched from a template, so it has no app check." % name
+        if not (store.load_templates().get(template) or {}).get("app_check"):
+            return "Template '%s' has no app check." % template
+        with self._creates_lock:
+            record = self._creates.get(name)
+            if record and record["finished_at"] is None:
+                return ("'%s' is still being created; its app check starts once it is "
+                        "done." % name)
+        if status != "Running":
+            return "'%s' is %s; app checks run only while it is running." % (
+                name, status.lower())
+        return ("'%s' is running, but the daemon did not report it as running in the "
+                "last health rounds, so its app check was paused. It resumes at the next "
+                "round that sees it (every %ds)."
+                % (name, (self._health_settings or {}).get("interval_seconds", 60)))
 
     def _app_result_landed(self, name):
         """Fold a check that finished between rounds into its instance's record."""
@@ -1740,11 +1787,55 @@ class ContainerService:
             _log(note)
         return placed, notes
 
-    def _create_from_template(self, template, bootstrap, instance_name, stack=None):
-        """One instance, reported rather than raised so its siblings carry on."""
-        config = {TEMPLATE_CONFIG_KEY: template["name"]}
+    # -- staleness ---------------------------------------------------------
+
+    def _mark_stale(self, summaries):
+        """Say, on each instance, which of its template and stack changed since it was made.
+
+        Judged against this node's copies, which sync keeps level with every
+        other node's, so each node can answer for its own instances. An
+        instance with no revision recorded (made before revisions were) is
+        never called stale: there is nothing to compare, and guessing would
+        flag every instance there is.
+        """
+        tracked = [s for s in summaries if s["revisions"]["template"] or s["revisions"]["stack"]]
+        if not tracked:
+            for summary in summaries:
+                summary["stale"] = []
+            return summaries
+        templates = {n: template_revision(t) for n, t in store.load_templates().items()}
+        stacks = {n: stack_revision(s) for n, s in store.load_stacks().items()}
+        for summary in summaries:
+            summary["stale"] = [kind for kind, current in (
+                ("template", templates.get(summary["template"] or "")),
+                ("stack", stacks.get(summary["stack"] or "")))
+                # A definition that has gone is a different problem from one
+                # that has moved on; only the second makes an instance stale.
+                if current and summary["revisions"][kind]
+                and summary["revisions"][kind] != current]
+        return summaries
+
+    def _revision_of(self, kind, name):
+        record = (store.load_templates() if kind == "template" else store.load_stacks()).get(name)
+        if not record:
+            return ""
+        return template_revision(record) if kind == "template" else stack_revision(record)
+
+    def _create_from_template(self, template, bootstrap, instance_name, stack=None,
+                              stack_rev=None):
+        """One instance, reported rather than raised so its siblings carry on.
+
+        ``template`` may be placed for this host; the revision recorded is the
+        saved template's, which is the one every node holds a copy of.
+        ``stack_rev`` keeps a recreated instance's stack revision: a
+        recreate applies the template as it is now, not the stack.
+        """
+        config = {TEMPLATE_CONFIG_KEY: template["name"],
+                  TEMPLATE_REVISION_KEY: self._revision_of("template", template["name"])}
         if stack:
             config[STACK_CONFIG_KEY] = stack
+            config[STACK_REVISION_KEY] = stack_rev if stack_rev is not None \
+                else self._revision_of("stack", stack)
         try:
             container = self.create_container(
                 name=instance_name, image=template["image"],
@@ -1883,28 +1974,37 @@ class ContainerService:
             return None
         return self._record_name(str(stack), "stack")
 
-    def template_instances(self, name):
-        """Names of the instances launched from template ``name``, sorted."""
-        return sorted(c["name"] for c in self.list_containers() if c["template"] == name)
+    def template_instances(self, name, stale=False):
+        """Names of the instances launched from template ``name``, sorted.
 
-    def _confirmed_instances(self, name, confirmed):
+        ``stale`` narrows it to those made from an older version of the
+        template that no stack launched: a stack's instances take values the
+        stack rendered for them, which recreating from the template would drop,
+        so the stack is what replaces those.
+        """
+        return sorted(c["name"] for c in self.list_containers() if c["template"] == name
+                      and (not stale or ("template" in c["stale"] and not c["stack"])))
+
+    def _confirmed_instances(self, name, confirmed, stale=False):
         """The template's instances, provided they are exactly what was confirmed.
 
         Destroying by tag alone would also take out an instance launched after
         the user looked -- by another tab, or the CLI. So the caller names what
-        it showed, and any difference refuses the whole request.
+        it showed, and any difference refuses the whole request. With
+        ``stale`` the set compared is the stale one, for the same reason.
         """
         if not isinstance(confirmed, list) or not all(isinstance(n, str) for n in confirmed):
             raise ServiceError(
                 "List the instances to act on in 'instances', as confirmed.")
-        current = self.template_instances(name)
+        current = self.template_instances(name, stale=stale)
         if sorted(set(confirmed)) != current:
             raise ServiceError(
-                "The instances from template '%s' have changed since they were "
+                "The %sinstances from template '%s' have changed since they were "
                 "confirmed (now: %s). Nothing was changed; review and try again."
-                % (name, ", ".join(current) or "none"), 409)
+                % ("stale " if stale else "", name, ", ".join(current) or "none"), 409)
         if not current:
-            raise ServiceError("No instances were launched from template '%s'." % name, 404)
+            raise ServiceError("No %sinstances were launched from template '%s'."
+                               % ("stale " if stale else "", name), 404)
         return current
 
     # The three below come in pairs, like launch: an ``*_instances`` method that
@@ -1928,26 +2028,30 @@ class ContainerService:
         return self.track_run(name, "destroy", len(names),
                               lambda: self.destroy_instances(name, names), background)
 
-    def recreate_instances(self, name, instances, params=None):
+    def recreate_instances(self, name, instances, params=None, stale=False):
         """Replace a template's instances with fresh ones. ``(results, notes)``."""
         template = self._template(name)
-        names = self._confirmed_instances(name, instances)
+        names = self._confirmed_instances(name, instances, stale=stale)
         bootstrap = self._launch_bootstrap(template, params)
         template, notes = self.place_template(template)
-        # A recreated instance stays in the stack it was launched by.
-        stacks = {c["name"]: c["stack"] for c in self.list_containers()}
+        # A recreated instance stays in the stack it was launched by, at the
+        # stack revision it had: recreating applies the template, not the stack.
+        stacks = {c["name"]: (c["stack"], c["revisions"]["stack"])
+                  for c in self.list_containers()}
 
         def replace(instance_name):
             removed = self._remove_instance(instance_name)
             if not removed["ok"]:
                 return dict(removed, error="Not recreated: could not delete it: %s"
                             % removed["error"])
+            stack, revision = stacks.get(instance_name, (None, None))
             return self._create_from_template(template, bootstrap, instance_name,
-                                              stacks.get(instance_name))
+                                              stack, revision or "")
 
         return self._each(names, replace), notes
 
-    def recreate_template_instances(self, name, instances, params=None, background=False):
+    def recreate_template_instances(self, name, instances, params=None, background=False,
+                                    stale=False):
         """Replace each of a template's instances with a fresh one of the same name.
 
         The new instances take the template as it is now, so this is also how
@@ -1958,10 +2062,10 @@ class ContainerService:
         """
         # Validated before the run is recorded, so a bad request is refused
         # rather than filed as a run that failed.
-        names = self._confirmed_instances(name, instances)
+        names = self._confirmed_instances(name, instances, stale=stale)
         self._launch_bootstrap(self._template(name), params)
         return self.track_run(name, "recreate", len(names),
-                              lambda: self.recreate_instances(name, names, params),
+                              lambda: self.recreate_instances(name, names, params, stale),
                               background)
 
     # A command is mostly waiting on the guest, not on the host, so it can
@@ -3362,7 +3466,25 @@ def _summarize(instance):
         "snapshot_count": len(instance.get("snapshots") or []),
         "template": config.get(TEMPLATE_CONFIG_KEY) or None,
         "stack": config.get(STACK_CONFIG_KEY) or None,
+        "revisions": {"template": config.get(TEMPLATE_REVISION_KEY) or "",
+                      "stack": config.get(STACK_REVISION_KEY) or ""},
     }
+
+
+def _revision(record, ignore):
+    body = {k: v for k, v in record.items() if k not in ignore}
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def template_revision(record):
+    """A digest of what a template makes: changes when its instances would differ."""
+    return _revision(record, _NOT_INFRA)
+
+
+def stack_revision(record):
+    """A digest of a stack's stages. Any step can feed another, so it is one revision."""
+    return _revision(record, ("name", "description"))
 
 
 def instance_prefix(name):

@@ -51,7 +51,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from . import store
-from .auth import ADMIN, TOKEN_PREFIX
+from .auth import ADMIN, TOKEN_PREFIX, AuthError
 from .bootstrap import discover_modules, module_source, normalise_module_id
 from .lxd import LXDError
 from .nodeclient import (DEFAULT_TIMEOUT, LONG_TIMEOUT, NodeClient, NodeError,
@@ -382,7 +382,8 @@ def clean_member(record):
     return {"name": name, "url": url,
             "fingerprint": fingerprint if FINGERPRINT.match(fingerprint) else "",
             "description": str(record.get("description") or "")[:200],
-            "fabric": store.clean_fabric(record.get("fabric"))}
+            "fabric": store.clean_fabric(record.get("fabric")),
+            "maintenance": store.clean_maintenance(record.get("maintenance"))}
 
 
 # -- the service -----------------------------------------------------------
@@ -400,6 +401,7 @@ class ClusterService:
     def __init__(self, service, auth, settings=None):
         self.service = service
         self.auth = auth
+        auth.member_login = self.requires_remote_token
         self._settings = settings
         self._lock = threading.Lock()
         self._probes = {}            # node name -> (checked_at, record)
@@ -520,6 +522,9 @@ class ClusterService:
             # per fabric. Empty on a node that is on none, which is how a mixed
             # cluster works: a node without a fabric is one nobody routes to.
             "fabric": fabric_mod.local_claim(self.local_route_address()),
+            # Travels the same way as the fabric claim: this node's own word,
+            # which is the only one peers take for its entry.
+            "maintenance": store.load_maintenance(),
         }
 
     def local_route_address(self):
@@ -784,7 +789,8 @@ class ClusterService:
             records.append({"name": peer["name"], "url": peer["url"],
                             "fingerprint": peer["fingerprint"],
                             "description": peer["description"], "added": peer["added"],
-                            "fabric": peer.get("fabric")})
+                            "fabric": peer.get("fabric"),
+                            "maintenance": peer.get("maintenance")})
         return records
 
     def remember_members(self, records, source="", authoritative=None):
@@ -815,8 +821,10 @@ class ClusterService:
             # The fabric claim is part of what a member's own record tells us:
             # left out of this comparison, a node that was just given a subnet
             # would never have it noticed here, and nothing would route to it.
-            if current and (current["url"], current["fingerprint"], current.get("fabric")) \
-                    == (member["url"], member["fingerprint"], member["fabric"]):
+            if current and (current["url"], current["fingerprint"], current.get("fabric"),
+                            current.get("maintenance")) \
+                    == (member["url"], member["fingerprint"], member["fabric"],
+                        member["maintenance"]):
                 continue
             if current and authoritative and member["name"] != authoritative:
                 continue        # second-hand, and we already have its own word
@@ -902,6 +910,36 @@ class ClusterService:
         states = self._probe_all([n for n in nodes if not n["self"]])
         return [dict(node, state=self._local_state() if node["self"]
                      else states.get(node["name"])) for node in nodes]
+
+    def summary(self):
+        """Membership and instance counts, here and across the cluster.
+
+        Built on ``list_nodes()`` so the counts are the ones the Nodes tab
+        shows, probe cache included. An unreachable member is named rather than
+        counted as zero, since "12 running" that silently leaves out a host is
+        a wrong answer, not a partial one. An unfederated node never probes.
+        """
+        member = self.in_cluster()
+        nodes = self.list_nodes(probe=member)
+        if not member:
+            nodes = [dict(nodes[0], state=self._local_state())]
+        local = nodes[0]["state"]
+        reached = [n for n in nodes if n["state"] and n["state"]["reachable"]]
+        return {
+            "in_cluster": member,
+            "members": len(nodes) if member else 1,
+            "nodes": [{"name": n["name"], "self": n["self"],
+                       "reachable": n in reached,
+                       "error": (n["state"] or {}).get("error")} for n in nodes]
+            if member else [],
+            "local": {"instances": local["containers"], "running": local["running"],
+                      "error": local["error"]},
+            "cluster": {
+                "instances": sum(n["state"]["containers"] for n in reached),
+                "running": sum(n["state"]["running"] for n in reached),
+                "unreachable": [n["name"] for n in nodes if n not in reached],
+            } if member else None,
+        }
 
     def _local_state(self):
         try:
@@ -1228,6 +1266,98 @@ class ClusterService:
         return self._with_sync({"deleted": name}, "groups", name, everywhere,
                                deleted=True)
 
+    # -- maintenance -------------------------------------------------------
+    #
+    # A node in maintenance takes no new instances and no fabric changes, but
+    # still receives shared definitions: a push to it is attempted as always,
+    # so it comes out of maintenance level with everyone rather than needing a
+    # sync. The mark is the node's own (store.load_maintenance()) and reaches
+    # peers on its member record, so each node judges against the copy it has
+    # -- and the node itself refuses as well, which covers a peer whose copy is
+    # stale.
+
+    def maintenance(self):
+        """This node's maintenance mark, or None."""
+        return store.load_maintenance()
+
+    def maintenance_of(self, name):
+        if name == self.local_name():
+            return self.maintenance()
+        return (self._peers().get(name) or {}).get("maintenance")
+
+    def set_maintenance(self, enabled, reason="", by=""):
+        """Put this node into maintenance, or take it out, and tell every member.
+
+        Another node's mark is set by calling that node -- through the proxy,
+        like any per-node call -- because only its own word counts for its
+        record; a mark written here onto a peer's record would be overwritten
+        by the peer's own at the next sync.
+        """
+        was = self.maintenance()
+        if enabled:
+            record = store.save_maintenance({
+                # Re-marking keeps the original start, so "since" stays true.
+                "since": (was or {}).get("since") or int(time.time()),
+                "reason": str(reason or "").strip(), "by": str(by or "")})
+        else:
+            record = store.save_maintenance(None)
+        if bool(was) != bool(record):
+            _log("maintenance %s%s" % ("on" if record else "off",
+                                       ": %s" % record["reason"] if record and record["reason"]
+                                       else ""))
+        told = []
+        if self.in_cluster():
+            try:
+                told = self.sync_members()["results"]
+            except (ClusterError, NodeError):
+                pass
+        if was and not record:
+            # Routes were left alone while it lasted; membership may have moved.
+            self._fabric().reapply()
+        return {"node": self.local_name(), "maintenance": record, "told": told}
+
+    def refuse_maintenance(self, nodes, what):
+        """Raise 409 if any of ``nodes`` is in maintenance; None otherwise.
+
+        Returns None so a route can put it in front of the call it guards.
+        """
+        held = [n for n in nodes if self.maintenance_of(n)]
+        if held:
+            raise ClusterError(self._maintenance_message(held, what), 409)
+        return None
+
+    def _maintenance_message(self, held, what):
+        one = len(held) == 1
+        reason = (self.maintenance_of(held[0]) or {}).get("reason") if one else ""
+        return ("Cannot %s: %s %s in maintenance%s. End it on the Nodes tab, or with "
+                "`lemondx cluster maintenance off` on %s."
+                % (what, ", ".join(held), "is" if one else "are",
+                   " (%s)" % reason if reason else "", "that node" if one else "those nodes"))
+
+    def launch_targets(self, nodes=None, groups=None):
+        """Where a launch may go: ``(targets, skipped)``.
+
+        A node named outright, or this node when nothing is named, is refused
+        if it is in maintenance -- the caller asked for that node. A node that
+        only came in through a group is skipped instead, because a group is a
+        way of saying "wherever there is room" and maintenance is exactly the
+        lack of it. A group with nothing left is refused.
+        """
+        targets = self.resolve_targets(nodes, groups)
+        held = [t for t in targets if self.maintenance_of(t)]
+        if not held:
+            return targets, []
+        named = {str(n).strip() for n in nodes or []}
+        refused = [t for t in held if t in named or not groups]
+        if refused:
+            raise ClusterError(self._maintenance_message(
+                refused, "launch instances there"), 409)
+        left = [t for t in targets if t not in held]
+        if not left:
+            raise ClusterError(self._maintenance_message(
+                held, "launch instances on %s" % ", ".join(groups)), 409)
+        return left, held
+
     def all_nodes(self):
         """Every member's name, this node included."""
         return sorted(set(self._peers()) | {self.local_name()})
@@ -1449,6 +1579,10 @@ class ClusterService:
             # conflicting claims says which is right -- so the node admitting
             # it picks one, the same way it hands over the credential.
             "fabrics": self._enrolment_claims(joiner["name"]),
+            # So a person can log in to the joiner from another host. Nothing
+            # is exposed that the credential above does not already reach:
+            # any member is an admin of every other and could sync them.
+            "users": self.auth.export_users(),
         }
 
     def _enrolment_claims(self, joiner):
@@ -1544,6 +1678,7 @@ class ClusterService:
         # claim is on this node's record by the time peers read it and they
         # route to it on the first pass rather than the next hourly one.
         fabric_note = self._accept_enrolment(answer.get("fabrics"))
+        users_note = self._accept_users(answer.get("users"))
 
         # Now that we hold the credential, tell everyone else we exist. The node
         # that admitted us already knows; the rest learn here, or on the next
@@ -1558,7 +1693,32 @@ class ClusterService:
             "unreachable": [r["node"] for r in spread["results"] if not r["ok"]],
             "warning": warning,
             "fabrics": fabric_note,
+            "users": users_note,
         }
+
+    def _accept_users(self, offered):
+        """Take the cluster's accounts, so this node can be logged in to.
+
+        Joining turns on the rule that remote callers need a credential
+        (`requires_remote_token()`), and without accounts the only one a
+        person could get is a token minted in a shell here. An account this
+        node already has is kept: it was someone's decision on this host, and
+        an explicit `cluster sync users` is how to overwrite it.
+        """
+        existing = {u["name"] for u in self.auth.export_users()}
+        note = {"adopted": [], "kept": [], "failed": []}
+        for record in offered if isinstance(offered, list) else []:
+            name = str(record.get("name") or "") if isinstance(record, dict) else ""
+            if name in existing:
+                note["kept"].append(name)
+                continue
+            try:
+                self.auth.adopt_user(name, record)
+                note["adopted"].append(name)
+            except AuthError as exc:
+                note["failed"].append(name)
+                _log("joined, but could not adopt user %r: %s" % (name, exc.message))
+        return note
 
     def _accept_enrolment(self, offered):
         """Take the fabric subnets the cluster allocated, one per fabric it has.
@@ -2333,9 +2493,9 @@ class ClusterService:
         per node. What a node cannot substitute -- an image it cannot pull, no
         space -- fails that node's instances and leaves the rest alone.
         """
-        targets = self.resolve_targets(nodes, groups)
+        targets, skipped = self.launch_targets(nodes, groups)
         local_name = self.local_name()
-        if targets == [local_name]:
+        if targets == [local_name] and not skipped:
             # Nothing federated about this one: the same call a lemondx that has
             # never been joined to anything makes.
             return self.service.launch_template(name, count=count, prefix=prefix,
@@ -2366,6 +2526,7 @@ class ClusterService:
                     stack)):
                 collected.extend(outcome[0])
                 notes.extend(outcome[1])
+            notes.extend("%s: skipped, in maintenance" % node for node in skipped)
             return collected, notes
 
         return self.service.track_run(
@@ -2596,7 +2757,7 @@ class ClusterService:
     # -- template runs across nodes ----------------------------------------
 
     def template_action(self, name, action, instances, params=None, command=None,
-                        timeout=300, background=False):
+                        timeout=300, background=False, stale=False):
         """Destroy, recreate or exec over a template's instances, wherever they are.
 
         Recorded as one run on this node's template, exactly as the local
@@ -2609,6 +2770,10 @@ class ClusterService:
         if action not in ("destroy", "recreate", "exec"):
             raise ClusterError("Unknown template action '%s'." % action, 400)
         grouped = self._by_node(instances)
+        if action == "recreate":
+            # A recreate is a delete and a fresh create, and the create half is
+            # what maintenance stops -- so refused before the delete, not after.
+            self.refuse_maintenance(sorted(grouped), "recreate instances there")
         if list(grouped) == [self.local_name()]:
             # Nothing federated about it: the same call an unjoined lemondx makes.
             local = grouped[self.local_name()]
@@ -2616,7 +2781,7 @@ class ClusterService:
                 return self.service.destroy_template_instances(name, local, background)
             if action == "recreate":
                 return self.service.recreate_template_instances(
-                    name, local, params=params, background=background)
+                    name, local, params=params, background=background, stale=stale)
             return self.service.exec_template_instances(
                 name, command, local, timeout=timeout, background=background)
 
@@ -2625,7 +2790,7 @@ class ClusterService:
         def work():
             collected, notes = [], []
             for outcome in self._fanout(sorted(grouped), lambda node: self._act_on(
-                    node, name, action, grouped[node], params, command, timeout)):
+                    node, name, action, grouped[node], params, command, timeout, stale)):
                 collected.extend(outcome[0])
                 notes.extend(outcome[1])
             return collected, notes
@@ -2633,7 +2798,8 @@ class ClusterService:
         return self.service.track_run(name, action, total, work, background,
                                       command=command, nodes=sorted(grouped))
 
-    def _act_on(self, node_name, template, action, names, params, command, timeout):
+    def _act_on(self, node_name, template, action, names, params, command, timeout,
+                stale=False):
         """One node's share of a template run. ``(instances, notes)``; never raises."""
         if node_name == self.local_name():
             try:
@@ -2641,7 +2807,7 @@ class ClusterService:
                     results, notes = self.service.destroy_instances(template, names), []
                 elif action == "recreate":
                     results, notes = self.service.recreate_instances(
-                        template, names, params=params)
+                        template, names, params=params, stale=stale)
                 else:
                     results, notes = self.service.exec_instances(
                         template, command, names, timeout=timeout), []
@@ -2656,7 +2822,7 @@ class ClusterService:
             if action == "destroy":
                 started = client.destroy(template, names)
             elif action == "recreate":
-                started = client.recreate(template, names, params=params)
+                started = client.recreate(template, names, params=params, stale=stale)
             else:
                 started = client.exec_instances(template, command, names, timeout=timeout)
             run = self._await_run(client, template, started)

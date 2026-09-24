@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useCanWrite } from '../hooks/useAuth'
-import { api } from '../lib/api'
+import { useCanOperate, useCanWrite } from '../hooks/useAuth'
+import { api, calls } from '../lib/api'
 import { keyOf } from '../lib/instance'
 import { syncDetail, syncKind } from '../lib/sync'
 import type {
@@ -12,6 +12,7 @@ import { CloseIcon, PencilIcon, PlusIcon, RestartIcon, TerminalIcon, TrashIcon }
 import { Modal } from './Modal'
 import { StatusBadge } from './StatusBadge'
 import { TemplateDialog } from './TemplateDialog'
+import { StaleBadge } from './StaleBadge'
 
 interface Props {
   containers: ScopedContainer[] | null
@@ -65,6 +66,7 @@ export function TemplatesView({
   onChanged,
 }: Props) {
   const canWrite = useCanWrite()
+  const canOperate = useCanOperate()
   const [templates, setTemplates] = useState<InstanceTemplate[] | null>(null)
   const [modules, setModules] = useState<BootstrapModule[]>([])
   const [error, setError] = useState<string | null>(null)
@@ -77,7 +79,9 @@ export function TemplatesView({
   // Only while the request that starts a run is out, which is brief: the
   // server answers once it has accepted the run, not when the run is done.
   const [starting, setStarting] = useState<Record<string, { action: Action; count: number }>>({})
-  const [confirming, setConfirming] = useState<{ template: InstanceTemplate; action: Action } | null>(null)
+  // `stale`: a recreate of only the stale instances no stack launched.
+  const [confirming, setConfirming] = useState<
+    { template: InstanceTemplate; action: Action; stale?: boolean } | null>(null)
   // Where a launch may go. Unprobed: only the names matter here, and probing
   // every node to draw a picker would make opening this tab a fan-out.
   const [nodes, setNodes] = useState<ClusterNode[]>([])
@@ -162,7 +166,7 @@ export function TemplatesView({
   async function run(template: InstanceTemplate, action: Action,
                      instances: ScopedContainer[],
                      params: Record<string, string>, command = '', timeout?: number,
-                     targets: Targets = {}) {
+                     targets: Targets = {}, stale = false) {
     const count = action === 'launch' ? countFor(template.name) : instances.length
     setStarting((current) => ({ ...current, [template.name]: { action, count } }))
     try {
@@ -171,7 +175,7 @@ export function TemplatesView({
       const started = action === 'launch'
         ? await api.launchTemplate(template.name, { count, params, ...targets })
         : action === 'recreate'
-          ? await api.recreateTemplateInstances(template.name, refs(instances), params)
+          ? await api.recreateTemplateInstances(template.name, refs(instances), params, stale)
           : action === 'exec'
             ? await api.execTemplateInstances(template.name, command, refs(instances), timeout)
             : await api.destroyTemplateInstances(template.name, refs(instances))
@@ -251,6 +255,8 @@ export function TemplatesView({
               (id) => modules.find((m) => m.id === id)?.name ?? id)
             const members = membersOf(template)
             const running = members.filter((c) => c.status === 'Running').length
+            const staleCount = members.filter((c) => c.stale?.includes('template')).length
+            const staleHere = replaceable(members).length
             const count = countFor(template.name)
             const busy = busyWith(template.name)
             const preview = previewNames(template.name_prefix, count, containers ?? [])
@@ -326,6 +332,8 @@ export function TemplatesView({
                                 : c.status}>
                               <span className={`dot${c.status === 'Running' ? ' dot-ok' : ''}`} />
                               {c.name}
+                              <StaleBadge stale={c.stale ?? []} template={c.template}
+                                stack={c.stack} />
                               {/* Which host it is on, once the view spans more
                                   than one and the name alone is ambiguous. */}
                               {c.node && c.node !== localNode && (
@@ -338,6 +346,17 @@ export function TemplatesView({
                       )}
                     </dd>
                   </dl>
+
+                  {staleCount > 0 && (
+                    <p className="hint stale-hint">
+                      {staleCount} of {members.length} {staleCount === 1 ? 'was' : 'were'} made
+                      from an older version of this template.
+                      {staleHere > 0 && <> <strong>Replace stale</strong> recreates
+                        {staleHere === staleCount ? (staleCount === 1 ? ' it' : ' them')
+                          : ` the ${staleHere} no stack launched`}.</>}
+                      {staleHere < staleCount && ' A stack’s instances are replaced from the Stacks tab, which keeps the values the stack gave them.'}
+                    </p>
+                  )}
 
                   {gone.length > 0 && (
                     <p className="hint" style={{ color: 'var(--danger)' }}>
@@ -359,7 +378,7 @@ export function TemplatesView({
                         ...current, [template.name]: event.target.value }))}
                     />
                     <button className="btn btn-primary"
-                      disabled={!ready || !canWrite || !!busy || gone.length > 0}
+                      disabled={!ready || !canOperate || !!busy || gone.length > 0}
                       onClick={() => requestLaunch(template)}>
                       {busy?.action === 'launch' && <span className="spinner" />}
                       {busy?.action === 'launch' ? `Launching ${busy.count}…` : 'Launch'}
@@ -373,21 +392,29 @@ export function TemplatesView({
                       <div className="template-fleet">
                         <button className="btn btn-sm"
                           title="Run a shell command on the running instances from this template"
-                          disabled={!!busy || !canWrite || running === 0}
+                          disabled={!!busy || !canOperate || running === 0}
                           onClick={() => setConfirming({ template, action: 'exec' })}>
                           {busy?.action === 'exec' ? <span className="spinner" /> : <TerminalIcon size={13} />}
                           {busy?.action === 'exec' ? `Running on ${busy.count}…` : 'Run command'}
                         </button>
                         <button className="btn btn-sm"
                           title="Delete every instance from this template and create it again, with the template as it is now"
-                          disabled={!ready || !canWrite || !!busy || gone.length > 0}
+                          disabled={!ready || !canOperate || !!busy || gone.length > 0}
                           onClick={() => setConfirming({ template, action: 'recreate' })}>
                           {busy?.action === 'recreate' ? <span className="spinner" /> : <RestartIcon size={13} />}
                           {busy?.action === 'recreate' ? `Recreating ${busy.count}…` : 'Recreate all'}
                         </button>
+                        {staleHere > 0 && !busy && (
+                          <button className="btn btn-sm btn-warn"
+                            title="Recreate only the instances made from an older version of this template"
+                            disabled={!ready || !canOperate || gone.length > 0}
+                            onClick={() => setConfirming({ template, action: 'recreate', stale: true })}>
+                            <RestartIcon size={13} /> Replace {staleHere} stale
+                          </button>
+                        )}
                         <button className="btn btn-sm btn-danger"
                           title="Stop and delete every instance from this template"
-                          disabled={!ready || !canWrite || !!busy}
+                          disabled={!ready || !canOperate || !!busy}
                           onClick={() => setConfirming({ template, action: 'destroy' })}>
                           {busy?.action === 'destroy' ? <span className="spinner" /> : <TrashIcon size={13} />}
                           {busy?.action === 'destroy' ? `Destroying ${busy.count}…` : 'Destroy all'}
@@ -496,6 +523,7 @@ export function TemplatesView({
           template={confirming.template}
           members={membersOf(confirming.template)}
           localNode={localNode}
+          refs={refs}
           lastCommand={runs[confirming.template.name]?.command ?? ''}
           onCancel={() => setConfirming(null)}
           onConfirm={(instances, command, timeout) => {
@@ -512,7 +540,9 @@ export function TemplatesView({
           action={confirming.action}
           // Live, so what the dialog lists is what gets sent -- and if polling
           // shows a change, the list the user is agreeing to changes with it.
-          members={membersOf(confirming.template)}
+          members={confirming.stale ? replaceable(membersOf(confirming.template))
+            : membersOf(confirming.template)}
+          stale={!!confirming.stale}
           secrets={confirming.action === 'destroy' ? []
             : secretParams(confirming.template, modules)}
           count={countFor(confirming.template.name)}
@@ -520,11 +550,12 @@ export function TemplatesView({
           groups={groups}
           scope={scope}
           localNode={localNode}
+          refs={refs}
           onCancel={() => setConfirming(null)}
           onConfirm={(instances, params, targets) => {
-            const { template, action } = confirming
+            const { template, action, stale } = confirming
             setConfirming(null)
-            run(template, action, instances, params, '', undefined, targets)
+            run(template, action, instances, params, '', undefined, targets, !!stale)
           }}
         />
       )}
@@ -554,10 +585,22 @@ export function TemplatesView({
   )
 }
 
+/**
+ * What "Replace stale" recreates: made from an older version of the template,
+ * and not launched by a stack -- a stack's instances carry values the stack
+ * rendered, which a recreate from the template would drop. Mirrors the
+ * server's `template_instances(stale=True)`, which refuses any other set.
+ */
+function replaceable(members: ScopedContainer[]) {
+  return members.filter((c) => c.stale?.includes('template') && !c.stack)
+}
+
 interface ActionProps {
   template: InstanceTemplate
   action: Action
   members: ScopedContainer[]
+  /** A recreate of the stale instances only; `members` are those. */
+  stale: boolean
   secrets: BootstrapModule['params']
   count: number
   /** Every node this one knows, including itself. One means no picker. */
@@ -566,6 +609,8 @@ interface ActionProps {
   /** What the Containers tab is scoped to; a launch starts from the same. */
   scope: Scope
   localNode: string
+  /** How the run names its instances: the explorer shows the request `run()` makes. */
+  refs: (instances: ScopedContainer[]) => (string | InstanceRef)[]
   onCancel: () => void
   onConfirm: (instances: ScopedContainer[], params: Record<string, string>,
               targets: Targets) => void
@@ -576,19 +621,23 @@ interface ActionProps {
  * and collects any secrets a launch or recreate needs -- those go to this run
  * and nowhere else.
  */
-function ActionDialog({ template, action, members, secrets, count, nodes, groups,
-                       scope, localNode, onCancel, onConfirm }: ActionProps) {
+function ActionDialog({ template, action, members, stale, secrets, count, nodes, groups,
+                       scope, localNode, refs, onCancel, onConfirm }: ActionProps) {
   const [values, setValues] = useState<Record<string, string>>({})
   // This node by default: a launch that names nowhere else behaves exactly as
   // it did before there was anywhere else.
   const here = nodes.find((n) => n.self)?.name ?? localNode
   // Opens on whatever the view is scoped to, so launching does the obvious
   // thing after switching the Containers tab to a group or the whole cluster.
-  const [chosen, setChosen] = useState<string[]>(
+  // A node in maintenance takes no launches, so it is never ticked for one.
+  const held = new Set(nodes.filter((n) => n.maintenance).map((n) => n.name))
+  const [chosen, setChosen] = useState<string[]>(() => (
     scope.kind === 'cluster' ? nodes.map((n) => n.name)
       : scope.kind === 'node' ? [scope.name]
-        : here ? [here] : [])
+        : here ? [here] : []).filter((name) => !held.has(name)))
   const [group, setGroup] = useState(scope.kind === 'group' ? scope.name : '')
+  const skipped = group
+    ? (groups.find((g) => g.name === group)?.members ?? []).filter((m) => held.has(m)) : []
   const complete = secrets.every((p) => values[p.name])
   const launch = action === 'launch'
   const federated = launch && nodes.length > 1
@@ -605,21 +654,29 @@ function ActionDialog({ template, action, members, secrets, count, nodes, groups
   const spread = group ? `the “${group}” group`
     : chosen.length > 1 ? `${chosen.length} nodes` : chosen[0] || 'this node'
   const title = launch ? `Launch ${count} from “${template.name}”`
-    : action === 'recreate' ? `Recreate ${members.length} from “${template.name}”?`
+    : action === 'recreate' ? (stale
+      ? `Replace ${members.length} stale from “${template.name}”?`
+      : `Recreate ${members.length} from “${template.name}”?`)
     : `Destroy ${members.length} from “${template.name}”?`
   const subtitle = launch
     ? (federated
       ? `Spread over ${spread}, round robin, with one run of names across them all. A node without the template's storage pool or network uses its own default and says so.`
       : 'Secrets are never saved, so they are entered for each launch. Every instance in this launch gets the same values.')
     : action === 'recreate'
-      ? 'Each instance is stopped, deleted and created again with the same name, from the template as it is now. Everything inside them, including snapshots, is lost.'
+      ? `${stale ? 'These were made from an older version of the template. ' : ''}Each instance is stopped, deleted and created again with the same name, from the template as it is now. Everything inside them, including snapshots, is lost.`
       : 'Each instance is stopped and deleted, with its filesystem and snapshots. This cannot be undone. The template itself is kept.'
+
+  const call = launch ? calls.launchTemplate(template.name, { count, params: values, ...targets })
+    : action === 'recreate'
+      ? calls.recreateTemplateInstances(template.name, refs(members), values, stale)
+      : calls.destroyTemplateInstances(template.name, refs(members))
 
   return (
     <Modal
       title={title}
       subtitle={subtitle}
       onClose={onCancel}
+      api={{ ...call, secrets: secrets.map((p) => `params.${p.name}`) }}
       footer={
         <>
           <button type="button" className="btn" onClick={onCancel}>Cancel</button>
@@ -650,6 +707,12 @@ function ActionDialog({ template, action, members, secrets, count, nodes, groups
                   </option>
                 ))}
               </select>
+              {skipped.length > 0 && (
+                <span className="hint">
+                  {skipped.join(', ')} {skipped.length === 1 ? 'is' : 'are'} in maintenance
+                  and will be skipped.
+                </span>
+              )}
             </div>
             {!group && (
               <div className="field">
@@ -658,10 +721,14 @@ function ActionDialog({ template, action, members, secrets, count, nodes, groups
                   {nodes.map((node) => (
                     <label key={node.name} className="check">
                       <input type="checkbox" checked={chosen.includes(node.name)}
+                        disabled={held.has(node.name)}
                         onChange={() => setChosen((current) => current.includes(node.name)
                           ? current.filter((n) => n !== node.name)
                           : [...current, node.name])} />
-                      <span>{node.name}{node.self ? ' (this node)' : ''}</span>
+                      <span>
+                        {node.name}{node.self ? ' (this node)' : ''}
+                        {held.has(node.name) && <span className="badge badge-warn">maintenance</span>}
+                      </span>
                     </label>
                   ))}
                 </div>
@@ -762,13 +829,14 @@ interface ExecProps {
   template: InstanceTemplate
   members: ScopedContainer[]
   localNode: string
+  refs: (instances: ScopedContainer[]) => (string | InstanceRef)[]
   lastCommand: string
   onCancel: () => void
   onConfirm: (instances: ScopedContainer[], command: string, timeout: number) => void
 }
 
 /** Pick a command and which of a template's running instances it runs on. */
-function ExecDialog({ template, members, localNode, lastCommand, onCancel,
+function ExecDialog({ template, members, localNode, refs, lastCommand, onCancel,
                      onConfirm }: ExecProps) {
   const [command, setCommand] = useState(lastCommand)
   const [timeout, setTimeoutSeconds] = useState('300')
@@ -798,6 +866,8 @@ function ExecDialog({ template, members, localNode, lastCommand, onCancel,
       title={`Run a command on “${template.name}”`}
       subtitle="Runs through sh -c on each selected instance at the same time, non-interactively, as root."
       onClose={onCancel}
+      api={calls.execTemplateInstances(template.name, command.trim(), refs(targets),
+        timeoutValid ? seconds : undefined)}
       footer={
         <>
           <button type="button" className="btn" onClick={onCancel}>Cancel</button>

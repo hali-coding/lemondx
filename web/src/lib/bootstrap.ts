@@ -27,6 +27,17 @@ export function keyModules(
  * never a secret. The form keeps values for modules that were ticked and then
  * unticked, which the server would reject as undeclared.
  */
+/** The secret params of the selected modules, which an API example must not echo. */
+export function secretParamNames(
+  modules: BootstrapModule[], selection: BootstrapSelection,
+): string[] {
+  return modules
+    .filter((m) => selection.modules.includes(m.id))
+    .flatMap((m) => m.params)
+    .filter((p) => p.secret)
+    .map((p) => p.name)
+}
+
 export function savableSelection(
   modules: BootstrapModule[], selection: BootstrapSelection,
 ): BootstrapSelection {

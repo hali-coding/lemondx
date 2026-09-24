@@ -580,6 +580,22 @@ class FabricService:
                 "text": hostnet.describe(commands),
                 "privileged": hostnet.available()}
 
+    def refuse_here(self, what):
+        """Raise 409 while this node is in maintenance; None otherwise.
+
+        Fabric changes are what maintenance stops on a host: its routes,
+        bridges and firewall stay exactly as they were until it ends.
+        """
+        local = self.cluster.local_name()
+        if self.cluster.maintenance_of(local):
+            raise FabricError(self.cluster._maintenance_message([local], what), 409)
+        return None
+
+    def _refuse_members(self, nodes, what):
+        held = [n for n in nodes if self.cluster.maintenance_of(n)]
+        if held:
+            raise FabricError(self.cluster._maintenance_message(held, what), 409)
+
     def apply(self):
         """Create the bridges if needed, then program the routes.
 
@@ -587,6 +603,7 @@ class FabricService:
         The routes are kernel state, so unless this process is already root
         they go to the helper -- which is handed the wanted state, not commands.
         """
+        self.refuse_here("change this node's fabric routes")
         with self._lock:
             # One bridge that cannot be ours must not keep every other
             # fabric's routes from being programmed.
@@ -638,6 +655,9 @@ class FabricService:
         """
         try:
             if not hostnet.available():
+                return None
+            # Frozen for the duration; ending maintenance calls this again.
+            if self.cluster.maintenance():
                 return None
             # With no fabric left there may still be routes of ours to clear,
             # so this does not stop at `enabled()`; `_program()` with nothing
@@ -970,14 +990,19 @@ class FabricService:
         unreachable_error = ""
         if unreachable:
             unreachable_error = _unreachable_message(sorted(unreachable))
+        # Every member takes a claim, so one in maintenance stops the fabric.
+        held = [n for n in self.cluster.all_nodes() if self.cluster.maintenance_of(n)]
+        maintenance_error = self.cluster._maintenance_message(
+            held, "create a fabric") if held else ""
         return {
             "name": name, "suggested_name": suggested_name, "name_error": name_error,
             "prefix": prefix, "suggested_prefix": suggested_prefix,
             "prefix_error": prefix_error, "conflicts": conflicts,
             "unreachable": [{"node": n, "error": e} for n, e in sorted(unreachable.items())],
             "unreachable_error": unreachable_error,
+            "maintenance_error": maintenance_error,
             "allocation": allocation,
-            "ok": not (name_error or prefix_error or unreachable),
+            "ok": not (name_error or prefix_error or unreachable or maintenance_error),
         }
 
     def _name_error(self, name, hosts, definitions):
@@ -1086,7 +1111,8 @@ class FabricService:
         """
         with self._change_lock:
             report = self.check(name, prefix)
-            for key in ("unreachable_error", "name_error", "prefix_error"):
+            for key in ("maintenance_error", "unreachable_error", "name_error",
+                        "prefix_error"):
                 if report[key]:
                     raise FabricError(report[key], 409)
             name, prefix = report["name"], report["prefix"]
@@ -1112,6 +1138,7 @@ class FabricService:
                        if fabric == name and claim_prefix == str(prefix)}
             members = [m["name"] for m in self.cluster.members()]
             missing = [node for node in members if node not in holding]
+            self._refuse_members(missing, "extend %s there" % name)
             if not missing:
                 return {"name": name, "prefix": str(prefix), "assigned": {},
                         "nodes": [], "ok": True}
@@ -1181,6 +1208,8 @@ class FabricService:
                 for ok, answer in answers.values())
             if not known:
                 raise FabricError("There is no fabric called '%s'." % name, 404)
+            # It would come off every member, the one in maintenance included.
+            self._refuse_members(self.cluster.all_nodes(), "delete a fabric")
             self.cluster.refuse_in_use("fabrics", "fabric", name)
             attached = []
             for node, (ok, answer) in sorted(answers.items()):
@@ -1225,6 +1254,9 @@ class FabricService:
         another /24 would leave the rest of the cluster routing to the one it
         was told about.
         """
+        # The coordinator refuses already; this covers one whose copy of our
+        # record predates the mark.
+        self.refuse_here("take a fabric subnet on this node")
         name = clean_name(name)
         prefix_network = clean_prefix(prefix)
         network = clean_subnet(subnet, prefix_network)
@@ -1355,6 +1387,7 @@ class FabricService:
 
     def attach(self, name, fabric=True):
         """Give a running instance a NIC on a fabric, and an address on it."""
+        self.refuse_here("attach instances to a fabric")
         bridge = self.require(fabric)
         # Read, pick a key and write as one step: two attaches reading the
         # same devices would pick the same eth<N>, and the PATCH below merges
@@ -1402,6 +1435,7 @@ class FabricService:
         A whole-record PUT, because PATCH merges maps and so cannot remove a
         key. Everything else is sent back exactly as it was read.
         """
+        self.refuse_here("detach instances from a fabric")
         bridges = {self.require(fabric)} if fabric else set(self.fabrics())
         record = self.service.lxd.get_instance_record(name)
         devices = dict(record.get("devices") or {})

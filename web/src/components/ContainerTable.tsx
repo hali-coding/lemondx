@@ -2,7 +2,7 @@ import { useState } from 'react'
 import type {
   CreateProgress, HealthRecord, InstanceRef, ScopedContainer, StateAction,
 } from '../lib/types'
-import { useCanWrite } from '../hooks/useAuth'
+import { useCanOperate, useCanWrite } from '../hooks/useAuth'
 import { bytes } from '../lib/format'
 import { keyOf } from '../lib/instance'
 import { ConfirmDialog } from './ConfirmDialog'
@@ -10,6 +10,7 @@ import { CopyButton } from './CopyButton'
 import { AppDot, HealthDot, PendingHealth } from './HealthDot'
 import { StatusBadge } from './StatusBadge'
 import { ExternalIcon, PlayIcon, PlusIcon, RestartIcon, StopIcon, TrashIcon } from './Icons'
+import { StaleBadge } from './StaleBadge'
 
 interface Props {
   containers: ScopedContainer[]
@@ -80,6 +81,7 @@ export function ContainerTable({
   onCreate, canCreate, localNode, nodeUrls, showNodes,
 }: Props) {
   const canWrite = useCanWrite()
+  const canOperate = useCanOperate()
   // Ticked names, not containers: the list is replaced by every poll, and a
   // name that has since gone is filtered out below rather than tracked, so
   // nothing has to prune this when a container disappears.
@@ -157,12 +159,12 @@ export function ContainerTable({
             {nameList(chosen.map((c) => c.name), 4)}
           </span>
           <div className="bulk-actions">
-            <button className="btn btn-sm" disabled={!canWrite || applying}
+            <button className="btn btn-sm" disabled={!canOperate || applying}
               onClick={() => setConfirming({
                 action: 'start', instances: chosen.map((c) => refOf(c, localNode)) })}>
               <PlayIcon /> Start
             </button>
-            <button className="btn btn-sm" disabled={!canWrite || applying}
+            <button className="btn btn-sm" disabled={!canOperate || applying}
               onClick={() => setConfirming({
                 action: 'stop', instances: chosen.map((c) => refOf(c, localNode)) })}>
               <StopIcon /> Stop
@@ -185,7 +187,7 @@ export function ContainerTable({
                 ref={(box) => {
                   if (box) box.indeterminate = chosen.length > 0 && !allTicked
                 }}
-                disabled={selectable.length === 0 || !canWrite}
+                disabled={selectable.length === 0 || !canOperate}
                 aria-label={allTicked ? 'Clear selection' : 'Select all containers'}
                 onChange={(event) => setTicked(
                   event.target.checked ? new Set(selectable.map(keyOf)) : new Set())}
@@ -253,7 +255,7 @@ export function ContainerTable({
                   <input
                     type="checkbox"
                     checked={ticked.has(rowKey)}
-                    disabled={isBusy || !canWrite}
+                    disabled={isBusy || !canOperate}
                     aria-label={`Select ${container.name}`}
                     onKeyDown={(event) => event.stopPropagation()}
                     onChange={(event) => tick(rowKey, event.target.checked)}
@@ -264,6 +266,8 @@ export function ContainerTable({
                     {container.name}
                     {container.type === 'virtual-machine' && <span className="vm-tag">VM</span>}
                     {container.ephemeral && <span className="vm-tag">EPH</span>}
+                    <StaleBadge stale={container.stale ?? []} template={container.template}
+                      stack={container.stack} />
                   </div>
                   {container.description && (
                     <div className="cdesc truncate">{container.description}</div>
@@ -319,7 +323,7 @@ export function ContainerTable({
                           className="btn btn-sm btn-icon"
                           title="Restart"
                           aria-label={`Restart ${container.name}`}
-                          disabled={isBusy || !canWrite}
+                          disabled={isBusy || !canOperate}
                           onClick={() => onAction(container, 'restart')}
                         >
                           <RestartIcon />
@@ -328,7 +332,7 @@ export function ContainerTable({
                           className="btn btn-sm btn-icon"
                           title="Stop"
                           aria-label={`Stop ${container.name}`}
-                          disabled={isBusy || !canWrite}
+                          disabled={isBusy || !canOperate}
                           onClick={() => onAction(container, 'stop')}
                         >
                           <StopIcon />
@@ -339,7 +343,7 @@ export function ContainerTable({
                         className="btn btn-sm btn-icon"
                         title="Start"
                         aria-label={`Start ${container.name}`}
-                        disabled={isBusy || !canWrite}
+                        disabled={isBusy || !canOperate}
                         onClick={() => onAction(container, 'start')}
                       >
                         <PlayIcon />
@@ -349,7 +353,7 @@ export function ContainerTable({
                       className="btn btn-sm btn-icon btn-danger"
                       title="Delete"
                       aria-label={`Delete ${container.name}`}
-                      disabled={busy[rowKey] || !canWrite}
+                      disabled={busy[rowKey] || !canOperate}
                       onClick={() => onDelete(container)}
                     >
                       <TrashIcon />

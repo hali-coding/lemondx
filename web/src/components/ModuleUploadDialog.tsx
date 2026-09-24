@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react'
-import { api } from '../lib/api'
+import { api, calls } from '../lib/api'
 import type { AutoSync } from '../lib/types'
 import { Modal } from './Modal'
 
@@ -62,6 +62,7 @@ export function ModuleUploadDialog({ onCancel, onUploaded }: Props) {
       title="Upload a module"
       subtitle="A POSIX shell script that runs inside containers you select it for."
       onClose={busy ? () => {} : onCancel}
+      api={calls.uploadModule(name.trim(), content, needsOverwrite)}
       footer={
         <>
           <button className="btn" onClick={onCancel} disabled={busy}>Cancel</button>

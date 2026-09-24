@@ -129,11 +129,13 @@ def cmd_serve(args, _service):
         "allow_insecure_login": args.allow_insecure_login,
         "pam_service": args.pam_service,
         "pam_admin_groups": args.pam_admin_group,
+        "pam_operator_groups": args.pam_operator_group,
         "pam_read_groups": args.pam_read_group,
         "trusted_proxies": args.trust_proxy,
         "proxy_user_header": args.proxy_user_header,
         "proxy_groups_header": args.proxy_groups_header,
         "proxy_admin_group": args.proxy_admin_group,
+        "proxy_operator_group": args.proxy_operator_group,
         "proxy_read_group": args.proxy_read_group,
     }
     # The cluster section names the certificate that identifies this node to its
@@ -327,6 +329,8 @@ def cmd_pam_test(args, _service):
         methods=["pam"], pam_service=args.service,
         pam_admin_groups=args.pam_admin_group if args.pam_admin_group is not None
         else saved["pam_admin_groups"],
+        pam_operator_groups=args.pam_operator_group if args.pam_operator_group is not None
+        else saved["pam_operator_groups"],
         pam_read_groups=args.pam_read_group if args.pam_read_group is not None
         else saved["pam_read_groups"])
     service = AuthService(config)
@@ -346,7 +350,7 @@ def cmd_pam_test(args, _service):
         if not r["role"]:
             return "%s password OK, but %s is in none of: %s" % (
                 YELLOW("!"), r["user"],
-                ", ".join(config.pam_admin_groups + config.pam_read_groups) or "(no groups)")
+                ", ".join(config.pam_groups) or "(no groups)")
         return "%s %s would log in as %s" % (GREEN("+"), r["user"], r["role"])
     emit(args, result, render)
     return 0 if ok and role else 1
@@ -374,9 +378,44 @@ def cmd_status(args, service):
                 "%s %s" % (n["name"], n.get("ipv4") or "") for n in s["networks"])))
         if fabric_line:
             lines.append("%s  %s" % (DIM("fabric "), fabric_line))
+        if cluster_lines:
+            lines.extend(cluster_lines)
         for issue in s["issues"]:
             lines.append(YELLOW("  ! " + issue))
         return "\n".join(lines)
+
+    # Like the fabric line below: federation lives above the service, so it is
+    # added here rather than in `service.status()`, which the UI polls every
+    # 3s and must not fan out to every peer.
+    cluster_lines = []
+    try:
+        summary = cluster_service(service).summary()
+        status = dict(status, cluster=summary)
+        local = summary["local"]
+        cluster_lines.append("%s  %s" % (DIM("cluster"), (
+            "member, %d node(s)" % summary["members"] if summary["in_cluster"]
+            else "not in a cluster")))
+        up = [n["name"] for n in summary["nodes"] if n["reachable"]]
+        down = [n for n in summary["nodes"] if not n["reachable"]]
+        if up:
+            cluster_lines.append("%s  %s %s" % (
+                DIM("nodes  "), GREEN("reachable"), ", ".join(up)))
+        for node in down:
+            cluster_lines.append("%s  %s %s%s" % (
+                DIM("nodes  ") if not up and node is down[0] else "       ",
+                RED("unreachable"), node["name"],
+                DIM(" (%s)" % node["error"]) if node["error"] else ""))
+        cluster_lines.append("%s  %s" % (DIM("local  "), (
+            YELLOW(local["error"]) if local["error"] else
+            "%d running of %d instance(s)" % (local["running"], local["instances"]))))
+        whole = summary["cluster"]
+        if whole:
+            cluster_lines.append("%s  %d running of %d instance(s)%s" % (
+                DIM("total  "), whole["running"], whole["instances"],
+                YELLOW(" -- not counted: " + ", ".join(whole["unreachable"]))
+                if whole["unreachable"] else ""))
+    except Exception:                       # status must never fail over this
+        pass
 
     # Only when it is actually on: a line saying "off" on every status of
     # every unfederated host is noise, not information.
@@ -425,8 +464,10 @@ def cmd_list(args, service):
                 ", ".join(c["ipv4"]) or "-",
                 human_bytes(c["memory_usage"]),
                 str(c["snapshot_count"] or "-"),
+                # Which definition moved on since it was made; recreate to catch up.
+                YELLOW("stale: %s" % ", ".join(c["stale"])) if c.get("stale") else "",
             ])
-        return table(rows, ["name", "state", "image", "ipv4", "memory", "snaps"])
+        return table(rows, ["name", "state", "image", "ipv4", "memory", "snaps", "note"])
 
     emit(args, containers, render)
     return 0
@@ -469,6 +510,10 @@ def cmd_info(args, service):
 
 
 def cmd_create(args, service):
+    # The API refuses this in front of the create route; the CLI calls the
+    # service directly, so it has to ask the same question itself.
+    cluster = cluster_service(service)
+    cluster.refuse_maintenance([cluster.local_name()], "create instances here")
     image = args.image or service.default_image()
     if args.disk and not args.json:
         pool = service.root_pool_info(args.profile, args.pool)
@@ -957,15 +1002,16 @@ def render_template_run(result):
     return "\n".join(lines)
 
 
-def confirm_template_instances(args, service, verb):
+def confirm_template_instances(args, service, verb, stale=False):
     """The instances to act on, after the user has seen and accepted them."""
-    names = service.template_instances(args.template)
+    names = service.template_instances(args.template, stale=stale)
+    what = "stale instances" if stale else "instances"
     if not names:
-        raise ServiceError("No instances were launched from template '%s'." % args.template)
+        raise ServiceError("No %s from template '%s'." % (what, args.template))
     if not args.json:
-        print("Instances from %s: %s" % (BOLD(args.template), ", ".join(names)))
-    if not confirm("%s all %d? Their filesystems and snapshots are deleted."
-                   % (verb, len(names)), args.yes):
+        print("%s from %s: %s" % (what.capitalize(), BOLD(args.template), ", ".join(names)))
+    if not confirm("%s %s %d? Their filesystems and snapshots are deleted."
+                   % (verb, "these" if stale else "all", len(names)), args.yes):
         return None
     return names
 
@@ -983,8 +1029,12 @@ def cmd_template_destroy(args, service):
 def cmd_template_recreate(args, service):
     template = find_template(service, args.template)
     args.template = template["name"]
+    # A recreate is a delete and a fresh create: refuse before anything is
+    # deleted, as cluster.template_action() does for the API.
+    cluster = cluster_service(service)
+    cluster.refuse_maintenance([cluster.local_name()], "recreate instances here")
     params = parse_params(args.param)
-    names = confirm_template_instances(args, service, "Recreate")
+    names = confirm_template_instances(args, service, "Recreate", stale=args.stale)
     if names is None:
         print(DIM("nothing recreated"))
         return 1
@@ -992,7 +1042,8 @@ def cmd_template_recreate(args, service):
     if not args.json:
         print(DIM("Recreating %d instance(s) from %s..." % (len(names), template["name"])),
               flush=True)
-    result = service.recreate_template_instances(template["name"], names, params=params)
+    result = service.recreate_template_instances(template["name"], names, params=params,
+                                                 stale=args.stale)
     emit(args, result, render_template_run)
     return 0 if result["ok"] else 1
 
@@ -1718,6 +1769,10 @@ def cluster_service(service):
 
 def _node_state(node):
     state = node.get("state") or {}
+    if node.get("maintenance"):
+        # Said first: it is the one state somebody chose, and what explains
+        # a launch or fabric change being refused.
+        return YELLOW("maintenance")
     if not state:
         return DIM("-")
     if not state["reachable"]:
@@ -1752,6 +1807,34 @@ def cmd_cluster_refresh(args, service):
 
     emit(args, result, render)
     return 0 if result["ok"] else 1
+
+
+def cmd_cluster_maintenance(args, service):
+    """Put a node into maintenance, or take it out. This node unless --node."""
+    cluster = cluster_service(service)
+    body = {"enabled": args.state == "on", "reason": args.reason or "",
+            "by": local_principal().name}
+    if args.node and args.node != cluster.local_name():
+        # Only a node's own word counts for its record, so the node is asked.
+        result = cluster.proxy("PUT", args.node, "/api/cluster/maintenance", body=body)
+    else:
+        result = cluster.set_maintenance(body["enabled"], reason=body["reason"],
+                                         by=local_principal().name)
+
+    def render(r):
+        mark = r["maintenance"]
+        lines = ["%s %s %s" % (YELLOW("~") if mark else GREEN("+"), BOLD(r["node"]),
+                               "is in maintenance%s" % (": %s" % mark["reason"]
+                                                        if mark["reason"] else "")
+                               if mark else "is out of maintenance")]
+        missed = [t["node"] for t in r["told"] if not t["ok"]]
+        if missed:
+            lines.append(YELLOW("! not told yet: %s -- they learn at the next member sync"
+                                % ", ".join(missed)))
+        return "\n".join(lines)
+
+    emit(args, result, render)
+    return 0
 
 
 def cmd_cluster_reconcile(args, service):
@@ -1855,8 +1938,8 @@ def cmd_cluster_status(args, service):
                  if p["in_cluster"] else DIM("not in a cluster")),
                 ("new members", "accepted" if p["allow_enrollment"] else "refused")]
         if p["remote_requires_token"]:
-            rows.append(("authentication", "off for this host, API token required "
-                                           "from others"))
+            rows.append(("authentication", "off for this host, login or API token "
+                                           "required from others"))
         else:
             rows.append(("authentication", GREEN("on") if p["auth_enabled"] else RED("off")))
         out = [BOLD("This node"), _describe_rows(rows)]
@@ -1955,6 +2038,16 @@ def cmd_cluster_join(args, service):
                 "! %s could not be told about this node; they will pick it up from "
                 "another member, or run `lemondx cluster refresh` when they are back."
                 % ", ".join(r["unreachable"])))
+        users = r.get("users") or {}
+        if users.get("adopted"):
+            lines.append(DIM("  took the cluster's accounts (%s): they can log in here "
+                             "from other hosts" % ", ".join(users["adopted"])))
+        if users.get("kept"):
+            lines.append(DIM("  kept this node's own %s; `lemondx cluster sync users` "
+                             "from a member overwrites them" % ", ".join(users["kept"])))
+        if users.get("failed"):
+            lines.append(YELLOW("! could not take the account(s) %s"
+                                % ", ".join(users["failed"])))
         if r["warning"]:
             lines.append(YELLOW("! %s" % r["warning"]))
         return "\n".join(lines)
@@ -2443,6 +2536,9 @@ def build_parser():
                    help="PAM service name, i.e. /etc/pam.d/<name> (default: lemondx)")
     g.add_argument("--pam-admin-group", action="append", metavar="GROUP",
                    help="members get admin (repeatable; default: lxd / incus-admin)")
+    g.add_argument("--pam-operator-group", action="append", metavar="GROUP",
+                   help="members may run, stop and destroy instances, templates and "
+                        "stacks but change no settings (repeatable)")
     g.add_argument("--pam-read-group", action="append", metavar="GROUP",
                    help="members get read-only access (repeatable)")
     g.add_argument("--trust-proxy", action="append", metavar="CIDR",
@@ -2453,6 +2549,8 @@ def build_parser():
                    help="header carrying the user's groups, comma separated")
     g.add_argument("--proxy-admin-group", metavar="GROUP",
                    help="with --proxy-groups-header: group granted admin")
+    g.add_argument("--proxy-operator-group", metavar="GROUP",
+                   help="with --proxy-groups-header: group granted operator access")
     g.add_argument("--proxy-read-group", metavar="GROUP",
                    help="with --proxy-groups-header: group granted read-only access")
     g = p.add_argument_group("TLS")
@@ -2507,6 +2605,7 @@ def build_parser():
     p.add_argument("user")
     p.add_argument("--service", help="PAM service name (default: saved setting, or lemondx)")
     p.add_argument("--pam-admin-group", action="append", metavar="GROUP")
+    p.add_argument("--pam-operator-group", action="append", metavar="GROUP")
     p.add_argument("--pam-read-group", action="append", metavar="GROUP")
     p.set_defaults(func=cmd_pam_test, needs_service=False)
 
@@ -2833,6 +2932,9 @@ def build_parser():
     p.add_argument("template")
     p.add_argument("--param", action="append", metavar="KEY=VALUE",
                    help="override a saved parameter or supply a secret (repeatable)")
+    p.add_argument("--stale", action="store_true",
+                   help="only those made from an older version of the template "
+                        "(a stack's are left to the stack)")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     p.set_defaults(func=cmd_template_recreate)
 
@@ -2946,6 +3048,14 @@ def build_parser():
     p = cluster_sub.add_parser("refresh", parents=[common],
                                help="level the member list with every other node")
     p.set_defaults(func=cmd_cluster_refresh)
+
+    p = cluster_sub.add_parser(
+        "maintenance", parents=[common],
+        help="stop new instances and fabric changes on a node, or allow them again")
+    p.add_argument("state", choices=["on", "off"])
+    p.add_argument("--node", help="the node to mark (default: this one)")
+    p.add_argument("--reason", help="shown wherever the mark stops something")
+    p.set_defaults(func=cmd_cluster_maintenance)
 
     p = cluster_sub.add_parser("reconcile", parents=[common],
                                help="settle this node's templates, modules, profiles, "
