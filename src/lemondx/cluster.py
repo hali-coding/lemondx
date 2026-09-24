@@ -2756,6 +2756,25 @@ class ClusterService:
 
     # -- template runs across nodes ----------------------------------------
 
+    def template_instances(self, name, stale=False, nodes=None):
+        """``[{node, name, status}]`` for template ``name``'s instances on every member.
+
+        What ``template_action()`` needs handed to it: each node refuses a
+        share that is not its whole tagged set, so the list has to come from
+        every node. A node that cannot be read refuses the whole thing rather
+        than leaving its instances out -- "destroyed them all" would be
+        untrue, and nothing would say which were missed. ``nodes`` narrows it
+        to those members.
+        """
+        listing = self.containers(nodes=nodes, everything=nodes is None)
+        if listing["errors"]:
+            raise ClusterError("Cannot list the template's instances: %s" % "; ".join(
+                "%s: %s" % (e["node"], e["error"]) for e in listing["errors"]), 502)
+        return sorted(({"node": c["node"], "name": c["name"], "status": c["status"]}
+                       for c in listing["instances"]
+                       if self.service.of_template(c, name, stale)),
+                      key=lambda m: (m["node"], m["name"]))
+
     def template_action(self, name, action, instances, params=None, command=None,
                         timeout=300, background=False, stale=False):
         """Destroy, recreate or exec over a template's instances, wherever they are.
@@ -2765,7 +2784,9 @@ class ClusterService:
         cannot overlap on the same template. Each node is handed its own share
         and validates it against its own tagged set, so a node that has since
         gained or lost an instance refuses its share rather than the whole run
-        silently acting on the wrong thing.
+        silently acting on the wrong thing -- and a destroy or recreate first
+        checks every share together (``_refuse_drift()``), so such a refusal
+        stops the run before any node has begun deleting.
         """
         if action not in ("destroy", "recreate", "exec"):
             raise ClusterError("Unknown template action '%s'." % action, 400)
@@ -2784,6 +2805,8 @@ class ClusterService:
                     name, local, params=params, background=background, stale=stale)
             return self.service.exec_template_instances(
                 name, command, local, timeout=timeout, background=background)
+        if action != "exec":
+            self._refuse_drift(name, grouped, stale)
 
         total = sum(len(v) for v in grouped.values())
 
@@ -2797,6 +2820,27 @@ class ClusterService:
 
         return self.service.track_run(name, action, total, work, background,
                                       command=command, nodes=sorted(grouped))
+
+    def _refuse_drift(self, name, grouped, stale):
+        """Refuse the whole run if any named node's set is not its share any more.
+
+        Each node checks its own share again when it starts, but the shares
+        start side by side, so one node refusing would come after another had
+        begun deleting. With no lock across nodes this cannot close the gap,
+        only shrink it from however long the confirmation took to one listing
+        round -- which is the gap a single node's own check leaves too.
+        Destructive actions only: exec runs on whichever of them it is handed.
+        """
+        current = {}
+        for member in self.template_instances(name, stale=stale, nodes=sorted(grouped)):
+            current.setdefault(member["node"], set()).add(member["name"])
+        drifted = sorted(node for node, names in grouped.items()
+                         if set(names) != current.get(node, set()))
+        if drifted:
+            raise ClusterError(
+                "The instances from template '%s' changed on %s since they were "
+                "listed. Nothing was done; list them again." % (name, ", ".join(drifted)),
+                409)
 
     def _act_on(self, node_name, template, action, names, params, command, timeout,
                 stale=False):

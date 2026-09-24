@@ -34,8 +34,8 @@ resolved; `--json` on any CLI command prints the same payload the REST API retur
 
 ## Hard constraints
 
-- **The backend is stdlib-only, and Python 3.9+.** `pyproject.toml` declares no
-  dependencies by design — do not add any, and do not use syntax newer than 3.9
+- **The backend is stdlib-only, and Python 3.10+.** `pyproject.toml` declares no
+  dependencies by design — do not add any, and do not use syntax newer than 3.10
   (every module starts with `from __future__ import annotations`, so annotations
   themselves are free).
 - **`web/dist` is a build output, not source**, and is gitignored. The release workflow

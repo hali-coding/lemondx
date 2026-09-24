@@ -26,7 +26,7 @@ shelling out and no parsing of CLI output.
 - Membership of the daemon's admin group — `lxd` for LXD, `incus-admin` for
   Incus. Check with `id`; after `usermod -aG`, run `newgrp <group>` or log out
   and back in.
-- **Python 3.9+**. That is the whole dependency list — the backend is stdlib
+- **Python 3.10+**. That is the whole dependency list — the backend is stdlib
   only, so there is no pip install, virtualenv or lockfile.
 
 Node is **not** required to run a release: the archive on the
@@ -41,7 +41,7 @@ finds and adapts to whichever one is installed.
 
 ## Quick start
 
-Download the latest release — Python 3.9+ is all it needs, the UI is already
+Download the latest release — Python 3.10+ is all it needs, the UI is already
 built:
 
 ```bash

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Assemble the release archives: a tree that runs with nothing but Python 3.9+,
+# Assemble the release archives: a tree that runs with nothing but Python 3.10+,
 # which is what a clone gave you back when web/dist was committed.
 #
 #   .github/scripts/bundle.sh <version> [outdir]

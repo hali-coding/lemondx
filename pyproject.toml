@@ -7,7 +7,7 @@ name = "lemondx"
 version = "0.8.0"
 description = "Web UI and CLI for managing local LXC/LXD containers"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = []          # stdlib only, by design
 
 [project.scripts]

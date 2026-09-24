@@ -245,6 +245,11 @@ at, and named in the output — running this while a host is down would otherwis
 quietly shrink the groups it belongs to. Both groups are pushed to every member
 like any other group.
 
+They are only ever a reading taken when someone asked, never kept up by
+themselves: a node that joins afterwards is in neither until the next
+`group auto`, and a cluster formed afresh (every member having left) starts
+with neither — standing down drops a node's groups, these included.
+
 **`large` and `small` cannot be edited or deleted by hand** — not from the CLI,
 not from the UI, not by `PUT`/`DELETE` on their routes. They say what the
 cluster measured, so a hand edit would leave a group whose name promises
