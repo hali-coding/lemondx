@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useCanOperate, useCanWrite } from '../hooks/useAuth'
 import { api, calls } from '../lib/api'
-import { keyOf } from '../lib/instance'
+import { keyOf, madeFrom } from '../lib/instance'
 import { syncDetail, syncKind } from '../lib/sync'
 import type {
   BootstrapModule, ClusterNode, InstanceRef, InstanceTemplate, LaunchedInstance, NodeGroup,
@@ -297,8 +297,8 @@ export function TemplatesView({
                     <p className="module-desc-full">{template.description}</p>
                   )}
                   <dl className="kv template-facts">
-                    <dt>Image</dt>
-                    <dd className="mono">{template.image}</dd>
+                    <dt>{template.snapshot ? 'Snapshot' : 'Image'}</dt>
+                    <dd className="mono">{madeFrom(template)}</dd>
                     <dt>Limits</dt>
                     <dd>{limits || <span className="faint">none</span>}</dd>
                     <dt>Modules</dt>

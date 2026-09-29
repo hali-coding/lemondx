@@ -2,11 +2,21 @@
 
 [← back to README](../README.md)
 
-A stack launches several [templates](templates.md) in a fixed order at the click
-of a button: one database server, then three app servers pointed at it, then
-six load-test runners pointed at those. Later launches are handed the names and
-addresses of what earlier ones made, so nothing has to be copied by hand between
-steps.
+A stack is how lemondx describes a deployment, and the thing it is built to
+run. It launches several [templates](templates.md) in a fixed order: one
+database server, then three app servers pointed at it, then six load-test
+runners pointed at those. Later launches are handed the names and addresses of
+what earlier ones made, so nothing has to be copied by hand between steps, and
+health gates hold a stage back until what it depends on is actually up.
+
+Once launched, the stack is operated as a whole: stopped, started, relaunched
+and destroyed together, marked stale when its definition changes, and followed
+in the web UI, the CLI and `lemondx top`. Templates and modules are its parts;
+launching a template on its own is for a single tier with nothing to wire up.
+
+Stacks are meant to span **several nodes**: each launch step can name nodes or
+a node group, and a [fabric](networking.md) lets the tiers reach each other
+across hosts. That is the recommended deployment — see [Clusters](#clusters).
 
 A stack is a list of **stages**. Stages run one after another, and the **steps**
 inside one stage run at the same time. A step is one of:
@@ -257,6 +267,15 @@ so it is clear what a password is about to be used for. The CLI takes them from
 environment variables of the same name, or prompts, as `launch` does.
 
 ## Clusters
+
+A stack on one host works, and is a fine way to develop one. A stack across
+several is what lemondx is for: losing a host costs its share rather than the
+deployment, tiers can be put where there is room (`lemondx cluster group auto`
+sorts nodes into `large` and `small`), and one join code is all a new host
+needs. For tiers to reach each other across hosts, put their templates on a
+[fabric](networking.md) — a step's `{{db.ip}}` is then the fabric address,
+which means something on every node. See
+[the recommended deployment](../README.md#recommended-deployment-several-nodes).
 
 A launch step can name nodes or a node group, like the Launch dialog. Instances
 go round robin over them, and names are numbered across the whole cluster. The

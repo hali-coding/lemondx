@@ -66,17 +66,24 @@ class Router:
     handlers whose answer depends on who is asking. ``peers=True`` marks a
     route only members call each other on; the handler still guards it with
     ``_peers_only()``, and the mark is what stops ``_forward()`` relaying it.
+    ``stream=True`` hands the handler the request body unread, as a
+    ``_BodyReader``, for an upload too large to hold -- only a peers route,
+    since nothing relays one.
     """
 
     def __init__(self):
         self.routes = []
         self.peer_routes = set()
+        self.stream_routes = set()
 
-    def add(self, method, pattern, handler, role=None, principal=False, peers=False):
+    def add(self, method, pattern, handler, role=None, principal=False, peers=False,
+            stream=False):
         role = role or (READ if method == "GET" else ADMIN)
         self.routes.append((method, re.compile("^%s$" % pattern), handler, role, principal))
         if peers:
             self.peer_routes.add(handler)
+        if stream:
+            self.stream_routes.add(handler)
 
     def resolve(self, method, path):
         """``(handler, args, role, wants_principal)``; handler is None for no match."""
@@ -175,6 +182,13 @@ def build_router(service, auth=None, cluster=None, stacks=None):
           lambda body, q, name, snap: service.delete_snapshot(name, snap))
     r.add("POST", r"/api/containers/%s/snapshots/%s/restore" % (NAME, NAME),
           lambda body, q, name, snap: service.restore_snapshot(name, snap))
+    # A snapshot made into an image here, then sent to other members: how a
+    # snapshot runs anywhere but on its own node. See cluster.publish_snapshot().
+    r.add("POST", r"/api/containers/%s/snapshots/%s/publish" % (NAME, NAME),
+          lambda body, q, name, snap: cluster.publish_snapshot(
+              name, snap, body.get("alias"), nodes=body.get("nodes"),
+              description=body.get("description", ""),
+              background=bool(body.get("background", False))))
 
     r.add("GET", r"/api/resources", lambda body, q: service.resources())
     # The monitor's latest results; there is deliberately no way to trigger a
@@ -277,7 +291,8 @@ def build_router(service, auth=None, cluster=None, stacks=None):
               bootstrap=body.get("bootstrap"),
               description=body.get("description", ""),
               name_prefix=body.get("name_prefix"),
-              app_check=body.get("app_check")), principal=True)
+              app_check=body.get("app_check"),
+              snapshot=body.get("snapshot")), principal=True)
     r.add("DELETE", r"/api/templates/%s" % NAME,
           lambda body, q, who, name: cluster.delete_template(
               name, everywhere=_everywhere(body, q, who),
@@ -370,6 +385,23 @@ def build_router(service, auth=None, cluster=None, stacks=None):
           role=OPERATOR, principal=True)
 
     r.add("GET", r"/api/images", lambda body, q: service.list_images())
+    r.add("GET", r"/api/image-jobs", lambda body, q: cluster.image_jobs())
+    r.add("POST", r"/api/images/%s/copy" % NAME,
+          lambda body, q, alias: cluster.copy_image(
+              alias, body.get("nodes"), background=bool(body.get("background", False))))
+    # The two halves of a copy, as the sending member makes them: "have you
+    # got this image?", then the image itself when not. Members only -- a
+    # person publishes or copies through the routes above.
+    r.add("POST", r"/api/images/adopt",
+          lambda body, q, who: _peers_only(who, "Images are copied between members only.")
+          or service.adopt_image(body.get("fingerprint"), body.get("alias"),
+                                 body.get("description", "")),
+          principal=True, peers=True)
+    r.add("PUT", r"/api/images/receive",
+          lambda body, q, who: _peers_only(who, "Images are copied between members only.")
+          or service.receive_image(body, body.length, q.get("fingerprint"),
+                                   q.get("alias"), q.get("description", "")),
+          principal=True, peers=True, stream=True)
     r.add("GET", r"/api/profiles", lambda body, q: service.list_profiles())
 
     # -- federation --------------------------------------------------------
@@ -679,10 +711,15 @@ class LemondxHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "Forbidden: this needs %s access, and %s has %s"
                                  % (role, principal.name, principal.role)}, 403)
                 return
-            body = self._read_body()
+            stream = handler in self.router.stream_routes
+            body = _BodyReader(self.rfile, self.headers.get("Content-Length")) if stream \
+                else self._read_body()
             if wants_principal:
                 args = [principal] + list(args)
             result = handler(body, query, *args)
+            # A handler that stopped short leaves bytes that _send_json() must
+            # not let be parsed as the next request.
+            self._body_read = not stream or body.remaining == 0
             self._send_json({"data": result}, 200)
         except ServiceError as exc:
             self._send_json({"error": exc.message}, exc.code)
@@ -1103,6 +1140,31 @@ def _fabric_bridge(cluster, wanted):
     return cluster.fabric().require(wanted)
 
 
+class _BodyReader:
+    """A request body read on demand, never past its Content-Length."""
+
+    def __init__(self, rfile, length):
+        self._rfile = rfile
+        try:
+            self.length = max(0, int(length or 0))
+        except ValueError:
+            raise ServiceError("Bad Content-Length.")
+        self.remaining = self.length
+
+    def read(self, size=-1):
+        if self.remaining <= 0:
+            return b""
+        size = self.remaining if size is None or size < 0 else min(size, self.remaining)
+        data = self._rfile.read(size)
+        self.remaining -= len(data)
+        if not data:
+            # The sender hung up early: say so, rather than let the daemon wait
+            # on the rest of an image that is never coming.
+            self.remaining = 0
+            raise ServiceError("The upload ended early.", 400)
+        return data
+
+
 def _peers_only(principal, message):
     """Raise unless this caller is another cluster member; returns None to pass.
 
@@ -1355,15 +1417,16 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
         httpd.serve_forever()
     except KeyboardInterrupt:
         _wait_for_background_work(getattr(httpd.RequestHandlerClass, "service", None),
-                                  getattr(httpd.RequestHandlerClass, "stacks", None))
+                                  getattr(httpd.RequestHandlerClass, "stacks", None),
+                                  getattr(httpd.RequestHandlerClass, "cluster", None))
         print("Shutting down.")
     finally:
         store.clear_runtime()
         httpd.server_close()
 
 
-def _wait_for_background_work(service, stacks=None):
-    """Give creates, template runs and stacks the chance to finish before exiting.
+def _wait_for_background_work(service, stacks=None, cluster=None):
+    """Give creates, template runs, stacks and image copies the chance to finish.
 
     They run on threads the process takes down with it, and stopping one
     halfway leaves an instance created but never bootstrapped, or a recreate
@@ -1374,7 +1437,8 @@ def _wait_for_background_work(service, stacks=None):
     # leaves the rest of it never launched.
     def pending():
         return (service.pending_work() if service else []) + \
-            (stacks.pending_work() if stacks else [])
+            (stacks.pending_work() if stacks else []) + \
+            (cluster.pending_work() if cluster else [])
     if not pending():
         return
     print("\nStill running: %s." % "; ".join(pending()))

@@ -34,8 +34,12 @@ catalog rather than typing an alias by hand.
 
 ## Storage, and disk sizes
 
-`lemondx init` creates a pool with the `dir` driver by default: it works
-everywhere, needs no extra packages, and creates no large backing file.
+`lemondx init` gets a fresh host ready for instances — a pool, a bridge and a
+default profile that uses them. It is a convenience for a new node, not a
+substitute for setting up the daemon deliberately: a host whose daemon is
+already configured needs none of it. It creates the pool with the `dir` driver
+by default: it works everywhere, needs no extra packages, and creates no large
+backing file.
 
 The trade-off is that **`dir` cannot enforce a per-container disk size** unless
 the backing filesystem has project quotas enabled. The daemon accepts the size,

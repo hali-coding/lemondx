@@ -2,11 +2,16 @@
 
 [← back to README](../README.md)
 
-A template is a whole instance setup saved under a name: image, container or
-VM, CPU/memory/disk limits, storage pool, network, daemon profiles, the ephemeral,
+A template is a whole instance setup saved under a name: image (or a
+[snapshot to clone](#from-a-snapshot)), container or VM, CPU/memory/disk limits, storage pool, network, daemon profiles, the ephemeral,
 start and secure boot flags, and a bootstrap selection — modules, every one of their
 parameters, and the SSH public keys to install. Launching one creates one or
 many identical instances in a single step.
+
+Templates are what a [stack](stacks.md) is made of: each launch step names
+one. Launching a template on its own is useful for a fleet of identical
+instances with nothing to wire between them; anything with tiers that depend
+on each other is a stack.
 
 A [bootstrap profile](modules.md#defaults-saved-settings-and-profiles) only
 covers the bootstrap part; a template covers everything. The template editor
@@ -243,6 +248,57 @@ A node that lacks the template's storage pool, network or profile substitutes
 its own default rather than failing every instance, and the run says so, per
 node. A node that fails outright fails only its own share.
 
+## From a snapshot
+
+A template can clone a snapshot instead of pulling an image: an instance set up
+by hand once, snapshotted, then stamped out as many times as needed. In the
+editor pick **Made from → A snapshot**, then the instance and snapshot; from
+the CLI:
+
+```bash
+lemondx snapshot golden base
+lemondx template-save "Golden" --snapshot golden/base --prefix app
+lemondx launch "Golden" -n 3                      # app-1..3, clones of golden/base
+```
+
+Each instance is a copy-on-write clone where the storage driver supports it
+(zfs, btrfs, lvm), so a launch is quick. The clone is container or VM as its
+source was, and it is made its own instance on the way: lemondx tags from the
+source (its template, its stack) are removed, and a container's
+`/etc/machine-id` is emptied so systemd makes a new one at first boot --
+otherwise every clone would ask DHCP for the source's address. A VM's files
+cannot be reached before it boots, so a VM clone keeps its source's
+machine-id; so does anything else the image generated once, like SSH host
+keys, which a bootstrap module can regenerate.
+
+**A snapshot exists on one node,** so that is where the template's instances
+are made. The template records the node (the one it was saved on, unless
+`--snapshot-node` says otherwise); a launch that names no node goes there, and
+one naming any other node or group is refused. Its saved snapshot is checked
+before anything is created -- or, for a recreate, deleted.
+
+To run it anywhere else, make an image of it and copy that to the nodes you
+choose: **Make image** on the snapshot in the container drawer, or
+
+```bash
+lemondx snapshot-publish golden base golden-base --to node2 --to node3
+lemondx image-copy golden-base --to node4          # later, to one that was missed
+lemondx template-save "Golden anywhere" -i local:golden-base
+```
+
+The image is made on the snapshot's node and kept there, then sent whole to
+each chosen node over the cluster's own pinned connection, a few at a time,
+and imported by that node's daemon -- whose fingerprint of what arrived must
+match the source's, or the copy is discarded. A node that already has the
+image only gets the name. The name must be free where the image is made; on a
+node it is copied to, an image already called that is replaced by the copy, as
+a pushed template replaces a copy. Copying is never done for a launch, because
+it is a full image per node: you choose once where it should be.
+
+The work runs in the background on the snapshot's node and carries on if the
+page is closed; the drawer shows each node's progress, and a notification says
+how it ended. `serve` waits for it at Ctrl-C like a template run.
+
 ## Parameters, keys and secrets
 
 Saving fills in every non-secret parameter the selected modules declare — from
@@ -281,7 +337,17 @@ curl -s -X POST localhost:8099/api/templates/Web%20server/destroy \
 ```
 
 `PUT` replaces the whole template, so `app_check` absent or `null` means no
-check.
+check. A template made from a snapshot sends `"snapshot": {"instance", "name",
+"node"}` instead of an image; a blank `node` means the node saving it.
+
+`POST /api/containers/{name}/snapshots/{snap}/publish` takes `{"alias",
+"nodes": [...], "description"}` and makes the image, copying it to `nodes`;
+`POST /api/images/{alias}/copy` takes `{"nodes": [...]}` for an image that
+exists already. Both block until done unless the body has `"background":
+true`, and return the job: `{"id", "alias", "source", "node", "fingerprint",
+"size", "stage", "started_at", "finished_at", "ok", "error", "nodes": [{"node",
+"state", "sent", "error"}]}`. `GET /api/image-jobs` on the image's node lists
+them while running and for ten minutes after.
 
 Launch, recreate and destroy all respond with `{"template", "ok", "notes",
 "instances": [{"name", "ok", "error", "container"}]}`. `notes` lists what a node
@@ -322,6 +388,7 @@ or check them into a project:
   "description": "nginx boxes",
   "name_prefix": "web",
   "image": "images:debian/12",
+  "snapshot": null,
   "type": "container",
   "cpu": "2",
   "memory": "2GiB",

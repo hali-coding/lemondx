@@ -1,0 +1,29 @@
+#cloud-config
+# image: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+# Ubuntu 24.04 with LXD from snap (5.21/stable, the LTS track Ubuntu ships).
+# @HOSTNAME@ and @SSH_KEYS@ are filled in by scripts/create-vm.sh.
+hostname: @HOSTNAME@
+fqdn: @HOSTNAME@.lemondx.test
+users:
+  - name: ci
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+@SSH_KEYS@
+package_update: true
+package_upgrade: true
+package_reboot_if_required: true
+packages:
+  - qemu-guest-agent
+  - python3
+  - git
+  - curl
+  - jq
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  - snap wait system seed.loaded
+  - snap install lxd --channel=5.21/stable
+  - lxd waitready --timeout=120
+  - lxd init --auto
+  - groupadd -f lxd && usermod -aG lxd ci
+  - touch /var/lib/cloud/testcluster-ready

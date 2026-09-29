@@ -29,6 +29,33 @@ way. Under it is just `npm --prefix web run build`, if you would rather drive
 that directly. There is nothing to commit afterwards: `.gitignore` covers
 `web/dist`.
 
+## The live-daemon CI job
+
+GitHub's hosted runners have no LXD or Incus, so `pr.yml`'s `daemon` job runs on
+a self-hosted runner labelled `lemondx-daemon`. The runner is a small Debian 13
+VM (1 vCPU, 1 GB) with Incus. The job runs `.github/scripts/daemon_smoke.sh`,
+which you can also run by hand on any host with a daemon. It covers:
+
+- `status`
+- a create on Alpine with the `base` module
+- exec, including an exit code of 127
+- snapshot and restore
+- `serve` answering the API
+- delete
+
+Every name in the script carries the run id, and a trap removes what the run
+made, because the VM is long-lived.
+
+The repository is public, and the runner's user can drive the daemon, which is
+as good as root on that VM. So:
+
+- The job is skipped for PRs from forks. To check a fork's change, push it to
+  a branch here.
+- Every PR from an outside contributor needs approval before any workflow runs
+  (Settings → Actions → General). The job's `if:` is not enough on its own: a
+  PR's workflows run from the PR's copy of the files, so a fork could simply
+  delete the condition.
+
 ## Releases
 
 Releases are cut by [release-please](https://github.com/googleapis/release-please)

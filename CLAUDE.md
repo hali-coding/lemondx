@@ -2,9 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-lemondx is a web UI and CLI for local LXD/Incus containers, optionally federated
-with other lemondx nodes. `README.md` and `docs/*.md`
-are the user-facing reference (CLI commands, REST endpoints, module authoring, socket
+lemondx is application orchestration on LXD/Incus: a web UI, CLI and REST API
+whose core is the **stack** (templates launched in stages across federated
+nodes, wired together and operated as one deployment). Multi-node is the
+recommended deployment; the host-level features (init, storage, networks,
+maintenance) exist to get a node ready and are not a node management tool.
+`README.md` and `docs/*.md` are the user-facing reference (CLI commands, REST endpoints, module authoring, socket
 discovery) and are kept current — read them for behaviour; this file covers how the code
 is put together. README.md is deliberately short: it links out to docs/ for anything more
 than a paragraph, so update the doc a change actually affects rather than growing the
@@ -302,6 +305,21 @@ which would start a second run on the same template. Remote shares are started
 with `background: true` and polled (`_await_run`), never held open for the
 minutes an image pull takes.
 
+A template may clone a snapshot (`snapshot: {node, instance, name}`) instead
+of naming an image. A snapshot is on one node, so `template_targets()` sends
+every launch there -- with nothing named, that node; naming any other,
+refused -- and stacks resolve a step's targets through it too, or they would
+follow the wrong node's listing. `_detach_clone()` strips the source's
+`user.lemondx.*` keys (the daemon merges ours over the copied config, so a
+key we do not set would survive -- a stack tag being the dangerous one) and
+empties a container's `/etc/machine-id`, without which every clone asks DHCP
+for the source's address. Running it elsewhere is deliberately explicit:
+`publish_snapshot()` makes an image and `_send_image()` streams it to each
+chosen peer (`/api/images/adopt` first, so a node holding it only gets the
+alias, then the `stream=True` route `/api/images/receive`, whose body the
+handler reads on demand). The far daemon's fingerprint of what arrived is the
+integrity check. Jobs live in memory on the image's node, like template runs.
+
 `place_template()` is why a template written for one host launches on another: a
 pool, network or profile the node lacks falls back to the default profile's, and
 the substitution is returned as run notes *and* logged, since a launch started
@@ -475,9 +493,14 @@ published API and has not been exercised against a live daemon.
 files over HTTP and deletes them, which avoids a websocket client entirely. It deliberately
 recovers output from *failed* operations, because the daemon reports some non-zero exits
 (127 among them) as operation failures even though the record holds the real exit code. A
-command that ran and failed is a result, not an API error. The consequence is that there is
-no TTY and no streaming anywhere — the browser console is non-interactive, and
-`lemondx shell` hands off to the real `lxc`/`incus` binary instead.
+command that ran and failed is a result, not an API error. The consequence is that exec
+has no TTY and no streaming — the browser console is non-interactive, and `lemondx shell`
+hands off to the real `lxc`/`incus` binary instead. Interactive terminals are a separate
+path: `ContainerService.open_terminal()` attaches to the daemon's shell or console
+WebSocket (`websocket.py`, both halves), `server.py` bridges it at
+`/api/containers/{name}/shell|console`, and `lemondx top` attaches to a local instance
+directly and to a peer's through that endpoint via `NodeClient.open_websocket()`, which
+goes through the pinned `_connect()` like every other peer call.
 
 ### Bootstrap modules
 

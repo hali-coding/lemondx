@@ -2,10 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useCanOperate, useCanWrite } from '../hooks/useAuth'
 import { api } from '../lib/api'
 import { absoluteTime, bytes, cpuTime, relativeTime, secondsAgo } from '../lib/format'
-import type { ContainerDetail, HealthRecord, StateAction } from '../lib/types'
+import type { ContainerDetail, HealthRecord, ImageJob, StateAction } from '../lib/types'
 import { CameraIcon, CloseIcon, PauseIcon, PlayIcon, RestartIcon, StopIcon, TrashIcon } from './Icons'
 import { BootstrapPanel } from './BootstrapPanel'
 import { ExecConsole } from './ExecConsole'
+import { PublishDialog } from './PublishDialog'
 import { AppCheckLabel, HealthLabel } from './HealthDot'
 import { StatusBadge } from './StatusBadge'
 import { staleSummary } from '../lib/stale'
@@ -31,11 +32,16 @@ interface Props {
   onNotify: (kind: 'success' | 'error', title: string, detail?: string) => void
   /** Open the full output of this instance's app check. */
   onShowAppCheck: () => void
+  /** Images being made from this instance's snapshots, or made lately. */
+  imageJobs: ImageJob[]
+  /** A publish started here, for the page to follow until it finishes. */
+  onImageJob: (job: ImageJob) => void
   refreshToken: number
 }
 
 export function ContainerDrawer({
-  name, node, health, healthPending, busy, onClose, onAction, onDelete, onNotify, onShowAppCheck, refreshToken,
+  name, node, health, healthPending, busy, onClose, onAction, onDelete, onNotify, onShowAppCheck,
+  imageJobs, onImageJob, refreshToken,
 }: Props) {
   const canWrite = useCanWrite()
   const canOperate = useCanOperate()
@@ -44,6 +50,7 @@ export function ContainerDrawer({
   const [tab, setTab] = useState<Tab>('overview')
   const [snapshotName, setSnapshotName] = useState('')
   const [snapBusy, setSnapBusy] = useState(false)
+  const [publishing, setPublishing] = useState<string | null>(null)
   const [editingLimits, setEditingLimits] = useState(false)
   const [limitCpu, setLimitCpu] = useState('')
   const [limitMemory, setLimitMemory] = useState('')
@@ -439,6 +446,11 @@ export function ContainerDrawer({
                       </div>
                     </div>
                     <button className="btn btn-sm" disabled={snapBusy || !canWrite}
+                      title="Publish it as an image, and copy that to other nodes"
+                      onClick={() => setPublishing(snapshot.name)}>
+                      Make image
+                    </button>
+                    <button className="btn btn-sm" disabled={snapBusy || !canWrite}
                       onClick={() => runSnapshotAction('restore', snapshot.name)}>
                       Restore
                     </button>
@@ -451,6 +463,13 @@ export function ContainerDrawer({
                 ))
               )}
             </>
+          )}
+
+          {detail && tab === 'snapshots' && imageJobs.length > 0 && (
+            <div style={{ marginTop: 14 }}>
+              <h4 className="dim" style={{ fontSize: 12, margin: '0 0 6px' }}>Images</h4>
+              {imageJobs.map((job) => <ImageJobRow key={job.id} job={job} />)}
+            </div>
           )}
 
           {detail && tab === 'bootstrap' && (
@@ -490,7 +509,48 @@ export function ContainerDrawer({
           </button>
         </div>
       </aside>
+      {publishing && (
+        <PublishDialog instance={name} snapshot={publishing} node={node}
+          onCancel={() => setPublishing(null)}
+          onStarted={(job) => {
+            setPublishing(null)
+            onImageJob(job)
+          }} />
+      )}
     </>
+  )
+}
+
+const JOB_STATES: Record<ImageJob['nodes'][number]['state'], string> = {
+  waiting: 'waiting', sending: 'sending', importing: 'importing',
+  done: 'copied', present: 'had it already', failed: 'failed',
+}
+
+function ImageJobRow({ job }: { job: ImageJob }) {
+  const stage = job.finished_at === null
+    ? (job.stage === 'publishing' ? 'publishing…' : 'copying…')
+    : job.ok ? 'ready' : 'failed'
+  return (
+    <div className="list-row">
+      <div className="list-row-main">
+        <strong className="mono">local:{job.alias}</strong>
+        <div className="faint" style={{ fontSize: 12 }}>
+          {job.source ? `from ${job.source.split('/')[1]} · ` : ''}
+          {stage}{job.size ? ` · ${bytes(job.size)}` : ''}
+        </div>
+        {job.nodes.map((entry) => (
+          <div key={entry.node} className="faint" style={{ fontSize: 12 }}>
+            {entry.node}: {JOB_STATES[entry.state]}
+            {entry.state === 'sending' && job.size
+              ? ` ${Math.floor((entry.sent / job.size) * 100)}% of ${bytes(job.size)}` : ''}
+            {entry.error && <span style={{ color: 'var(--danger)' }}> — {entry.error}</span>}
+          </div>
+        ))}
+        {job.error && !job.nodes.some((e) => e.error) && (
+          <div style={{ fontSize: 12, color: 'var(--danger)' }}>{job.error}</div>
+        )}
+      </div>
+    </div>
   )
 }
 

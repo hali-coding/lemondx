@@ -3,7 +3,7 @@ import type { ReactNode } from 'react'
 import { ApiError, api, hasToken, setToken } from './lib/api'
 import type {
   AuthInfo, CreateProgress, CreateRequest, HealthRecord, HealthStatus, InstanceRef,
-  ScopedContainer, StackRun, StateAction, Status, TemplateRun,
+  ImageJob, ScopedContainer, StackRun, StateAction, Status, TemplateRun,
 } from './lib/types'
 import { keyOf } from './lib/instance'
 import { AuthContext } from './hooks/useAuth'
@@ -118,6 +118,7 @@ export default function App() {
   const [creates, setCreates] = useState<CreateProgress[]>([])
   const [templateRuns, setTemplateRuns] = useState<TemplateRun[]>([])
   const [stackRuns, setStackRuns] = useState<StackRun[]>([])
+  const [imageJobs, setImageJobs] = useState<ImageJob[]>([])
   const [health, setHealth] = useState<Record<string, HealthRecord>>({})
   // Nodes that check health at all, keyed as rows are ('' for this host
   // alone), so a running instance not yet checked there shows as pending.
@@ -169,6 +170,11 @@ export default function App() {
   const watchedCreates = useRef(new Set<string>())
   const watchedRuns = useRef(new Set<string>())
   const watchedStacks = useRef(new Set<string>())
+  // An image job is held by the node the image is on. This node is always
+  // asked; another is asked only after this page started a job there, until
+  // it has none left running -- so an idle page polls nobody else for them.
+  const watchedImages = useRef(new Set<string>())
+  const imageNodes = useRef(new Set<string>())
   // The health status each instance had at this page's previous poll, so a
   // change is reported once, by the page that saw it happen -- and a page
   // opened on an instance that is already unhealthy says nothing.
@@ -262,6 +268,43 @@ export default function App() {
     }
   }, [notify])
 
+  const reportImages = useCallback((jobs: ImageJob[]) => {
+    for (const job of jobs) {
+      const key = `${job.node}/${job.id}`
+      if (job.finished_at === null) {
+        watchedImages.current.add(key)
+        continue
+      }
+      if (!watchedImages.current.delete(key)) continue
+      const copied = job.nodes.filter((e) => e.state === 'done' || e.state === 'present')
+      if (job.ok) {
+        notify('success', `Image local:${job.alias} is ready`,
+          `On ${[job.node, ...copied.map((e) => e.node)].join(', ')}.`)
+      } else {
+        notify('error', `Image local:${job.alias} ${job.fingerprint ? 'was not copied everywhere' : 'failed'}`,
+          job.error ?? undefined)
+      }
+    }
+  }, [notify])
+
+  const fetchImageJobs = useCallback(async (signal?: AbortSignal) => {
+    const remote = [...imageNodes.current]
+    const lists = await Promise.all([undefined, ...remote].map(
+      (node) => api.imageJobs(node, signal).catch(() => null)))
+    remote.forEach((node, index) => {
+      const list = lists[index + 1]
+      if (list && !list.some((job) => job.finished_at === null)) imageNodes.current.delete(node)
+    })
+    return lists.every((list) => list === null) ? null
+      : lists.flatMap((list) => list ?? [])
+  }, [])
+
+  const followImageJob = useCallback((job: ImageJob, node?: string) => {
+    if (node) imageNodes.current.add(node)
+    watchedImages.current.add(`${job.node}/${job.id}`)
+    setImageJobs((jobs) => [...jobs.filter((j) => j.node !== job.node || j.id !== job.id), job])
+  }, [])
+
   const reportHealth = useCallback((records: HealthRecord[]) => {
     const previous = seenHealth.current
     const next = new Map(records.map((r) => [keyOf(r), r.status] as [string, HealthStatus]))
@@ -284,7 +327,7 @@ export default function App() {
     const sequence = ++refreshSequence.current
     const epoch = authEpoch.current
     try {
-      const [nextStatus, nextContainers, nextCreates, nextRuns, nextHealth, nextStacks] = await Promise.all([
+      const [nextStatus, nextContainers, nextCreates, nextRuns, nextHealth, nextStacks, nextImages] = await Promise.all([
         api.status(signal),
         // One fetch drives both the Containers and Templates tabs, so they can
         // never disagree about which hosts are in view.
@@ -301,6 +344,7 @@ export default function App() {
         // brings every node's own records along with its instances instead.
         scope.kind === 'local' ? api.health(signal).catch(() => null) : Promise.resolve(null),
         api.stackRuns(signal).catch(() => null),
+        fetchImageJobs(signal),
       ])
       if (sequence !== refreshSequence.current) return
       setStatus(nextStatus)
@@ -317,6 +361,10 @@ export default function App() {
       if (nextStacks) {
         setStackRuns(nextStacks)
         reportStacks(nextStacks)
+      }
+      if (nextImages) {
+        setImageJobs(nextImages)
+        reportImages(nextImages)
       }
       // Keyed as the rows are (keyOf), so a web-1 on two nodes keeps two dots.
       const records = nextContainers.health ?? nextHealth?.instances
@@ -347,7 +395,7 @@ export default function App() {
       }
       setConnectionError((cause as Error).message)
     }
-  }, [reportCreates, reportRuns, reportStacks, reportHealth, scope])
+  }, [reportCreates, reportRuns, reportStacks, reportImages, reportHealth, fetchImageJobs, scope])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -867,6 +915,10 @@ export default function App() {
           onDelete={() => setPendingDelete(selected)}
           onNotify={notify}
           onShowAppCheck={() => setAppCheckFor(selected)}
+          imageJobs={imageJobs.filter((job) => job.node === (selected.node || localNode)
+            && job.source?.startsWith(`${selected.name}/`))}
+          onImageJob={(job) => followImageJob(job,
+            selected.node && selected.node !== localNode ? selected.node : undefined)}
         />
       )}
 

@@ -91,7 +91,10 @@ Widened, the table gains a Node column, and start/stop/restart/delete are routed
 to whichever node owns each row — a selection may span hosts. Clicking any row
 opens the full detail drawer, wherever the instance lives: overview and limits,
 snapshots, bootstrap and the console all act on its own node. The bootstrap
-picker's modules and keys come from that node too.
+picker's modules and keys come from that node too. A snapshot's **Make image**
+publishes it as an image and copies that to the nodes you tick, with each
+node's progress shown under the snapshots — see
+[Templates](templates.md#from-a-snapshot).
 
 Health dots and app-check diamonds show for every node's rows: each node's
 monitor judges its own instances, and the listing carries what the owner last
@@ -288,6 +291,10 @@ curl -s localhost:8099/api/resources | jq '.memory, .instances[].memory'
 ```
 
 ## Storage view
+
+The Storage and Network views, like **This node** on Home, are about the host
+under one node: enough to get it ready for instances and to see what they are
+using. They are not meant to replace the host's own tooling.
 
 The **Storage** tab has separate Pools and Volumes views. Pools show their
 driver, source, capacity, resident instances, volume count and whether lemondx

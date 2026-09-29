@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 node_modules/
 .DS_Store
+nohup.out
 
 # web/dist is a build output, not source: it is rebuilt by the release
 # workflow and shipped in the release archive, so a clone builds it with

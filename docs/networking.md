@@ -198,9 +198,13 @@ rules to add yourself.
 
 **`serve` cannot program routes.** The shipped systemd units set
 `NoNewPrivileges=yes`, which stops sudo raising privilege at all. That is the
-same thing that breaks PAM password logins. Either set `NoNewPrivileges=no` for
-the unit (see [docs/service.md](service.md)) or run `lemondx fabric apply`
-yourself; the result is identical.
+same thing that breaks PAM password logins. On the system unit, set
+`NoNewPrivileges=no`. On the **user** unit that is not enough: the filesystem
+sandbox runs in a user namespace where sudo cannot work at all, so it has to go
+too ([the drop-in](service.md#a-user-unit-that-can-raise-privilege)). Or run
+`lemondx fabric apply` yourself; the result is identical. This failure is
+quiet: `fabric create` still reports success. The sign is `fabric list`
+showing every node as `routes`, with each peer's route missing.
 
 **A node shows `routes` or `no bridge`.** It was told about the fabric but has
 not stood it up, usually for want of privilege there. Run

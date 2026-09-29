@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import socket
 import struct
@@ -37,7 +38,14 @@ GOING_AWAY = 1001
 
 
 class WebSocketError(Exception):
-    """The connection failed, or the peer broke the protocol."""
+    """The connection failed, or the peer broke the protocol.
+
+    ``code`` is the HTTP status when the upgrade itself was refused.
+    """
+
+    def __init__(self, message="", code=None):
+        super().__init__(message)
+        self.code = code
 
 
 def accept_key(key):
@@ -227,51 +235,70 @@ def server_handshake(headers, write):
            "\r\n" % accept_key(key)).encode("ascii"))
 
 
-def connect_unix(socket_path, path, timeout=15):
-    """Open a WebSocket to ``path`` on a daemon listening on a unix socket.
+def client_handshake(sock, host, path, headers=None):
+    """Upgrade an open connection to a WebSocket, as the client.
 
     The handshake is read through the same buffered reader the frames will use,
-    so no reply bytes can be stranded between the two.
+    so no reply bytes can be stranded between the two. A refused upgrade is an
+    ordinary HTTP response, and lemondx and the daemon both put the reason in a
+    JSON ``error``, which is what the WebSocketError then says. The caller owns
+    the socket until this returns, and closes it if this raises.
     """
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     request = (
         "GET %s HTTP/1.1\r\n"
-        "Host: localhost\r\n"
+        "Host: %s\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Key: %s\r\n"
         "Sec-WebSocket-Version: 13\r\n"
-        "\r\n" % (path, key)
+        "%s"
+        "\r\n" % (path, host, key,
+                   "".join("%s: %s\r\n" % pair for pair in (headers or {}).items()))
     )
-
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
-    reader = None
     try:
-        sock.connect(socket_path)
-        sock.sendall(request.encode("ascii"))
+        sock.sendall(request.encode("latin-1"))
         reader = sock.makefile("rb")
-
         status = reader.readline(8192).decode("latin-1").strip()
-        if " 101" not in status:
-            raise WebSocketError("upgrade refused: %s" % (status or "no response"))
-        accepted = ""
+        received = {}
         while True:
             line = reader.readline(8192).decode("latin-1")
             if line in ("\r\n", "\n", ""):
                 break
             name, _, value = line.partition(":")
-            if name.strip().lower() == "sec-websocket-accept":
-                accepted = value.strip()
-        if accepted != accept_key(key):
+            received[name.strip().lower()] = value.strip()
+        parts = status.split(" ", 2)
+        code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+        if code != 101:
+            reason = status or "no response"
+            length = received.get("content-length") or "0"
+            if length.isdigit() and 0 < int(length) <= 65536:
+                try:
+                    body = json.loads(reader.read(int(length)).decode("utf-8"))
+                    reason = body.get("error") or reason
+                except (ValueError, UnicodeDecodeError, AttributeError):
+                    pass
+            raise WebSocketError("upgrade refused: %s" % reason, code)
+        if received.get("sec-websocket-accept") != accept_key(key):
             raise WebSocketError("upgrade answered with a bad Sec-WebSocket-Accept")
+    except OSError as exc:
+        raise WebSocketError("cannot open %s: %s" % (path, exc)) from exc
+
+    # A session lasts as long as someone is typing; nothing may time out now.
+    sock.settimeout(None)
+    return WebSocket(reader, sock.sendall, mask=True, closer=shutdown_closer(sock))
+
+
+def connect_unix(socket_path, path, timeout=15):
+    """Open a WebSocket to ``path`` on a daemon listening on a unix socket."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(socket_path)
+        return client_handshake(sock, "localhost", path)
     except OSError as exc:
         sock.close()
         raise WebSocketError("cannot open %s: %s" % (socket_path, exc)) from exc
     except WebSocketError:
         sock.close()
         raise
-
-    # A session lasts as long as someone is typing; nothing may time out now.
-    sock.settimeout(None)
-    return WebSocket(reader, sock.sendall, mask=True, closer=shutdown_closer(sock))

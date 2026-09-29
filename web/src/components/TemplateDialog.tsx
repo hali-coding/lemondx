@@ -1,11 +1,14 @@
 import { useState } from 'react'
 import { api, calls } from '../lib/api'
 import { savableSelection } from '../lib/bootstrap'
-import type { InstanceSpec, InstanceTemplate, Synced, TemplateRequest } from '../lib/types'
+import type {
+  InstanceSpec, InstanceTemplate, SnapshotSource, Synced, TemplateRequest,
+} from '../lib/types'
 import { useBootstrapData } from '../hooks/useBootstrapData'
 import { blankSpec, resolvedSpec, specOf, specProblems } from '../lib/instance'
 import { InstanceForm } from './InstanceForm'
 import { Modal } from './Modal'
+import { SnapshotPicker } from './SnapshotPicker'
 
 interface Props {
   /** The template being edited; absent when creating one. */
@@ -51,6 +54,8 @@ export function TemplateDialog({ template, onCancel, onSaved }: Props) {
     template?.app_check ? String(template.app_check.interval_seconds) : '')
   const [checkTimeout, setCheckTimeout] = useState(
     template?.app_check ? String(template.app_check.timeout_seconds) : '')
+  const [fromSnapshot, setFromSnapshot] = useState(Boolean(template?.snapshot))
+  const [snapshot, setSnapshot] = useState<SnapshotSource | null>(template?.snapshot ?? null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const { modules, profiles, hostKeys, reloadProfiles } = useBootstrapData()
@@ -67,13 +72,18 @@ export function TemplateDialog({ template, onCancel, onSaved }: Props) {
     : timeout >= interval ? 'The timeout must be shorter than the interval.'
     : !spec.start ? 'An app check needs the instance started.'
     : null
-  const canSubmit = nameValid && prefixValid && !busy && !problems.blocked && !checkProblem
+  // The image is what `blocked` checks first; a snapshot stands in for it.
+  const sourceMissing = fromSnapshot ? !snapshot?.name : !spec.image.trim()
+  const specBlocked = sourceMissing || problems.keysMissing || problems.secretsMissing.length > 0
+  const canSubmit = nameValid && prefixValid && !busy && !specBlocked && !checkProblem
   const shownPrefix = prefix.trim() || defaultPrefix(name.trim() || 'instance')
 
   function templateRequest(): TemplateRequest {
     const resolved = resolvedSpec(spec)
     return {
       ...resolved,
+      image: fromSnapshot ? '' : resolved.image,
+      snapshot: fromSnapshot ? snapshot : null,
       bootstrap: savableSelection(modules, resolved.bootstrap),
       description: description.trim(),
       name_prefix: prefix.trim() || undefined,
@@ -174,7 +184,25 @@ export function TemplateDialog({ template, onCancel, onSaved }: Props) {
             placeholder="What these instances are for" autoComplete="off" />
         </div>
 
+        <div className="field">
+          <label>Made from</label>
+          <div className="stack-segmented" role="radiogroup" aria-label="Made from">
+            <button type="button" role="radio" aria-checked={!fromSnapshot} disabled={busy}
+              onClick={() => setFromSnapshot(false)}>
+              An image
+            </button>
+            <button type="button" role="radio" aria-checked={fromSnapshot} disabled={busy}
+              onClick={() => setFromSnapshot(true)}>
+              A snapshot
+            </button>
+          </div>
+        </div>
+        {fromSnapshot && (
+          <SnapshotPicker value={snapshot} onChange={setSnapshot} disabled={busy} />
+        )}
+
         <InstanceForm
+          fromSnapshot={fromSnapshot}
           value={spec}
           onChange={setSpec}
           modules={modules}

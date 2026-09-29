@@ -430,11 +430,24 @@ export interface AppCheck {
 }
 
 /** A saved InstanceSpec, launched as `<name_prefix>-1`, `-2`, … */
+/**
+ * A snapshot a template clones instead of pulling an image. It exists on
+ * `node` alone, so that is where the template's instances are made; to run it
+ * anywhere else, publish it as an image and copy that (`ImageJob`).
+ */
+export interface SnapshotSource {
+  node: string
+  instance: string
+  name: string
+}
+
 export interface InstanceTemplate extends InstanceSpec {
   name: string
   description: string
   name_prefix: string
   app_check: AppCheck | null
+  /** Set, it replaces `image` (which is then blank). */
+  snapshot: SnapshotSource | null
 }
 
 export type TemplateRequest = Partial<InstanceSpec> & {
@@ -443,6 +456,49 @@ export type TemplateRequest = Partial<InstanceSpec> & {
   name_prefix?: string
   /** Null or absent: no app check. */
   app_check?: Partial<AppCheck> | null
+  /** Null or absent: made from `image`. A blank node means the node saving it. */
+  snapshot?: SnapshotSource | null
+}
+
+/** One node's part in an image job. */
+export interface ImageJobNode {
+  node: string
+  /** `present`: it had the image already, so only the alias was set there. */
+  state: 'waiting' | 'sending' | 'importing' | 'done' | 'present' | 'failed'
+  /** Bytes sent so far, of the job's `size`. */
+  sent: number
+  error: string | null
+}
+
+/**
+ * A snapshot made into an image and copied to other nodes, or an existing
+ * image copied. Held in memory by the node the image is on, like a template
+ * run, and read from its `/api/image-jobs`.
+ */
+export interface ImageJob {
+  id: string
+  alias: string
+  /** `instance/snapshot` when published from one; null for a copy. */
+  source: string | null
+  /** Where the image is, and so where this job runs. */
+  node: string
+  /** Null until publishing has made the image. */
+  fingerprint: string | null
+  size: number | null
+  stage: 'publishing' | 'copying' | 'done'
+  started_at: number
+  finished_at: number | null
+  ok: boolean | null
+  error: string | null
+  nodes: ImageJobNode[]
+}
+
+export interface PublishRequest {
+  /** The image's name there and everywhere it is copied: launch it as `local:<alias>`. */
+  alias: string
+  /** Other nodes to copy it to; the snapshot's own node always has it. */
+  nodes: string[]
+  description?: string
 }
 
 export interface LaunchedInstance {

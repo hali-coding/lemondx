@@ -27,10 +27,14 @@ import socket
 import ssl
 import urllib.parse
 
+from .websocket import WebSocketError, client_handshake
+
 DEFAULT_TIMEOUT = 20
 # A create pulling an image can take minutes; a launch fanned out to a peer is
 # started in the background there and polled, so no single call waits that long.
 LONG_TIMEOUT = 120
+# Sending an image: the far side imports it before it answers.
+IMAGE_TIMEOUT = 1800
 
 
 class NodeError(Exception):
@@ -232,6 +236,72 @@ class NodeClient:
                             status)
         return parsed.get("data")
 
+    def upload(self, path, stream, length, params=None, timeout=None):
+        """PUT ``length`` bytes read from ``stream``, and return the ``data`` envelope.
+
+        For an image, which is too large to hold in memory: http.client reads
+        the file-like body a block at a time. Through ``_connect()``, so the pin
+        is checked before any of it is sent. ``timeout`` bounds each read and
+        write, not the whole transfer, which is only as slow as the data.
+        """
+        target = path
+        if params:
+            target = "%s?%s" % (path, urllib.parse.urlencode(
+                {k: v for k, v in params.items() if v is not None}))
+        headers = {"Accept": "application/json",
+                   "Content-Type": "application/octet-stream",
+                   "Content-Length": str(length)}
+        if self.token:
+            headers["Authorization"] = "Bearer %s" % self.token
+        conn = self._connect(timeout or self.timeout)
+        try:
+            conn.request("PUT", target, body=stream, headers=headers)
+            response = conn.getresponse()
+            raw = response.read()
+            status = response.status
+        except NodeError:
+            raise
+        except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+            raise NodeError("PUT %s failed: %s" % (self.url + path, exc), 502)
+        finally:
+            conn.close()
+        try:
+            parsed = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            raise NodeError("%s answered %s with something that is not JSON."
+                            % (self.url, status), 502)
+        if status >= 400:
+            raise NodeError(parsed.get("error") or "%s refused: HTTP %d" % (self.url, status),
+                            status)
+        return parsed.get("data")
+
+    def open_websocket(self, path, params=None, timeout=None):
+        """A WebSocket to one of the peer's endpoints -- a terminal -- as this node.
+
+        Through ``_connect()`` like every other call, so the pin is checked
+        before the upgrade request, token and all, is written. The socket is
+        taken off the HTTP connection because it stops being HTTP here.
+        """
+        target = path
+        if params:
+            target = "%s?%s" % (path, urllib.parse.urlencode(
+                {k: v for k, v in params.items() if v is not None}))
+        conn = self._connect(timeout or self.timeout)
+        try:
+            if conn.sock is None:
+                conn.connect()          # plain HTTP connects lazily
+        except OSError as exc:
+            conn.close()
+            raise NodeError("Cannot reach %s: %s" % (self.url, exc), 502)
+        sock, conn.sock = conn.sock, None
+        host = "[%s]" % self.host if ":" in self.host else self.host
+        headers = {"Authorization": "Bearer %s" % self.token} if self.token else {}
+        try:
+            return client_handshake(sock, "%s:%d" % (host, self.port), target, headers)
+        except WebSocketError as exc:
+            sock.close()
+            raise NodeError("%s: %s" % (self.url, exc), exc.code or 502)
+
     # -- the calls federation makes ----------------------------------------
 
     def status(self):
@@ -384,6 +454,17 @@ class NodeClient:
 
     def health(self):
         return self.request("GET", "/api/health")
+
+    def adopt_image(self, fingerprint, alias, description=""):
+        return self.request("POST", "/api/images/adopt", {
+            "fingerprint": fingerprint, "alias": alias, "description": description})
+
+    def send_image(self, stream, length, fingerprint, alias, description=""):
+        # Each read waits on the sender's disk and each write on this link, but
+        # the answer waits on the far daemon unpacking what it was sent.
+        return self.upload("/api/images/receive", stream, length, params={
+            "fingerprint": fingerprint, "alias": alias, "description": description},
+            timeout=IMAGE_TIMEOUT)
 
 
 def _seg(value):

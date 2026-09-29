@@ -1,0 +1,35 @@
+#cloud-config
+# image: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+# Debian 13 with both daemons (Incus from Debian, LXD from snap) and what
+# ./build.sh needs. Debian's npm drags in 600+ node-* packages: first boot
+# takes ~12 minutes, most of it that.
+hostname: @HOSTNAME@
+fqdn: @HOSTNAME@.lemondx.test
+users:
+  - name: ci
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+@SSH_KEYS@
+package_update: true
+package_upgrade: true
+package_reboot_if_required: true
+packages:
+  - qemu-guest-agent
+  - incus
+  - snapd
+  - git
+  - python3
+  - nodejs
+  - npm
+  - curl
+  - jq
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  - usermod -aG incus-admin ci
+  - incus admin init --auto
+  - snap wait system seed.loaded
+  - snap install lxd
+  - /snap/bin/lxd init --auto
+  - groupadd -f lxd && usermod -aG lxd ci
+  - touch /var/lib/cloud/testcluster-ready

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lemondx"
 version = "0.8.1"
-description = "Web UI and CLI for managing local LXC/LXD containers"
+description = "Application orchestration on LXD and Incus: staged, multi-node stacks of instance templates"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []          # stdlib only, by design

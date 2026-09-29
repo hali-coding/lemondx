@@ -54,8 +54,13 @@ with the CLI as the account the service runs as (for `--system`,
 around `NoNewPrivileges=yes`, which both units set and which stops PAM's
 `unix_chkpwd` helper from reading `/etc/shadow`:
 
-- **User unit:** add `NoNewPrivileges=no` to the drop-in. PAM will then accept
-  only your own account — the one the service runs as.
+- **User unit:** `NoNewPrivileges=no` alone is not enough. A user manager
+  has no privilege of its own, so it applies the unit's filesystem sandbox
+  (`ProtectSystem=`, `ProtectHome=`, `PrivateTmp=`, `ReadWritePaths=`) inside a
+  user namespace. In there, root's files show up as owned by `nobody` and no
+  setuid or setgid helper works. So the drop-in has to turn the whole sandbox
+  off (see [the drop-in below](#a-user-unit-that-can-raise-privilege)). PAM
+  will then accept only your own account, the one the service runs as.
 - **System unit:** add `SupplementaryGroups=shadow` instead (Debian/Ubuntu,
   where `/etc/shadow` is group-readable), which lets `pam_unix` read it
   directly and log in any member of `--pam-admin-group`. On distributions whose
@@ -64,7 +69,28 @@ around `NoNewPrivileges=yes`, which both units set and which stops PAM's
 `serve` prints a warning at startup when PAM cannot work as configured, so
 check `journalctl` after the change.
 
-The fabric (routed networking between nodes) is blocked by `NoNewPrivileges=yes`
-for the same reason: it raises privilege through `sudo` for one command. Set it
-to `no` for the unit, or program the routes yourself with `lemondx fabric apply`
--- the result is identical. See [networking.md](networking.md).
+The fabric (routed networking between nodes) is blocked for the same reason:
+it raises privilege through `sudo` for one command. On the system unit, set
+`NoNewPrivileges=no`. On the user unit, use the drop-in below. Either way, you
+can instead program the routes yourself with `lemondx fabric apply`; the result
+is identical. See [networking.md](networking.md).
+
+### A user unit that can raise privilege
+
+For `--auth pam` or a fabric on the user unit. It gives up the sandbox, so
+lemondx can then write anywhere the account can:
+
+```ini
+# ~/.config/systemd/user/lemondx.service.d/privilege.conf
+[Service]
+NoNewPrivileges=no
+ProtectSystem=no
+ProtectHome=no
+PrivateTmp=no
+ReadWritePaths=
+```
+
+Then run `systemctl --user daemon-reload && systemctl --user restart lemondx`.
+If any one of those lines is left out, sudo fails inside the service with
+`/etc/sudo.conf is owned by uid 65534`, and PAM's helper exits without
+checking the password.

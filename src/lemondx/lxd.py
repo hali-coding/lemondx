@@ -517,6 +517,123 @@ class LXDClient:
     def delete_image(self, fingerprint):
         return self._async("DELETE", "/1.0/images/%s" % _seg(fingerprint), timeout=120)
 
+    def get_image(self, fingerprint):
+        """The image record, or None when this daemon has no such image."""
+        try:
+            return self._sync("GET", "/1.0/images/%s" % _seg(fingerprint))
+        except LXDError as exc:
+            if exc.code == 404:
+                return None
+            raise
+
+    def get_alias(self, name):
+        try:
+            return self._sync("GET", "/1.0/images/aliases/%s" % _seg(name))
+        except LXDError as exc:
+            if exc.code == 404:
+                return None
+            raise
+
+    def set_alias(self, name, fingerprint, description=""):
+        """Point an alias at an image, creating it or moving it as needed."""
+        if self.get_alias(name) is None:
+            return self._sync("POST", "/1.0/images/aliases", {
+                "name": name, "target": fingerprint, "description": description})
+        return self._sync("PUT", "/1.0/images/aliases/%s" % _seg(name), {
+            "target": fingerprint, "description": description})
+
+    def publish_snapshot(self, instance, snapshot, properties=None, timeout=3600):
+        """Make an image of a snapshot; returns the new image's fingerprint.
+
+        Publishing compresses the whole root filesystem, which for a large
+        instance is minutes of work, hence the long wait.
+        """
+        metadata = self._async("POST", "/1.0/images", {
+            "source": {"type": "snapshot", "name": "%s/%s" % (instance, snapshot)},
+            "properties": dict(properties or {}),
+            "public": False,
+        }, timeout=timeout)
+        fingerprint = ((metadata or {}).get("metadata") or {}).get("fingerprint")
+        if not fingerprint:
+            raise LXDError("Publishing gave no image fingerprint.", 502)
+        return fingerprint
+
+    def open_image_export(self, fingerprint):
+        """``(stream, length, close)`` for an image's tarball, read as it arrives.
+
+        Streamed rather than read whole: an image is routinely gigabytes. Only
+        a unified image (one tarball) is accepted -- which is what publishing
+        makes -- because a split one comes back as multipart and would need
+        taking apart to import anywhere else.
+        """
+        conn = _UnixHTTPConnection(self.socket_path, self.timeout)
+        try:
+            conn.request("GET", self._path("/1.0/images/%s/export" % _seg(fingerprint)))
+            response = conn.getresponse()
+            if response.status >= 400:
+                raise LXDError(_decode_error(response.read(), response.status),
+                               response.status)
+            if "multipart" in (response.getheader("Content-Type") or ""):
+                raise LXDError("Image %s is split into metadata and rootfs; only "
+                               "unified images can be copied between nodes."
+                               % fingerprint[:12], 409)
+            length = response.getheader("Content-Length")
+            if not length or not length.isdigit():
+                raise LXDError("The daemon did not say how large image %s is."
+                               % fingerprint[:12], 502)
+        except (OSError, http.client.HTTPException) as exc:
+            conn.close()
+            raise LXDError("Cannot read image %s: %s" % (fingerprint[:12], exc), 503) from exc
+        except BaseException:
+            conn.close()
+            raise
+        return response, int(length), conn.close
+
+    def import_image(self, stream, length, properties=None, timeout=1800):
+        """Upload an image tarball from ``stream``; returns its fingerprint.
+
+        The fingerprint is the daemon's own SHA-256 of what arrived, so a
+        caller comparing it with the source's fingerprint has checked the
+        whole transfer end to end.
+        """
+        headers = {"Content-Type": "application/octet-stream",
+                   "Content-Length": str(length)}
+        encoded = urllib.parse.urlencode(dict(properties or {}))
+        # Both spellings, as for files: each daemon ignores the other's.
+        for prefix in ("X-LXD", "X-Incus"):
+            headers["%s-public" % prefix] = "0"
+            if encoded:
+                headers["%s-properties" % prefix] = encoded
+        conn = _UnixHTTPConnection(self.socket_path, timeout)
+        try:
+            conn.request("POST", self._path("/1.0/images"), body=stream, headers=headers)
+            response = conn.getresponse()
+            data = response.read()
+            status = response.status
+        except (OSError, http.client.HTTPException) as exc:
+            raise LXDError("Cannot import the image: %s" % exc, 503) from exc
+        finally:
+            conn.close()
+        try:
+            parsed = json.loads(data)
+        except ValueError as exc:
+            raise LXDError("Malformed response from LXD: %s" % exc, 502) from exc
+        if parsed.get("type") == "error" or status >= 400:
+            raise LXDError(parsed.get("error") or "LXD returned HTTP %d" % status,
+                           parsed.get("error_code") or status)
+        operation = (parsed.get("operation") or "").rsplit("/", 1)[-1]
+        metadata = self.wait_for_operation(operation, timeout) if operation \
+            else parsed.get("metadata") or {}
+        fingerprint = (metadata.get("metadata") or {}).get("fingerprint")
+        if not fingerprint:
+            raise LXDError("Importing gave no image fingerprint.", 502)
+        return fingerprint
+
+    def _path(self, path):
+        if self.project and self.project != "default":
+            return "%s?%s" % (path, urllib.parse.urlencode({"project": self.project}))
+        return path
+
     # -- profiles, storage, networks ---------------------------------------
 
     def list_profiles(self):

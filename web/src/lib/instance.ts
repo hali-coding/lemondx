@@ -91,3 +91,9 @@ export function specProblems(
 export function keyOf(container: { name: string; node?: string }) {
   return container.node ? `${container.node}/${container.name}` : container.name
 }
+
+/** What a template's instances are made of, in a few words: its image, or its snapshot. */
+export function madeFrom(template: InstanceTemplate) {
+  const source = template.snapshot
+  return source ? `${source.instance}/${source.name} on ${source.node}` : template.image
+}
