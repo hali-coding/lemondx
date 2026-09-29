@@ -665,6 +665,37 @@ def cmd_snap_delete(args, service):
     return 0
 
 
+def render_image_job(job):
+    lines = []
+    fingerprint = (job["fingerprint"] or "")[:12]
+    head = "%s image %s%s" % (GREEN("+") if job["ok"] else RED("x"), BOLD(job["alias"]),
+                              " (%s, %s)" % (fingerprint, human_bytes(job["size"]))
+                              if fingerprint else "")
+    lines.append(head + (" from %s" % job["source"] if job["source"] else ""))
+    for entry in job["nodes"]:
+        state = {"done": GREEN("copied"), "present": GREEN("already there"),
+                 "failed": RED("failed")}.get(entry["state"], entry["state"])
+        lines.append("  %s: %s%s" % (entry["node"], state,
+                                     " -- %s" % entry["error"] if entry["error"] else ""))
+    if job["error"] and not job["nodes"]:
+        lines.append(RED("  %s" % job["error"]))
+    return "\n".join(lines)
+
+
+def cmd_snapshot_publish(args, service):
+    job = cluster_service(service).publish_snapshot(
+        args.name, args.snapshot, args.alias, nodes=args.to or [],
+        description=args.description or "")
+    emit(args, job, render_image_job)
+    return 0 if job["ok"] else 1
+
+
+def cmd_image_copy(args, service):
+    job = cluster_service(service).copy_image(args.alias, args.to)
+    emit(args, job, render_image_job)
+    return 0 if job["ok"] else 1
+
+
 def cmd_modules(args, service):
     modules = service.list_modules()
 
@@ -887,7 +918,10 @@ def describe_template(t):
     kind = ""
     if t["type"] == "virtual-machine":
         kind = " (vm)" if t["secureboot"] else " (vm, no secure boot)"
-    return "%s%s%s" % (t["image"], kind,
+    source = t.get("snapshot")
+    made_of = "snapshot %s/%s on %s" % (source["instance"], source["name"], source["node"]) \
+        if source else t["image"]
+    return "%s%s%s" % (made_of, kind,
                        " · " + size if size else "")
 
 
@@ -944,8 +978,16 @@ def describe_app_check(app_check):
 def cmd_template_save(args, service):
     modules, params, ssh_keys = resolve_selection(args, service)
     app_check = read_app_check(args, service)
+    snapshot = None
+    if args.snapshot:
+        if args.image:
+            raise ServiceError("Give --image or --snapshot, not both: a template is "
+                               "made from one or the other.")
+        instance, _, name = args.snapshot.partition("/")
+        snapshot = {"instance": instance, "name": name, "node": args.snapshot_node or ""}
     template = cluster_service(service).save_template(
-        name=args.name, image=args.image or service.default_image(),
+        name=args.name, image=args.image or ("" if snapshot else service.default_image()),
+        snapshot=snapshot,
         instance_type="virtual-machine" if args.vm else "container",
         cpu=args.cpu, memory=args.memory, disk=args.disk, pool=args.pool,
         network=args.network, profiles=args.profile,
@@ -1119,8 +1161,10 @@ def cmd_launch(args, service):
         # never been federated, naming it would be noise about a feature the
         # user is not using.
         where = "" if targets == [cluster.local_name()] else " on %s" % ", ".join(targets)
-        print(DIM("Launching %d instance(s) from %s%s (this pulls the image on "
-                  "first use)..." % (args.count, template["name"], where)), flush=True)
+        print(DIM("Launching %d instance(s) from %s%s (%s)..." % (
+            args.count, template["name"], where,
+            "clones of a snapshot" if template.get("snapshot")
+            else "this pulls the image on first use")), flush=True)
     result = cluster.launch_template(template["name"], count=args.count,
                                      prefix=args.prefix, params=params,
                                      nodes=args.node, groups=args.group)
@@ -1517,6 +1561,12 @@ def cmd_resources(args, service):
 
     emit(args, resources, render)
     return 0
+
+
+def cmd_top(args, service):
+    from . import top
+    return top.run(cluster_service(service), interval=args.interval, once=args.once,
+                   as_json=getattr(args, "json", False))
 
 
 def cmd_storage_pools(args, service):
@@ -2647,6 +2697,13 @@ def build_parser():
     p = add("resources", help="show allocated CPU/memory/disk against the host")
     p.set_defaults(func=cmd_resources)
 
+    p = add("top", help="live view of nodes, instances and stacks (q quits)")
+    p.add_argument("-i", "--interval", type=int, default=2, metavar="SECONDS",
+                   help="seconds between readings (default: 2; +/- change it)")
+    p.add_argument("--once", action="store_true",
+                   help="print one frame and exit, e.g. into a file or a pager")
+    p.set_defaults(func=cmd_top)
+
     storage = add("storage", help="view and manage local storage")
     storage_sub = storage.add_subparsers(dest="storage_command", metavar="<storage-command>")
 
@@ -2866,8 +2923,24 @@ def build_parser():
     p.add_argument("snapshot")
     p.set_defaults(func=cmd_snap_delete)
 
+    p = add("snapshot-publish",
+            help="make an image of a snapshot, and copy it to other nodes")
+    p.add_argument("name")
+    p.add_argument("snapshot")
+    p.add_argument("alias", help="the image's name; launch it as local:ALIAS")
+    p.add_argument("--to", action="append", metavar="NODE",
+                   help="also copy the image to this node (repeatable)")
+    p.add_argument("--description", help="the image's description")
+    p.set_defaults(func=cmd_snapshot_publish)
+
     p = add("images", help="list cached and suggested images")
     p.set_defaults(func=cmd_images)
+
+    p = add("image-copy", help="copy one of this node's images to other nodes")
+    p.add_argument("alias")
+    p.add_argument("--to", action="append", metavar="NODE", required=True,
+                   help="node to copy it to (repeatable)")
+    p.set_defaults(func=cmd_image_copy)
 
     p = add("modules", help="list available bootstrap modules")
     p.set_defaults(func=cmd_modules)
@@ -2919,6 +2992,11 @@ def build_parser():
     p = add("template-save", parents=[common, spec, boot],
             help="save an instance spec and bootstrap selection as a template")
     p.add_argument("name")
+    p.add_argument("--snapshot", metavar="INSTANCE/SNAPSHOT",
+                   help="clone this snapshot instead of using an image; instances "
+                        "are made on the node that has it")
+    p.add_argument("--snapshot-node", metavar="NODE",
+                   help="the node the snapshot is on (default: this one)")
     p.add_argument("--description", default="", help="what the template is for")
     p.add_argument("--prefix", help="instance name prefix (default: from the name)")
     p.add_argument("--app-check", metavar="SCRIPT",

@@ -1,8 +1,9 @@
 # Runs on every pull request: the checks documented in CLAUDE.md's
 # "Commands" section, since that's the closest thing this project has to a
-# test suite. There is no live LXD/Incus daemon here, so nothing that needs
-# one (`lemondx status`, `create`, etc.) runs -- see CLAUDE.md for how to
-# verify those by hand against a real daemon.
+# test suite. GitHub's runners have no LXD/Incus daemon, so everything that
+# needs one runs in the `daemon` job on a self-hosted runner (see
+# docs/development.md); anything beyond its smoke test is still verified by
+# hand against a real daemon, as CLAUDE.md describes.
 name: PR
 
 on:
@@ -109,6 +110,22 @@ jobs:
           cd "$RUNNER_TEMP/lemondx-0.0.0-pr"
           test -f web/dist/index.html
           ./lemondx --help > /dev/null
+
+  daemon:
+    name: Live daemon (Incus)
+    # The one job with a real daemon: a small Debian 13 VM with Incus, running
+    # a self-hosted runner. The repo is public and that VM's runner user is in
+    # incus-admin (root-equivalent), so a fork's PR never gets here -- it
+    # would be running its own code on our host. Same-repo PRs and manual runs
+    # only; a fork's change is checked here after it is pushed to a branch.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, lemondx-daemon]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Smoke test against the daemon
+        run: .github/scripts/daemon_smoke.sh
 
   commit-style:
     name: PR title is a conventional commit

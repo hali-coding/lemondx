@@ -325,6 +325,21 @@ def _clean_app_check(stored):
             "timeout_seconds": seconds(stored.get("timeout_seconds"), APP_CHECK_TIMEOUT)}
 
 
+def clean_snapshot_source(value):
+    """A template's snapshot to clone, ``{node, instance, name}``, or None.
+
+    What a daemon would reject as an instance or snapshot name is dropped
+    rather than passed on: the two are joined into ``instance/snapshot`` for
+    the daemon, so a slash in either would name something else.
+    """
+    if not isinstance(value, dict):
+        return None
+    instance, snapshot = _text(value.get("instance"), 63), _text(value.get("name"), 63)
+    if not instance or not snapshot or "/" in instance + snapshot:
+        return None
+    return {"node": _text(value.get("node"), 64), "instance": instance, "name": snapshot}
+
+
 def _clean_template(stored, name):
     """Normalise one template record, with the same tolerance as a profile."""
     bootstrap = stored.get("bootstrap")
@@ -334,6 +349,9 @@ def _clean_template(stored, name):
         "description": _text(stored.get("description"), 200),
         "name_prefix": _text(stored.get("name_prefix"), 50),
         "image": _text(stored.get("image"), 200),
+        # Set, it replaces the image: instances are clones of this snapshot,
+        # which exists on one node only, so that is where they are made.
+        "snapshot": clean_snapshot_source(stored.get("snapshot")),
         "type": kind if kind in INSTANCE_TYPES else "container",
         "cpu": _text(stored.get("cpu"), 32),
         "memory": _text(stored.get("memory"), 32),

@@ -541,8 +541,10 @@ class StackService:
             done = dict(context)
         values = dict(_exports(run["stack"], done), **params)
         values.update({k: _render(v, done, params) for k, v in step["params"].items()})
-        # Where it will actually go: a group member in maintenance is skipped.
-        targets, _ = self.cluster.launch_targets(step["nodes"], step["groups"])
+        # Where it will actually go: a group member in maintenance is skipped,
+        # and a template cloning a snapshot goes to the snapshot's node.
+        targets, _ = self.cluster.launch_targets(*self.cluster.template_targets(
+            name, step["nodes"], step["groups"]))
         before = self._template_keys(name, targets)
         self._update(record, nodes=targets, detail="Launching %d on %s" % (
             step["count"], ", ".join(targets)))

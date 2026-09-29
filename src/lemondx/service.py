@@ -43,6 +43,11 @@ STACK_CONFIG_KEY = "user.lemondx.stack"
 # would call every instance stale after any of them.
 TEMPLATE_REVISION_KEY = "user.lemondx.template-revision"
 STACK_REVISION_KEY = "user.lemondx.stack-revision"
+# Every key lemondx sets on an instance starts with this. A clone inherits its
+# source's, so the ones the new instance should not carry are taken off again.
+LEMONDX_CONFIG_PREFIX = "user.lemondx."
+# Image aliases lemondx makes: what `local:<alias>` must then parse as.
+VALID_ALIAS = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 # What a template can change without its instances being any different: its
 # label, how new instances are named, and the app check, which is read from
 # the template every round rather than baked into the instance.
@@ -568,7 +573,7 @@ class ContainerService:
                          network=None, description=None, ephemeral=False, start=True,
                          config=None, wait=True, bootstrap=None,
                          remember_params=True, background=False, secureboot=True,
-                         fabric=None):
+                         fabric=None, source_snapshot=None):
         """Create an instance, start it and run its bootstrap modules.
 
         With ``background`` everything that can be checked up front still is
@@ -585,8 +590,12 @@ class ContainerService:
                 "Invalid name '%s'. Use letters, digits and dashes, starting "
                 "with a letter (max 62 chars)." % name
             )
-        if not image:
+        if not image and not source_snapshot:
             raise ServiceError("An image is required, e.g. 'ubuntu:24.04'.")
+        if source_snapshot:
+            # The clone is whatever the source was; asking for the other kind
+            # would only fail inside the daemon.
+            instance_type = self.snapshot_type(source_snapshot)
 
         instance_config = dict(config or {})
         if cpu:
@@ -603,7 +612,8 @@ class ContainerService:
         payload = {
             "name": name,
             "type": instance_type,
-            "source": _image_source(image, self.lxd.remotes),
+            "source": ({"type": "copy", "source": source_snapshot, "instance_only": True}
+                       if source_snapshot else _image_source(image, self.lxd.remotes)),
             "profiles": profiles or ["default"],
             "config": instance_config,
             "ephemeral": bool(ephemeral),
@@ -649,12 +659,12 @@ class ContainerService:
             return {"name": name, "status": "Pending"}
 
         modules = (bootstrap or {}).get("modules") or []
-        record = self._begin_create(name, image, instance_type,
+        record = self._begin_create(name, source_snapshot or image, instance_type,
                                     instance_config.get(TEMPLATE_CONFIG_KEY), len(modules))
 
         def work():
             return self._run_create(record, payload, start, bootstrap, remember_params,
-                                    fabric_key)
+                                    fabric_key, cloned=bool(source_snapshot))
 
         if background:
             self._in_background("create-%s" % name, work)
@@ -662,11 +672,13 @@ class ContainerService:
         return work()
 
     def _run_create(self, record, payload, start, bootstrap, remember_params,
-                    fabric_key=None):
+                    fabric_key=None, cloned=False):
         name = payload["name"]
         modules = (bootstrap or {}).get("modules") or []
         try:
             self.lxd.create_instance(payload, wait=True)
+            if cloned:
+                self._detach_clone(name, payload)
             if start:
                 self._create_stage(record, stage="starting")
                 self.lxd.set_state(name, "start")
@@ -706,6 +718,63 @@ class ContainerService:
             raise
         finally:
             self._create_stage(record, stage="done", finished_at=time.time())
+
+    def _check_source(self, template):
+        """Refuse a snapshot template on a node without the snapshot.
+
+        Before anything is created -- or, for a recreate, deleted: finding out
+        per instance would be after each one had gone.
+        """
+        source = template.get("snapshot")
+        if source:
+            self.snapshot_type("%s/%s" % (source["instance"], source["name"]))
+
+    def snapshot_type(self, source):
+        """The instance type of ``instance/snapshot``, or 404 if it is not here."""
+        instance, _, snapshot = source.partition("/")
+        try:
+            record = self.lxd.get_instance_record(instance)
+            if not any(s.get("name") == snapshot for s in self.lxd.list_snapshots(instance)):
+                raise LXDError("not found", 404)
+        except LXDError as exc:
+            if exc.code == 404:
+                raise ServiceError("No snapshot '%s' on this node." % source, 404)
+            raise
+        return record.get("type") or "container"
+
+    def _detach_clone(self, name, payload):
+        """Make a fresh clone its own instance rather than a second copy of its source.
+
+        The daemon copies the source's config, and ours is merged over it, so
+        any lemondx key we did not set -- the source's stack, say, which a
+        stack's teardown would then take this clone for -- is removed here.
+        And a container that has booted has a machine-id, which the clone
+        would share: systemd-networkd derives its DHCP client id from it, so
+        every clone would ask for, and be given, the source's address. An empty
+        file makes systemd generate a new one at first boot; an image without
+        systemd has no file, and is left without one. A VM's files are out of
+        reach until its agent runs, so it keeps its source's.
+        """
+        record = self.lxd.get_instance_record(name)
+        config = dict(record.get("config") or {})
+        wanted = payload.get("config") or {}
+        inherited = [k for k in config if k.startswith(LEMONDX_CONFIG_PREFIX) and k not in wanted]
+        if inherited:
+            for key in inherited:
+                del config[key]
+            self.lxd.replace_instance(name, {
+                key: record.get(key) for key in (
+                    "architecture", "devices", "ephemeral", "profiles", "description")
+            } | {"config": config})
+        if (record.get("type") or "container") == "container":
+            try:
+                if self.lxd.read_file(name, "/etc/machine-id").strip():
+                    self.lxd.push_file(name, "/etc/machine-id", b"", mode="0444")
+            except LXDError as exc:
+                if exc.code == 404:
+                    return
+                _log("%s: could not reset its machine-id, so it shares its "
+                     "source's: %s" % (name, exc))
 
     # Finished creates stay listed this long, so a page reloaded mid-create
     # can still find out how it ended.
@@ -1377,6 +1446,97 @@ class ContainerService:
             "remotes": sorted(self.lxd.remotes),
         }
 
+    @staticmethod
+    def image_alias(alias):
+        alias = str(alias or "").strip()
+        if not VALID_ALIAS.match(alias):
+            raise ServiceError(
+                "Invalid image alias '%s'. Use letters, digits, dots, dashes and "
+                "underscores, starting with a letter or digit (max 64 chars)." % alias)
+        return alias
+
+    def publish_snapshot(self, name, snapshot, alias, description=""):
+        """Make a snapshot into an image here, under ``alias``; returns the image.
+
+        An alias already in use on this node is refused rather than moved:
+        here it is a new name being chosen, and taking it from an image that
+        templates may already launch as ``local:<alias>`` would change what
+        they make without anyone having asked. (Where the image is *copied*
+        to, the alias does move -- see ``adopt_image()``.)
+        """
+        alias = self.check_publish(name, snapshot, alias)
+        description = str(description or "").strip()[:200] or \
+            "%s/%s, published by lemondx" % (name, snapshot)
+        fingerprint = self.lxd.publish_snapshot(name, snapshot, {
+            "description": description,
+            "lemondx.source": "%s/%s" % (name, snapshot)})
+        self.lxd.set_alias(alias, fingerprint, description)
+        return self._image_summary(fingerprint, alias)
+
+    def check_publish(self, name, snapshot, alias):
+        """What ``publish_snapshot()`` would refuse, refused now; returns the alias."""
+        alias = self.image_alias(alias)
+        self.snapshot_type("%s/%s" % (name, snapshot))
+        taken = self.lxd.get_alias(alias)
+        if taken:
+            raise ServiceError("This node already has an image called '%s' (%s). "
+                               "Pick another name, or delete that image first."
+                               % (alias, (taken.get("target") or "")[:12]), 409)
+        return alias
+
+    def image_by_alias(self, alias):
+        """``(fingerprint, description)`` of this node's image called ``alias``."""
+        alias = self.image_alias(alias)
+        target = (self.lxd.get_alias(alias) or {}).get("target")
+        if not target:
+            raise ServiceError("This node has no image called '%s'." % alias, 404)
+        image = self.lxd.get_image(target) or {}
+        return target, (image.get("properties") or {}).get("description") or ""
+
+    def adopt_image(self, fingerprint, alias, description=""):
+        """Point ``alias`` at ``fingerprint`` if this node has that image.
+
+        Returns the image, or None when it is not here and has to be sent.
+        The alias moves if it named another image: the node the copy came from
+        holds the image under that name, and a cluster where ``local:<alias>``
+        launches something different on each node is worse than one that was
+        updated.
+        """
+        fingerprint = str(fingerprint or "").strip().lower()
+        alias = self.image_alias(alias)
+        if not re.match(r"^[0-9a-f]{64}$", fingerprint):
+            raise ServiceError("An image fingerprint is 64 hex digits.")
+        if self.lxd.get_image(fingerprint) is None:
+            return None
+        self.lxd.set_alias(alias, fingerprint, str(description or "")[:200])
+        return self._image_summary(fingerprint, alias)
+
+    def receive_image(self, stream, length, fingerprint, alias, description=""):
+        """Import an image sent from another node, and check it arrived whole.
+
+        The daemon fingerprints what it received; anything other than the
+        fingerprint the sender named is a transfer that went wrong, and the
+        image is deleted rather than left under a name it does not deserve.
+        """
+        fingerprint = str(fingerprint or "").strip().lower()
+        alias = self.image_alias(alias)
+        got = self.lxd.import_image(stream, length, {"description": str(description or "")[:200]})
+        if got != fingerprint:
+            try:
+                self.lxd.delete_image(got)
+            except LXDError:
+                pass
+            raise ServiceError("The image arrived damaged (fingerprint %s, expected %s) "
+                               "and was discarded." % (got[:12], fingerprint[:12]), 502)
+        self.lxd.set_alias(alias, fingerprint, str(description or "")[:200])
+        return self._image_summary(fingerprint, alias)
+
+    def _image_summary(self, fingerprint, alias):
+        image = self.lxd.get_image(fingerprint) or {}
+        return {"fingerprint": fingerprint, "alias": alias,
+                "size": image.get("size"), "architecture": image.get("architecture"),
+                "type": image.get("type") or "container"}
+
     def default_image(self):
         """A reasonable starting image for whichever daemon is in use."""
         catalog = (IMAGE_CATALOG_INCUS if self.lxd.flavor == INCUS
@@ -1568,11 +1728,16 @@ class ContainerService:
                       memory=None, disk=None, pool=None, network=None, profiles=None,
                       ephemeral=False, start=True, bootstrap=None, description="",
                       fabric="",
-                      name_prefix=None, secureboot=True, app_check=None):
+                      name_prefix=None, secureboot=True, app_check=None, snapshot=None):
         name = self._record_name(name, "template")
         image = str(image or "").strip()
-        if not image:
-            raise ServiceError("A template needs an image, e.g. 'ubuntu:24.04'.")
+        source = store.clean_snapshot_source(snapshot)
+        if snapshot and not source:
+            raise ServiceError("A snapshot source needs 'instance' and 'name' (the "
+                               "snapshot's), neither containing '/'.")
+        if not image and not source:
+            raise ServiceError("A template needs an image, e.g. 'ubuntu:24.04', "
+                               "or a snapshot to clone.")
         if instance_type not in store.INSTANCE_TYPES:
             raise ServiceError("Unknown instance type '%s'. Try: %s"
                                % (instance_type, ", ".join(store.INSTANCE_TYPES)))
@@ -1607,7 +1772,8 @@ class ContainerService:
         saved = store.save_template(name, {
             "description": str(description or "")[:200],
             "name_prefix": prefix,
-            "image": image,
+            "image": "" if source else image,
+            "snapshot": source,
             "type": instance_type,
             "cpu": str(cpu).strip() if cpu else "",
             # Checked now so a typo fails on save rather than on every launch.
@@ -1837,8 +2003,11 @@ class ContainerService:
             config[STACK_REVISION_KEY] = stack_rev if stack_rev is not None \
                 else self._revision_of("stack", stack)
         try:
+            source = template.get("snapshot")
             container = self.create_container(
                 name=instance_name, image=template["image"],
+                source_snapshot="%s/%s" % (source["instance"], source["name"])
+                if source else None,
                 instance_type=template["type"],
                 profiles=template["profiles"] or None,
                 cpu=template["cpu"] or None, memory=template["memory"] or None,
@@ -1934,6 +2103,7 @@ class ContainerService:
         bootstrap = self._launch_bootstrap(template, params)
         notes = []
         if place:
+            self._check_source(template)
             template, notes = self.place_template(template)
         return template, bootstrap, names, count, prefix, notes
 
@@ -2044,6 +2214,7 @@ class ContainerService:
         template = self._template(name)
         names = self._confirmed_instances(name, instances, stale=stale)
         bootstrap = self._launch_bootstrap(template, params)
+        self._check_source(template)
         template, notes = self.place_template(template)
         # A recreated instance stays in the stack it was launched by, at the
         # stack revision it had: recreating applies the template, not the stack.
@@ -2074,7 +2245,9 @@ class ContainerService:
         # Validated before the run is recorded, so a bad request is refused
         # rather than filed as a run that failed.
         names = self._confirmed_instances(name, instances, stale=stale)
-        self._launch_bootstrap(self._template(name), params)
+        template = self._template(name)
+        self._launch_bootstrap(template, params)
+        self._check_source(template)
         return self.track_run(name, "recreate", len(names),
                               lambda: self.recreate_instances(name, names, params, stale),
                               background)

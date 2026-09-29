@@ -6,7 +6,7 @@ import type {
   InstanceRef, ScopedStateResult,
   BootstrapModule, BootstrapProfile, BootstrapResult, BootstrapSelection, BulkStateResult,
   AppCheckOutput, Container, ModuleSource,
-  ContainerDetail, CreateProgress, CreateRequest, ExecResult, ImageBrowse, Images, NetworkDetail,
+  ContainerDetail, CreateProgress, CreateRequest, ExecResult, ImageBrowse, ImageJob, Images, NetworkDetail, PublishRequest,
   InstanceTemplate, NetworkRequest, NetworkSummary, SubnetInUse, Resources, SetupResult, Snapshot, SshKey,
   StateAction, Status, StorageOverview, StoragePoolDetail, StoragePoolRequest,
   StorageVolume, StorageVolumeRequest, TemplateRequest, TemplateRun,
@@ -178,6 +178,11 @@ export const calls = {
   saveTemplate: (name: string, body: TemplateRequest): ApiCall =>
     ({ method: 'PUT', path: `/templates/${seg(name)}`, body }),
 
+  /** In the background, like a create: follow it with `imageJobs()` on that node. */
+  publishSnapshot: (name: string, snapshot: string, body: PublishRequest, node?: string): ApiCall =>
+    ({ method: 'POST', path: on(node, `/containers/${seg(name)}/snapshots/${seg(snapshot)}/publish`),
+      body: { ...body, background: true } }),
+
   launchTemplate: (name: string, body: {
     count: number; prefix?: string; params?: Record<string, string>
     nodes?: string[]; groups?: string[]
@@ -292,6 +297,14 @@ export const api = {
     request<{ deleted: string }>(on(node,
       `/containers/${encodeURIComponent(name)}/snapshots/${encodeURIComponent(snapshot)}`),
       { method: 'DELETE' }),
+
+  /** Starts publishing and copying, and returns the job at once; see `imageJobs()`. */
+  publishSnapshot: (name: string, snapshot: string, body: PublishRequest, node?: string) =>
+    send<ImageJob>(calls.publishSnapshot(name, snapshot, body, node)),
+
+  /** Image jobs held by one node: the one the image is on. */
+  imageJobs: (node?: string, signal?: AbortSignal) =>
+    request<ImageJob[]>(on(node, '/image-jobs'), { signal }),
 
   restoreSnapshot: (name: string, snapshot: string, node?: string) =>
     request<{ restored: string }>(on(node,

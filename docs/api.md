@@ -32,6 +32,7 @@ credentials get `401`, too little access `403`, too many failed logins `429`.
 | `GET`/`POST` | `/api/containers/{name}/snapshots` | list / create |
 | `DELETE` | `/api/containers/{name}/snapshots/{snap}` | delete |
 | `POST` | `/api/containers/{name}/snapshots/{snap}/restore` | restore |
+| `POST` | `/api/containers/{name}/snapshots/{snap}/publish` | `{"alias","nodes":[...]}` → make an image of it here and copy it to those nodes (see [Templates](templates.md#from-a-snapshot)) |
 | `GET` | `/api/resources` | host CPU/memory/disk against what instances have allocated |
 | `GET` | `/api/health` | latest health check per running instance (see [Web UI tour](web-ui.md#health-checks)) |
 | `GET` | `/api/containers/{name}/app-check` | the latest [app check](templates.md#app-health-checks) run in full: `{template, script, interval_seconds, timeout_seconds, result}`, `result` carrying `stdout`/`stderr` (last 16 KiB each) or null before the first run |
@@ -42,6 +43,10 @@ credentials get `401`, too little access `403`, too many failed logins `429`.
 | `GET`/`PATCH`/`DELETE` | `/api/storage/pools/{pool}/volumes/custom/{volume}` | manage an unattached custom volume |
 | `GET` | `/api/images` | cached images, suggested catalog, remotes |
 | `GET` | `/api/images/browse` | full remote catalogs, flagged with what is local |
+| `POST` | `/api/images/{alias}/copy` | `{"nodes":[...]}` → copy this node's image to other nodes |
+| `GET` | `/api/image-jobs` | publishes and copies held by this node, running or finished in the last 10 minutes |
+| `POST` | `/api/images/adopt` | "have you got this image?" — name it if so — cluster members only |
+| `PUT` | `/api/images/receive` | an image tarball, streamed and checked by fingerprint — cluster members only |
 | `GET`/`POST` | `/api/networks` | every interface the daemon can see / create a managed bridge |
 | `GET` | `/api/subnets` | every subnet already on the host, which a new bridge must not overlap |
 | `GET`/`PATCH`/`DELETE` | `/api/networks/{name}` | config, state, DHCP leases, attachments / change or delete a managed bridge |

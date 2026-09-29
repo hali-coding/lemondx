@@ -2,8 +2,19 @@
 
 [← back to README](../README.md)
 
-lemondx manages the host it runs on. Federation lets one lemondx *also* reach
-others, so a single UI can list, launch on and sync to every host you run.
+A lemondx deployment is meant to be several nodes: hosts that each run their
+own LXD or Incus and their own lemondx, federated so that any one of them can
+launch a [stack](stacks.md) across all of them, and list, operate and sync
+everything on every host. A single node works on its own, and is where a
+cluster starts; see
+[the recommended deployment](../README.md#recommended-deployment-several-nodes)
+for the usual shape.
+
+Federation is about running workloads over the nodes, not about managing the
+nodes themselves. It carries what a deployment needs from each host — its
+instances, its capacity for sizing groups, a maintenance mark that keeps new
+instances off it — and leaves provisioning and looking after the hosts to the
+tools built for that.
 
 Containers on different nodes cannot reach each other by default -- a managed
 bridge NATs its traffic. [Fabrics](networking.md) add routed networks shared by
@@ -350,6 +361,94 @@ off (or running a lemondx too old to report app checks) shows no dot, or no
 diamond, for its rows. The external
 link on a remote row opens that node's own UI, for the things that are still
 about the host rather than the instance: its storage, networks and nodes.
+
+### Watching it from a terminal
+
+`lemondx top` is the same picture, live, in the style of btop: every node with
+a CPU and memory meter and a CPU history, every instance on every node with
+its health, CPU, memory and network rates, and a stacks panel while any stack
+has instances or a run in progress (stage by stage, with the step that is
+running). It needs no `serve` of its own to work.
+
+```
+lemondx top                  # q quits; ↑↓ select, tab to stacks and templates,
+                             # space mark, c console, b bootstrap, s sort
+                             # (node/cpu/mem/name), r running only, n one node
+                             # at a time, +/- interval
+lemondx top -i 5             # a reading every 5 seconds (default 2)
+lemondx top --once           # one frame, e.g. into a file
+lemondx top --json           # one snapshot, two readings a second apart
+```
+
+Health records and stack runs are kept in memory by the `serve` that made
+them, so for this node `top` asks the local `serve` (over loopback, pinned
+like a peer when it serves TLS) and says so in its header when there is none;
+a peer's come from that peer. CPU is worked out between two readings, so the
+first frame has none. A node's CPU meter is the share of its threads its
+*instances* use — the API does not report the host's own load — and its
+memory meter is the whole host's.
+
+**`c` (or Enter) attaches to the selected instance's console** — the guest's
+own console device, as `lxc console` gives it: a login prompt on a container,
+the serial console on a VM. It takes over the whole terminal until **Ctrl-]**
+(the key `virsh console` uses, since a guest never needs it) brings `top` back;
+every other key, Ctrl-C included, goes to the guest. That works for an
+instance on any node: on this one it is the daemon's console session directly,
+and on a peer it is that peer's own terminal endpoint
+(`/api/containers/{name}/console`, a WebSocket), reached over the same pinned
+connection and cluster credential as every other call to it. Only a running
+instance has a console; asking for one on anything else says so in the header.
+
+**`b` runs a bootstrap** on the instances marked with space — on any mix of
+nodes — or on the selected one when none are. The picker lists saved bootstrap
+profiles (Enter runs one as saved) and then the modules, to tick with space.
+Either way a form follows with every parameter the modules declare, filled with
+this node's saved values, which are what is sent to every target; secrets start
+empty and must be typed (they are masked and never kept), and a module that
+installs SSH keys offers the profile's, every key in `~/.ssh`, or none. A
+multi-line value is left to each node's own setting. Each target runs in the
+background and reports in a bootstrap panel — the modules, how long, or which
+module failed and its last line of output; `x` clears the finished ones.
+Nothing is saved as a module default: a run on this node goes straight to
+the daemon and one on a peer through that node's own bootstrap endpoint, both
+with `remember` off. Quitting while a run is going asks twice, since a run on
+this node stops part-way when `top` does; one on a peer carries on there.
+
+**Tab moves to the stacks panel, then the templates panel**, and back to the
+instances. Both panels list every stack or template this node holds — they
+are synced, so that is the cluster's — whether or not it has instances, so a
+first launch happens from here too. With a panel focused, the footer switches
+to its keys and ↑↓ picks an item:
+
+| | Stacks | Templates |
+| --- | --- | --- |
+| `l` | relaunch (launch, when it has no instances) | launch: a count, and in a cluster where — this node, every node or a group |
+| `u` / `s` / `r` | start / stop / restart every instance | start / stop / restart every instance |
+| `c` | | recreate every instance from the template |
+| `d` | destroy | destroy |
+| `x` | cancel the run in progress | |
+
+A key that does not apply to the selected item is dimmed, and pressing it
+says why — such as while a run is going; a template has one run at a time,
+whichever node started it. Enter opens the same actions as a menu.
+
+A shortcut goes straight to the same confirmation the menu does: stop,
+restart, recreate, destroy and relaunch list every instance they will touch
+and wait for `y` (Esc backs out); that list is also what the service checks
+the instances against, so one launched meanwhile makes it refuse rather than
+act on something unseen. Recreating or destroying a template's instances that
+belong to a stack says so first. A stack relaunch asks for the stack's launch
+inputs (`{{params.NAME}}`) and any module secret no step sets, the same values
+`lemondx stack-launch` prompts for; a template launch or recreate asks for its
+modules' secrets. Either way they are masked and never kept.
+
+The actions go to this node's `serve`, so a launch, recreate, destroy or
+relaunch is an ordinary stack or template run there: it carries on after
+`top` exits, and the panel — like the web UI — follows it. A cancel goes to
+whichever node holds the run. Without a `serve` here, start, stop and restart
+still work (they finish in seconds), but the actions that start a run are
+refused, since the run would die with `top`. When authentication is on, `top` calls its own `serve` with
+`LEMONDX_TOKEN` if set, else the cluster credential.
 
 ### Reaching one node's own API
 

@@ -16,6 +16,10 @@ import { SshKeyPicker } from './SshKeyPicker'
 // How a fabric is told from a network in the one picker; a network name
 // cannot contain a colon.
 const FABRIC_CHOICE = 'fabric:'
+// A NAT'd fabric stored as a second NIC, which the picker never makes but
+// `lemondx template --fabric` does: shown as its own choice, or it reads as
+// the fabric alone and picking that changes nothing.
+const SECOND_NIC_CHOICE = 'second-nic:'
 
 interface Props {
   value: InstanceSpec
@@ -31,6 +35,11 @@ interface Props {
    * value is asked for on launch, and a missing one blocks nothing here.
    */
   secretsAtLaunch?: boolean
+  /**
+   * Made from a snapshot rather than an image: no image to pick, and the
+   * snapshot decides container or VM, so neither is asked.
+   */
+  fromSnapshot?: boolean
 }
 
 /**
@@ -40,7 +49,7 @@ interface Props {
  */
 export function InstanceForm({
   value, onChange, modules, profiles, hostKeys, reloadProfiles, onError, disabled,
-  secretsAtLaunch = false,
+  secretsAtLaunch = false, fromSnapshot = false,
 }: Props) {
   const [images, setImages] = useState<Images | null>(null)
   const [status, setStatus] = useState<Status | null>(null)
@@ -129,12 +138,16 @@ export function InstanceForm({
   // NIC beside the default network, since it carries nothing but the fabric.
   const chosenFabric = value.fabric || (fabricNames.has(value.network) ? value.network : '')
   const selectedNetworkName = value.network || defaultNetworkName
-  const selectedChoice = chosenFabric ? `${FABRIC_CHOICE}${chosenFabric}` : selectedNetworkName
   const selectedNetwork = chosenFabric ? null
     : networks?.find((n) => n.name === selectedNetworkName) ?? null
   const selectedFabric = fabrics.find((f) => f.name === chosenFabric) ?? null
+  const asSecondNic = Boolean(value.fabric && selectedFabric?.nat)
+  const selectedChoice = asSecondNic ? `${SECOND_NIC_CHOICE}${chosenFabric}`
+    : chosenFabric ? `${FABRIC_CHOICE}${chosenFabric}` : selectedNetworkName
+  const baseNetworkName = value.network || defaultNetworkName || 'default'
 
   function choose(choice: string) {
+    if (choice.startsWith(SECOND_NIC_CHOICE)) return
     if (!choice.startsWith(FABRIC_CHOICE)) {
       set({ network: choice === defaultNetworkName ? '' : choice, fabric: '' })
       return
@@ -180,7 +193,7 @@ export function InstanceForm({
 
   return (
     <>
-      <div className="field">
+      {!fromSnapshot && <div className="field">
         <label>Image</label>
         {!customImage ? (
           <>
@@ -224,7 +237,7 @@ export function InstanceForm({
             onBack={() => setCustomImage(false)}
           />
         )}
-      </div>
+      </div>}
 
       <div className="grid-2">
         <div className="field">
@@ -278,9 +291,15 @@ export function InstanceForm({
               <optgroup label="Fabrics — span every node">
                 {fabrics.map((f) => (
                   <option key={f.name} value={`${FABRIC_CHOICE}${f.name}`}>
-                    {f.name} ({f.prefix}{f.nat ? '' : ', no NAT'})
+                    {f.nat ? f.name : `${baseNetworkName} + ${f.name}`}
+                    {' '}({f.prefix}{f.nat ? '' : ', no NAT'})
                   </option>
                 ))}
+                {asSecondNic && (
+                  <option value={selectedChoice}>
+                    {baseNetworkName} + {chosenFabric} (second NIC)
+                  </option>
+                )}
               </optgroup>
             )}
           </select>
@@ -408,12 +427,12 @@ export function InstanceForm({
             <span className="hint">— required by the selected modules</span>
           )}
         </label>
-        <label className="checkbox">
+        {!fromSnapshot && <label className="checkbox">
           <input type="checkbox" checked={isVm} disabled={disabled}
             onChange={(e) => set({ type: e.target.checked ? 'virtual-machine' : 'container' })} />
           Create a virtual machine instead of a container
-        </label>
-        {isVm && (
+        </label>}
+        {isVm && !fromSnapshot && (
           <label className="checkbox">
             <input type="checkbox" checked={!value.secureboot} disabled={disabled}
               onChange={(e) => set({ secureboot: !e.target.checked })} />

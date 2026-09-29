@@ -1,0 +1,24 @@
+#cloud-config
+# image: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+# Plain Debian 13 + Incus. @HOSTNAME@ and @SSH_KEYS@ are filled in by
+# scripts/create-vm.sh; Proxmox's own meta-data sets no hostname when
+# cicustom supplies user-data, so it has to be here.
+hostname: @HOSTNAME@
+fqdn: @HOSTNAME@.lemondx.test
+users:
+  - name: ci
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+@SSH_KEYS@
+package_update: true
+package_upgrade: true
+package_reboot_if_required: true
+packages:
+  - qemu-guest-agent
+  - incus
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  - usermod -aG incus-admin ci
+  - incus admin init --auto
+  - touch /var/lib/cloud/testcluster-ready

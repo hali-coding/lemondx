@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from 'react'
 import type { DragEvent, ReactNode } from 'react'
 import { api, ApiError } from '../lib/api'
+import { madeFrom } from '../lib/instance'
 import type {
   BootstrapModule, ClusterNode, InstanceTemplate, NodeGroup, Stack, StackLaunchStep,
   StackStep, StackStepType, Synced,
@@ -456,7 +457,7 @@ export function StackEditor({ stack, templates, modules, nodes, groups, running 
           {templates.length === 0 && <p className="hint">No templates yet; make one first.</p>}
           {templates.map((template) => (
             <PaletteItem key={template.name} icon={<ServerIcon />} label={template.name}
-              detail={template.image} mono
+              detail={madeFrom(template)} mono
               onDragStart={(e) => onDragStart(e, { kind: 'new', step: blank('launch', template) })}
               onDragEnd={endDrag} onAdd={() => add(blank('launch', template))} />
           ))}
@@ -630,7 +631,7 @@ function StepCard({ step, selected, issues, templates, onSelect, onRemove, onDra
       </div>
       {step.type === 'launch' && template && (
         <div className="stack-step-sub mono truncate">
-          {(step.prefix || template.name_prefix)}-N · {template.image}
+          {(step.prefix || template.name_prefix)}-N · {madeFrom(template)}
         </div>
       )}
       {issues.length > 0 && <div className="stack-step-issue">{issues[0]}</div>}

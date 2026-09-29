@@ -76,6 +76,11 @@ install_user() {
     fi
 
     mkdir -p "$unit_dir"
+    # The unit's ReadWritePaths= names the data directory, and systemd refuses
+    # to spawn anything when a path there is missing (226/NAMESPACE) -- lemondx
+    # never gets the chance to create it. An account that has never run
+    # lemondx has no such directory, so make it here.
+    mkdir -p "$HOME/.local/share/lemondx"
     sed "s|@LEMONDX_PATH@|$repo_dir|g" "$script_dir/lemondx.service" > "$unit_path"
     echo "Installed $unit_path"
 
@@ -91,6 +96,14 @@ install_user() {
     fi
 
     systemctl --user enable --now lemondx.service
+    # `enable --now` succeeds as soon as the start is queued, so a unit that
+    # dies at spawn and sits in auto-restart would still read as a success.
+    sleep 2
+    if ! systemctl --user is-active --quiet lemondx.service; then
+        echo
+        echo "lemondx did not stay up. See: journalctl --user -u lemondx -n 30" >&2
+        exit 1
+    fi
     echo
     echo "lemondx is running: http://127.0.0.1:8099"
     echo "Logs:   journalctl --user -u lemondx -f"

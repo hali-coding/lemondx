@@ -405,6 +405,7 @@ class ClusterService:
         self._settings = settings
         self._lock = threading.Lock()
         self._probes = {}            # node name -> (checked_at, record)
+        self._images = {}            # image jobs by id; see publish_snapshot()
         # What the last reconciliation found, kept like a template run: in
         # memory on the one service `serve` builds, so the UI can read drift
         # without setting a pass going every time somebody opens the tab.
@@ -2295,7 +2296,8 @@ class ClusterService:
                 secureboot=bool(body.get("secureboot", True)),
                 bootstrap=body.get("bootstrap"),
                 description=body.get("description", ""),
-                name_prefix=body.get("name_prefix"), app_check=body.get("app_check"))
+                name_prefix=body.get("name_prefix"), app_check=body.get("app_check"),
+                snapshot=body.get("snapshot"))
         elif kind == "profiles":
             self.service.save_bootstrap_profile(
                 name=name, modules=body.get("modules") or [], params=body.get("params"),
@@ -2434,6 +2436,18 @@ class ClusterService:
         return thread
 
     def save_template(self, propagate=True, **kwargs):
+        source = kwargs.get("snapshot")
+        if isinstance(source, dict) and not str(source.get("node") or "").strip():
+            # Named now, while "here" means something: the template is pushed
+            # to every member, and the snapshot is on this one.
+            source = kwargs["snapshot"] = dict(source, node=self.local_name())
+        clean = store.clean_snapshot_source(source)
+        if propagate and clean and clean["node"] == self.local_name():
+            # Checked where it can be, so a typo fails the save rather than
+            # every launch -- and the clone's type is the source's, whatever
+            # was asked for. Not on a relayed save, which must never be refused.
+            kwargs["instance_type"] = self.service.snapshot_type(
+                "%s/%s" % (clean["instance"], clean["name"]))
         record = self.service.save_template(**kwargs)
         return self._with_sync(record, "templates", record["name"], propagate)
 
@@ -2475,6 +2489,146 @@ class ClusterService:
         outcome = self._propagate(kind, name, deleted=deleted)
         return dict(record, synced=outcome) if isinstance(record, dict) else record
 
+    # -- images between nodes ----------------------------------------------
+    #
+    # A snapshot lives on one node; an image can be anywhere. So the way to run
+    # a snapshot elsewhere is to publish it here and send the image to the
+    # nodes asked for, each as one streamed upload through the pinned peer
+    # channel, checked on arrival by the far daemon's own fingerprint. Never
+    # done implicitly by a launch: it is gigabytes per node.
+    #
+    # A job is held in memory here like a template run, on the node where the
+    # image is, and followed through `/api/image-jobs` there.
+
+    IMAGE_JOB_RETENTION = 600
+    # Each send is a full image read from this node's disk and pushed down one
+    # link; a few at once is as much as either is likely to take.
+    IMAGE_SEND_WORKERS = 2
+
+    def publish_snapshot(self, instance, snapshot, alias, nodes=None, description="",
+                         background=False):
+        """Make an image of a snapshot on this node and copy it to ``nodes``."""
+        alias = self.service.check_publish(instance, snapshot, alias)
+        return self._image_job(alias, self._image_targets(nodes), background,
+                               source="%s/%s" % (instance, snapshot),
+                               description=str(description or "").strip()[:200])
+
+    def copy_image(self, alias, nodes, background=False):
+        """Copy this node's image ``alias`` to ``nodes``: for a node that was missed."""
+        targets = self._image_targets(nodes)
+        if not targets:
+            raise ClusterError("Name at least one other node to copy the image to.")
+        fingerprint, description = self.service.image_by_alias(alias)
+        return self._image_job(self.service.image_alias(alias), targets, background,
+                               fingerprint=fingerprint, description=description)
+
+    def image_jobs(self):
+        """Publishes and copies started here, running or finished in the last minutes."""
+        now = time.time()
+        with self._lock:
+            for key, job in list(self._images.items()):
+                if job["finished_at"] and now - job["finished_at"] > self.IMAGE_JOB_RETENTION:
+                    del self._images[key]
+            return sorted((_copy_job(j) for j in self._images.values()),
+                          key=lambda j: j["started_at"])
+
+    def pending_work(self):
+        with self._lock:
+            return ["image '%s' (%s)" % (j["alias"], j["stage"])
+                    for j in self._images.values()
+                    if j["finished_at"] is None]
+
+    def _image_targets(self, nodes):
+        wanted = list(dict.fromkeys(str(n).strip() for n in nodes or [] if str(n).strip()))
+        unknown = [n for n in wanted if n not in self.all_nodes()]
+        if unknown:
+            raise ClusterError("No member called %s." % ", ".join(
+                "'%s'" % n for n in unknown), 404)
+        # This node has the image by making it; naming it is not an error.
+        return [n for n in wanted if n != self.local_name()]
+
+    def _image_job(self, alias, targets, background, source=None, fingerprint=None,
+                   description=""):
+        job = {
+            "id": secrets.token_hex(4), "alias": alias, "source": source,
+            "node": self.local_name(), "fingerprint": fingerprint, "size": None,
+            "stage": "publishing" if source else "copying",
+            "started_at": time.time(), "finished_at": None, "ok": None, "error": None,
+            "nodes": [{"node": n, "state": "waiting", "sent": 0, "error": None}
+                      for n in targets],
+        }
+        with self._lock:
+            if any(j["alias"] == alias and j["finished_at"] is None
+                   for j in self._images.values()):
+                raise ClusterError("Image '%s' is already being published or copied "
+                                   "from here." % alias, 409)
+            self._images[job["id"]] = job
+
+        def work():
+            try:
+                if source:
+                    instance, _, snapshot = source.partition("/")
+                    image = self.service.publish_snapshot(instance, snapshot, alias,
+                                                          description)
+                    self._image_update(job, fingerprint=image["fingerprint"])
+                self._image_update(job, stage="copying",
+                                   size=(self.service.lxd.get_image(job["fingerprint"])
+                                         or {}).get("size"))
+                self._fanout_limited(job["nodes"], lambda entry: self._send_image(
+                    job, entry, description))
+                failed = [e["node"] for e in job["nodes"] if e["state"] == "failed"]
+                self._image_update(job, ok=not failed, error="Not copied to %s." % ", ".join(
+                    failed) if failed else None)
+            except (ServiceError, LXDError, ClusterError, NodeError) as exc:
+                self._image_update(job, ok=False, error=exc.message)
+            except Exception as exc:                  # noqa: BLE001
+                _log("image job %s failed: %r" % (alias, exc))
+                self._image_update(job, ok=False, error="Unexpected error: %s" % exc)
+            finally:
+                self._image_update(job, stage="done", finished_at=time.time())
+            return _copy_job(job)
+
+        if not background:
+            return work()
+        threading.Thread(target=work, name="lemondx-image-%s" % alias, daemon=True).start()
+        return _copy_job(job)
+
+    def _fanout_limited(self, items, work):
+        if items:
+            with ThreadPoolExecutor(max_workers=min(len(items),
+                                                    self.IMAGE_SEND_WORKERS)) as pool:
+                list(pool.map(work, items))
+
+    def _image_update(self, job, entry=None, **changes):
+        with self._lock:
+            (entry if entry is not None else job).update(changes)
+
+    def _send_image(self, job, entry, description):
+        """One node's copy; recorded on ``entry``, never raised."""
+        fingerprint, alias = job["fingerprint"], job["alias"]
+        try:
+            client = self.client(entry["node"])
+            # The far side may have it already -- an earlier copy, or the same
+            # image under another name -- and then only the alias moves.
+            if client.adopt_image(fingerprint, alias, description):
+                self._image_update(job, entry, state="present")
+                return
+            stream, length, close = self.service.lxd.open_image_export(fingerprint)
+            try:
+                self._image_update(job, entry, state="sending")
+
+                def progress(sent):
+                    self._image_update(job, entry, sent=sent,
+                                       state="importing" if sent >= length else "sending")
+                client.send_image(_CountingReader(stream, progress), length,
+                                  fingerprint, alias, description)
+            finally:
+                close()
+            self._image_update(job, entry, state="done", sent=length)
+        except (ClusterError, NodeError, LXDError, ServiceError) as exc:
+            _log("copying image %s to %s failed: %s" % (alias, entry["node"], exc.message))
+            self._image_update(job, entry, state="failed", error=exc.message)
+
     # -- launching across nodes --------------------------------------------
 
     def launch_template(self, name, count=1, nodes=None, groups=None, params=None,
@@ -2493,6 +2647,7 @@ class ClusterService:
         per node. What a node cannot substitute -- an image it cannot pull, no
         space -- fails that node's instances and leaves the rest alone.
         """
+        nodes, groups = self.template_targets(name, nodes, groups)
         targets, skipped = self.launch_targets(nodes, groups)
         local_name = self.local_name()
         if targets == [local_name] and not skipped:
@@ -2532,6 +2687,32 @@ class ClusterService:
         return self.service.track_run(
             template["name"], "launch", total, work, background,
             nodes=[t for t in targets if shares[t]])
+
+    def template_targets(self, name, nodes, groups):
+        """Where a launch goes: unchanged, unless the template clones a snapshot.
+
+        A snapshot exists on one node, so its clones are made there and
+        nowhere else -- with nothing named, that node rather than this one; a
+        launch naming anywhere else is refused, with what to do instead. The
+        snapshot is not copied between nodes on a launch's behalf: that is
+        gigabytes, and publishing it as an image says once, deliberately,
+        where it should be.
+        """
+        template = next((t for t in self.service.list_templates()
+                         if t["name"] == name), None)
+        source = (template or {}).get("snapshot")
+        if not source:
+            return nodes, groups
+        owner = source["node"] or self.local_name()
+        if not nodes and not groups:
+            return [owner], None
+        if self.resolve_targets(nodes, groups) != [owner]:
+            raise ClusterError(
+                "Template '%s' clones the snapshot %s/%s, which is on %s only, so "
+                "it launches there. To run it elsewhere, publish the snapshot as "
+                "an image, copy it to those nodes, and make a template from "
+                "local:<alias>." % (name, source["instance"], source["name"], owner), 409)
+        return nodes, groups
 
     def _share_names(self, prefix, total, targets):
         """Instance names for each node: round robin, and unique across them all.
@@ -2975,6 +3156,35 @@ def _changed_at(peer, kind, name):
     return peer["changes"][kind].get(name, {}).get("at", 0)
 
 
+def _copy_job(job):
+    """An image job to hand out: nothing a reader holds may change under it."""
+    return dict(job, nodes=[dict(e) for e in job["nodes"]])
+
+
+class _CountingReader:
+    """A file-like wrapper that reports how much has been read, as it is.
+
+    Reported once per megabyte at most: progress lands in a record the UI polls
+    every few seconds, so finer than that is lock traffic nobody sees.
+    """
+
+    STEP = 1 << 20
+
+    def __init__(self, stream, report):
+        self._stream = stream
+        self._report = report
+        self._count = 0
+        self._reported = 0
+
+    def read(self, size=-1):
+        data = self._stream.read(size)
+        self._count += len(data)
+        if not data or self._count - self._reported >= self.STEP:
+            self._reported = self._count
+            self._report(self._count)
+        return data
+
+
 def _template_body(template):
     """A template as the REST API takes it, for pushing to another node."""
     return {
@@ -3003,4 +3213,5 @@ def _template_body(template):
         # A PUT replaces the whole template, so a field left out here is not
         # "unchanged" on the far side but deleted there.
         "app_check": template.get("app_check"),
+        "snapshot": template.get("snapshot"),
     }
