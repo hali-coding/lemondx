@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.0](https://github.com/hali-coding/lemondx/compare/v0.8.1...v0.9.0) (2026-09-29)
+
+
+### Features
+
+* adds the top feature ([3409551](https://github.com/hali-coding/lemondx/commit/34095516585a70d091a51af4ca90f342b514562d))
+* adds the top feature ([4c6644a](https://github.com/hali-coding/lemondx/commit/4c6644a43fc7be39b3aa387eb95ef19988cc4418))
+
 ## [0.8.1](https://github.com/hali-coding/lemondx/compare/v0.8.0...v0.8.1) (2026-09-24)
 
 
