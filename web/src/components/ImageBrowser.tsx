@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../lib/api'
 import { bytes } from '../lib/format'
+import { shortSerial } from '../lib/pins'
 import type { ImageBrowse, RemoteImage } from '../lib/types'
 
 interface Props {
@@ -36,6 +37,7 @@ export function ImageBrowser({ value, onPick, onBack, disabled, forVm }: Props) 
   const matches = useMemo(() => {
     if (!data) return []
     const needle = query.trim().toLowerCase()
+    // Pinned images first, the catalog's own order otherwise (sort is stable).
     return data.entries.filter((image) => {
       if (remote && image.remote !== remote) return false
       if (downloadedOnly && !isCached(image)) return false
@@ -49,7 +51,7 @@ export function ImageBrowser({ value, onPick, onBack, disabled, forVm }: Props) 
         image.label.toLowerCase().includes(needle) ||
         image.variant.toLowerCase().includes(needle)
       )
-    })
+    }).sort((a, b) => Number(b.pins.length > 0) - Number(a.pins.length > 0))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data, query, remote, downloadedOnly, forVm])
 
@@ -145,6 +147,13 @@ export function ImageBrowser({ value, onPick, onBack, disabled, forVm }: Props) 
                   <span className="mono faint">{image.full_alias}</span>
                 </span>
                 <span className="browser-row-side">
+                  {image.pins.length > 0 && (
+                    <span className="badge" title={`Pinned builds: ${image.pins.map((p) =>
+                      `${p.serial} (pin:${p.nicknames[0] ?? p.name})`).join(', ')}. This picks the remote's newest; pick a pin above for a fixed build.`}>
+                      Pinned {image.pins.length > 1 ? `×${image.pins.length}`
+                        : shortSerial(image.pins[0].serial)}
+                    </span>
+                  )}
                   {cached ? (
                     <span className="badge badge-ok">Downloaded</span>
                   ) : (

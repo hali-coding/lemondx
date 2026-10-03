@@ -150,37 +150,7 @@ class Collector:
 
     def local_api(self):
         """A client for this node's own ``serve``, or ``(None, why not)``."""
-        runtime = store.read_runtime()
-        if not isinstance(runtime, dict) or not _alive(runtime.get("pid")):
-            return None, "no `lemondx serve` running here"
-        port = runtime.get("port")
-        if not isinstance(port, int):
-            return None, "serve did not record its port"
-        host = str(runtime.get("host") or "")
-        host = {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
-        fingerprint = ""
-        if runtime.get("tls"):
-            # Pinned like any peer: the token below must never be handed to
-            # whatever else might be answering on that port.
-            cert, _ = self.cluster.certificate()
-            if not cert:
-                return None, "serve uses a TLS certificate this node cannot pin"
-            try:
-                fingerprint = certificate_fingerprint(cert)
-            except ClusterError as exc:
-                return None, exc.message
-        token = None
-        if self.cluster.auth.config.enabled or self.cluster.requires_remote_token():
-            # The cluster credential is an ordinary admin token this node
-            # accepts too, so a member needs nothing configured to read itself.
-            token = os.environ.get("LEMONDX_TOKEN") or self.cluster.cluster_secret()
-        url = "%s://%s:%d" % ("https" if runtime.get("tls") else "http",
-                              "[%s]" % host if ":" in host else host, port)
-        try:
-            return NodeClient(url, token=token, fingerprint=fingerprint,
-                              timeout=PEER_TIMEOUT), None
-        except NodeError as exc:
-            return None, exc.message
+        return self.cluster.local_api(timeout=PEER_TIMEOUT)
 
     def _read_node(self, name, local, api):
         view = {"node": name, "local": local, "error": None, "instances": [],
@@ -271,18 +241,6 @@ class Collector:
             "memory": memory, "memory_used": used, "memory_total": total,
             "history": {"cpu": list(history["cpu"]), "mem": list(history["mem"])},
         }
-
-
-def _alive(pid):
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 def _stage_state(steps):

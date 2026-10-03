@@ -26,12 +26,13 @@ else here judges it as a machine.
 from __future__ import annotations
 
 import datetime
+import logging
 import math
 import os
 import threading
 import time
 
-from . import store
+from . import eventlog, store
 
 HEALTHY = "healthy"
 DEGRADED = "degraded"
@@ -352,9 +353,19 @@ class LoadSampler:
                 try:
                     self.tick()
                 except Exception as exc:                    # noqa: BLE001
-                    print("[lemondx] load sampling failed: %s" % exc)
+                    eventlog.message("load sampling failed: %s" % exc,
+                                     level=logging.WARNING)
                 time.sleep(max(0.5, self.period - (time.time() - started)))
-        threading.Thread(target=loop, name="lemondx-loadavg", daemon=True).start()
+        threading.Thread(target=_as_system("load-sampler", loop), name="lemondx-loadavg",
+                         daemon=True).start()
+
+
+def _as_system(task, fn):
+    """``fn`` run as `serve` itself, so what it logs says which chore did it."""
+    def run():
+        with eventlog.system(task):
+            return fn()
+    return run
 
 
 def iso_epoch(value):
@@ -553,7 +564,8 @@ class AppChecker:
             try:
                 self._on_result(name)
             except Exception as exc:                        # noqa: BLE001
-                print("[lemondx] app check for %s not recorded: %s" % (name, exc))
+                eventlog.message("app check for %s not recorded: %s" % (name, exc),
+                                 level=logging.WARNING)
 
     def start(self):
         from concurrent.futures import ThreadPoolExecutor
@@ -573,9 +585,10 @@ class AppChecker:
                         self._due[name] = now + app_check["interval_seconds"]
                         self._running.add(name)
                 for name, app_check in due:
-                    pool.submit(self._check, name, app_check)
+                    pool.submit(eventlog.carry(self._check), name, app_check)
                 time.sleep(self.TICK_SECONDS)
-        threading.Thread(target=loop, name="lemondx-appchecks", daemon=True).start()
+        threading.Thread(target=_as_system("app-check", loop), name="lemondx-appchecks",
+                         daemon=True).start()
 
 
 # -- judgement -------------------------------------------------------------

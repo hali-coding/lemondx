@@ -31,7 +31,7 @@ interface Props {
 
 // Header keys the runner reads; shown distinctly so the metadata stands out
 // from the script it describes.
-const HEADER_LINE = /^#\s*(name|description|order|uses|param|secret|os)\s*:/i
+const HEADER_LINE = /^#\s*(name|description|order|uses|param|secret|os|repeatable)\s*:/i
 
 /** One module: its settings, its script, and where it is used. */
 export function ModuleDetail({ module, usage, onBack, onChanged, onDeleted, onNotify }: Props) {
@@ -198,6 +198,10 @@ export function ModuleDetail({ module, usage, onBack, onChanged, onDeleted, onNo
               order <span className="mono">{module.order}</span>
               <span className="faint"> · lower runs first</span>
             </dd>
+          </div>
+          <div>
+            <dt>Per instance</dt>
+            <dd>{module.repeatable ? 'can be added more than once' : 'once'}</dd>
           </div>
           <div>
             <dt>Distros</dt>

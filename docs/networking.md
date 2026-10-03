@@ -2,6 +2,10 @@
 
 [← back to README](../README.md)
 
+This page is about networks between lemondx's own instances across nodes. To
+put instances on your LAN, addressed by your router, see
+[Containers on your LAN](lan.md).
+
 A managed bridge is NAT'd. That is right for reaching the internet and wrong
 for reaching a container on another host: the source address is rewritten to
 the host's, and there is no route back. So by default a container on one node
@@ -33,7 +37,17 @@ on one and its web tier on another.
 - **Into the fabric, nothing else.** A bridge only accepts traffic from its own
   fabric's prefix, or replies to connections its instances started. A host on
   your LAN, a container on `lxdbr0`, and an instance on another fabric are all
-  dropped. The node itself can still reach its own instances.
+  dropped.
+- **Every node reaches every instance.** A node's own traffic into a fabric
+  leaves from its fabric gateway address (the routes carry it as `src`), so it
+  is inside the prefix and let in on every other node -- not only its own
+  instances. Forwarded traffic ignores the hint, so a plain container still
+  arrives from the host's LAN address and is dropped.
+- **Once a macvlan network exists anywhere in the cluster,** every node also
+  admits the LAN subnet it is on, so instances on that LAN reach every fabric
+  (see [Containers on your LAN](lan.md#reaching-the-fabrics)). That opens the
+  fabrics to the whole of that LAN, which is the trade: a device there that
+  adds a route can reach fabric instances too.
 - **Out of the fabric, NAT'd** (the default). Traffic for anywhere else leaves
   behind the host's address, like any managed bridge. A NAT'd fabric also
   offers a gateway over DHCP, so an instance can have the fabric as its *only*
@@ -65,7 +79,8 @@ instance is reached by address, not by name.
 
 ## Creating one
 
-From the **Network** tab, choose **New fabric**. The dialog asks every node what
+From the **Network** tab, choose **New network** → *Shared across the cluster
+(fabric)*. The next step asks every node what
 it already uses (every interface the daemon can see *and* every route in the
 host's table, so a VPN's range counts too) and proposes a name and the first
 free /16. Each edit is checked again, and the dialog shows which /24 each node
@@ -87,8 +102,9 @@ and programs its routes and firewall.
 **Every node in the cluster must be reachable.** A node that does not answer
 cannot be checked for what it already uses, and it would have no way to catch
 up later, because nothing reconciles a subnet claim. So while any member is
-down, **New fabric** is disabled and `fabric create` is refused. Bring the node
-back, or, if it is gone for good, evict it (**Evict** on the Nodes tab, or
+down, the fabric step names it and will not create, and `fabric create` is
+refused. Bring the node
+back, or, if it is gone for good, evict it (**Evict** on the Cluster tab, or
 `lemondx cluster evict NAME`). Eviction works on a node that cannot be reached:
 instead of telling it to stand down, it rotates the cluster credential so the
 node can no longer act as a member.
@@ -178,6 +194,9 @@ knowing before you edit that file:
   which matches command arguments literally and supports neither wildcards nor
   regular expressions; classic sudo supports both. A pattern that confines on
   Debian is wide open or simply broken on Ubuntu.
+
+The same helper also converts a NIC into a bridge for
+[Containers on your LAN](lan.md#privilege), under confinement of the same kind.
 
 The grant goes to the daemon's own admin group (`lxd` or `incus-admin`), which
 [docs/security.md](security.md) already treats as root-equivalent: creating a

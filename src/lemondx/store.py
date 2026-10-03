@@ -33,6 +33,8 @@ import tempfile
 import threading
 import time
 
+from . import eventlog
+
 # 1 kept profiles inside settings.json; 2 moved them to profiles/.
 SETTINGS_VERSION = 2
 
@@ -95,6 +97,21 @@ def nodes_dir():
 
 def node_groups_dir():
     return os.path.join(data_dir(), "node-groups")
+
+
+def pins_dir():
+    return os.path.join(data_dir(), "pins")
+
+
+def events_socket_path():
+    """Where `serve` takes CLI processes' events for its live tail."""
+    return os.path.join(data_dir(), "events.sock")
+
+
+def settings_records_dir():
+    # Not settings.json's directory: that file is this node's module defaults,
+    # and these are the cluster's shared settings (logging so far).
+    return os.path.join(data_dir(), "cluster-settings")
 
 
 def auth_dir():
@@ -281,8 +298,11 @@ def _clean_selection(stored):
     can promise without importing it.
     """
     params = stored.get("params")
+    modules = stored.get("modules")
     return {
-        "modules": _strings(stored.get("modules")),
+        # Not deduplicated: a module listed twice runs twice, the second time
+        # with its NAME@2 parameters (see bootstrap.occurrences()).
+        "modules": [str(m) for m in (modules if isinstance(modules, list) else [])][:64],
         "params": {str(k): str(v) for k, v in
                    (params.items() if isinstance(params, dict) else ())},
         "ssh_keys": [k for k in (s.strip() for s in _strings(stored.get("ssh_keys")))
@@ -607,7 +627,7 @@ def clean_fabric(stored):
     An unparseable claim is dropped rather than failing the record -- a node
     with no usable claim is simply not on that fabric.
     """
-    empty = {"via": "", "fabrics": {}}
+    empty = {"via": "", "fabrics": {}, "lan": []}
     if not isinstance(stored, dict):
         return empty
     try:
@@ -639,7 +659,16 @@ def clean_fabric(stored):
             continue
         fabrics[name] = {"prefix": str(prefix), "subnet": str(subnet),
                          "nat": claim.get("nat") is not False}
-    return {"via": via, "fabrics": fabrics}
+    # The LAN subnets its macvlan networks are on; see fabric.DEFAULT_SETTINGS.
+    lan = set()
+    for item in stored.get("lan") if isinstance(stored.get("lan"), list) else []:
+        try:
+            network = ipaddress.ip_network(_text(item, 43), strict=False)
+        except ValueError:
+            continue
+        if network.version == 4 and len(lan) < 16:
+            lan.add(str(network))
+    return {"via": via, "fabrics": fabrics, "lan": sorted(lan)}
 
 
 def _clean_node_group(stored, name):
@@ -647,6 +676,60 @@ def _clean_node_group(stored, name):
         "name": name,
         "description": _text(stored.get("description"), 200),
         "members": _strings(stored.get("members")),
+    }
+
+
+# -- pinned images ---------------------------------------------------------
+#
+# A pin is one build of one remote image (`images:debian/12` as built on
+# 1 October), by fingerprint, so a launch next month makes what a launch
+# today makes. It is a shared artifact like a template -- the point is that
+# every node makes the same base -- and as copyable and untrusted as one.
+#
+# Its name is derived from the image and the build, and the build never
+# changes: a newer build is another pin beside it, so a template naming a pin
+# launches the same thing for as long as it names it. Nicknames are the one
+# part a person edits -- other names the pin answers to, in the same namespace
+# as the ids, so `pin:debian-golden` reads better in a template than the id.
+
+PIN_IMAGE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+PIN_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,79}$")
+_PIN_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+# What a pin may change after it is made; everything else is the build.
+PIN_EDITABLE = ("nicknames", "note")
+
+
+def clean_pin(stored, name):
+    image = _text(stored.get("image"), 200)
+    image = image if PIN_IMAGE.match(image) else ""
+    remote, _, alias = image.partition(":")
+
+    def fingerprint(value):
+        value = _text(value, 64).lower()
+        return value if _FINGERPRINT.match(value) else ""
+    aliases = [a for a in _strings(stored.get("aliases")) if _PIN_ALIAS.match(a)][:16]
+    nicknames = [n for n in dict.fromkeys(_strings(stored.get("nicknames")))
+                 if PIN_ID.match(n) and n != name][:16]
+    return {
+        "name": name,
+        "image": image,
+        "remote": remote,
+        "alias": alias,
+        "aliases": aliases if not alias or alias in aliases else [alias] + aliases,
+        "nicknames": nicknames,
+        "serial": _text(stored.get("serial"), 64),
+        # The server the build came from. `images:` is a different server on
+        # LXD and on Incus, with different builds, so the remote's name alone
+        # does not say where this fingerprint can be fetched.
+        "server": _text(stored.get("server"), 200) if str(stored.get("server") or "")
+        .startswith("https://") else "",
+        "arch": _text(stored.get("arch"), 32),
+        "fingerprint": fingerprint(stored.get("fingerprint")),
+        "vm_fingerprint": fingerprint(stored.get("vm_fingerprint")),
+        "label": _text(stored.get("label"), 120),
+        "note": _text(stored.get("note"), 200),
+        "pinned_at": _epoch(stored.get("pinned_at")),
+        "pinned_by": _text(stored.get("pinned_by"), 64),
     }
 
 
@@ -743,6 +826,8 @@ _templates = _Records(templates_dir, _clean_template)
 _stacks = _Records(stacks_dir, _clean_stack)
 _nodes = _Records(nodes_dir, _clean_node)
 _node_groups = _Records(node_groups_dir, _clean_node_group)
+_pins = _Records(pins_dir, clean_pin)
+_settings = _Records(settings_records_dir, lambda stored, name: clean_setting(stored, name))
 
 # Node records are the one _Records directory that is not a shared artifact --
 # membership converges through sync_members(), not through reconciliation --
@@ -757,16 +842,26 @@ load_templates = _templates.load
 load_stacks = _stacks.load
 
 
+def load_pins():
+    """Every pin by id. A record that names no image, or whose name is not an
+    id (an early draft keyed pins by image), is not a pin."""
+    return {name: pin for name, pin in _pins.load().items()
+            if PIN_ID.match(name) and pin["image"]}
+
+
 def _tracked(records, kind):
     """Bind one record directory's save and delete, noting each in the ledger."""
     def save(name, record, note=True):
         saved = records.save(name, record)
         if note:
             note_change(kind, saved.get("name") or name)
+        eventlog.event("change", "definition.save", kind=kind, name=saved.get("name") or name)
         return saved
 
     def delete(name, note=True):
         removed = records.delete(name)
+        if removed:
+            eventlog.event("change", "definition.delete", kind=kind, name=name)
         # Only a deletion that removed something is a tombstone: a name that
         # was not here never was, and claiming otherwise would have this node
         # pushing the removal of a record it has simply never seen.
@@ -780,6 +875,17 @@ save_profile, delete_profile = _tracked(_profiles, "profiles")
 save_template, delete_template = _tracked(_templates, "templates")
 save_stack, delete_stack = _tracked(_stacks, "stacks")
 save_node_group, delete_node_group = _tracked(_node_groups, "groups")
+save_pin, delete_pin = _tracked(_pins, "pins")
+save_setting, delete_setting = _tracked(_settings, "settings")
+load_settings_records = _settings.load
+settings_record_path = _settings.path_for
+
+
+def clean_setting(stored, name):
+    """One shared setting: its name and a value only its consumer validates
+    (eventlog.clean_settings() for `logging`), so a bad one is judged there."""
+    value = stored.get("value")
+    return {"name": name, "value": value if isinstance(value, dict) else {}}
 
 
 def prune_module(module_id):
@@ -837,6 +943,11 @@ def dependents(kind, name):
                                    if name in record["bootstrap"]["modules"]))
                 + label("profile", (p for _, p, record in _profiles.scan()
                                     if name in record["modules"])))
+    if kind == "pins":
+        # ``name`` is one name a pin answers to -- its id or a nickname -- since
+        # either can be taken away while a template still launches by it.
+        return label("template", (t for _, t, record in _templates.scan()
+                                  if record["image"] == "pin:" + name))
     if kind == "fabrics":
         # A fabric is the bridge of the same name, so naming it as the network
         # (the instance's only NIC) uses it as much as the extra NIC does.
@@ -939,6 +1050,25 @@ def read_runtime():
     return stored if isinstance(stored, dict) else {}
 
 
+def live_runtime():
+    """``read_runtime()``, but only while the `serve` that wrote it still runs.
+
+    A server killed outright never clears the file, and a stale one would go
+    on describing a server that is gone.
+    """
+    runtime = read_runtime()
+    pid = runtime.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return {}
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return {}
+    except PermissionError:
+        pass                      # alive, just not ours to signal
+    return runtime
+
+
 def maintenance_path():
     return os.path.join(data_dir(), "maintenance.json")
 
@@ -1016,12 +1146,14 @@ def save_config(section, payload):
     with _lock:
         os.makedirs(directory, mode=0o700, exist_ok=True)
         _write_json(path, payload)
+    eventlog.event("change", "config.save", level=eventlog.NOTICE, section=section)
     return path
 
 
 def delete_config(section):
     try:
         os.unlink(config_path(section))
+        eventlog.event("change", "config.reset", level=eventlog.NOTICE, section=section)
         return True
     except FileNotFoundError:
         return False

@@ -9,7 +9,8 @@
 #   install_ssh_keys USER   write $LEMONDX_SSH_KEYS to that user's authorized_keys
 #
 # Available variables: LEMONDX_OS_ID, LEMONDX_OS_LIKE, LEMONDX_PKG,
-# LEMONDX_SSH_KEYS, LEMONDX_MODULE, plus any parameters the module declares.
+# LEMONDX_SSH_KEYS, LEMONDX_MODULE, LEMONDX_OCCURRENCE (1, or n for the nth time
+# a module is selected in one run), plus any parameters the module declares.
 
 # Modules run under /bin/sh, which is dash on Debian/Ubuntu and busybox ash on
 # Alpine -- not necessarily bash, which minimal images often lack entirely.

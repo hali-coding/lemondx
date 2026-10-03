@@ -841,6 +841,15 @@ button, input, select, textarea { font: inherit; color: inherit; }
   flex-direction: column;
   gap: 9px;
 }
+/* One repeat of a module added more than once, and the button that adds one. */
+.module-occurrence {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.module-again { margin: 8px 0 0 23px; }
 
 .key-row {
   align-items: center;
@@ -1505,6 +1514,20 @@ button, input, select, textarea { font: inherit; color: inherit; }
   border-bottom: 1px solid var(--border);
 }
 .access-inset { margin: 12px 14px; }
+/* Cluster tab > Logging: the settings form, and one row per remote destination. */
+.logging-body { display: grid; gap: 14px; padding: 14px; border-bottom: 1px solid var(--border); }
+.logging-local { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.logging-local .select { width: auto; }
+.logging-destination {
+  display: grid;
+  grid-template-columns: minmax(160px, 2fr) minmax(80px, 0.7fr) minmax(90px, 0.8fr) minmax(110px, 1fr);
+  gap: 10px;
+}
+.logging-destination-head { display: flex; align-items: center; justify-content: space-between; }
+.logging-test { display: grid; gap: 4px; font-size: 12.5px; }
+@media (max-width: 640px) {
+  .logging-destination { grid-template-columns: 1fr 1fr; }
+}
 .access-card .ctable tbody tr { cursor: default; }
 .access-card .ctable td { vertical-align: middle; }
 .access-card .ctable .select { width: auto; }
@@ -2333,3 +2356,67 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .stale-hint { color: var(--warn); }
 .btn-warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 38%, var(--border)); }
 .btn-warn:hover:not(:disabled) { background: var(--warn-bg); }
+
+/* -- Logs view and the drawer's Activity tab: a live tail, newest at the bottom -- */
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.log-toolbar .select, .log-toolbar .input { width: auto; min-width: 110px; }
+.log-kinds { display: flex; gap: 4px; }
+.log-kinds .btn { opacity: 0.55; }
+.log-kinds .btn.is-on { opacity: 1; border-color: var(--accent); }
+.log-live { font-size: 12px; color: var(--text-faint); }
+.log-live.is-live { color: var(--ok); }
+.log-live.is-live::before { content: "● "; }
+.log-chip-row { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 12.5px; }
+.log-chip-x { margin-left: 6px; border: 0; background: none; cursor: pointer; color: inherit; }
+.log-notice { margin: 0 0 6px; color: var(--warn); }
+.log-list {
+  height: calc(100vh - 290px);
+  min-height: 260px;
+  overflow-y: auto;
+  font-size: 12.5px;
+}
+.log-list-compact { height: auto; max-height: 60vh; }
+.log-empty { padding: 18px; }
+.log-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.log-row.log-warning { background: var(--warn-bg); }
+.log-row.log-error { background: var(--danger-bg); }
+.log-time { color: var(--text-faint); }
+.log-node { font-weight: 600; min-width: 64px; }
+.log-level { font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; min-width: 52px; }
+.log-level-debug { color: var(--text-faint); }
+.log-level-notice { color: var(--accent); }
+.log-level-warning { color: var(--warn); }
+.log-level-error { color: var(--danger); }
+.log-kind { font-size: 11.5px; min-width: 50px; }
+.log-action { font-weight: 600; }
+.log-actor, .log-req, .log-field-link {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.log-actor:hover, .log-req:hover, .log-field-link:hover { text-decoration: underline; }
+.log-actor:disabled, .log-req:disabled { cursor: default; text-decoration: none; }
+.log-fields { display: flex; flex-wrap: wrap; gap: 2px 10px; flex: 1 1 280px; min-width: 0; }
+.log-field { font-family: var(--mono); font-size: 11.5px; overflow-wrap: anywhere; }
+.log-req { color: var(--text-faint); font-size: 11px; margin-left: auto; }
+@media (max-width: 640px) {
+  .log-list { height: 60vh; }
+  .log-toolbar .select, .log-toolbar .input { flex: 1 1 140px; }
+}

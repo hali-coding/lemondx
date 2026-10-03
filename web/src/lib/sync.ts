@@ -12,7 +12,7 @@ export function syncDetail(synced: AutoSync | null | undefined) {
   const failed = synced.results.filter((r) => !r.ok)
   return `${verb} ${synced.nodes.length - failed.length} of ${synced.nodes.length} nodes. `
     + `${failed.map((r) => `${r.node}: ${r.error ?? 'failed'}`).join('; ')}. `
-    + 'Use Sync on the Nodes tab once they are back.'
+    + 'Use Sync on the Cluster tab once they are back.'
 }
 
 /** Whether to report it as a success or as something that needs attention. */

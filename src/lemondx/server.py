@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import errno
-import ipaddress
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -17,19 +17,22 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 
-from . import store, websocket
+from . import eventlog, store, websocket
 from .auth import ADMIN, OPERATOR, READ, SESSION_COOKIE, AuthConfig, AuthError, AuthService
 from .cluster import ClusterError, ClusterService, from_peer
 from .fabric import FabricError
 from .hostnet import HostNetError
 from .lxd import LXDError
 from .nodeclient import NodeError
+from .nodesetup import DEFAULT_HOST, DEFAULT_PORT, NodeSetup, SetupError
+from .nodesetup import is_loopback as _is_loopback
 from .service import ContainerService, ServiceError
 from .stacks import StackService
 
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8099
 TLS_HANDSHAKE_TIMEOUT = 10
+# Long enough for the answer to a configure request to reach the browser
+# before the socket it came over is closed by the restart.
+RESTART_DELAY = 0.5
 
 # The Vite dev server proxies /api with changeOrigin, which rewrites Host but
 # leaves the browser's Origin alone, so --dev has to accept that origin too.
@@ -85,6 +88,14 @@ class Router:
         if stream:
             self.stream_routes.add(handler)
 
+    def template(self, method, path):
+        """The matching route's pattern with its names as ``{}``, for the log:
+        ``/api/containers/{}/state``. None when nothing matches."""
+        for route_method, pattern, _, _, _ in self.routes:
+            if route_method == method and pattern.match(path):
+                return re.sub(r"\([^)]*\)", "{}", pattern.pattern.strip("^$"))
+        return None
+
     def resolve(self, method, path):
         """``(handler, args, role, wants_principal)``; handler is None for no match."""
         allowed = set()
@@ -100,14 +111,44 @@ class Router:
         return None, [], ADMIN, False
 
 
-def build_router(service, auth=None, cluster=None, stacks=None):
+def build_router(service, auth=None, cluster=None, stacks=None, setup=None):
     r = Router()
     NAME = r"([^/]+)"
     auth = auth or AuthService()
     cluster = cluster or ClusterService(service, auth)
     stacks = stacks or StackService(cluster)
+    setup = setup or NodeSetup(auth)
 
     r.add("GET", r"/api/status", lambda body, q: service.status())
+    # How this node is reached -- bind address, HTTPS, logins -- and leaving
+    # unconfigured mode, which restarts the server once it has answered.
+    # Logging is a cluster setting: saved here, pushed to every member. GET is
+    # this node's own view -- what it applied and how each destination is
+    # doing -- so another node's goes through /api/nodes/{node}/logging.
+    r.add("GET", r"/api/logging", lambda body, q: dict(
+        eventlog.status(), saved=cluster.setting(eventlog.SETTING_NAME) is not None))
+    r.add("PUT", r"/api/logging", lambda body, q, who: cluster.save_setting(
+        eventlog.SETTING_NAME, body.get("settings", body)), principal=True)
+    r.add("POST", r"/api/logging/test", lambda body, q, who: eventlog.test(by=who.name),
+          principal=True)
+    r.add("PUT", r"/api/settings/%s" % NAME,
+          lambda body, q, who, name: _peers_only(who, _SYNCED % "Cluster settings")
+          or cluster.save_setting(name, body.get("value"), propagate=False),
+          principal=True, peers=True)
+    r.add("DELETE", r"/api/settings/%s" % NAME,
+          lambda body, q, who, name: _peers_only(who, _SYNCED % "Cluster settings")
+          or cluster.delete_setting(name, everywhere=False), principal=True, peers=True)
+    # The live tail. One node's recent events, waiting up to `wait` seconds for
+    # the next after `after`; and the whole cluster's, merged, with an opaque
+    # cursor holding each node's place. Readable by anyone who can log in.
+    r.add("GET", r"/api/logs", lambda body, q: eventlog.read(
+        after=q.get("after"), limit=q.get("limit"), wait=q.get("wait"),
+        filters=_log_filters(q)))
+    r.add("GET", r"/api/cluster/logs", lambda body, q: cluster.logs(
+        cursor=q.get("cursor"), wait=q.get("wait"), limit=q.get("limit"),
+        filters=_log_filters(q), nodes=q.get("nodes"), group=q.get("group")))
+    r.add("GET", r"/api/configure", lambda body, q: setup.state())
+    r.add("POST", r"/api/configure", lambda body, q: setup.configure(body))
     r.add("POST", r"/api/setup", lambda body, q: service.initialize(
         storage_driver=body.get("storage_driver", "dir"),
         pool_name=body.get("pool_name", "default"),
@@ -245,6 +286,27 @@ def build_router(service, auth=None, cluster=None, stacks=None):
               name, description=body.get("description"), config=body.get("config")))
     r.add("DELETE", r"/api/networks/%s" % NAME,
           lambda body, q, name: service.delete_network(name))
+    # Instances on a host NIC's LAN, addressed by its router. Under their own
+    # prefix: /api/networks/{name} would take a network called "lan".
+    # One name on several members: which have it, and deleting it on them.
+    r.add("GET", r"/api/cluster/networks/%s" % NAME,
+          lambda body, q, name: cluster.network_presence(name))
+    r.add("DELETE", r"/api/cluster/networks/%s" % NAME,
+          lambda body, q, name: cluster.delete_network_everywhere(
+              name, nodes=_list(q.get("nodes")) if q.get("nodes") else None))
+    r.add("GET", r"/api/lan", lambda body, q: service.lan_interfaces())
+    # `default` picks the NIC this node's default route leaves by; `everywhere`
+    # does that on every member, so one name means the LAN on each of them.
+    r.add("POST", r"/api/lan/networks", lambda body, q: cluster.create_lan_everywhere(
+        body.get("mode"), body.get("name"), description=body.get("description", ""))
+        if body.get("everywhere") else service.create_lan_network(
+            body.get("nic"), body.get("mode"), body.get("name"),
+            description=body.get("description", ""), default=bool(body.get("default"))))
+    r.add("GET", r"/api/lan/plan", lambda body, q: service.lan_convert_plan(
+        q.get("nic") or "", q.get("bridge") or "br0"))
+    r.add("POST", r"/api/lan/convert",
+          lambda body, q: service.convert_nic(body.get("nic"), body.get("bridge") or "br0"))
+    r.add("POST", r"/api/lan/revert", lambda body, q: service.revert_lan_bridge(body.get("bridge")))
 
     r.add("GET", r"/api/modules", lambda body, q: service.list_modules())
     # Saving anything the cluster shares pushes it to every member, unless the
@@ -385,7 +447,47 @@ def build_router(service, auth=None, cluster=None, stacks=None):
           role=OPERATOR, principal=True)
 
     r.add("GET", r"/api/images", lambda body, q: service.list_images())
+    # A pin is one build of a remote image; templates name it as `pin:<id>`.
+    # A person pins through POST, which reads the build from the remote's
+    # catalog, and PATCHes only nicknames and the note -- the build is fixed.
+    # PUT is how a member pushes a pin it already holds, and only a member
+    # may name a fingerprint outright.
+    # Downloaded images nothing needs. `apply` false is the preview; `only`
+    # holds a run to what the preview listed.
+    r.add("POST", r"/api/images/prune", lambda body, q: service.prune_images(
+        apply=bool(body.get("apply")), only=body.get("only")))
+    r.add("POST", r"/api/cluster/images/prune", lambda body, q: cluster.prune_images(
+        nodes=body.get("nodes"), apply=bool(body.get("apply")), only=body.get("only")))
+    r.add("GET", r"/api/images/pins", lambda body, q: service.list_image_pins())
+    r.add("GET", r"/api/images/versions", lambda body, q: service.image_versions(
+        q.get("image"), refresh=_flag(q.get("refresh"))))
+    r.add("POST", r"/api/images/pins", lambda body, q, who: cluster.pin_image(
+        body.get("image"), serial=body.get("serial"), nicknames=body.get("nicknames"),
+        note=body.get("note", ""), by=who.name, nodes=body.get("nodes"),
+        background=bool(body.get("background"))), principal=True)
+    r.add("PATCH", r"/api/images/pins/%s" % NAME,
+          lambda body, q, who, name: cluster.edit_pin(
+              name, nicknames=body.get("nicknames"), note=body.get("note")),
+          principal=True)
+    r.add("PUT", r"/api/images/pins/%s" % NAME,
+          lambda body, q, who, name: _peers_only(who, _SYNCED % "Pin records")
+          or service.save_pin_record(name, body), principal=True, peers=True)
+    r.add("DELETE", r"/api/images/pins/%s" % NAME,
+          lambda body, q, who, name: cluster.unpin_image(
+              name, everywhere=_everywhere(body, q, who), relayed=from_peer(who)),
+          principal=True)
+    r.add("POST", r"/api/images/pins/%s/fetch" % NAME,
+          lambda body, q, name: cluster.fetch_pin(
+              name, nodes=body.get("nodes"), background=bool(body.get("background"))))
+    # One node's own download, which a fetch job asks each member for.
+    r.add("POST", r"/api/images/pins/%s/pull" % NAME,
+          lambda body, q, name: service.fetch_pin(name))
     r.add("GET", r"/api/image-jobs", lambda body, q: cluster.image_jobs())
+    r.add("GET", r"/api/images/inventory", lambda body, q: service.image_inventory())
+    r.add("GET", r"/api/cluster/images", lambda body, q: cluster.image_inventory())
+    # This node's copy only; another node's goes through /api/nodes/{node}/.
+    r.add("DELETE", r"/api/images/%s" % NAME,
+          lambda body, q, fingerprint: service.delete_image(fingerprint))
     r.add("POST", r"/api/images/%s/copy" % NAME,
           lambda body, q, alias: cluster.copy_image(
               alias, body.get("nodes"), background=bool(body.get("background", False))))
@@ -400,7 +502,8 @@ def build_router(service, auth=None, cluster=None, stacks=None):
     r.add("PUT", r"/api/images/receive",
           lambda body, q, who: _peers_only(who, "Images are copied between members only.")
           or service.receive_image(body, body.length, q.get("fingerprint"),
-                                   q.get("alias"), q.get("description", "")),
+                                   q.get("alias"), q.get("description", ""),
+                                   content_type=q.get("content_type")),
           principal=True, peers=True, stream=True)
     r.add("GET", r"/api/profiles", lambda body, q: service.list_profiles())
 
@@ -642,11 +745,11 @@ class LemondxHandler(BaseHTTPRequestHandler):
         if self.quiet:
             return
         # A WebSocket client can only send its token in the query string, and
-        # the request line lands in this log -- which, under systemd, is the
-        # journal every admin on the host can read.
+        # the request line lands in this log -- which goes to syslog and, with a
+        # remote destination, off the host.
         line = _TOKEN_IN_LOG.sub(r"\1***", fmt % args)
-        who = " %s" % self.principal.name if self.principal else ""
-        print("[lemondx] %s%s - %s" % (self.address_string(), who, line))
+        eventlog.event("access", "http", level=logging.DEBUG, client=self.address_string(),
+                       user=self.principal.name if self.principal else None, line=line)
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -688,6 +791,65 @@ class LemondxHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Not found"}, 404)
 
     def _handle_api(self, method, path, query):
+        if path in ("/api/auth", "/api/auth/login", "/api/auth/logout") \
+                or path == "/api/cluster/enroll":
+            # Logged by AuthService and ClusterService themselves: a login has
+            # no caller yet, and its outcome is what matters.
+            with eventlog.acting(channel=self._channel(), via="login"):
+                self._answer_api(method, path, query)
+            return
+        try:
+            principal, explicit = self._principal()
+        except AuthError as exc:
+            self._send_json({"error": exc.message}, exc.code)
+            return
+        if principal is None:
+            presented = bool(self.headers.get("Authorization")
+                             or self.headers.get("X-Lemondx-Token"))
+            # A browser polling before anyone logged in, or with a session a
+            # restart ended, is not news; a token that was presented and
+            # refused is.
+            eventlog.event("auth", "request.unauthorized",
+                           level=logging.WARNING if presented else logging.DEBUG,
+                           client=self._client_ip(), route="%s %s" % (method, path))
+            self._send_json({"error": "Unauthorized: log in or send a valid API token"}, 401)
+            return
+        self.principal = principal
+        with self._acting(principal):
+            self._answer_api(method, path, query, principal, explicit)
+
+    def _channel(self):
+        """How a person's request was made: the web UI says so, anything else is
+        the API. Attribution for the log only -- any client can send the header,
+        so nothing may ever be decided by it."""
+        return "ui" if (self.headers.get("X-Lemondx-Client") or "").lower() == "web" \
+            else "api"
+
+    def _acting(self, principal):
+        """The log context for this caller; a member's call says whose it really is."""
+        if from_peer(principal):
+            req, relayed = eventlog.relayed(self.headers)
+            return eventlog.acting(actor=relayed.get("actor") or principal.name,
+                                   role=relayed.get("role", ""),
+                                   via=relayed.get("via") or principal.via, channel="peer",
+                                   origin=relayed.get("origin", ""),
+                                   origin_channel=relayed.get("channel", ""), req=req)
+        return eventlog.acting(actor=principal.name, role=principal.role, via=principal.via,
+                               channel=self._channel())
+
+    def _answer_api(self, method, path, query, principal=None, explicit=False):
+        started = time.time()
+        outcome = {"status": 200, "error": None, "body": None}
+        try:
+            self._dispatch_api(method, path, query, principal, explicit, outcome)
+        finally:
+            if principal is not None:
+                self._log_request(method, path, outcome, started)
+
+    def _dispatch_api(self, method, path, query, principal, explicit, outcome):
+        def refuse(message, code):
+            outcome.update(status=code, error=message)
+            self._send_json({"error": message}, code)
         try:
             if path in ("/api/auth", "/api/auth/login", "/api/auth/logout"):
                 self._handle_auth(method, path)
@@ -695,25 +857,21 @@ class LemondxHandler(BaseHTTPRequestHandler):
             if path == "/api/cluster/enroll":
                 self._handle_enroll(method)
                 return
-            principal, explicit = self._principal()
-            if principal is None:
-                self._send_json({"error": "Unauthorized: log in or send a valid API token"}, 401)
-                return
-            self.principal = principal
             if method not in ("GET", "HEAD") and not explicit and not self._same_origin():
-                self._send_json({"error": "Cross-origin request refused"}, 403)
+                refuse("Cross-origin request refused", 403)
                 return
             handler, args, role, wants_principal = self.router.resolve(method, path)
             if handler is None:
-                self._send_json({"error": "No such endpoint: %s" % path}, 404)
+                refuse("No such endpoint: %s" % path, 404)
                 return
             if not principal.can(role):
-                self._send_json({"error": "Forbidden: this needs %s access, and %s has %s"
-                                 % (role, principal.name, principal.role)}, 403)
+                refuse("Forbidden: this needs %s access, and %s has %s"
+                       % (role, principal.name, principal.role), 403)
                 return
             stream = handler in self.router.stream_routes
             body = _BodyReader(self.rfile, self.headers.get("Content-Length")) if stream \
                 else self._read_body()
+            outcome["body"] = body if isinstance(body, dict) else None
             if wants_principal:
                 args = [principal] + list(args)
             result = handler(body, query, *args)
@@ -722,14 +880,38 @@ class LemondxHandler(BaseHTTPRequestHandler):
             self._body_read = not stream or body.remaining == 0
             self._send_json({"data": result}, 200)
         except ServiceError as exc:
-            self._send_json({"error": exc.message}, exc.code)
+            refuse(exc.message, exc.code)
         except AuthError as exc:
-            self._send_json({"error": exc.message}, exc.code)
-        except (LXDError, ClusterError, NodeError, FabricError, HostNetError) as exc:
-            self._send_json({"error": exc.message}, _http_code(exc.code))
+            refuse(exc.message, exc.code)
+        except (LXDError, ClusterError, NodeError, FabricError, HostNetError,
+                SetupError, eventlog.LoggingSettingsError) as exc:
+            refuse(exc.message, _http_code(exc.code))
         except Exception as exc:  # noqa: BLE001 - never leak a traceback to the client
-            self.log_message("unhandled error: %r", exc)
+            outcome.update(status=500, error="unhandled: %r" % exc)
             self._send_json({"error": "Internal error: %s" % exc}, 500)
+
+    def _log_request(self, method, path, outcome, started):
+        """One line per API call: who, how, what, on what, and how it went."""
+        status = outcome["status"]
+        if status >= 500:
+            level = logging.ERROR
+        elif status in (401, 403):
+            level = logging.WARNING
+        elif method in ("GET", "HEAD"):
+            level = logging.DEBUG
+        else:
+            level = logging.WARNING if status >= 400 else logging.INFO
+        if not eventlog.enabled(level):
+            return
+        route, node, target = _route_of(self.router, method, path)
+        eventlog.event(
+            "request", _action_name(method, route), level=level,
+            route="%s %s" % (method, route or path), node=node, target=target,
+            client=self._client_ip(), result="ok" if status < 400 else "failed",
+            code=status if status >= 400 else None, error=outcome["error"],
+            ms=int((time.time() - started) * 1000),
+            # A tail polling itself would otherwise be most of what it shows.
+            _buffered=route not in _UNBUFFERED, **_logged_body(outcome["body"]))
 
     # -- interactive terminals ---------------------------------------------
 
@@ -785,11 +967,17 @@ class LemondxHandler(BaseHTTPRequestHandler):
             self.rfile, self.wfile.write,
             closer=websocket.shutdown_closer(self.connection),
         )
-        self.log_message('"%s" attached %s', self.path, kind)
-        try:
-            _bridge(browser, session)
-        finally:
-            session.close()
+        opened = time.time()
+        with self._acting(principal):
+            eventlog.event("request", "terminal.open", level=eventlog.NOTICE,
+                           instance=name, terminal=kind, client=self._client_ip())
+            try:
+                _bridge(browser, session)
+            finally:
+                session.close()
+                eventlog.event("request", "terminal.close", level=eventlog.NOTICE,
+                               instance=name, terminal=kind,
+                               seconds=int(time.time() - opened))
 
     def _read_body(self):
         self._body_read = True
@@ -866,7 +1054,6 @@ class LemondxHandler(BaseHTTPRequestHandler):
             body.get("password") if isinstance(body.get("password"), str) else "",
             client=self._client_ip(), secure_transport=self._secure_transport())
         self.principal = principal
-        self.log_message("logged in as %s (%s) via %s", principal.name, principal.role, principal.via)
         self._send_json({"data": self.auth.info(principal)}, headers=[
             ("Set-Cookie", self._session_cookie(session_id, self.auth.config.session_seconds))])
 
@@ -898,7 +1085,8 @@ class LemondxHandler(BaseHTTPRequestHandler):
             raise ServiceError("Method not allowed (try: POST)", 405)
         body = self._read_body()
         result = self.cluster.enroll(body, peer_address=self._client_ip())
-        self.log_message("cluster enrolment from %s accepted", self._client_ip())
+        eventlog.event("auth", "cluster.enroll", level=eventlog.NOTICE,
+                       client=self._client_ip(), result="ok")
         self._send_json({"data": result})
 
     def _cookie(self, name):
@@ -1256,19 +1444,6 @@ def _strip_port(host):
     return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
 
 
-def _is_loopback(address):
-    address = (address or "").split("%", 1)[0]
-    if address == "localhost":
-        return True
-    try:
-        ip = ipaddress.ip_address(address)
-    except ValueError:
-        return False
-    if ip.version == 6 and ip.ipv4_mapped:
-        ip = ip.ipv4_mapped
-    return ip.is_loopback
-
-
 class LemondxHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -1289,13 +1464,13 @@ def tls_context(cert, key):
 
 def make_server(host=DEFAULT_HOST, port=DEFAULT_PORT, service=None, token=None,
                 web_root=WEB_DIST, allow_origin=None, quiet=False, auth=None,
-                tls=None, dev=False, cluster=None):
+                tls=None, dev=False, cluster=None, setup=None):
     service = service or ContainerService()
     auth = auth or AuthService(AuthConfig(static_token=token))
     cluster = cluster or ClusterService(service, auth)
     stacks = StackService(cluster)
     handler = type("BoundHandler", (LemondxHandler,), {
-        "router": build_router(service, auth, cluster, stacks),
+        "router": build_router(service, auth, cluster, stacks, setup),
         "service": service,
         "stacks": stacks,
         "auth": auth,
@@ -1316,7 +1491,13 @@ def make_server(host=DEFAULT_HOST, port=DEFAULT_PORT, service=None, token=None,
 
 def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=False,
           open_browser=False, auth_config=None, tls_cert=None, tls_key=None, auth_source=None,
-          health_settings=None, cluster_settings=None, suggest_tls=False):
+          health_settings=None, cluster_settings=None, suggest_tls=False, pinned=()):
+    """Run the API and UI until interrupted -- or until configured, then re-execute.
+
+    ``pinned`` names the command-line flags that overrode saved settings, so
+    configuring from the UI can say which of its choices a restart with the
+    same command line would still ignore.
+    """
     allow_origin = "*" if dev else None
     auth = AuthService(auth_config or AuthConfig(static_token=token))
     tls = None
@@ -1329,10 +1510,24 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
             raise SystemExit("Cannot load the TLS certificate or key: %s" % exc)
     service = ContainerService()
     cluster = ClusterService(service, auth, settings=cluster_settings)
+    # In a terminal nobody is reading the journal, so lines go to stderr too;
+    # under systemd stderr is the journal already, which has them from syslog.
+    eventlog.setup(echo=sys.stderr.isatty(), buffer=True)
+    try:
+        close_ingest = eventlog.start_ingest(store.events_socket_path())
+    except OSError as exc:
+        print("WARNING: CLI commands will not show in the live log tail: %s" % exc)
+        close_ingest = lambda: None              # noqa: E731
+    try:
+        eventlog.set_node(cluster.local_name())
+    except Exception:                                # noqa: BLE001 - only a label
+        pass
+    setup = NodeSetup(auth, serving={"host": host, "port": port, "tls": tls is not None,
+                                     "pinned": list(pinned)})
     try:
         httpd = make_server(host=host, port=port, service=service, auth=auth,
                             allow_origin=allow_origin, quiet=quiet, tls=tls, dev=dev,
-                            cluster=cluster)
+                            cluster=cluster, setup=setup)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
             raise SystemExit(
@@ -1347,13 +1542,20 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
     url = "%s://%s:%d" % ("https" if tls else "http",
                           "localhost" if host in ("0.0.0.0", "127.0.0.1") else host, port)
     print("lemondx API + UI listening on %s" % url)
-    if not tls and suggest_tls:
+    unconfigured = setup.state()["unconfigured"]
+    if unconfigured:
+        print("Unconfigured mode: this host only, no login, no HTTPS. Open %s and press "
+              "Configure node (or run `lemondx configure node`) to add an admin login and "
+              "a certificate, and to listen on every interface." % url)
+    elif not tls and suggest_tls:
         # Not with --no-tls: that is someone who has already decided.
         print("Note: serving plain HTTP. `lemondx configure tls` sets up a "
               "certificate, and serve uses HTTPS by default from then on.")
     # So `lemondx cluster invite` in another process can advertise the port and
-    # scheme actually being served, rather than guessing at the default.
-    store.write_runtime({"host": host, "port": port, "tls": tls is not None})
+    # scheme actually being served, rather than guessing at the default -- and
+    # refuse outright while nothing but this host can reach it.
+    store.write_runtime({"host": host, "port": port, "tls": tls is not None,
+                         "unconfigured": unconfigured})
     config = auth.config
     if config.enabled:
         # Never the token itself: this output ends up in the journal.
@@ -1413,16 +1615,54 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
     if open_browser:
         threading.Timer(0.5, _open, args=(url,)).start()
 
+    stacks = getattr(httpd.RequestHandlerClass, "stacks", None)
+    restart = threading.Event()
+
+    def request_restart():
+        restart.set()
+        # From a thread of its own: shutdown() waits for serve_forever() to
+        # stop, and the request asking for this is still being answered.
+        threading.Timer(RESTART_DELAY, httpd.shutdown).start()
+    setup.restart = request_restart
+    setup.busy = lambda: service.pending_work() + \
+        (stacks.pending_work() if stacks else []) + cluster.pending_work()
+
+    with eventlog.system("serve"):
+        eventlog.event("system", "serve.start", level=eventlog.NOTICE, url=url,
+                       tls=tls is not None, auth=auth.config.enabled)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        _wait_for_background_work(getattr(httpd.RequestHandlerClass, "service", None),
-                                  getattr(httpd.RequestHandlerClass, "stacks", None),
-                                  getattr(httpd.RequestHandlerClass, "cluster", None))
+        _wait_for_background_work(service, stacks, cluster)
         print("Shutting down.")
     finally:
+        with eventlog.system("serve"):
+            eventlog.event("system", "serve.stop", level=eventlog.NOTICE,
+                           restart=restart.is_set())
+        eventlog.flush()
+        close_ingest()
         store.clear_runtime()
         httpd.server_close()
+    if restart.is_set():
+        _reexec()
+
+
+def _reexec():
+    """Start over as the same command, so every startup setting is read again.
+
+    The same process, not a child: a service manager keeps tracking the PID
+    it started, and a terminal keeps its foreground job. `sys.orig_argv`
+    rather than `sys.argv`, so `python3 -m lemondx` and interpreter flags
+    survive too.
+    """
+    print("Restarting to apply the new configuration.", flush=True)
+    sys.stderr.flush()
+    argv = list(getattr(sys, "orig_argv", None) or [sys.executable] + sys.argv)
+    try:
+        os.execv(sys.executable, argv)
+    except OSError as exc:
+        raise SystemExit("Could not restart (%s). The configuration is saved; start "
+                         "`lemondx serve` again to apply it." % exc)
 
 
 def _wait_for_background_work(service, stacks=None, cluster=None):
@@ -1457,3 +1697,84 @@ def _open(url):
         webbrowser.open(url)
     except Exception:
         pass
+
+
+# -- what a request is, for the log ------------------------------------------
+
+# Request body fields worth naming in the log: identifiers and switches. Never
+# what a person typed into a parameter, a password, a script, a module, a key
+# or a config value -- the list is what may be logged, not what may not.
+_LOGGED_FIELDS = ("action", "name", "names", "count", "type", "image", "template", "node",
+                  "nodes", "group", "groups", "force", "everywhere", "stateful", "snapshot",
+                  "alias", "serial", "to", "prefix", "network", "pool", "fabric", "profiles",
+                  "role", "nicknames", "instances", "targets", "level", "mode", "nic",
+                  "bridge", "kinds", "stack", "replace")
+# Body keys that would collide with the log's own fields.
+_RENAMED = {"action": "verb", "role": "set_role", "node": "body_node"}
+
+
+def _logged_body(body):
+    fields = {}
+    if not isinstance(body, dict):
+        return fields
+    for key in _LOGGED_FIELDS:
+        value = body.get(key)
+        if isinstance(value, bool) or (isinstance(value, (str, int, float)) and value != ""):
+            fields[_RENAMED.get(key, key)] = value
+        elif isinstance(value, list):
+            items = []
+            for item in value[:20]:
+                if isinstance(item, dict):
+                    item = "%s/%s" % (item.get("node"), item.get("name")) if item.get("node") \
+                        else item.get("name")
+                if isinstance(item, (str, int)):
+                    items.append(item)
+            if items:
+                fields[_RENAMED.get(key, key)] = items
+    return fields
+
+
+_NODE_PROXY = re.compile(r"^/api/nodes/([^/]+)/(.+)$")
+
+
+def _route_of(router, method, path):
+    """``(route template, node, target names)``; a proxied call is described by the
+    route it is relayed to, on the node it names."""
+    node = None
+    match = _NODE_PROXY.match(path)
+    if match:
+        node, path = unquote(match.group(1)), "/api/" + match.group(2)
+    route = router.template(method, path)
+    target = []
+    if route:
+        pattern = re.compile("^%s$" % re.escape(route).replace(r"\{\}", "([^/]+|.+)"))
+        found = pattern.match(path)
+        if found:
+            target = [unquote(g) for g in found.groups()]
+    return route, node, target
+
+
+def _action_name(method, route):
+    """``containers.state`` from ``/api/containers/{}/state``: the nouns, plus what
+    the method did when the route ends at a collection or an item."""
+    if not route:
+        return "api.unknown"
+    segments = [s for s in route.split("/")[2:] if s]
+    nouns = [s for s in segments if s != "{}"]
+    verb = {"POST": "create", "PUT": "update", "PATCH": "update", "DELETE": "delete",
+            "GET": "read", "HEAD": "read"}.get(method, method.lower())
+    if segments and segments[-1] == "{}":
+        verb = {"POST": "post", "GET": "read"}.get(method, verb)
+        return ".".join(nouns + [verb])
+    if len(nouns) == 1:
+        return ".".join(nouns + [verb if method != "GET" else "list"])
+    return ".".join(nouns)
+
+
+# Routes whose own requests stay out of the live tail (syslog still has them).
+_UNBUFFERED = {"/api/logs", "/api/cluster/logs"}
+_LOG_FILTERS = ("level", "kind", "actor", "req", "channel", "instance", "q")
+
+
+def _log_filters(query):
+    return {key: query.get(key) for key in _LOG_FILTERS if query.get(key)}

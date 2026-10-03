@@ -8,10 +8,12 @@ import json
 import os
 import shlex
 import shutil
+import logging
 import sys
 import time
 
-from . import auth, cluster as cluster_mod, configure, pam
+from . import auth, cluster as cluster_mod, configure, nodesetup, pam
+from . import eventlog
 from . import health as health_checks
 from .auth import (METHODS, ROLES, AuthConfig, AuthError, AuthService, local_principal,
                    parse_duration_days)
@@ -145,6 +147,18 @@ def cmd_serve(args, _service):
     cluster_settings = None if args.ignore_config else cluster_mod.load_settings()
     if not tls_cert and not args.no_tls and cluster_settings and cluster_settings["tls_cert"]:
         tls_cert, tls_key = cluster_settings["tls_cert"], cluster_settings["tls_key"]
+    # Where to listen is saved too (`configure node` / `configure listen`); with
+    # nothing saved it is loopback, which is half of unconfigured mode.
+    listen = (None if args.ignore_config else nodesetup.load_listen()) \
+        or nodesetup.DEFAULT_LISTEN
+    host = args.host if args.host is not None else listen["host"]
+    port = args.port if args.port is not None else listen["port"]
+    # What a restart from the UI would still be held to, since it re-runs
+    # this very command line.
+    pinned = [flag for flag, given in (
+        ("--host", args.host is not None), ("--port", args.port is not None),
+        ("--tls-cert", bool(args.tls_cert)), ("--no-tls", args.no_tls),
+        ("--auth", bool(args.auth)), ("--ignore-config", args.ignore_config)) if given]
 
     token = args.token
     if token is None and not args.token_file:
@@ -157,12 +171,12 @@ def cmd_serve(args, _service):
         print(YELLOW("WARNING: %s" % warning), file=sys.stderr)
     if args.no_health:
         health_settings = dict(health_settings, enabled=False)
-    serve(host=args.host, port=args.port, dev=args.dev, quiet=args.quiet,
+    serve(host=host, port=port, dev=args.dev, quiet=args.quiet,
           open_browser=args.open, auth_config=config,
           tls_cert=tls_cert, tls_key=tls_key,
           auth_source=auth.settings_path() if settings is not None else None,
           health_settings=health_settings, cluster_settings=cluster_settings,
-          suggest_tls=not args.no_tls)
+          suggest_tls=not args.no_tls, pinned=pinned)
     return 0
 
 
@@ -672,8 +686,13 @@ def render_image_job(job):
                               " (%s, %s)" % (fingerprint, human_bytes(job["size"]))
                               if fingerprint else "")
     lines.append(head + (" from %s" % job["source"] if job["source"] else ""))
+    # A pinned build's source is `remote:alias@serial`: the node running the
+    # job fetched it from the remote, and the others were sent it.
+    pinned = "@" in (job["source"] or "")
     for entry in job["nodes"]:
-        state = {"done": GREEN("copied"), "present": GREEN("already there"),
+        fetched = pinned and entry["node"] == job["node"]
+        state = {"done": GREEN("fetched from the remote" if fetched else "copied"),
+                 "present": GREEN("already there"),
                  "failed": RED("failed")}.get(entry["state"], entry["state"])
         lines.append("  %s: %s%s" % (entry["node"], state,
                                      " -- %s" % entry["error"] if entry["error"] else ""))
@@ -696,6 +715,144 @@ def cmd_image_copy(args, service):
     return 0 if job["ok"] else 1
 
 
+def cmd_image_search(args, service):
+    found = service.browse_images(remote=args.remote, arch="all" if args.all_arch else None,
+                                  refresh=args.refresh)
+    # Every word somewhere in the entry, so "debian 12" and "12 debian" both find it.
+    words = " ".join(args.query or []).lower().split()
+    entries = [e for e in found["entries"]
+               if all(any(word in str(e[k]).lower() for k in
+                          ("full_alias", "os", "release", "release_title", "label",
+                           "variant", "serial")) for word in words)]
+    payload = dict(found, entries=entries)
+
+    def render(data):
+        rows = []
+        for e in data["entries"]:
+            pinned = GREEN("pinned %s" % ", ".join(p["serial"] for p in e["pins"])) \
+                if e.get("pins") else ""
+            builds = ", ".join(v["serial"] for v in e["versions"]) if args.versions \
+                else e["serial"]
+            rows.append([e["full_alias"], e["label"], e["arch"], builds,
+                         human_bytes(e["size"]), pinned])
+        out = [table(rows, ["image", "name", "arch",
+                            "builds" if args.versions else "newest", "size", ""])
+               if rows else DIM("Nothing matched.")]
+        for remote, error in sorted(data["errors"].items()):
+            out.append(RED("! %s: %s" % (remote, error)))
+        return "\n".join(out)
+
+    emit(args, payload, render)
+    return 0
+
+
+def _render_pin(pin):
+    held = GREEN("held here") if pin.get("held") or pin.get("held_vm") \
+        else YELLOW("not on this node")
+    lines = ["%s  %s build %s  %s  %s" % (
+        BOLD("pin:" + pin["name"]), pin["image"], pin["serial"],
+        DIM((pin["fingerprint"] or pin["vm_fingerprint"])[:12]), held)]
+    if pin["nicknames"]:
+        lines.append("  also   %s" % ", ".join("pin:" + n for n in pin["nicknames"]))
+    if pin.get("used_by"):
+        lines.append("  used by %s" % ", ".join(pin["used_by"]))
+    if pin["note"]:
+        lines.append(DIM("  -- %s" % pin["note"]))
+    return "\n".join(lines)
+
+
+def cmd_image_pins(args, service):
+    pins = service.list_image_pins()
+    emit(args, pins, lambda items: "\n".join(_render_pin(p) for p in items)
+         if items else DIM("No pinned images. `lemondx image-pin images:debian/12` "
+                           "pins the build the remote serves today."))
+    return 0
+
+
+def cmd_image_pin(args, service):
+    result = cluster_service(service).pin_image(
+        args.image, serial=args.serial, nicknames=args.nickname or [],
+        note=args.note or "", by=local_principal().name, nodes=args.node or [])
+    emit(args, result, lambda r: "%s pinned build %s of %s as %s (%s)\n%s" % (
+        GREEN("+"), r["pin"]["serial"], r["pin"]["image"],
+        ", ".join(BOLD("pin:" + n) for n in [r["pin"]["name"]] + r["pin"]["nicknames"]),
+        (r["pin"]["fingerprint"] or r["pin"]["vm_fingerprint"])[:12],
+        render_image_job(r["job"])))
+    return 0 if result["job"]["ok"] else 1
+
+
+def cmd_image_pin_edit(args, service):
+    cluster = cluster_service(service)
+    nicknames = None
+    if args.add or args.remove:
+        pin = service._pin(args.pin)
+        nicknames = [n for n in pin["nicknames"] + (args.add or [])
+                     if n not in (args.remove or [])]
+    result = cluster.edit_pin(args.pin, nicknames=nicknames, note=args.note)
+    emit(args, result, lambda r: "%s pin:%s  %s" % (
+        GREEN("+"), BOLD(r["name"]), ", ".join("pin:" + n for n in r["nicknames"])
+        or DIM("no nicknames")))
+    return 0
+
+
+def cmd_image_fetch(args, service):
+    job = cluster_service(service).fetch_pin(args.image, nodes=args.node or [])
+    emit(args, job, render_image_job)
+    return 0 if job["ok"] else 1
+
+
+def _render_prune(result):
+    out = []
+    verb = "deleted" if result["applied"] else "would delete"
+    for node in result["nodes"]:
+        head = BOLD(node["node"])
+        if node.get("error"):
+            out.append("%s  %s" % (head, RED(node["error"])))
+            continue
+        out.append("%s  %s %d image(s), %s" % (head, verb, len(node["deleted"]),
+                                               human_bytes(node["freed"])))
+        for image in node["deleted"]:
+            out.append("  %s %s  %s  %s" % (RED("-"), image["fingerprint"][:12],
+                                           image["description"] or ", ".join(image["aliases"]),
+                                           DIM(human_bytes(image["size"]))))
+        for image in node["failed"]:
+            out.append("  %s %s  %s" % (RED("!"), image["fingerprint"][:12], image["error"]))
+        for image in node["kept"]:
+            out.append(DIM("  = %s  %s -- %s" % (image["fingerprint"][:12],
+                                                 image["description"] or ", ".join(
+                                                     image["aliases"]), image["reason"])))
+    out.append("%s %s in all" % ("freed" if result["applied"] else "would free",
+                                 human_bytes(result["freed"])))
+    return "\n".join(out)
+
+
+def cmd_image_prune(args, service):
+    cluster = cluster_service(service)
+    preview = cluster.prune_images(nodes=args.node or [], apply=False)
+    if args.dry_run or not any(n["deleted"] for n in preview["nodes"]):
+        emit(args, preview, _render_prune)
+        return 0 if preview["ok"] else 1
+    if not getattr(args, "json", False):
+        print(_render_prune(preview))
+    if not confirm("Delete these images?", args.yes):
+        print("Nothing deleted." if sys.stdin.isatty() else
+              "Refusing to delete without a terminal; pass --yes.", file=sys.stderr)
+        return 1
+    result = cluster.prune_images(
+        nodes=args.node or [], apply=True,
+        only={n["node"]: [i["fingerprint"] for i in n["deleted"]] for n in preview["nodes"]})
+    emit(args, result, _render_prune)
+    return 0 if result["ok"] else 1
+
+
+def cmd_image_unpin(args, service):
+    result = cluster_service(service).unpin_image(args.image,
+                                                   everywhere=not args.local_only)
+    emit(args, result, lambda r: "%s unpinned %s (the fetched build stays as local:%s)"
+         % (GREEN("+"), BOLD(r["unpinned"]), r["kept"]))
+    return 0
+
+
 def cmd_modules(args, service):
     modules = service.list_modules()
 
@@ -711,6 +868,8 @@ def cmd_modules(args, service):
                 flags.append(CYAN("uploaded"))
             if module["uses_ssh_keys"]:
                 flags.append(CYAN("ssh-keys"))
+            if module.get("repeatable"):
+                flags.append(CYAN("repeatable"))
             if module["os"]:
                 flags.append(DIM("os: " + " ".join(module["os"])))
             head = "%s  %s" % (BOLD(module["id"]), module["name"])
@@ -1821,7 +1980,210 @@ def cmd_network_delete(args, service):
     return 0
 
 
+def cmd_network_lan(args, service):
+    found = service.lan_interfaces()
+
+    def modes(nic):
+        return ", ".join(m for m, v in nic["modes"].items() if v["available"]) or "-"
+
+    def render(data):
+        rows = [[BOLD(n["name"]) + (DIM(" (default route)") if n["default_route"] else ""),
+                 ", ".join(n["addresses"]) or "-",
+                 "wifi" if n["wireless"] else ("port of %s" % n["master"] if n["master"]
+                                               else "wired"),
+                 n["network_manager"] or "-", modes(n)] for n in data["interfaces"]]
+        out = table(rows, ["nic", "addresses", "kind", "networkmanager", "can do"])
+        if data["docker"]:
+            out += "\n" + DIM("Docker is installed: LAN bridges get an exception in "
+                               "DOCKER-USER%s." % ("" if data["helper"]
+                                                    else " (run by hand: no helper)"))
+        return out
+    emit(args, found, render)
+    return 0
+
+
+def cmd_network_lan_create(args, service):
+    if args.all_nodes:
+        result = cluster_service(service).create_lan_everywhere(
+            args.mode, args.name, description=args.description or "")
+        emit(args, result, lambda r: "\n".join(
+            "%s %s: %s" % (GREEN("+") if n["ok"] else RED("x"), BOLD(n["node"]),
+                           ("%s on %s%s" % (r["name"], n["nic"],
+                                            " (already there)" if n["existing"] else ""))
+                           if n["ok"] else n["error"])
+            for n in r["nodes"]))
+        return 0 if result["ok"] else 1
+    if not args.nic and not args.default:
+        raise ServiceError("Name the NIC, or give --default for the one the default "
+                           "route leaves by.")
+    network = service.create_lan_network(args.nic, args.mode, args.name,
+                                         description=args.description or "",
+                                         default=args.default)
+    emit(args, network, lambda n: "%s %s %s: %s instances on %s's LAN%s" % (
+        GREEN("+"), "already have" if n.get("existing") else "made", BOLD(n["name"]),
+        args.mode, (n.get("lan") or {}).get("nic") or args.nic,
+        "".join("\n" + YELLOW("! %s" % note) for note in n.get("notes") or [])))
+    return 0
+
+
+def cmd_network_convert(args, service):
+    plan = service.lan_convert_plan(args.nic, args.bridge)
+    if args.dry_run:
+        emit(args, plan, lambda steps: "\n".join(
+            "%s\n  %s" % (DIM("# " + s["why"]), s["command"]) for s in steps))
+        return 0
+    print("This moves %s's addresses onto a new bridge %s. The host's network drops "
+          "for a few seconds while it does; if the bridge does not come up with its "
+          "address, it is put back as it was." % (args.nic, args.bridge))
+    if not confirm("Convert %s?" % args.nic, args.yes):
+        print(DIM("skipped"))
+        return 0
+    result = service.convert_nic(args.nic, args.bridge)
+    emit(args, result, lambda r: "%s %s is now a port of %s; instances can join %s%s" % (
+        GREEN("+"), r["nic"], BOLD(r["bridge"]), r["bridge"],
+        "".join("\n" + YELLOW("! %s" % note) for note in r["notes"])))
+    return 0
+
+
+def cmd_network_revert(args, service):
+    if not confirm("Give %s's NIC back its own connection and remove %s?"
+                   % (args.bridge, args.bridge), args.yes):
+        print(DIM("skipped"))
+        return 0
+    result = service.revert_lan_bridge(args.bridge)
+    emit(args, result, lambda r: "%s reverted %s" % (GREEN("+"), BOLD(r["reverted"])))
+    return 0
+
+
 # -- cluster ---------------------------------------------------------------
+
+
+def _render_logging(status):
+    settings = status["settings"]
+    lines = [
+        "%s %s" % (BOLD("level"), settings["level"]),
+        "%s %s, facility %s%s" % (
+            BOLD("local"), status["local_socket"], settings["local"]["facility"],
+            YELLOW("  (no socket: lines go to stderr)") if status["local_fallback"] else ""),
+    ]
+    for destination in settings["destinations"]:
+        lines.append("%s %s %s:%d, facility %s%s" % (
+            BOLD("remote"), destination["protocol"], destination["host"], destination["port"],
+            destination["facility"], "" if destination["enabled"] else DIM("  (off)")))
+    if not settings["destinations"]:
+        lines.append("%s %s" % (BOLD("remote"), DIM("none")))
+    for handler in status["destinations"]:
+        if handler["error"]:
+            lines.append(RED("! %s: %s" % (handler["label"], handler["error"])))
+    if not status.get("saved"):
+        lines.append(DIM("Defaults: nothing saved. `lemondx logging-set` or "
+                         "`lemondx configure logging` changes them for the whole cluster."))
+    return "\n".join(lines)
+
+
+def cmd_logging(args, service):
+    status = dict(eventlog.status(), saved=cluster_service(service).setting(
+        eventlog.SETTING_NAME) is not None)
+    emit(args, status, _render_logging)
+    return 0
+
+
+def cmd_logging_set(args, service):
+    cluster = cluster_service(service)
+    settings = eventlog.load_settings()[0]
+    if args.level:
+        settings["level"] = args.level
+    if args.facility:
+        settings["local"]["facility"] = args.facility
+    if args.no_remote:
+        settings["destinations"] = []
+    if args.remote:
+        host, _, port = args.remote.rpartition(":") if args.remote.count(":") == 1 \
+            else (args.remote, "", "")
+        settings["destinations"] = [{
+            "type": "syslog", "enabled": True, "host": host or args.remote,
+            "port": int(port) if port.isdigit() else 514,
+            "protocol": args.protocol or "udp", "facility": args.remote_facility or "local0"}]
+    try:
+        result = cluster.save_setting(eventlog.SETTING_NAME, settings)
+    except eventlog.LoggingSettingsError as exc:
+        raise ConfigureError(exc.message)
+    emit(args, result, lambda r: "%s logging saved for the cluster: %s" % (
+        GREEN("+"), cluster_mod._setting_summary(eventlog.SETTING_NAME, r["value"])))
+    return 0
+
+
+def cmd_logging_test(args, service):
+    result = eventlog.test(by=local_principal().name)
+    emit(args, result, lambda r: "\n".join(
+        "%s %s: %s" % (GREEN("+") if x["ok"] else RED("!"), x["label"], x["detail"])
+        for x in r["results"]))
+    return 0 if result["ok"] else 1
+
+
+_LEVEL_COLOURS = {"debug": DIM, "notice": CYAN, "warning": YELLOW, "error": RED}
+
+
+def _render_event(event, show_node):
+    when = time.strftime("%H:%M:%S", time.localtime(event.get("ts") or 0))
+    level = event.get("level") or "info"
+    paint = _LEVEL_COLOURS.get(level, lambda text: text)
+    fields = dict(event.get("fields") or {})
+    fields.pop("action", None)
+    req = fields.pop("req", None)
+    rest = " ".join("%s=%s" % (key, eventlog._quote(value)) for key, value in fields.items())
+    return "%s %s%s %s %s %s%s" % (
+        DIM(when), BOLD("%-8s" % (event.get("node") or "")) + " " if show_node else "",
+        paint("%-7s" % level), DIM("%-7s" % event.get("kind")), BOLD(event.get("action") or ""),
+        rest, DIM(" req=%s" % req) if req else "")
+
+
+def cmd_logs(args, service):
+    cluster = cluster_service(service)
+    api, why = cluster.local_api(timeout=eventlog.MAX_WAIT + 20)
+    if api is None:
+        print(RED("! %s. The live tail is kept by `serve`; its history is in syslog: "
+                  "journalctl -t lemondx" % why), file=sys.stderr)
+        return 1
+    params = {key: value for key, value in (
+        ("level", args.level), ("kind", args.kind), ("actor", args.actor), ("req", args.req),
+        ("instance", args.instance), ("q", args.grep)) if value}
+    params["limit"] = args.lines
+    clustered = bool(args.all or args.node or args.group) or len(cluster.all_nodes()) > 1
+    if args.node:
+        params["nodes"] = ",".join(args.node)
+    if args.group:
+        params["group"] = args.group
+    path = "/api/cluster/logs" if clustered else "/api/logs"
+    position_key = "cursor" if clustered else "after"
+    position, reported = None, {}
+    # -n 0: no backlog, only what happens from now on.
+    skip = args.lines <= 0
+    params["limit"] = max(1, args.lines)
+    try:
+        while True:
+            if position:
+                params.update({position_key: position, "wait": 20})
+            page = api.request("GET", path, params=params) or {}
+            events = [] if skip else page.get("events") or []
+            skip = False
+            for event in events:
+                if getattr(args, "json", False):
+                    print(json.dumps(event), flush=True)
+                else:
+                    print(_render_event(event, clustered), flush=True)
+            for node in page.get("nodes") or []:
+                problem = node.get("error") or ("restarted; showing from then" if node.get(
+                    "reset") else "some events were dropped (more than the buffer holds)"
+                    if node.get("truncated") else None)
+                if problem and reported.get(node["node"]) != problem:
+                    print(YELLOW("! %s: %s" % (node["node"], problem)), file=sys.stderr)
+                reported[node["node"]] = problem
+            position = page.get("cursor") or position
+            if not args.follow:
+                return 0
+    except KeyboardInterrupt:
+        return 0
 
 
 def cluster_service(service):
@@ -2058,8 +2420,8 @@ def cmd_cluster_invite(args, service):
             "",
             "    %s" % r["code"],
             "",
-            DIM("Run `lemondx cluster join '<code>'` on the node that should join -- "
-                "it needs no setup of its own."),
+            DIM("Run `lemondx cluster join '<code>'` on the node that should join, once "
+                "it is out of unconfigured mode (Configure node, or `lemondx configure node`)."),
             DIM("Single use, and it carries this node's address and certificate:"),
             DIM("    %s" % r["node"]["url"]),
             DIM("    %s" % r["fingerprint_pretty"]),
@@ -2115,6 +2477,30 @@ def cmd_cluster_join(args, service):
         if users.get("failed"):
             lines.append(YELLOW("! could not take the account(s) %s"
                                 % ", ".join(users["failed"])))
+        definitions = r.get("definitions") or {}
+        if definitions.get("taken"):
+            lines.append(DIM("  took %d shared definition(s): %s"
+                             % (len(definitions["taken"]), ", ".join(definitions["taken"]))))
+        if definitions.get("shared"):
+            lines.append(DIM("  shared this node's own: %s" % ", ".join(definitions["shared"])))
+        if definitions.get("conflicts"):
+            lines.append(YELLOW("! differs from the cluster's copy, left as it is: %s "
+                                "(`lemondx cluster reconcile` reports them)"
+                                % ", ".join(definitions["conflicts"])))
+        if definitions.get("unreachable"):
+            lines.append(YELLOW("! could not compare definitions with %s; the next "
+                                "reconciliation brings what they hold"
+                                % ", ".join(definitions["unreachable"])))
+        if definitions.get("error"):
+            lines.append(YELLOW("! definitions not synced yet (%s); the next "
+                                "reconciliation brings them" % definitions["error"]))
+        lan = r.get("lan") or {}
+        for made in lan.get("made") or []:
+            lines.append(DIM("  made the cluster's LAN network %s here, on %s"
+                             % (made["name"], made["nic"])))
+        for failed in lan.get("failed") or []:
+            lines.append(YELLOW("! could not make LAN network %s here: %s"
+                                % (failed["name"], failed["error"])))
         if r["warning"]:
             lines.append(YELLOW("! %s" % r["warning"]))
         return "\n".join(lines)
@@ -2562,9 +2948,11 @@ def build_parser():
     boot = argparse.ArgumentParser(add_help=False)
     # -b, not -m: `create` already uses -m for --memory.
     boot.add_argument("-b", "--module", action="append", metavar="ID",
-                      help="bootstrap module to run (repeatable; see `lemondx modules`)")
+                      help="bootstrap module to run (repeatable; see `lemondx modules`); a "
+                           "module marked repeatable may be given more than once")
     boot.add_argument("--param", action="append", metavar="KEY=VALUE",
-                      help="parameter passed to the modules (repeatable)")
+                      help="parameter passed to the modules (repeatable); KEY@2 sets KEY "
+                           "for the second copy of a module given twice")
     boot.add_argument("--ssh-key", action="append", metavar="PATH",
                       help="public key file to install (repeatable)")
     boot.add_argument("--all-ssh-keys", action="store_true",
@@ -2575,8 +2963,11 @@ def build_parser():
                       help="start from a saved bootstrap profile (see `lemondx profiles`)")
 
     p = add("serve", help="run the web UI and REST API")
-    p.add_argument("--host", default=DEFAULT_HOST)
-    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    # None, not the defaults, so a flag can be told from the saved setting it overrides.
+    p.add_argument("--host", help="address to listen on (default: the saved `configure "
+                                  "listen` setting, else %s)" % DEFAULT_HOST)
+    p.add_argument("--port", type=int,
+                   help="port to listen on (default: saved, else %d)" % DEFAULT_PORT)
     p.add_argument("--dev", action="store_true", help="allow cross-origin Vite dev server")
     p.add_argument("--open", action="store_true", help="open a browser window")
     p.add_argument("--quiet", action="store_true", help="do not log requests")
@@ -2687,6 +3078,45 @@ def build_parser():
     p.add_argument("--bridge", default="lxdbr0", help="bridge name")
     p.add_argument("--ipv6", action="store_true", help="also hand out IPv6")
     p.set_defaults(func=cmd_init)
+
+    p = add("logging", help="show the cluster's logging settings and how each "
+                            "destination is doing on this node")
+    p.set_defaults(func=cmd_logging)
+
+    p = add("logging-set", help="change the cluster's logging settings (every member)")
+    p.add_argument("--level", choices=list(eventlog.LEVELS),
+                   help="lowest severity logged (default info: every change)")
+    p.add_argument("--facility", choices=list(eventlog.FACILITIES),
+                   help="syslog facility for the local log")
+    p.add_argument("--remote", metavar="HOST[:PORT]",
+                   help="also send to this syslog host (replaces any remote set)")
+    p.add_argument("--protocol", choices=("udp", "tcp"), help="for --remote (default udp)")
+    p.add_argument("--remote-facility", choices=list(eventlog.FACILITIES),
+                   help="for --remote (default local0)")
+    p.add_argument("--no-remote", action="store_true", help="stop sending to a remote host")
+    p.set_defaults(func=cmd_logging_set)
+
+    p = add("logging-test", help="send a test line to every log destination now")
+    p.set_defaults(func=cmd_logging_test)
+
+    p = add("logs", help="recent events from the running serve, across the cluster; "
+                         "-f to follow")
+    p.add_argument("-f", "--follow", action="store_true", help="keep printing new events")
+    where = p.add_mutually_exclusive_group()
+    where.add_argument("--all", action="store_true",
+                       help="every member (the default in a cluster)")
+    where.add_argument("--node", action="append", metavar="NAME",
+                       help="only this node (repeatable)")
+    where.add_argument("--group", metavar="NAME", help="only this node group's members")
+    p.add_argument("-n", "--lines", type=int, default=50,
+                   help="how many recent events to start with (default 50)")
+    p.add_argument("--level", choices=list(eventlog.LEVELS), help="at least this severe")
+    p.add_argument("--kind", help="request, change, auth, system or access (comma-separated)")
+    p.add_argument("--actor", help="only what this user (or `system`) did")
+    p.add_argument("--req", help="one request, on every node it touched")
+    p.add_argument("--instance", help="only events naming this instance")
+    p.add_argument("--grep", metavar="TEXT", help="only events whose line contains TEXT")
+    p.set_defaults(func=cmd_logs)
 
     p = add("health", help="check running instances now: responsiveness, CPU, memory, load")
     p.add_argument("name", nargs="*", help="only these instances (default: all running)")
@@ -2830,6 +3260,41 @@ def build_parser():
     p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     p.set_defaults(func=cmd_network_delete)
 
+    p = network_sub.add_parser("lan", parents=[common],
+                               help="this host's NICs, and how each can put instances "
+                                    "on its LAN")
+    p.set_defaults(func=cmd_network_lan)
+
+    p = network_sub.add_parser("lan-create", parents=[common],
+                               help="a network on a NIC's LAN, addressed by its router")
+    p.add_argument("name", help="the network's name, max 15 characters")
+    p.add_argument("nic", nargs="?", help="the NIC (or --default / --all-nodes)")
+    p.add_argument("--default", action="store_true",
+                   help="use the NIC this host's default route leaves by")
+    p.add_argument("--all-nodes", action="store_true",
+                   help="on every node, each on its own default-route NIC (macvlan only)")
+    p.add_argument("--mode", choices=["bridge", "macvlan"], default="macvlan",
+                   help="bridge: over a spare NIC; macvlan: beside the NIC the host "
+                        "uses (the host then cannot reach them over it)")
+    p.add_argument("--description")
+    p.set_defaults(func=cmd_network_lan_create)
+
+    p = network_sub.add_parser("convert", parents=[common],
+                               help="make the NIC the host uses a bridge port, keeping "
+                                    "its address (through NetworkManager)")
+    p.add_argument("nic")
+    p.add_argument("--bridge", default="br0", help="the bridge's name (default: br0)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the commands instead of running them")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_network_convert)
+
+    p = network_sub.add_parser("revert", parents=[common],
+                               help="undo `network convert`")
+    p.add_argument("bridge")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_network_revert)
+
     p = add("list", aliases=["ls"], help="list containers")
     p.add_argument("--running", action="store_true", help="only running containers")
     p.set_defaults(func=cmd_list)
@@ -2936,6 +3401,57 @@ def build_parser():
     p = add("images", help="list cached and suggested images")
     p.set_defaults(func=cmd_images)
 
+    p = add("image-search", help="search the remotes' image catalogs")
+    p.add_argument("query", nargs="*", help="words that must all match, e.g. debian 12")
+    p.add_argument("--remote", help="only this remote (default: the browsable ones)")
+    p.add_argument("--all-arch", action="store_true",
+                   help="every architecture, not just this host's")
+    p.add_argument("--versions", action="store_true",
+                   help="list every build the remote still serves")
+    p.add_argument("--refresh", action="store_true", help="re-read the catalogs now")
+    p.set_defaults(func=cmd_image_search)
+
+    p = add("image-pins", help="list pinned builds, which templates launch as pin:NAME")
+    p.set_defaults(func=cmd_image_pins)
+
+    p = add("image-pin", help="pin one build of a remote image, on every node")
+    p.add_argument("image", help="e.g. images:debian/12")
+    p.add_argument("--serial", help="the build to pin (default: the newest; see "
+                                    "`image-search --versions`)")
+    p.add_argument("--nickname", action="append", metavar="NAME",
+                   help="another name it answers to, as pin:NAME (repeatable)")
+    p.add_argument("--note", help="why, for whoever finds the pin later")
+    p.add_argument("--node", action="append", metavar="NAME",
+                   help="fetch the build on this node only (repeatable; default: "
+                        "every member)")
+    p.set_defaults(func=cmd_image_pin)
+
+    p = add("image-pin-edit", help="add or remove a pin's nicknames, or change its note")
+    p.add_argument("pin", help="its id or a nickname")
+    p.add_argument("--add", action="append", metavar="NAME", help="repeatable")
+    p.add_argument("--remove", action="append", metavar="NAME",
+                   help="repeatable; refused while a template launches by it")
+    p.add_argument("--note")
+    p.set_defaults(func=cmd_image_pin_edit)
+
+    p = add("image-fetch", help="fetch a pinned build on nodes that lack it")
+    p.add_argument("image", metavar="pin")
+    p.add_argument("--node", action="append", metavar="NAME",
+                   help="this node only (repeatable; default: every member)")
+    p.set_defaults(func=cmd_image_fetch)
+
+    p = add("image-unpin", parents=[common, only_here],
+            help="forget a pin; refused while a template launches it")
+    p.add_argument("image", metavar="pin")
+    p.set_defaults(func=cmd_image_unpin)
+
+    p = add("image-prune", help="delete downloaded images nothing uses or pins")
+    p.add_argument("--node", action="append", metavar="NAME",
+                   help="only this node (repeatable; default: every member)")
+    p.add_argument("--dry-run", action="store_true", help="only say what would go")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask")
+    p.set_defaults(func=cmd_image_prune)
+
     p = add("image-copy", help="copy one of this node's images to other nodes")
     p.add_argument("alias")
     p.add_argument("--to", action="append", metavar="NODE", required=True,
@@ -3026,7 +3542,8 @@ def build_parser():
             help="replace every instance from a template with a fresh one")
     p.add_argument("template")
     p.add_argument("--param", action="append", metavar="KEY=VALUE",
-                   help="override a saved parameter or supply a secret (repeatable)")
+                   help="override a saved parameter or supply a secret (repeatable; "
+                        "KEY@2 for a module's second copy)")
     p.add_argument("--stale", action="store_true",
                    help="only those made from an older version of the template "
                         "(a stack's are left to the stack)")
@@ -3296,7 +3813,8 @@ def build_parser():
                    help="how many instances (default: 1)")
     p.add_argument("--prefix", help="name them <prefix>-N instead of the template's")
     p.add_argument("--param", action="append", metavar="KEY=VALUE",
-                   help="override a saved parameter or supply a secret (repeatable)")
+                   help="override a saved parameter or supply a secret (repeatable; "
+                        "KEY@2 for a module's second copy)")
     p.add_argument("--node", action="append", metavar="NAME",
                    help="launch on this node instead of here (repeatable; see "
                         "`lemondx cluster nodes`)")
@@ -3314,6 +3832,61 @@ def build_parser():
     return parser
 
 
+# Commands that only look. Logged at debug; everything else is a change, and
+# info -- so a new command is logged as a change unless it is listed here.
+READ_ONLY = {
+    "tokens", "users", "pam_test", "status", "list", "info", "snapshots", "image_search",
+    "image_pins", "modules", "ssh_keys", "profiles", "templates", "stacks", "stack_show",
+    "health", "resources", "top", "storage_pools", "storage_pool_show", "storage_volumes",
+    "storage_volume_show", "networks", "network_show", "network_subnets", "network_lan",
+    "cluster_nodes", "cluster_status", "cluster_show", "cluster_invites", "fabric_list",
+    "fabric_status", "fabric_plan", "fabric_check", "cluster_groups",
+    "cluster_containers", "cluster_cert", "cluster_fingerprint", "images", "logging",
+    "logs",
+}
+# Logged by themselves: `serve` is its own process's log, and the fabric
+# helper's commands are logged by the process that asked for them.
+NOT_LOGGED = {"serve", "fabric_helper"}
+# Positional arguments that name things, which the log may carry. Anything
+# else -- a join code, a command to run, a search, a file -- stays out.
+LOGGED_ARGS = ("name", "template", "snapshot", "pool", "image", "alias", "pin", "user",
+               "section", "nic", "bridge", "state", "id")
+
+
+def _cli_targets(args):
+    targets = {}
+    for key in LOGGED_ARGS:
+        value = getattr(args, key, None)
+        if isinstance(value, str) and value:
+            targets["arg_%s" % key] = value
+        elif isinstance(value, list) and value and all(isinstance(v, str) for v in value):
+            targets["arg_%s" % key] = value[:20]
+    return targets
+
+
+# The nested subcommand dests, in order, for naming a command in the log.
+_SUBCOMMANDS = ("storage_command", "pool_command", "volume_command", "network_command",
+                "cluster_command", "fabric_command", "group_command")
+
+
+def _command_label(args):
+    """``cluster.invite``, ``storage.pool.create``: the command as it was typed.
+
+    From argparse rather than the function, which several commands share
+    (start/stop/restart are one closure).
+    """
+    parts = [getattr(args, "command", None)] + [getattr(args, d, None) for d in _SUBCOMMANDS]
+    return ".".join(str(p) for p in parts if p)
+
+
+def _node_name():
+    try:
+        return (cluster_mod.load_settings() or {}).get("name") or \
+            cluster_mod.default_node_name()
+    except Exception:                               # noqa: BLE001 - only a label
+        return ""
+
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -3321,21 +3894,54 @@ def main(argv=None):
         parser.print_help()
         return 0
 
+    command = args.func.__name__[len("cmd_"):]
+    if command in NOT_LOGGED:
+        return _run(args)
+    eventlog.set_node(_node_name())
+    # Into the local serve's live tail too, if one is running.
+    eventlog.setup(forward=True)
+    who = local_principal()
+    with eventlog.acting(actor=who.name, role=who.role, via="cli", channel="cli"):
+        level = logging.DEBUG if command in READ_ONLY else logging.INFO
+        started = time.time()
+        outcome = {"code": 1}
+        try:
+            outcome["code"] = _run(args, outcome)
+            return outcome["code"]
+        except BaseException as exc:
+            outcome.setdefault("error", "unexpected: %r" % exc)
+            raise
+        finally:
+            failed = outcome["code"] != 0
+            eventlog.event("request", "cli.%s" % (_command_label(args) or command),
+                           level=max(level, logging.WARNING) if failed else level,
+                           result="failed" if failed else "ok",
+                           code=outcome["code"] if failed else None,
+                           error=outcome.get("error"),
+                           ms=int((time.time() - started) * 1000), **_cli_targets(args))
+            eventlog.flush()
+
+
+def _run(args, outcome=None):
+    outcome = {} if outcome is None else outcome
     service = None
     if getattr(args, "needs_service", True):
         try:
             service = ContainerService(project=args.project, socket_path=args.socket)
         except LXDError as exc:
             print(RED("! %s" % exc), file=sys.stderr)
+            outcome["error"] = str(exc)
             return 2
 
     try:
-        return args.func(args, service)
+        return args.func(args, service) or 0
     except (ServiceError, LXDError, AuthError, ConfigureError, ClusterError,
-            NodeError, FabricError, HostNetError) as exc:
+            NodeError, FabricError, HostNetError, nodesetup.SetupError) as exc:
         print(RED("! %s" % exc), file=sys.stderr)
+        outcome["error"] = str(exc)
         return 1
     except KeyboardInterrupt:
+        outcome["error"] = "interrupted"
         return 130
 
 

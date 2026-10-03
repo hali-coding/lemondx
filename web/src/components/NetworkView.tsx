@@ -7,9 +7,15 @@ import { bytes } from '../lib/format'
 import { displayAddress, subnetStatus } from '../lib/cidr'
 import type {
   FabricChangeResult, FabricCheck, FabricDeleteResult, FabricMember, FabricOverview,
-  FabricSummary, NetworkDetail, NetworkFamily, NetworkRequest, NetworkSummary, SubnetInUse,
+  FabricSummary, LanInfo, NetworkDetail, NetworkFamily, NetworkPresence, NetworkRequest,
+  NetworkSummary,
+  SubnetInUse,
 } from '../lib/types'
 import type { ToastKind } from '../hooks/useToasts'
+import { LanDialog } from './LanDialog'
+import { BackButton, NetworkWizard } from './NetworkWizard'
+import type { NetworkKind } from './NetworkWizard'
+import type { LanChoice } from './LanDialog'
 import { Modal } from './Modal'
 import { PlusIcon } from './Icons'
 import { SubnetField } from './SubnetField'
@@ -24,8 +30,13 @@ export function NetworkView({ onNotify }: Props) {
   const [summaries, setSummaries] = useState<NetworkSummary[] | null>(null)
   const [details, setDetails] = useState<Record<string, NetworkDetail>>({})
   const [error, setError] = useState<string | null>(null)
-  const [dialog, setDialog] = useState<NetworkDetail | 'new' | null>(null)
+  // Editing an existing bridge; making one goes through the wizard below.
+  const [dialog, setDialog] = useState<NetworkDetail | null>(null)
   const [pendingDelete, setPendingDelete] = useState<NetworkDetail | null>(null)
+  // "New network": the first step asks what instances should reach, and each
+  // answer carries on in its own form, which can step back to the question.
+  const [wizard, setWizard] = useState<'choose' | NetworkKind | null>(null)
+  const [pendingRevert, setPendingRevert] = useState<NetworkSummary | null>(null)
   const [busy, setBusy] = useState(false)
   // Pauses the 5s poll while a change is in flight. That stops new polls
   // only; loadSequence is what keeps one already under way from landing after
@@ -68,9 +79,44 @@ export function NetworkView({ onNotify }: Props) {
       await action()
       onNotify('success', success)
       setDialog(null)
+      setWizard(null)
       setPendingDelete(null)
     } catch (cause) {
       onNotify('error', 'Network change failed', (cause as Error).message)
+    } finally {
+      await load()
+      setBusy(false)
+      mutating.current = false
+    }
+  }, [load, onNotify])
+
+  // Not through run(): the dialog shows a refusal itself, so it is thrown on
+  // to it rather than turned into a toast.
+  const connectLan = useCallback(async (choice: LanChoice) => {
+    mutating.current = true
+    setBusy(true)
+    try {
+      if (choice.everywhere) {
+        const made = await api.createLanEverywhere(choice.name)
+        const good = made.nodes.filter((n) => n.ok)
+        if (good.length) {
+          onNotify('success', `${choice.name} is on ${good.length} of ${made.nodes.length} nodes`,
+            good.map((n) => `${n.node}: ${n.nic}${n.existing ? ' (already there)' : ''}`).join(', '))
+        }
+        for (const failed of made.nodes.filter((n) => !n.ok)) {
+          onNotify('error', `Not made on ${failed.node}`, failed.error ?? undefined)
+        }
+        setWizard(null)
+        return
+      }
+      const result = choice.mode === 'convert'
+        ? await api.convertNic(choice.nic, choice.name)
+        : await api.createLanNetwork({ nic: choice.nic, mode: choice.mode, name: choice.name })
+      onNotify('success', choice.mode === 'convert'
+        ? `${choice.nic} is now a port of ${choice.name}`
+        : `Created ${choice.name} on ${choice.nic}'s LAN`)
+      for (const note of result.notes ?? []) onNotify('error', 'Docker firewall', note)
+      setWizard(null)
     } finally {
       await load()
       setBusy(false)
@@ -102,16 +148,20 @@ export function NetworkView({ onNotify }: Props) {
         <div className="banner banner-error"><div className="banner-body"><p>{error}</p></div></div>
       )}
 
-      <FabricsSection onNotify={onNotify} onChanged={load} />
+      <FabricsSection onNotify={onNotify} onChanged={load}
+        creating={wizard === 'fabric'} onCreateClosed={() => setWizard(null)}
+        onBack={() => setWizard('choose')} />
 
       <div className="storage-toolbar">
         <span className="faint" style={{ fontSize: 12.5 }}>
           {managed.length} managed · {others.length} host interface{others.length === 1 ? '' : 's'}
         </span>
-        <button className="btn btn-primary" disabled={busy || !canWrite}
-          onClick={() => setDialog('new')}>
-          <PlusIcon /> New network
-        </button>
+        <span style={{ display: 'flex', gap: 8 }}>
+          <button className="btn btn-primary" disabled={busy || !canWrite}
+            onClick={() => setWizard('choose')}>
+            <PlusIcon /> New network
+          </button>
+        </span>
       </div>
 
       {managed.length === 0 && (
@@ -130,6 +180,7 @@ export function NetworkView({ onNotify }: Props) {
             <header className="net-head">
               <h3>{summary.name}</h3>
               <span className="badge badge-info">{summary.type}</span>
+              {summary.lan && <LanBadge lan={summary.lan} />}
               {summary.status && <span className="badge badge-ok">{summary.status}</span>}
               {summary.default && (
                 <span className="badge badge-dim"
@@ -146,8 +197,10 @@ export function NetworkView({ onNotify }: Props) {
                 )}
                 {detail?.manageable ? (
                   <>
-                    <button className="btn btn-sm" disabled={busy || !canWrite}
-                      onClick={() => setDialog(detail)}>Edit</button>
+                    {!detail.lan && (
+                      <button className="btn btn-sm" disabled={busy || !canWrite}
+                        onClick={() => setDialog(detail)}>Edit</button>
+                    )}
                     <button className="btn btn-sm btn-danger" disabled={busy || !canWrite}
                       onClick={() => setPendingDelete(detail)}>Delete</button>
                   </>
@@ -175,18 +228,30 @@ export function NetworkView({ onNotify }: Props) {
           <div className="table-scroll">
             <table className="ctable net-table">
               <thead>
-                <tr><th>Name</th><th>Type</th><th>Used by</th><th>New instances</th></tr>
+                <tr><th>Name</th><th>Type</th><th>Used by</th><th>New instances</th><th aria-label="Actions" /></tr>
               </thead>
               <tbody>
                 {others.map((network) => (
                   <tr key={network.name}>
-                    <td className="mono">{network.name}</td>
+                    <td className="mono">
+                      {network.name}
+                      {network.lan && <> <LanBadge lan={network.lan} /></>}
+                    </td>
                     <td className="dim">{network.type}</td>
                     <td className="dim">{network.used_by || '—'}</td>
                     <td>
                       {network.attachable
                         ? <span className="badge badge-ok">can join</span>
                         : <span className="faint">—</span>}
+                    </td>
+                    <td style={{ textAlign: 'right' }}>
+                      {network.lan?.kind === 'converted' && (
+                        <button className="btn btn-sm" disabled={busy || !canWrite}
+                          title={`Give ${network.lan.nic} back its own connection`}
+                          onClick={() => setPendingRevert(network)}>
+                          Revert
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -203,13 +268,55 @@ export function NetworkView({ onNotify }: Props) {
 
       {dialog && (
         <NetworkDialog
-          network={dialog === 'new' ? null : dialog}
+          network={dialog}
           busy={busy}
           onCancel={() => setDialog(null)}
-          onSubmit={(request) => dialog === 'new'
-            ? run(() => api.createNetwork(request), `Created network ${request.name}`)
-            : run(() => api.updateNetwork(dialog.name, request), `Updated network ${dialog.name}`)}
+          onSubmit={(request) =>
+            run(() => api.updateNetwork(dialog.name, request), `Updated network ${dialog.name}`)}
         />
+      )}
+
+      {wizard === 'choose' && (
+        <NetworkWizard onCancel={() => setWizard(null)} onPick={setWizard} />
+      )}
+      {wizard === 'bridge' && (
+        <NetworkDialog
+          network={null}
+          busy={busy}
+          onCancel={() => setWizard(null)}
+          onBack={() => setWizard('choose')}
+          onSubmit={(request) =>
+            run(() => api.createNetwork(request), `Created network ${request.name}`)}
+        />
+      )}
+      {wizard === 'lan' && (
+        <LanDialog onCancel={() => setWizard(null)} onBack={() => setWizard('choose')}
+          onSubmit={connectLan} />
+      )}
+
+      {pendingRevert?.lan && (
+        <Modal
+          title={`Revert ${pendingRevert.name}`}
+          subtitle={`Removes the bridge and gives ${pendingRevert.lan.nic} back the connection it had. The network drops for a few seconds.`}
+          onClose={busy ? () => {} : () => setPendingRevert(null)}
+          footer={
+            <>
+              <button className="btn" onClick={() => setPendingRevert(null)} disabled={busy}>Cancel</button>
+              <button className="btn btn-danger" disabled={busy}
+                onClick={() => run(() => api.revertLanBridge(pendingRevert.name).then(() => {
+                  setPendingRevert(null)
+                }), `Reverted ${pendingRevert.name}`)}>
+                {busy && <span className="spinner" />}
+                Revert
+              </button>
+            </>
+          }
+        >
+          <p className="hint" style={{ margin: 0 }}>
+            Refused while an instance or profile still has a NIC on{' '}
+            <span className="mono">{pendingRevert.name}</span>: move them to another network first.
+          </p>
+        </Modal>
       )}
 
       {pendingDelete && (
@@ -217,8 +324,15 @@ export function NetworkView({ onNotify }: Props) {
           network={pendingDelete}
           busy={busy}
           onCancel={() => setPendingDelete(null)}
-          onConfirm={() => run(() => api.deleteNetwork(pendingDelete.name),
-            `Deleted network ${pendingDelete.name}`)}
+          onConfirm={(everywhere) => everywhere
+            ? run(async () => {
+              const result = await api.deleteNetworkEverywhere(pendingDelete.name)
+              for (const failed of result.nodes.filter((n) => !n.ok)) {
+                onNotify('error', `Not deleted on ${failed.node}`, failed.error ?? undefined)
+              }
+            }, `Deleted network ${pendingDelete.name} on every node that had it`)
+            : run(() => api.deleteNetwork(pendingDelete.name),
+              `Deleted network ${pendingDelete.name}`)}
         />
       )}
     </>
@@ -231,16 +345,19 @@ export function NetworkView({ onNotify }: Props) {
  * each fabric's table is every node's own report of its part, so a missing
  * bridge or route on another host shows here rather than as silent loss.
  */
-function FabricsSection({ onNotify, onChanged }: {
+function FabricsSection({ onNotify, onChanged, creating, onCreateClosed, onBack }: {
   onNotify: (kind: ToastKind, title: string, detail?: string) => void
   onChanged: () => void
+  /** The wizard's fabric step is open; making one is done here, where its state is. */
+  creating: boolean
+  onCreateClosed: () => void
+  onBack: () => void
 }) {
   const canWrite = useCanWrite()
   const [overview, setOverview] = useState<FabricOverview | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [plan, setPlan] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
-  const [creating, setCreating] = useState(false)
   const [pendingDelete, setPendingDelete] = useState<FabricSummary | null>(null)
   const busyRef = useRef(false)
 
@@ -274,7 +391,7 @@ function FabricsSection({ onNotify, onChanged }: {
     setBusy(true)
     try {
       report(await run())
-      setCreating(false)
+      if (creating) onCreateClosed()
       setPendingDelete(null)
       setPlan(null)
     } catch (err) {
@@ -346,14 +463,6 @@ function FabricsSection({ onNotify, onChanged }: {
                 {plan !== null ? 'Hide plan' : 'Show plan'}
               </button>
             )}
-            <button className="btn btn-sm btn-primary"
-              disabled={busy || !canWrite || silent.length > 0}
-              title={silent.length > 0
-                ? `Every node must answer to create a fabric; ${silent.map((n) => n.node).join(', ')} does not`
-                : undefined}
-              onClick={() => setCreating(true)}>
-              <PlusIcon /> New fabric
-            </button>
           </span>
         </header>
 
@@ -361,9 +470,11 @@ function FabricsSection({ onNotify, onChanged }: {
           <p className="net-explain">
             A fabric is one bridge on every node, each on its own /24 of a shared
             prefix, with host routes between them. Its instances reach each other
-            across nodes by their own addresses, and nothing outside the fabric can
-            reach in. Traffic for anywhere else is NAT&apos;d behind the host,
-            unless the fabric was made without NAT.
+            across nodes by their own addresses, and so do the nodes themselves and
+            instances on a LAN network; nothing else can reach in. Traffic for
+            anywhere else is NAT&apos;d behind the host, unless the fabric was made
+            without NAT. Make one with <strong>New network</strong> → <em>Shared across
+            the cluster</em>.
             {!overview.clustered && ' This node is not in a cluster, so a fabric here spans this host only.'}
           </p>
           {plan !== null && <pre className="net-plan">{plan}</pre>}
@@ -413,7 +524,7 @@ function FabricsSection({ onNotify, onChanged }: {
       ))}
 
       {creating && (
-        <FabricDialog busy={busy} onCancel={() => setCreating(false)}
+        <FabricDialog busy={busy} onCancel={onCreateClosed} onBack={onBack}
           onSubmit={(request) => act(() => api.createFabric(request),
             (r) => reportNodes('created', r), 'Could not create the fabric')} />
       )}
@@ -529,9 +640,11 @@ function FabricCard({ fabric, busy, canWrite, onExtend, onDelete }: {
  * just this host's -- so the dialog shows each node's /24 before anything is
  * made, and refuses exactly what the server would.
  */
-function FabricDialog({ busy, onCancel, onSubmit }: {
+function FabricDialog({ busy, onCancel, onBack, onSubmit }: {
   busy: boolean
   onCancel: () => void
+  /** Back to the wizard's first step. */
+  onBack?: () => void
   onSubmit: (request: { name: string; prefix: string; nat: boolean }) => void
 }) {
   const [name, setName] = useState('')
@@ -590,7 +703,7 @@ function FabricDialog({ busy, onCancel, onSubmit }: {
 
   return (
     <Modal
-      title="Create fabric"
+      title="Fabric across the cluster"
       subtitle="A bridge on every node, each on its own /24 of one prefix, routed between them. Every node in the cluster must be reachable."
       onClose={busy ? () => {} : onCancel}
       // The server's check normalises the prefix, and that is what is sent.
@@ -598,6 +711,7 @@ function FabricDialog({ busy, onCancel, onSubmit }: {
         name: name.trim(), prefix: current ? check.prefix : prefix.trim(), nat })}
       footer={
         <>
+          {onBack && <BackButton onClick={onBack} disabled={busy} />}
           <button type="button" className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
           <button className="btn btn-primary" form="fabric-form" disabled={!canSubmit}>
             {busy && <span className="spinner" />}
@@ -749,7 +863,56 @@ function FabricDeleteDialog({ fabric, busy, onCancel, onConfirm }: {
   )
 }
 
+function NetworkUsers({ detail }: { detail: NetworkDetail }) {
+  return detail.profiles.length > 0 || detail.instances.length > 0 ? (
+    <p className="net-explain">
+      Attached{' '}
+      {detail.profiles.length > 0 && (
+        <>via profile{detail.profiles.length > 1 ? 's' : ''}{' '}
+          <span className="mono">{detail.profiles.join(', ')}</span></>
+      )}
+      {detail.profiles.length > 0 && detail.instances.length > 0 && ', plus '}
+      {detail.instances.length > 0 && (
+        <>directly by <span className="mono">{detail.instances.join(', ')}</span></>
+      )}
+      .
+    </p>
+  ) : (
+    <p className="net-explain">
+      Nothing is attached yet. Pick it under <strong>Network</strong> when
+      creating an instance.
+    </p>
+  )
+}
+
+function LanBadge({ lan }: { lan: LanInfo }) {
+  const how = lan.kind === 'macvlan' ? `macvlan on ${lan.nic}` : `bridged to ${lan.nic}`
+  return (
+    <span className="badge badge-ok"
+      title="Instances get their address from that LAN's own DHCP, usually the router">
+      LAN · {how}
+    </span>
+  )
+}
+
 function NetworkBody({ detail }: { detail: NetworkDetail }) {
+  if (detail.lan) {
+    return (
+      <div className="net-section">
+        <h4>How containers reach it</h4>
+        <p className="net-explain">
+          Instances are on the same network as <span className="mono">{detail.lan.nic}</span>,
+          and get their address, gateway and DNS from whatever serves that network —
+          usually your router. The daemon hands out nothing here and NATs nothing.
+          {detail.lan.kind === 'macvlan' && (
+            <> The host itself cannot reach them over <span className="mono">{detail.lan.nic}</span>{' '}
+              — that is how macvlan works — but every other machine on the LAN can.</>
+          )}
+        </p>
+        <NetworkUsers detail={detail} />
+      </div>
+    )
+  }
   return (
     <>
       <div className="net-grid">
@@ -783,25 +946,7 @@ function NetworkBody({ detail }: { detail: NetworkDetail }) {
             <>This network hands out no IPv4 addresses.</>
           )}
         </p>
-        {detail.profiles.length > 0 || detail.instances.length > 0 ? (
-          <p className="net-explain">
-            Attached{' '}
-            {detail.profiles.length > 0 && (
-              <>via profile{detail.profiles.length > 1 ? 's' : ''}{' '}
-                <span className="mono">{detail.profiles.join(', ')}</span></>
-            )}
-            {detail.profiles.length > 0 && detail.instances.length > 0 && ', plus '}
-            {detail.instances.length > 0 && (
-              <>directly by <span className="mono">{detail.instances.join(', ')}</span></>
-            )}
-            .
-          </p>
-        ) : (
-          <p className="net-explain">
-            Nothing is attached yet. Pick it under <strong>Network</strong> when
-            creating an instance.
-          </p>
-        )}
+        <NetworkUsers detail={detail} />
       </div>
 
       <div className="net-section">
@@ -863,10 +1008,12 @@ function initialSubnet(stored: string | undefined, family: 4 | 6, fallback: stri
   return stored === 'auto' || stored === 'none' ? stored : displayAddress(stored, family)
 }
 
-function NetworkDialog({ network, busy, onCancel, onSubmit }: {
+function NetworkDialog({ network, busy, onCancel, onBack, onSubmit }: {
   network: NetworkDetail | null
   busy: boolean
   onCancel: () => void
+  /** Back to the wizard's first step, when it was reached from there. */
+  onBack?: () => void
   onSubmit: (request: NetworkRequest) => void
 }) {
   const current = network?.config ?? {}
@@ -958,13 +1105,14 @@ function NetworkDialog({ network, busy, onCancel, onSubmit }: {
 
   return (
     <Modal
-      title={network ? `Edit ${network.name}` : 'Create network'}
+      title={network ? `Edit ${network.name}` : 'Private network on this node'}
       subtitle={network ? undefined
-        : 'A managed bridge: the daemon runs DHCP and DNS on it and can NAT it behind the host.'}
+        : 'A managed bridge: lemondx runs DHCP and DNS on it and can NAT it behind the host.'}
       onClose={busy ? () => {} : onCancel}
       api={call}
       footer={
         <>
+          {onBack && <BackButton onClick={onBack} disabled={busy} />}
           <button type="button" className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
           <button className="btn btn-primary" form="network-form" disabled={!canSubmit}>
             {busy && <span className="spinner" />}
@@ -1061,9 +1209,24 @@ function NetworkDeleteDialog({ network, busy, onCancel, onConfirm }: {
   network: NetworkDetail
   busy: boolean
   onCancel: () => void
-  onConfirm: () => void
+  /** `everywhere`: on every member that has a network of this name, too. */
+  onConfirm: (everywhere: boolean) => void
 }) {
   const inUse = network.instances.length > 0 || network.profiles.length > 0
+  // Whether the name is cluster-wide decides the question asked, so the
+  // buttons wait for the answer rather than offer a delete that may be half one.
+  const [presence, setPresence] = useState<NetworkPresence | null>(null)
+  const [looked, setLooked] = useState(false)
+  useEffect(() => {
+    const controller = new AbortController()
+    api.networkPresence(network.name, controller.signal)
+      .then((found) => { setPresence(found); setLooked(true) })
+      .catch((cause) => { if ((cause as Error).name !== 'AbortError') setLooked(true) })
+    return () => controller.abort()
+  }, [network.name])
+  const holders = presence && !presence.fabric
+    ? presence.nodes.filter((n) => n.present) : []
+  const others = holders.length > 1 ? holders : []
   return (
     <Modal
       title={`Delete network ${network.name}?`}
@@ -1072,13 +1235,42 @@ function NetworkDeleteDialog({ network, busy, onCancel, onConfirm }: {
       footer={
         <>
           <button className="btn" onClick={onCancel} disabled={busy}>Cancel</button>
-          <button className="btn btn-danger" onClick={onConfirm} disabled={busy || inUse}>
+          {others.length > 0 && (
+            <button className="btn btn-danger" onClick={() => onConfirm(false)}
+              disabled={busy || inUse}>
+              Delete on this node only
+            </button>
+          )}
+          <button className="btn btn-danger"
+            onClick={() => onConfirm(others.length > 0)}
+            disabled={busy || inUse || !looked}>
             {busy && <span className="spinner" />}
-            Delete network
+            {others.length > 0 ? `Delete on all ${others.length} nodes` : 'Delete network'}
           </button>
         </>
       }
     >
+      {others.length > 0 && !inUse && (
+        <div className="pool-delete-dialog" style={{ marginBottom: 10 }}>
+          <p style={{ margin: 0 }}>
+            <span className="mono">{network.name}</span> is on {others.length} nodes. Delete it
+            everywhere, or only here?
+          </p>
+          <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+            {others.map((n) => (
+              <li key={n.node}>
+                {n.node} <span className="faint">
+                  ({n.lan ? `LAN, ${n.lan.kind} on ${n.lan.nic}` : n.type}
+                  {n.used_by ? `, used by ${n.used_by}` : ''})
+                </span>
+              </li>
+            ))}
+          </ul>
+          <p className="hint" style={{ margin: '6px 0 0' }}>
+            A node where something still uses it refuses, and says so; the others go ahead.
+          </p>
+        </div>
+      )}
       {inUse ? (
         <div className="pool-delete-dialog">
           <p style={{ margin: 0 }}>
@@ -1101,8 +1293,12 @@ function NetworkDeleteDialog({ network, busy, onCancel, onConfirm }: {
         </div>
       ) : (
         <p style={{ margin: 0, fontSize: 13.5, lineHeight: 1.6 }}>
-          This removes the bridge <span className="mono">{network.name}</span> and its
-          DHCP and DNS service from the host. Nothing is attached to it.
+          {network.lan
+            ? <>This removes the LAN network <span className="mono">{network.name}</span>
+              {' '}from {others.length > 0 ? 'the chosen nodes' : 'the host'}. Nothing is attached to it here.</>
+            : <>This removes the bridge <span className="mono">{network.name}</span> and its
+              DHCP and DNS service from {others.length > 0 ? 'the chosen nodes' : 'the host'}.
+              Nothing is attached to it here.</>}
         </p>
       )}
     </Modal>
