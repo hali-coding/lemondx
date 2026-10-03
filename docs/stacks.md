@@ -53,6 +53,9 @@ that is not an earlier launch.
 The **Parameters** panel lists every parameter the step's template actually
 declares, grouped by the module that declares it, so what you are looking at is
 the whole set the launch will run with rather than only what you have changed.
+A module the template adds more than once gets a group per copy, numbered, and
+the second copy's parameters are named `NAME@2` (see
+[Adding a module more than once](modules.md#adding-a-module-more-than-once)).
 
 Each box shows, greyed out, the value the launch would use if you left it
 alone — the template's own answer, or failing that the module's default — with

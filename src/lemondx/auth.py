@@ -21,6 +21,7 @@ import getpass
 import grp
 import hashlib
 import ipaddress
+import logging
 import math
 import os
 import pwd
@@ -29,7 +30,7 @@ import secrets
 import threading
 import time
 
-from . import pam, store
+from . import eventlog, pam, store
 from .lxd import ADMIN_GROUP
 
 READ = "read"
@@ -93,6 +94,15 @@ class Principal:
 
     def to_dict(self):
         return {"name": self.name, "role": self.role, "via": self.via}
+
+
+def check_user_name(name):
+    """``name`` stripped, or AuthError if it cannot be a user's."""
+    name = (name or "").strip()
+    if not _NAME.match(name):
+        raise AuthError("User names are letters, digits and _ . @ -, up to 64 "
+                        "characters, not starting with punctuation.", 400)
+    return name
 
 
 def local_principal():
@@ -367,6 +377,8 @@ class AuthService:
         def mutate(records):
             records[token_id] = record
         store.update_auth("tokens", mutate)
+        eventlog.event("auth", "token.create", level=eventlog.NOTICE, token=token_id,
+                       name=name, token_role=role, owner=record.get("owner"))
         public = self._public_token(token_id, record)
         public["token"] = secret      # the only time it is ever shown
         return public
@@ -382,6 +394,7 @@ class AuthService:
         store.update_auth("tokens", mutate)
         with self._lock:
             self._last_used.pop(token_id, None)
+        eventlog.event("auth", "token.revoke", level=eventlog.NOTICE, token=token_id)
         return {"revoked": token_id}
 
     @staticmethod
@@ -416,10 +429,7 @@ class AuthService:
 
     def set_user(self, name, password=None, role=None):
         """Create a user, or change an existing one's password and/or role."""
-        name = (name or "").strip()
-        if not _NAME.match(name):
-            raise AuthError("User names are letters, digits and _ . @ -, up to 64 "
-                            "characters, not starting with punctuation.", 400)
+        name = check_user_name(name)
         if role is not None and role not in ROLES:
             raise AuthError("Role must be one of: %s." % ", ".join(ROLES), 400)
         if password is not None and not isinstance(password, str):
@@ -444,6 +454,9 @@ class AuthService:
             existing["updated"] = now
             return False
         created = store.update_auth("users", mutate)
+        eventlog.event("auth", "user.create" if created else "user.update",
+                       level=eventlog.NOTICE, user=name, user_role=role,
+                       password_changed=password is not None)
         record = self._records("users").get(name) or {}
         return {"name": name, "role": record.get("role"), "created": created}
 
@@ -452,6 +465,7 @@ class AuthService:
             return records.pop(name, None) is not None
         if not store.update_auth("users", mutate):
             raise AuthError("No such user: %s" % name, 404)
+        eventlog.event("auth", "user.remove", level=eventlog.NOTICE, user=name)
         return {"removed": name}
 
     # -- copying accounts between nodes ------------------------------------
@@ -532,6 +546,8 @@ class AuthService:
 
         if not principal:
             self._record_failure(keys)
+            eventlog.event("auth", "login", level=logging.WARNING, user=username,
+                           client=client, result="refused")
             raise AuthError("Wrong username or password, or this account may not use lemondx.", 401)
 
         with self._lock:
@@ -551,6 +567,8 @@ class AuthService:
                 "credential": credential,
                 "created": now, "expires": now + self.config.session_seconds, "checked": now,
             }
+        eventlog.event("auth", "login", level=eventlog.NOTICE, user=principal.name,
+                       user_role=principal.role, method=method, client=client, result="ok")
         return principal, session_id
 
     def _login_local(self, username, password):
@@ -563,7 +581,7 @@ class AuthService:
         role = self._pam_role(username)
         ok, reason = pam.authenticate(self.config.pam_service, username, password)
         if not ok:
-            _log("PAM refused %s: %s" % (username, reason))
+            _log("PAM refused %s: %s" % (username, reason), logging.WARNING)
             return None
         if not role:
             _log("PAM accepted %s, but they are in none of the groups %s"
@@ -620,7 +638,9 @@ class AuthService:
 
     def logout(self, session_id):
         with self._lock:
-            self._sessions.pop(session_id or "", None)
+            session = self._sessions.pop(session_id or "", None)
+        if session:
+            eventlog.event("auth", "logout", level=eventlog.NOTICE, user=session["name"])
         return {"logged_out": True}
 
     # -- throttling --------------------------------------------------------
@@ -636,6 +656,8 @@ class AuthService:
                 wait = min(LOCKOUT_BASE * 2 ** min(entry[0] - limit, 16), LOCKOUT_MAX)
                 remaining = int(entry[1] + wait - now) + 1
                 if remaining > 0:
+                    eventlog.event("auth", "login", level=logging.WARNING,
+                                   throttled=key, result="locked-out")
                     raise AuthError("Too many failed logins. Try again in %d seconds." % remaining, 429)
 
     def _record_failure(self, keys):
@@ -758,8 +780,8 @@ def _groups_of(username):
     return names
 
 
-def _log(message):
-    print("[lemondx] auth: %s" % message)
+def _log(message, level=logging.INFO):
+    eventlog.message("auth: %s" % message, level=level, msgid="auth")
 
 
 def parse_duration_days(text):

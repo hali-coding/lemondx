@@ -28,11 +28,17 @@ Type=simple
 User=lemondx
 Group=@LEMONDX_GROUP@
 Environment=HOME=/var/lib/lemondx
-ExecStart=/usr/bin/python3 @LEMONDX_PATH@/lemondx serve --host 127.0.0.1 --port 8099
-# Authentication is off until configured: run
-#   sudo -u lemondx env HOME=/var/lib/lemondx lemondx configure auth
-# and restart. Flags appended here override the saved settings.
+ExecStart=/usr/bin/python3 @LEMONDX_PATH@/lemondx serve
+# Starts in unconfigured mode -- 127.0.0.1:8099, no login, plain HTTP -- until
+# Configure node in the UI, or
+#   sudo -u lemondx env HOME=/var/lib/lemondx lemondx configure node
+# and a restart. No --host/--port here: a flag would override the saved
+# address. Flags appended here override saved settings.
 # See docs/service.md#authentication.
+# Unbuffered, or the startup warnings (a fabric that cannot program
+# routes, PAM that cannot work) sit in a block buffer and never reach
+# the journal, which is where they are meant to be read.
+Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=5
 

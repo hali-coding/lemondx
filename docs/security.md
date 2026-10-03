@@ -2,11 +2,46 @@
 
 [← back to README](../README.md)
 
-`serve` binds to `127.0.0.1` and, unless you ask for more, has no
-authentication: anyone who can reach the port controls your containers. Keep
-in mind what that means — creating a container is enough to become root on
-the host, which is why the daemon's own `lxd`/`incus-admin` group is treated
-as root-equivalent.
+Anyone who can drive lemondx controls your containers, and creating a
+container is enough to become root on the host — which is why the daemon's own
+`lxd`/`incus-admin` group is treated as root-equivalent.
+
+## Unconfigured mode
+
+A node starts in *unconfigured mode*: bound to `127.0.0.1`, no login, plain
+HTTP. That is safe because of all three together — whoever can reach a
+loopback port is already on the host, where the daemon socket is theirs anyway
+— and it is why nothing else can reach the node, so it can neither invite
+another node nor join a cluster (both are refused until it is configured).
+`serve` says so at startup, and the UI shows a **Configure node** banner.
+
+Configuring is one step that settles all three, in the order that never leaves
+the port open without a login: an admin account, a certificate (generated
+self-signed, uploaded, or the one already saved), the `local` login method, and
+then the address. lemondx then restarts itself in place — the same process, so
+a systemd unit keeps tracking it — and the browser carries on at `https://`,
+where it asks for the login just made. From a shell, the same thing:
+
+```bash
+lemondx configure node          # admin, certificate, listen on 0.0.0.0? -- then restart serve
+lemondx configure node --show   # what is saved
+lemondx configure node --reset  # back to unconfigured mode at the next start (accounts kept)
+lemondx configure listen        # just the address and port
+```
+
+Each part is saved where it already lives — the account in `auth/users.json`,
+the certificate where `configure tls` keeps it, the login method in
+`config/auth.json` — and the address in `config/listen.json`, which `serve`
+reads under its `--host`/`--port` flags. A flag on `serve`'s command line still
+wins after the restart, since the restart re-runs that command line; the UI
+says which of its choices one is overriding. Configuring is refused on a
+cluster member, whose peers pin its certificate and call it at its address.
+
+Configuring a headless node through an SSH tunnel to its loopback port
+(`ssh -L 8099:127.0.0.1:8099 host`) works: a node listening on `0.0.0.0` still
+answers on loopback, and the UI sends the browser back by the address it came.
+
+## Login methods
 
 Authentication is opt-in. There are four methods, usable together:
 
@@ -198,9 +233,11 @@ TLS 1.2 or newer, with the handshake done per connection so a client that
 stalls cannot block others. A TLS-terminating reverse proxy works just as well;
 either way, do not send passwords or tokens across a network in the clear.
 
-`configure tls` and `configure cluster` edit the same saved certificate (in
-`config/cluster.json`): a node serves one certificate, and its peers pin that
-one. Joining a cluster generates it if neither was run. `--tls-cert` overrides
+`configure tls`, `configure cluster` and **Configure node** edit the same
+saved certificate (in `config/cluster.json`): a node serves one certificate,
+and its peers pin that one. Joining a cluster generates it if none was saved.
+An uploaded one is loaded the way `serve` would load it before it is saved, so
+a key that does not match or carries a passphrase is refused up front. `--tls-cert` overrides
 it and `--no-tls` declines it, for a node behind a proxy that terminates TLS.
 On a cluster member, `configure tls` warns before replacing it, since every
 peer pins the old fingerprint.

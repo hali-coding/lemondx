@@ -27,6 +27,7 @@ has a **Bootstrap** tab with the same picker and a live log.
 | `nodejs` | Node.js and npm | — |
 | `postgresql` | PostgreSQL, a role with a password, optional database | `POSTGRES_PASSWORD` (secret), `POSTGRES_USER`, `POSTGRES_DB`, `LISTEN_ADDRESSES` |
 | `apache2` | Apache httpd, optionally with a virtual host you paste in | `VHOST_CONFIG` (text), `VHOST_NAME`, `ENABLE_MODULES`, `DISABLE_DEFAULT_SITE` |
+| `nfs-mount` | the NFS client, and a remote export mounted now and at every boot; add it once per mount | `NFS_SOURCE`, `NFS_MOUNTPOINT`, `NFS_OPTIONS` |
 
 Modules run in `order`, low to high, so `base` (10) precedes `ssh-access` (20)
 whatever sequence you tick them in. A failing module stops the run and its
@@ -38,6 +39,48 @@ three -- a user with no way in, or a server with no one to log in as, isn't
 useful on its own -- so they are one module now: installing sshd, creating
 the account and putting your key on it always happen together, and a key is
 mandatory rather than optional.
+
+## Adding a module more than once
+
+A module whose header says `# repeatable: yes` can be added to one instance,
+template or profile more than once, each time with its own parameters — two
+NFS mounts, say. Of the shipped modules only `nfs-mount` does: most install
+something, and installing PostgreSQL twice would fail, so without the line a
+module is refused a second time on save, at launch and when it runs. In the
+picker, a ticked repeatable module has **+ Add another**, and each repeat has
+its own fields and a **Remove**. Repeats of a module run one after another, in
+the order they were added, at that module's place in the `order`.
+
+In a selection the module is simply listed again, and the *n*th occurrence
+keeps its parameters as `NAME@n`; the first keeps plain `NAME`, as a module
+added once always has:
+
+```json
+"bootstrap": {
+  "modules": ["nfs-mount", "nfs-mount"],
+  "params": {
+    "NFS_SOURCE": "192.168.1.10:/media",  "NFS_MOUNTPOINT": "/mnt/media",
+    "NFS_SOURCE@2": "192.168.1.11:/shared", "NFS_MOUNTPOINT@2": "/mnt/shared"
+  }
+}
+```
+
+```bash
+lemondx create box -i images:debian/12 -b nfs-mount -b nfs-mount \
+    --param NFS_SOURCE=192.168.1.10:/media --param NFS_MOUNTPOINT=/mnt/media \
+    --param NFS_SOURCE@2=192.168.1.11:/shared --param NFS_MOUNTPOINT@2=/mnt/shared
+```
+
+The module itself sees plain `NAME` every time; `LEMONDX_OCCURRENCE` says
+which run it is. Each repeat starts from the module's own defaults (and your
+saved settings for it), never from the first copy's values, so give every
+`NAME@n` that differs. Secrets are the exception: a repeat with no secret of its
+own shares the first's, so a secret is asked for once, by its plain name,
+unless a repeat is given `NAME@n` too.
+
+The same keys work wherever parameters do: `--param NAME@2=…` on `launch`,
+`template-recreate` and `bootstrap`, and in a stack step, whose designer lists
+each repeat's parameters separately.
 
 ## SSH keys
 
@@ -204,7 +247,9 @@ Every module is prepended with `modules/_prelude.sh`, which provides
 `log` / `warn` / `die`, `have`, `pkg_refresh`, `pkg_install`, `svc_enable` and
 `install_ssh_keys`, and sets `LEMONDX_OS_ID` and `LEMONDX_PKG`. The package
 helpers cover apt, dnf/yum/microdnf, apk, pacman and zypper; `svc_enable`
-handles systemd and OpenRC.
+handles systemd and OpenRC. The runner also sets `LEMONDX_INSTANCE`, the instance's name on
+the daemon. Use that, not `hostname`, in anything telling someone what to run
+on the host, since the guest may call itself something else.
 
 Modules run under `/bin/sh` — dash on Debian, busybox ash on Alpine — because
 minimal images often have no bash. **Keep them POSIX.** `dash -n module.sh`
@@ -212,6 +257,11 @@ catches most mistakes.
 
 Declared `param` values arrive as environment variables, with the declared
 default applied when you do not override it.
+
+Add `# repeatable: yes` only if running the module twice in one instance,
+with different parameters, makes sense — it then can be
+[added more than once](#adding-a-module-more-than-once). Without it, a second
+copy is refused.
 
 ## Multi-line parameters
 
@@ -327,6 +377,42 @@ disabled when a vhost is installed; set `DISABLE_DEFAULT_SITE=no` to keep it.
 Write the config for the container's distro: `${APACHE_LOG_DIR}` is defined
 only on Debian/Ubuntu, and log directories are `/var/log/apache2` there and on
 Alpine, `/var/log/httpd` elsewhere.
+
+## The NFS module
+
+`nfs-mount` installs the NFS client, writes the export to `/etc/fstab` (one
+line per mount point, replaced on a re-run) and mounts it. Add it once per
+export. Verified with Debian 12 and Alpine 3.23 containers and a Debian 12 VM,
+across reboots.
+
+```bash
+lemondx create files -i images:debian/12 -b nfs-mount \
+    --param NFS_SOURCE=192.168.1.10:/srv/share --param NFS_MOUNTPOINT=/srv/share
+```
+
+A virtual machine needs nothing more. **An unprivileged container may not
+mount NFS itself**: the daemon has to do it on its behalf, through mount
+interception. Give the container both keys — most simply in a profile its
+template uses — and restart it:
+
+```bash
+lxc profile create nfs-client      # incus on Incus
+lxc profile set nfs-client security.syscalls.intercept.mount=true \
+    security.syscalls.intercept.mount.allowed=nfs,nfs4
+lemondx template-save files -i images:debian/12 --profile default --profile nfs-client -b nfs-mount ...
+```
+
+Without them, the module fails with those commands in its error. The profile
+is per node, like any daemon profile: a template launched on a node that lacks
+it falls back to the default profile and the mount is refused there.
+
+Two things differ through interception. The server sees the *host's* address,
+not the container's, so the export must allow the host. And the client cannot
+fall back to an older NFS version when the server refuses the newest, so when
+a mount fails the module tries 4.1, 4.0 and 3 in turn and writes the one that
+worked into fstab as `vers=`. Naming `vers=` in `NFS_OPTIONS` skips that. On
+Alpine, OpenRC's `netmount` does not run in a container, so the module adds
+`/etc/local.d/lemondx-nfs.start` to mount NFS at boot instead.
 
 ## If modules cannot install anything
 

@@ -40,24 +40,27 @@ import hashlib
 import ipaddress
 import json
 import os
+import logging
 import re
 import secrets
 import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
-from . import store
+from . import eventlog, store
 from .auth import ADMIN, TOKEN_PREFIX, AuthError
 from .bootstrap import discover_modules, module_source, normalise_module_id
-from .lxd import LXDError
+from .lxd import LXDError, cluster_version_problem
 from .nodeclient import (DEFAULT_TIMEOUT, LONG_TIMEOUT, NodeClient, NodeError,
                          fingerprint_of,
                          normalize_url, parse_url, peer_fingerprint, pretty_fingerprint)
-from .service import ServiceError
+from .service import PIN_REMOTE, ServiceError, pin_alias
 
 SETTINGS_SECTION = "cluster"
 SETTINGS_VERSION = 1
@@ -119,7 +122,13 @@ SIZE_TOLERANCE = 0.05
 # and a host that is switched off refuses at once anyway.
 EVICT_TIMEOUT = 10
 
-SYNC_KINDS = ("templates", "modules", "profiles", "groups", "users", "stacks")
+SYNC_KINDS = ("templates", "modules", "profiles", "groups", "users", "stacks", "pins",
+              "settings")
+
+# Cluster-wide settings: one record each in store's cluster-settings/, synced
+# like a template. The function is what makes a value valid, and the only
+# names a record may have.
+CLUSTER_SETTINGS = {eventlog.SETTING_NAME: eventlog.clean_settings}
 
 # What a node reconciles on its own when it comes back. The auto-propagated
 # kinds and only those: `users` crosses as a password hash and is pushed only
@@ -162,10 +171,52 @@ def from_peer(principal):
         and principal.via == "token:%s" % CLUSTER_TOKEN_NAME
 
 
-def _log(message):
-    # stderr, not stdout: these happen inside CLI commands too, where stdout may
-    # be a --json payload something else is parsing.
-    print("[lemondx] cluster: %s" % message, file=sys.stderr, flush=True)
+def _decode_cursor(cursor):
+    """``{node: "<boot>:<seq>"}`` from the cluster tail's opaque cursor."""
+    if not cursor:
+        return {}
+    try:
+        padded = str(cursor) + "=" * (-len(str(cursor)) % 4)
+        raw = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+    except (ValueError, binascii.Error, UnicodeError):
+        raise ClusterError("'cursor' must be one the cluster log tail returned.")
+    if not isinstance(raw, dict):
+        raise ClusterError("'cursor' must be one the cluster log tail returned.")
+    return {str(k): str(v) for k, v in raw.items() if isinstance(v, str)}
+
+
+def _encode_cursor(positions):
+    data = json.dumps({k: v for k, v in positions.items() if v}, sort_keys=True,
+                      separators=(",", ":"))
+    return base64.urlsafe_b64encode(data.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _setting_summary(name, value):
+    """A setting in a few words for the log, never its whole body."""
+    if name == eventlog.SETTING_NAME:
+        remote = ["%s://%s:%s" % (d["protocol"], d["host"], d["port"])
+                  for d in value["destinations"] if d["enabled"]]
+        return "level %s, remote %s" % (value["level"], ", ".join(remote) or "none")
+    return ""
+
+
+def _log(message, level=None):
+    """A cluster note, through eventlog (never stdout: a CLI's --json is there).
+
+    Failures are warnings, membership changes notices, and the rest -- syncs,
+    reconciliation rounds -- info, unless a caller says otherwise.
+    """
+    if level is None:
+        lowered = message.lower()
+        level = logging.WARNING if any(word in lowered for word in _FAILURE_WORDS) \
+            else eventlog.NOTICE if lowered.startswith(_MEMBERSHIP_WORDS) else logging.INFO
+    eventlog.message("cluster: %s" % message, level=level)
+
+
+_FAILURE_WORDS = ("failed", "did not", "could not")
+_MEMBERSHIP_WORDS = ("formed", "rotated", "accepted a rotated", "evicted", "forgot",
+                     "issued join", "node ", "joined", "left the", "cleared leftover",
+                     "maintenance", "sized", "membership")
 
 
 # -- settings --------------------------------------------------------------
@@ -333,6 +384,69 @@ def generate_certificate(host, days=3650, directory=None):
             "host": host, "days": int(days)}
 
 
+def check_certificate(cert_pem, key_pem):
+    """The fingerprint of an uploaded certificate and key, or ClusterError.
+
+    Loaded into a TLS context exactly as `serve` would load them, so a key
+    that does not match, a file that is not PEM, or a key `serve` could not
+    open unattended is refused here -- not discovered when the server fails
+    to restart with it. Leaves nothing behind.
+    """
+    with tempfile.TemporaryDirectory(prefix="lemondx-tls-") as directory:
+        return _try_pair(directory, cert_pem, key_pem, install=False)
+
+
+def install_certificate(cert_pem, key_pem):
+    """Make an uploaded certificate and key this node's, once they prove to work."""
+    cert, key = default_certificate_paths()
+    os.makedirs(os.path.dirname(cert), mode=0o700, exist_ok=True)
+    fingerprint = _try_pair(os.path.dirname(cert), cert_pem, key_pem, install=True)
+    return {"cert": cert, "key": key, "fingerprint": fingerprint}
+
+
+def _try_pair(directory, cert_pem, key_pem, install):
+    if "ENCRYPTED" in key_pem:
+        raise ClusterError(
+            "That key is protected by a passphrase, which a server starting on its own "
+            "cannot type. Remove it first: openssl pkey -in key.pem -out plain-key.pem")
+    if "-----BEGIN CERTIFICATE-----" not in cert_pem:
+        raise ClusterError("The certificate is not a PEM certificate "
+                           "(-----BEGIN CERTIFICATE-----).")
+    if "PRIVATE KEY-----" not in key_pem:
+        raise ClusterError("The key is not a PEM private key (-----BEGIN ... PRIVATE KEY-----).")
+    # Staged beside the final names, so installing is a rename on one filesystem.
+    staged = []
+    try:
+        for text in (cert_pem, key_pem):
+            handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory,
+                                                 prefix=".upload-", suffix=".pem",
+                                                 delete=False)
+            staged.append(handle.name)       # mode 0600 from mkstemp, key included
+            with handle:
+                handle.write(text.strip() + "\n")
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            # A callable, so OpenSSL never falls back to prompting on the
+            # terminal for a passphrase the check above did not spot.
+            context.load_cert_chain(staged[0], staged[1], password=lambda: b"")
+        except (ssl.SSLError, OSError) as exc:
+            raise ClusterError("That certificate and key do not work together: %s"
+                               % (getattr(exc, "reason", None) or exc))
+        fingerprint = certificate_fingerprint(staged[0])
+        if install:
+            cert, key = default_certificate_paths()
+            os.replace(staged[0], cert)
+            os.replace(staged[1], key)
+            staged = []
+        return fingerprint
+    finally:
+        for path in staged:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 # -- join codes ------------------------------------------------------------
 
 
@@ -422,6 +536,8 @@ class ClusterService:
         # read fabric settings itself.
         service.fabric_bridge = self._fabric_bridge
         service.fabric_configure = self._fabric_configure
+        service.lan_configure = self._lan_configure
+        service.lan_changed = self._lan_changed
 
     # -- this node ---------------------------------------------------------
 
@@ -621,6 +737,23 @@ class ClusterService:
                 return exc.message
         return ""
 
+    def refuse_unconfigured(self, what):
+        """Refuse to federate while this node's server is in unconfigured mode.
+
+        That server listens on loopback only, so whatever a peer would call
+        back on is not there: a join would enrol a member nobody can reach,
+        and a join code would send the joiner to an address nothing answers.
+        Asked of the running `serve` (its runtime file) because that, not the
+        settings on disk, is what peers would meet; with no server running
+        there is nothing to judge, and `self_check()` says so afterwards.
+        """
+        if store.live_runtime().get("unconfigured"):
+            raise ClusterError(
+                "This node is in unconfigured mode -- listening on localhost only, with "
+                "no login and no HTTPS -- so no other node could reach it to %s. "
+                "Configure it first: Configure node in the UI, or `lemondx configure "
+                "node` here and a restart of serve." % what, 409)
+
     def info(self):
         """What the UI needs to describe this node's place in a cluster."""
         settings = self.settings()
@@ -767,6 +900,122 @@ class ClusterService:
             raise ClusterError("No node called '%s'. Join a cluster with "
                                "`lemondx cluster join`." % name, 404)
         return peer
+
+    def local_api(self, timeout=DEFAULT_TIMEOUT):
+        """A client for this node's own ``serve``, or ``(None, why not)``.
+
+        What a CLI command uses for what only the running server has -- its
+        health records, runs, the live log tail. Pinned like any peer: the
+        token must never be handed to whatever else is answering on the port.
+        """
+        runtime = store.live_runtime()
+        if not runtime:
+            return None, "no `lemondx serve` running here"
+        port = runtime.get("port")
+        if not isinstance(port, int):
+            return None, "serve did not record its port"
+        host = str(runtime.get("host") or "")
+        host = {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+        fingerprint = ""
+        if runtime.get("tls"):
+            cert, _ = self.certificate()
+            if not cert:
+                return None, "serve uses a TLS certificate this node cannot pin"
+            try:
+                fingerprint = certificate_fingerprint(cert)
+            except ClusterError as exc:
+                return None, exc.message
+        token = None
+        if self.auth.config.enabled or self.requires_remote_token():
+            # The cluster credential is an ordinary admin token this node
+            # accepts too, so a member needs nothing configured to read itself.
+            token = os.environ.get("LEMONDX_TOKEN") or self.cluster_secret()
+        url = "%s://%s:%d" % ("https" if runtime.get("tls") else "http",
+                              "[%s]" % host if ":" in host else host, port)
+        try:
+            return NodeClient(url, token=token, fingerprint=fingerprint,
+                              timeout=timeout), None
+        except NodeError as exc:
+            return None, exc.message
+
+    # -- the live log tail, across nodes --------------------------------------
+    #
+    # Every node keeps its own recent events (eventlog's buffer); the cluster
+    # tail asks each for what came after its part of the cursor and merges by
+    # time. As a long-poll: each node is asked to wait, the answer goes back as
+    # soon as one has something (plus a moment for any close behind), and the
+    # nodes still waiting are left to it -- their cursor is not advanced, so
+    # the next poll asks them again from the same place and nothing is lost.
+
+    LOG_WAIT = 20
+    LOG_GRACE = 0.3
+
+    def logs(self, cursor=None, wait=0, limit=200, filters=None, nodes=None, group=None):
+        if isinstance(nodes, str):
+            nodes = [n for n in nodes.split(",") if n.strip()]
+        targets = self.resolve_targets(nodes=nodes, groups=[group] if group else None,
+                                       everything=not nodes and not group)
+        positions = _decode_cursor(cursor)
+        try:
+            wait = max(0.0, min(float(self.LOG_WAIT), float(wait or 0)))
+            limit = max(1, min(eventlog.MAX_PAGE, int(limit or 200)))
+        except (TypeError, ValueError):
+            raise ClusterError("limit and wait must be numbers.")
+        filters = {k: v for k, v in (filters or {}).items() if v not in (None, "")}
+        local = self.local_name()
+        answers, lock, ready = {}, threading.Lock(), threading.Event()
+
+        def one(node):
+            after = positions.get(node)
+            try:
+                if node == local:
+                    page = eventlog.read(after=after, limit=limit, wait=wait, filters=filters)
+                else:
+                    params = dict(filters, limit=limit, wait=wait)
+                    if after:
+                        params["after"] = after
+                    page = self.client(node, timeout=wait + 10).request(
+                        "GET", "/api/logs", params=params) or {}
+                answer = {"ok": True, "page": page}
+            except (ClusterError, NodeError, eventlog.LoggingSettingsError) as exc:
+                answer = {"ok": False, "error": exc.message}
+            with lock:
+                answers[node] = answer
+                if (answer["ok"] and answer["page"].get("events")) \
+                        or len(answers) == len(targets):
+                    ready.set()
+
+        for node in targets:
+            threading.Thread(target=eventlog.carry(one), args=(node,),
+                             name="lemondx-logs-%s" % node, daemon=True).start()
+        ready.wait(wait + 12)
+        with lock:
+            pending = len(answers) < len(targets)
+        if pending:
+            time.sleep(self.LOG_GRACE)      # for the nodes just behind the first
+        with lock:
+            answered = dict(answers)
+
+        events, report, cursor_out = [], [], dict(positions)
+        for node in targets:
+            answer = answered.get(node)
+            if answer is None:
+                report.append({"node": node, "ok": True, "pending": True})
+                continue
+            if not answer["ok"]:
+                report.append({"node": node, "ok": False, "error": answer["error"]})
+                continue
+            page = answer["page"]
+            cursor_out[node] = page.get("cursor") or positions.get(node)
+            for event in page.get("events") or []:
+                events.append(dict(event, node=node))
+            report.append({"node": node, "ok": True, "reset": bool(page.get("reset")),
+                           "truncated": bool(page.get("truncated"))})
+        events.sort(key=lambda e: (e.get("ts") or 0, e.get("node"), e.get("seq") or 0))
+        if not cursor:
+            # The backlog a tail opens with: the latest across the cluster.
+            events = events[-limit:]
+        return {"cursor": _encode_cursor(cursor_out), "events": events, "nodes": report}
 
     def client(self, name, timeout=DEFAULT_TIMEOUT):
         """A client for one peer, carrying the cluster credential."""
@@ -994,7 +1243,7 @@ class ClusterService:
         if not items:
             return []
         with ThreadPoolExecutor(max_workers=min(len(items), FANOUT_WORKERS)) as pool:
-            return list(pool.map(work, items))
+            return list(pool.map(eventlog.carry(work), items))
 
     def _forget(self, name):
         """Drop one node here: its record, its group memberships, its probe."""
@@ -1404,8 +1653,8 @@ class ClusterService:
         """A one-time code any node can redeem to join this node's cluster.
 
         Issuing one forms a cluster if this node is not in one yet, so the first
-        node is set up by the act of inviting the second -- there is nothing to
-        configure first. The code carries this node's address and certificate
+        node is set up by the act of inviting the second -- once it is out of
+        unconfigured mode, there is nothing else to configure first. The code carries this node's address and certificate
         fingerprint as well as the secret, so the operator moves one string and
         both directions of trust come from it: the secret proves the joiner was
         given permission, the fingerprint proves it reached the right node.
@@ -1423,6 +1672,7 @@ class ClusterService:
             raise ClusterError("A join code may last between 1 and %d minutes."
                                % MAX_INVITE_MINUTES)
 
+        self.refuse_unconfigured("join through it")
         local = self.ensure_identity()
         self._form_cluster()
         warning = self.self_check()
@@ -1539,6 +1789,21 @@ class ClusterService:
                 "This node is not in a cluster, so it has nothing to admit anyone "
                 "to. Issue the code with `lemondx cluster invite`.", 409)
 
+        # Before the code is spent, so a node turned away can upgrade and come
+        # back with the same code. The joiner checked itself already; this is
+        # for one whose lemondx predates the rule and so says nothing.
+        daemon = (body.get("node") or {}).get("daemon") if isinstance(
+            body.get("node"), dict) else None
+        if not isinstance(daemon, dict):
+            raise ClusterError(
+                "The joining node did not say which daemon it runs, so it has an "
+                "older lemondx. Update lemondx there, then join again with the same "
+                "code.", 409)
+        problem = cluster_version_problem(str(daemon.get("flavor") or ""),
+                                          str(daemon.get("version") or ""))
+        if problem:
+            raise ClusterError("That node cannot join: %s" % problem, 409)
+
         invite_id = self._redeem(body.get("code"))
         joiner = clean_member(body.get("node") or {})
         if joiner is None:
@@ -1598,11 +1863,12 @@ class ClusterService:
     def join(self, code, description=""):
         """Redeem a join code and become a member of that cluster.
 
-        One direction, and no setup: this node works out its own name, address
-        and certificate first (``ensure_identity``), redeems the code, takes the
-        cluster's credential and member list, and then announces itself to every
-        member. Which member issued the code does not matter -- what is joined
-        is the cluster.
+        One direction, and no setup beyond leaving unconfigured mode: this node
+        works out its own name, address and certificate first
+        (``ensure_identity``), redeems the code, takes the cluster's credential
+        and member list, and then announces itself to every member. Which
+        member issued the code does not matter -- what is joined is the
+        cluster.
         """
         payload = decode_join_code(code)
         name = str(payload["name"]).strip()
@@ -1626,6 +1892,14 @@ class ClusterService:
                 "there would be nothing to recognise that node by. Issue a fresh "
                 "code with `lemondx cluster invite`." % url)
 
+        # Checked here first, before anything is sent: a daemon too old to be a
+        # member is refused either way, and finding out locally keeps the code.
+        daemon = self.service.daemon_identity()
+        problem = cluster_version_problem(daemon["flavor"], daemon["version"])
+        if problem:
+            raise ClusterError("This node cannot join a cluster: %s" % problem, 409)
+
+        self.refuse_unconfigured("call it back as a member")
         mine = self.ensure_identity()
         if name == mine["name"]:
             raise ClusterError(
@@ -1640,7 +1914,8 @@ class ClusterService:
         client = NodeClient(url, fingerprint=fingerprint, timeout=DEFAULT_TIMEOUT)
         try:
             answer = client.enroll({"code": payload["code"],
-                                    "node": dict(mine, description=description)})
+                                    "node": dict(mine, description=description,
+                                                 daemon=daemon)})
         except NodeError as exc:
             raise ClusterError("Could not join %s: %s" % (url, exc.message), exc.code)
         if not isinstance(answer, dict) or not answer.get("secret"):
@@ -1685,6 +1960,12 @@ class ClusterService:
         # that admitted us already knows; the rest learn here, or on the next
         # sync_members() if they are down right now.
         spread = self.sync_members()
+        # Everything the cluster shares, now: a node people just joined is one
+        # they launch on next, and the reconciliation that would otherwise
+        # bring it over can be an hour away. Then its LAN networks, which
+        # nothing syncs because each is made on a NIC of its own host.
+        definitions = self._join_definitions()
+        lan = self.adopt_lan_networks()
         warning = self.self_check()
         _log("joined the cluster through %s (%d member(s))"
              % (name, len(self.members())))
@@ -1695,7 +1976,72 @@ class ClusterService:
             "warning": warning,
             "fabrics": fabric_note,
             "users": users_note,
+            "definitions": definitions,
+            "lan": lan,
         }
+
+    def _join_definitions(self):
+        """One reconciliation pass, summarised for the join's answer. Never raises.
+
+        A node that has just joined has no deletions on record, so it takes
+        every member's templates, modules, profiles, stacks and groups -- and
+        shares any of its own -- the way it would on its first hourly pass.
+        """
+        try:
+            report = self.reconcile(apply=True)
+        except (ClusterError, NodeError, ServiceError, LXDError) as exc:
+            return {"taken": [], "shared": [], "conflicts": [], "unreachable": [],
+                    "error": exc.message}
+        local = self.local_name()
+        done = [a for a in report.get("actions") or [] if a.get("ok")]
+        return {
+            "taken": sorted("%s %s" % (a["kind"], a["name"]) for a in done
+                            if a.get("node") == local),
+            "shared": sorted({"%s %s" % (a["kind"], a["name"]) for a in done
+                              if a.get("node") != local}),
+            "conflicts": ["%s %s" % (c["kind"], c["name"])
+                          for c in report.get("conflicts") or []],
+            # Members it could not compare with: what they hold arrives at the
+            # next reconciliation instead.
+            "unreachable": sorted(u["node"] if isinstance(u, dict) else str(u)
+                                  for u in report.get("unreachable") or []),
+            "error": None,
+        }
+
+    def adopt_lan_networks(self):
+        """Make here every macvlan network a member has, on this node's default NIC.
+
+        Named as the cluster names it, so a template naming `lan` means the LAN
+        on this node too -- the same rule as making one on every node at once.
+        Only macvlan: a bridge over a spare NIC or a converted NIC belongs to
+        one host's hardware, and has no counterpart to make here. Reported per
+        network, never raised; a name this node already uses for something
+        else is refused and left for a person.
+        """
+        wanted = {}
+        for node_name in sorted(self._peers()):
+            try:
+                networks = self.client(node_name).request("GET", "/api/networks") or []
+            except (ClusterError, NodeError):
+                continue
+            for network in networks:
+                if (network.get("lan") or {}).get("kind") == "macvlan":
+                    wanted.setdefault(network.get("name"), node_name)
+        have = {n["name"]: n for n in self.service.list_networks()}
+        made, existing, failed = [], [], []
+        for net in sorted(n for n in wanted if n):
+            if ((have.get(net) or {}).get("lan") or {}).get("kind") == "macvlan":
+                existing.append(net)
+                continue
+            try:
+                made_net = self.service.create_lan_network(None, "macvlan", net, default=True)
+                made.append({"name": net, "nic": (made_net.get("lan") or {}).get("nic", "")})
+            except (ServiceError, LXDError) as exc:
+                failed.append({"name": net, "error": exc.message})
+        if made:
+            _log("made the cluster's LAN network(s) here: %s"
+                 % ", ".join("%s on %s" % (m["name"], m["nic"]) for m in made))
+        return {"made": made, "existing": existing, "failed": failed}
 
     def _accept_users(self, offered):
         """Take the cluster's accounts, so this node can be logged in to.
@@ -1937,6 +2283,17 @@ class ClusterService:
                 items.append(("groups", group["name"], {
                     "members": group["members"], "description": group["description"]}))
 
+        if "settings" in kinds:
+            for name, record in sorted(store.load_settings_records().items()):
+                if name in CLUSTER_SETTINGS and (wanted is None or name in wanted):
+                    items.append(("settings", name, {"value": record["value"]}))
+
+        if "pins" in kinds:
+            for name, pin in sorted(store.load_pins().items()):
+                if wanted is not None and name not in wanted:
+                    continue
+                items.append(("pins", name, {k: v for k, v in pin.items() if k != "name"}))
+
         if "users" in kinds:
             # As stored, hash and all: an account is only usable on the far
             # side if the hash goes with it, and there is no plaintext kept
@@ -1966,10 +2323,11 @@ class ClusterService:
                 continue
             items.append(("modules", module_id, {"content": source["content"]}))
 
-        # Modules first: a template that arrives before the module it names is
-        # accepted but cannot be launched until the module follows.
-        order = {"modules": 0, "profiles": 1, "templates": 2, "stacks": 3, "groups": 4,
-                 "users": 5}
+        # Modules and pins first: a template that arrives before the module or
+        # pin it names is accepted but cannot be launched until that follows.
+        order = {"settings": -1, "modules": 0, "pins": 1, "profiles": 2, "templates": 3,
+                 "stacks": 4,
+                 "groups": 5, "users": 6}
         return sorted(items, key=lambda item: (order[item[0]], item[1]))
 
     def _sync_to(self, node_name, items, timeout=DEFAULT_TIMEOUT):
@@ -1992,6 +2350,10 @@ class ClusterService:
                     client.adopt_user(name, body)
                 elif kind == "stacks":
                     client.save_stack(name, body)
+                elif kind == "pins":
+                    client.save_pin(name, body)
+                elif kind == "settings":
+                    client.save_setting(name, body)
                 else:
                     client.upload_module(name, body["content"], overwrite=True)
             except NodeError as exc:
@@ -2046,6 +2408,10 @@ class ClusterService:
                 client.delete_group(name)
             elif kind == "stacks":
                 client.delete_stack(name)
+            elif kind == "pins":
+                client.delete_pin(name)
+            elif kind == "settings":
+                client.delete_setting(name)
             else:
                 client.delete_module(name)
         except NodeError as exc:
@@ -2312,6 +2678,10 @@ class ClusterService:
             self._stack_service().save_stack(name, stages=body.get("stages"),
                                              description=body.get("description", ""),
                                              propagate=False)
+        elif kind == "pins":
+            self.service.save_pin_record(name, body)
+        elif kind == "settings":
+            self.save_setting(name, body.get("value"), propagate=False)
         else:
             self.service.upload_module(name, body.get("content"), overwrite=True)
 
@@ -2325,6 +2695,10 @@ class ClusterService:
                               relayed=True)
         elif kind == "stacks":
             self._stack_service().delete_stack(name, everywhere=False)
+        elif kind == "pins":
+            self.service.unpin_image(name)
+        elif kind == "settings":
+            self.delete_setting(name, everywhere=False)
         else:
             self.service.remove_module(name)
 
@@ -2361,6 +2735,22 @@ class ClusterService:
             return self._fabric().configure_guest(name, iface, bridge)
         except Exception:
             return None
+
+    def _lan_configure(self, name):
+        """Routes to every fabric in a new macvlan instance. Never fails the launch."""
+        try:
+            return self._fabric().configure_new_lan_instance(name)
+        except Exception:                 # noqa: BLE001
+            return None
+
+    def _lan_changed(self):
+        """A macvlan network came or went: publish it and fix the firewalls, in the background.
+
+        On a thread because it asks every peer, and the request that made the
+        network has already done its part.
+        """
+        threading.Thread(target=eventlog.carry(self._fabric().reapply), name="lan-changed",
+                         daemon=True).start()
 
     def _fabric_bridge(self, wanted):
         """This node's bridge for fabric ``wanted``, or "" when it is not on it."""
@@ -2431,9 +2821,47 @@ class ClusterService:
                 except Exception as exc:              # noqa: BLE001 - a chore thread
                     _log("reconciliation failed: %s" % exc)
 
-        thread = threading.Thread(target=loop, name="lemondx-reconcile", daemon=True)
+        def run():
+            with eventlog.system("reconcile"):
+                loop()
+        thread = threading.Thread(target=run, name="lemondx-reconcile", daemon=True)
         thread.start()
         return thread
+
+    # -- cluster-wide settings ------------------------------------------------
+
+    def setting(self, name):
+        """A cluster setting's value as stored here, or None."""
+        record = store.load_settings_records().get(name)
+        return record["value"] if record else None
+
+    def save_setting(self, name, value, propagate=True):
+        """Save one cluster setting here and push it to every member.
+
+        A relayed save (``propagate`` off) is validated all the same: the
+        record is a file a member sent, as untrusted as any other.
+        """
+        clean = CLUSTER_SETTINGS.get(name)
+        if clean is None:
+            raise ClusterError("There is no cluster setting called '%s'." % name, 404)
+        try:
+            value = clean(value)
+        except eventlog.LoggingSettingsError as exc:
+            raise ClusterError(exc.message, exc.code)
+        store.save_setting(name, {"value": value})
+        if name == eventlog.SETTING_NAME:
+            eventlog.refresh(force=True)
+        eventlog.event("change", "setting.save", level=eventlog.NOTICE, setting=name,
+                       summary=_setting_summary(name, value))
+        return self._with_sync({"name": name, "value": value}, "settings", name, propagate)
+
+    def delete_setting(self, name, everywhere=True):
+        """Back to the default, here and (``everywhere``) on every member."""
+        store.delete_setting(name)
+        if name == eventlog.SETTING_NAME:
+            eventlog.refresh(force=True)
+        return self._with_sync({"name": name, "deleted": True}, "settings", name, everywhere,
+                               deleted=True)
 
     def save_template(self, propagate=True, **kwargs):
         source = kwargs.get("snapshot")
@@ -2448,6 +2876,10 @@ class ClusterService:
             # was asked for. Not on a relayed save, which must never be refused.
             kwargs["instance_type"] = self.service.snapshot_type(
                 "%s/%s" % (clean["instance"], clean["name"]))
+        image = str(kwargs.get("image") or "").strip()
+        if propagate and not clean and image.startswith(PIN_REMOTE + ":"):
+            # A pin is a shared record, so this node's copy answers for all.
+            self.service._pin(image)
         record = self.service.save_template(**kwargs)
         return self._with_sync(record, "templates", record["name"], propagate)
 
@@ -2500,7 +2932,9 @@ class ClusterService:
     # A job is held in memory here like a template run, on the node where the
     # image is, and followed through `/api/image-jobs` there.
 
-    IMAGE_JOB_RETENTION = 600
+    # Long enough to see how a job ended after switching tabs, short enough
+    # that the list is not a log; the UI can dismiss a row sooner.
+    IMAGE_JOB_RETENTION = 180
     # Each send is a full image read from this node's disk and pushed down one
     # link; a few at once is as much as either is likely to take.
     IMAGE_SEND_WORKERS = 2
@@ -2521,6 +2955,268 @@ class ClusterService:
         fingerprint, description = self.service.image_by_alias(alias)
         return self._image_job(self.service.image_alias(alias), targets, background,
                                fingerprint=fingerprint, description=description)
+
+    # -- pinned images across nodes ------------------------------------------
+    #
+    # The pin itself is a shared definition and travels like a template. The
+    # build it names has to reach every node while somebody still has it --
+    # `images:` keeps about a day's builds -- so pinning fetches it at once,
+    # as an image job like a copy.
+
+    def pin_image(self, image, serial=None, nicknames=None, note="", by="", nodes=None,
+                  background=False):
+        """Pin a build of ``image``, share the pin, and fetch the build on ``nodes``."""
+        targets = self._pin_targets(nodes)
+        pin = self.service.pin_image(image, serial=serial, nicknames=nicknames, note=note,
+                                     by=by)
+        pin = self._with_sync(pin, "pins", pin["name"], True)
+        return {"pin": pin, "job": self.fetch_pin(pin["name"], targets, background)}
+
+    def edit_pin(self, ref, nicknames=None, note=None, propagate=True):
+        """A pin's nicknames and note; a nickname a template launches by stays."""
+        pin = self.service._pin(ref)
+        if nicknames is not None and propagate:
+            kept = set(self.service._free_nicknames(pin["name"], nicknames))
+            for gone in sorted(set(pin["nicknames"]) - kept):
+                self.refuse_in_use("pins", "pin nickname", gone)
+        record = self.service.edit_pin(pin["name"], nicknames=nicknames, note=note)
+        return self._with_sync(record, "pins", record["name"], propagate)
+
+    def unpin_image(self, ref, everywhere=True, relayed=False):
+        if not relayed:
+            # By any name it answers to: each is a way a template launches it.
+            pin = self.service._pin(ref)
+            for name in [pin["name"]] + pin["nicknames"]:
+                self.refuse_in_use("pins", "pin", name)
+        record = self.service.unpin_image(ref)
+        return self._with_sync(record, "pins", record["unpinned"], everywhere, deleted=True)
+
+    def _pin_targets(self, nodes):
+        wanted = list(dict.fromkeys(str(n).strip() for n in nodes or [] if str(n).strip()))
+        unknown = [n for n in wanted if n not in self.all_nodes()]
+        if unknown:
+            raise ClusterError("No member called %s." % ", ".join(
+                "'%s'" % n for n in unknown), 404)
+        return wanted or self.all_nodes()
+
+    def fetch_pin(self, image, nodes=None, background=False):
+        """Put a pinned build on this node and on each of ``nodes`` (default: all).
+
+        Pulled here from the server the pin names, then sent to the others
+        over the peer channel -- not pulled by each: a remote keeps only its
+        last few builds, and in a cluster of LXD and Incus nodes there is no
+        one server every node can fetch the same build from. Sending also
+        makes every copy the bytes this node checked. A node that has the
+        image already only gets the alias. Run it on a node that holds the
+        build, or can still fetch it.
+        """
+        pin = self.service._pin(image)
+        targets = self._pin_targets(nodes)
+        local = self.local_name()
+        alias = pin_alias(pin["name"])
+        job = {
+            "id": secrets.token_hex(4), "alias": alias,
+            "source": "%s@%s" % (pin["image"], pin["serial"]),
+            "node": local, "fingerprint": pin["fingerprint"] or pin["vm_fingerprint"],
+            "size": None, "stage": "pulling",
+            "started_at": time.time(), "finished_at": None, "ok": None, "error": None,
+            "nodes": [{"node": n, "state": "waiting", "sent": 0, "error": None}
+                      for n in targets],
+        }
+        self._track_image_job(job)
+        here = next((e for e in job["nodes"] if e["node"] == local), None)
+        description = "%s %s, pinned" % (pin["image"], pin["serial"])
+
+        def work():
+            try:
+                if here:
+                    self._image_update(job, here, state="pulling")
+                try:
+                    got = self.service.fetch_pin(pin["name"])
+                except (ServiceError, LXDError) as exc:
+                    if here:
+                        self._image_update(job, here, state="failed", error=exc.message)
+                    raise
+                job_alias = got["alias"]
+                self._image_update(job, fingerprint=got["fingerprint"], size=got["size"],
+                                   alias=job_alias, stage="copying")
+                if here:
+                    self._image_update(job, here, sent=got["size"], state="present"
+                                       if got["state"] == "present" else "done")
+                self._fanout_limited([e for e in job["nodes"] if e is not here],
+                                     lambda entry: self._send_image(job, entry, description))
+                failed = [e["node"] for e in job["nodes"] if e["state"] == "failed"]
+                self._image_update(job, ok=not failed, error="Not on %s." % ", ".join(
+                    failed) if failed else None)
+            except (ServiceError, LXDError, ClusterError, NodeError) as exc:
+                self._image_update(job, ok=False, error=exc.message)
+            except Exception as exc:                  # noqa: BLE001
+                _log("pin fetch %s failed: %r" % (pin["name"], exc))
+                self._image_update(job, ok=False, error="Unexpected error: %s" % exc)
+            finally:
+                self._image_update(job, stage="done", finished_at=time.time())
+            return _copy_job(job)
+
+        if not background:
+            return work()
+        threading.Thread(target=eventlog.carry(work), name="lemondx-pin-%s" % alias,
+                         daemon=True).start()
+        return _copy_job(job)
+
+    def create_lan_everywhere(self, mode, name, description=""):
+        """One LAN network, under one name, on every member's default interface.
+
+        Each node picks its own NIC from its own default route, since the
+        names differ between machines while "the way out" does not; the one
+        name is what lets a template say `network: lan` and mean it on every
+        node. Only macvlan: converting would move every host's connection at
+        once, and a spare NIC is by definition not the default one.
+        """
+        if mode != "macvlan":
+            raise ClusterError("Only macvlan can be made on every node at once: "
+                               "converting moves each host's own connection, and is "
+                               "done node by node.", 400)
+        body = {"mode": mode, "name": name, "description": description, "default": True}
+
+        def one(node_name):
+            try:
+                if node_name == self.local_name():
+                    made = self.service.create_lan_network(
+                        None, mode, name, description=description, default=True)
+                else:
+                    made = self.client(node_name, timeout=LONG_TIMEOUT).request(
+                        "POST", "/api/lan/networks", body) or {}
+            except (ServiceError, LXDError, ClusterError, NodeError) as exc:
+                return {"node": node_name, "ok": False, "nic": "", "existing": False,
+                        "error": exc.message}
+            return {"node": node_name, "ok": True, "nic": (made.get("lan") or {}).get("nic", ""),
+                    "existing": bool(made.get("existing")), "error": None}
+
+        nodes = self._fanout(self.all_nodes(), one)
+        return {"name": name, "mode": mode, "ok": all(n["ok"] for n in nodes), "nodes": nodes}
+
+    # -- networks with one name on several nodes -----------------------------
+    #
+    # A network is a node's own, but the same name on several members is
+    # usually one decision -- a LAN network made on every node, or given to
+    # each as it joined -- and deleting it is too. Fabrics are left to their
+    # own delete, which also takes their routes and claims away.
+
+    def network_presence(self, name):
+        """Which members have a managed network called ``name``, as each reports it."""
+        local = self.local_name()
+
+        def one(node_name):
+            try:
+                if node_name == local:
+                    networks = self.service.list_networks()
+                else:
+                    networks = self.client(node_name).request("GET", "/api/networks") or []
+            except (ServiceError, LXDError, ClusterError, NodeError) as exc:
+                return {"node": node_name, "present": None, "error": exc.message}
+            found = next((n for n in networks if n.get("name") == name
+                          and n.get("managed")), None)
+            return {"node": node_name, "present": found is not None,
+                    "type": (found or {}).get("type") or "",
+                    "lan": (found or {}).get("lan"), "used_by": (found or {}).get("used_by") or 0,
+                    "error": None}
+
+        return {"name": name, "fabric": self._is_fabric(name),
+                "nodes": self._fanout(self.all_nodes(), one)}
+
+    def _is_fabric(self, name):
+        try:
+            return name in self._fabric().definitions()
+        except Exception:                           # noqa: BLE001
+            return False
+
+    def delete_network_everywhere(self, name, nodes=None):
+        """Delete network ``name`` on every member that has it, or on ``nodes``.
+
+        Each node applies its own rules -- refused while an instance or profile
+        is on it there -- and answers for itself; one refusing leaves the others
+        deleted, and the result says which.
+        """
+        if self._is_fabric(name):
+            raise ClusterError("'%s' is a fabric: delete it from the Fabrics section "
+                               "(`lemondx fabric delete`), which also removes its "
+                               "routes on every node." % name, 409)
+        if nodes is None:
+            nodes = [row["node"] for row in self.network_presence(name)["nodes"]
+                     if row["present"]]
+        unknown = [n for n in nodes if n not in self.all_nodes()]
+        if unknown:
+            raise ClusterError("No member called %s." % ", ".join(unknown), 404)
+        local = self.local_name()
+
+        def one(node_name):
+            try:
+                if node_name == local:
+                    self.service.delete_network(name)
+                else:
+                    self.client(node_name).request(
+                        "DELETE", "/api/networks/%s" % urllib.parse.quote(name, safe=""))
+            except (ServiceError, LXDError, ClusterError, NodeError) as exc:
+                return {"node": node_name, "ok": False, "error": exc.message}
+            return {"node": node_name, "ok": True, "error": None}
+
+        results = self._fanout(sorted(nodes), one)
+        return {"name": name, "ok": all(r["ok"] for r in results), "nodes": results}
+
+    def image_inventory(self):
+        """Every member's images and snapshots, each tagged with its node.
+
+        For the Images tab, which shows the cluster as one place: where each
+        image is, where it is missing, and what could be made into one. A
+        member that cannot answer is reported, and the rest still listed.
+        """
+        targets = self.all_nodes()
+
+        def one(node_name):
+            try:
+                if node_name == self.local_name():
+                    return node_name, self.service.image_inventory(), None
+                return node_name, self.client(node_name).image_inventory() or {}, None
+            except (ServiceError, LXDError, ClusterError, NodeError) as exc:
+                return node_name, {}, exc.message
+
+        images, snapshots, errors = [], [], []
+        for node_name, found, error in self._fanout(targets, one):
+            if error:
+                errors.append({"node": node_name, "error": error})
+            images.extend(dict(i, node=node_name) for i in found.get("images") or [])
+            snapshots.extend(dict(s, node=node_name) for s in found.get("snapshots") or [])
+        return {"nodes": targets, "images": images, "snapshots": snapshots,
+                "errors": errors}
+
+    def prune_images(self, nodes=None, apply=False, only=None):
+        """`ContainerService.prune_images()` on each of ``nodes`` (default: all).
+
+        ``only`` is ``{node: [fingerprint, ...]}`` from a preview: a node not
+        in it deletes nothing. Each node judges its own images against its own
+        instances, and its copy of the pins and templates, which sync keeps
+        level -- a member that cannot be reached is reported, not guessed at.
+        """
+        targets = self._pin_targets(nodes)
+        local = self.local_name()
+
+        def one(node_name):
+            wanted = None if only is None else list((only or {}).get(node_name) or [])
+            try:
+                if node_name == local:
+                    result = self.service.prune_images(apply=apply, only=wanted)
+                else:
+                    result = self.client(node_name, timeout=LONG_TIMEOUT).request(
+                        "POST", "/api/images/prune", {"apply": bool(apply), "only": wanted}) or {}
+            except (ServiceError, LXDError, ClusterError, NodeError) as exc:
+                return {"node": node_name, "ok": False, "error": exc.message,
+                        "deleted": [], "kept": [], "failed": [], "freed": 0}
+            return dict(result, node=node_name, ok=not result.get("failed"), error=None)
+
+        results = self._fanout(targets, one)
+        return {"applied": bool(apply), "nodes": results,
+                "freed": sum(r.get("freed") or 0 for r in results),
+                "ok": all(r["ok"] for r in results)}
 
     def image_jobs(self):
         """Publishes and copies started here, running or finished in the last minutes."""
@@ -2557,19 +3253,15 @@ class ClusterService:
             "nodes": [{"node": n, "state": "waiting", "sent": 0, "error": None}
                       for n in targets],
         }
-        with self._lock:
-            if any(j["alias"] == alias and j["finished_at"] is None
-                   for j in self._images.values()):
-                raise ClusterError("Image '%s' is already being published or copied "
-                                   "from here." % alias, 409)
-            self._images[job["id"]] = job
+        self._track_image_job(job)
 
         def work():
             try:
                 if source:
                     instance, _, snapshot = source.partition("/")
                     image = self.service.publish_snapshot(instance, snapshot, alias,
-                                                          description)
+                                                          description,
+                                                          node=self.local_name())
                     self._image_update(job, fingerprint=image["fingerprint"])
                 self._image_update(job, stage="copying",
                                    size=(self.service.lxd.get_image(job["fingerprint"])
@@ -2590,14 +3282,23 @@ class ClusterService:
 
         if not background:
             return work()
-        threading.Thread(target=work, name="lemondx-image-%s" % alias, daemon=True).start()
+        threading.Thread(target=eventlog.carry(work), name="lemondx-image-%s" % alias,
+                         daemon=True).start()
         return _copy_job(job)
+
+    def _track_image_job(self, job):
+        with self._lock:
+            if any(j["alias"] == job["alias"] and j["finished_at"] is None
+                   for j in self._images.values()):
+                raise ClusterError("Image '%s' is already being published, copied or "
+                                   "fetched from here." % job["alias"], 409)
+            self._images[job["id"]] = job
 
     def _fanout_limited(self, items, work):
         if items:
             with ThreadPoolExecutor(max_workers=min(len(items),
                                                     self.IMAGE_SEND_WORKERS)) as pool:
-                list(pool.map(work, items))
+                list(pool.map(eventlog.carry(work), items))
 
     def _image_update(self, job, entry=None, **changes):
         with self._lock:
@@ -2613,7 +3314,8 @@ class ClusterService:
             if client.adopt_image(fingerprint, alias, description):
                 self._image_update(job, entry, state="present")
                 return
-            stream, length, close = self.service.lxd.open_image_export(fingerprint)
+            stream, length, close, content_type = self.service.lxd.open_image_export(
+                fingerprint, spool_dir=store.data_dir())
             try:
                 self._image_update(job, entry, state="sending")
 
@@ -2621,7 +3323,7 @@ class ClusterService:
                     self._image_update(job, entry, sent=sent,
                                        state="importing" if sent >= length else "sending")
                 client.send_image(_CountingReader(stream, progress), length,
-                                  fingerprint, alias, description)
+                                  fingerprint, alias, description, content_type=content_type)
             finally:
                 close()
             self._image_update(job, entry, state="done", sent=length)
@@ -2647,7 +3349,12 @@ class ClusterService:
         per node. What a node cannot substitute -- an image it cannot pull, no
         space -- fails that node's instances and leaves the rest alone.
         """
-        nodes, groups = self.template_targets(name, nodes, groups)
+        # Names chosen means a coordinator's share for this node: it is already
+        # where it should be, and this node makes it from the snapshot or an
+        # image of it (`resolve_source()`). Sending it on to the snapshot's node
+        # again would bounce a share that was placed on purpose.
+        if names is None:
+            nodes, groups = self.template_targets(name, nodes, groups)
         targets, skipped = self.launch_targets(nodes, groups)
         local_name = self.local_name()
         if targets == [local_name] and not skipped:
@@ -2691,12 +3398,13 @@ class ClusterService:
     def template_targets(self, name, nodes, groups):
         """Where a launch goes: unchanged, unless the template clones a snapshot.
 
-        A snapshot exists on one node, so its clones are made there and
-        nowhere else -- with nothing named, that node rather than this one; a
-        launch naming anywhere else is refused, with what to do instead. The
-        snapshot is not copied between nodes on a launch's behalf: that is
-        gigabytes, and publishing it as an image says once, deliberately,
-        where it should be.
+        A snapshot exists on one node, so with nothing named its clones are
+        made there rather than here. Any other node named launches from an
+        image published from the snapshot (`ContainerService.resolve_source()`
+        makes that switch on the node itself), so each has to hold one; a
+        launch naming a node without is refused, with what to do. The snapshot
+        is never copied on a launch's behalf: that is gigabytes, and publishing
+        it as an image says once, deliberately, where it should be.
         """
         template = next((t for t in self.service.list_templates()
                          if t["name"] == name), None)
@@ -2706,13 +3414,35 @@ class ClusterService:
         owner = source["node"] or self.local_name()
         if not nodes and not groups:
             return [owner], None
-        if self.resolve_targets(nodes, groups) != [owner]:
+        # Elsewhere it launches from an image of the snapshot, so every other
+        # node named has to hold one. Asked of each, since an image is local
+        # to its node; refused as a whole, naming the ones without.
+        others = [t for t in self.resolve_targets(nodes, groups) if t != owner]
+        lacking = [node for node, has in self._fanout(
+            others, lambda node: (node, self._holds_snapshot_image(node, source)))
+            if not has]
+        if lacking:
             raise ClusterError(
-                "Template '%s' clones the snapshot %s/%s, which is on %s only, so "
-                "it launches there. To run it elsewhere, publish the snapshot as "
-                "an image, copy it to those nodes, and make a template from "
-                "local:<alias>." % (name, source["instance"], source["name"], owner), 409)
+                "Template '%s' clones the snapshot %s/%s, which is on %s. Other "
+                "nodes launch it from an image made from that snapshot, and %s "
+                "%s none: make an image of it (Images tab, or `lemondx "
+                "snapshot-publish` on %s) and copy it there."
+                % (name, source["instance"], source["name"], owner,
+                   ", ".join(lacking), "has" if len(lacking) == 1 else "have", owner), 409)
         return nodes, groups
+
+    def _holds_snapshot_image(self, node_name, source):
+        """Whether ``node_name`` has an image published from ``source``."""
+        wanted = "%s/%s" % (source["instance"], source["name"])
+        try:
+            if node_name == self.local_name():
+                images = self.service.image_inventory()["images"]
+            else:
+                images = (self.client(node_name).image_inventory() or {}).get("images") or []
+        except (ServiceError, LXDError, ClusterError, NodeError):
+            return False
+        return any(i.get("source") == wanted
+                   and i.get("source_node") in ("", None, source["node"]) for i in images)
 
     def _share_names(self, prefix, total, targets):
         """Instance names for each node: round robin, and unique across them all.
@@ -2832,7 +3562,8 @@ class ClusterService:
     # How long to wait on a proxied call, by what it is. A bootstrap run
     # installs packages inside a container and is the one thing here that can
     # genuinely take many minutes; everything else is a normal API call.
-    PROXY_TIMEOUTS = (("/bootstrap", 1800), ("/exec", 600))
+    # A proxied log tail waits up to eventlog.MAX_WAIT for the next event.
+    PROXY_TIMEOUTS = (("/bootstrap", 1800), ("/exec", 600), ("/pull", 3600), ("/logs", 40))
 
     def proxy_timeout(self, path):
         for suffix, seconds in self.PROXY_TIMEOUTS:

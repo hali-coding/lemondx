@@ -21,6 +21,14 @@ read and tested rather than in a glob:
   * every gateway must be an address on a directly-connected subnet, which is
     the same-L2 precondition the fabric is built on anyway.
 
+The same command also puts containers on the LAN (`{"lan": {...}}` on stdin),
+under rules of the same kind: a NIC to convert must be a physical, wired NIC
+that is no bridge's port yet, the bridge a new name; only connections named
+`lemondx-<bridge>` are ever removed; and Docker is only told to let through
+bridges that /sys shows have a physical port. A conversion that leaves the
+host without an address, or without the way out it had, is undone before
+this returns.
+
 What that buys is a bound on damage, not a boundary against the person running
 lemondx: the group this is granted to is the daemon's admin group, which
 `docs/security.md` already treats as root-equivalent. The point is that a bug,
@@ -34,6 +42,7 @@ import ipaddress
 import json
 import os
 import pwd
+import re
 import sys
 
 from . import hostnet
@@ -69,6 +78,9 @@ def _caller_settings():
 
 def main(argv=None):
     """Read the wanted state on stdin, program it, answer with what was done."""
+    # The caller logs what is applied here, under the identity of whoever
+    # asked; this process only knows it is root.
+    hostnet.IN_HELPER = True
     if not hostnet.is_root():
         return _fail("The fabric helper only runs as root, through sudo.")
     try:
@@ -77,9 +89,12 @@ def main(argv=None):
         return _fail("stdin is not JSON: %s" % exc)
     if not isinstance(wanted, dict):
         return _fail("stdin must be a JSON object.")
+    if "lan" in wanted:
+        return _lan(wanted["lan"])
 
     try:
-        fabrics = _caller_settings()["fabrics"]
+        settings = _caller_settings()
+        fabrics = settings["fabrics"]
         prefixes = [ipaddress.ip_network(f["prefix"]) for f in fabrics.values()]
     except Exception as exc:                    # noqa: BLE001
         return _fail("Cannot read the fabric settings: %s"
@@ -100,12 +115,14 @@ def main(argv=None):
 
     try:
         current = hostnet.current_routes()
-        commands = hostnet.route_commands(routes, current, prefixes)
+        from .fabric import firewall_spec, route_sources
+        commands = hostnet.route_commands(routes, current, prefixes, route_sources(fabrics),
+                                          hostnet.current_route_sources())
         commands += hostnet.forwarding_commands([str(b) for b in bridges])
         # Built from the settings alone, like the prefixes: nothing on stdin
         # has a say in what the firewall lets through.
-        from .fabric import firewall_spec
-        commands += hostnet.firewall_commands(firewall_spec(fabrics))
+        commands += hostnet.firewall_commands(firewall_spec(fabrics),
+                                              hostnet.connected_subnets(settings["admit"]))
         commands += hostnet.docker_commands(sorted(fabrics))
         applied = hostnet.apply(commands)
     except hostnet.HostNetError as exc:
@@ -115,6 +132,111 @@ def main(argv=None):
     json.dump({"ok": not failed, "error": "", "applied": applied}, sys.stdout)
     sys.stdout.write("\n")
     return 1 if failed else 0
+
+
+BRIDGE_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,14}$")
+
+
+def _answer(applied, ok=None, error="", **extra):
+    failed = [record for record in applied if not record["ok"]]
+    ok = not failed if ok is None else ok
+    json.dump(dict({"ok": ok, "error": error, "applied": applied}, **extra), sys.stdout)
+    sys.stdout.write("\n")
+    return 0 if ok else 1
+
+
+def _lan(request):
+    """Convert a NIC to a bridge, undo that, or keep Docker letting LAN bridges through."""
+    if not isinstance(request, dict):
+        return _fail("'lan' must be an object.")
+    action = request.get("action")
+    try:
+        if action == "convert":
+            return _convert(str(request.get("nic") or ""), str(request.get("bridge") or ""))
+        if action == "revert":
+            bridge = str(request.get("bridge") or "")
+            if bridge not in hostnet.nm_lan_bridges():
+                return _fail("%s is not a bridge lemondx made." % (bridge or "(none)"))
+            return _answer(hostnet.apply(hostnet.lan_revert_plan(bridge)))
+        if action == "shim":
+            try:
+                wanted = _shims(request.get("parents") or {})
+            except ValueError as exc:
+                return _fail(str(exc))
+            return _answer(hostnet.apply(hostnet.shim_commands(wanted)))
+        if action == "docker":
+            bridges = request.get("bridges") or []
+            if not isinstance(bridges, list):
+                return _fail("'bridges' must be a list of names.")
+            # A LAN bridge is one with a physical NIC as a port. Anything else
+            # is refused: this opens Docker's FORWARD drop, and must not do so
+            # for a bridge that merely has a plausible name.
+            stray = [str(b) for b in bridges
+                     if not BRIDGE_NAME.match(str(b)) or not hostnet.lan_bridge_ports(str(b))]
+            if stray:
+                return _fail("Refusing to let %s through: not a bridge with a "
+                             "physical port." % ", ".join(stray))
+            return _answer(hostnet.apply(hostnet.lan_docker_commands(
+                sorted(str(b) for b in bridges))))
+    except hostnet.HostNetError as exc:
+        return _fail(exc.message)
+    return _fail("Unknown LAN action %r." % action)
+
+
+def _convert(nic, bridge):
+    facts = hostnet.nic_facts(nic) if nic and "/" not in nic else {"exists": False}
+    if not facts["exists"] or not facts["physical"]:
+        return _fail("%s is not a network card on this host." % (nic or "(none)"))
+    if facts["wireless"]:
+        return _fail("%s is wireless; an access point drops frames from any MAC that "
+                     "did not associate with it, so it cannot be bridged." % nic)
+    if facts["master"]:
+        return _fail("%s is already a port of %s." % (nic, facts["master"]))
+    if not BRIDGE_NAME.match(bridge) or hostnet.nic_facts(bridge)["exists"]:
+        return _fail("%s is not a free interface name for the bridge." % (bridge or "(none)"))
+
+    need_default = nic in hostnet.default_route_devices()
+    commands, previous = hostnet.lan_convert_plan(nic, bridge)
+    applied = hostnet.apply(commands)
+    if all(r["ok"] for r in applied) and hostnet.lan_link_up(bridge, need_default):
+        return _answer(applied, previous=previous)
+    # Whatever got half done is undone, and the NIC's own connection brought
+    # back: a host left without its address is one nobody can reach to fix.
+    why = next((r["error"] for r in applied if not r["ok"]), "") or (
+        "%s came up without %s" % (bridge, "an address and a default route"
+                                   if need_default else "an address"))
+    undo = hostnet.apply_all(hostnet.lan_revert_plan(bridge, previous))
+    return _answer(applied + undo, ok=False,
+                   error="Could not move %s onto %s (%s); put back as it was."
+                   % (nic, bridge, why), rolled_back=True)
+
+
+def _shims(raw):
+    """{nic: [address]} for `shim`, every NIC wired and every address on its LAN."""
+    if not isinstance(raw, dict) or len(raw) > 16:
+        raise ValueError("'parents' must be an object of NIC -> addresses.")
+    wanted = {}
+    for nic, addresses in raw.items():
+        nic = str(nic)
+        facts = hostnet.nic_facts(nic) if "/" not in nic else {"exists": False}
+        if not facts["exists"] or not facts["physical"] or facts["wireless"]:
+            raise ValueError("%s is not a wired network card on this host." % nic)
+        subnets = hostnet.nic_subnets(nic)
+        if not isinstance(addresses, list) or len(addresses) > 1024:
+            raise ValueError("The addresses for %s must be a list." % nic)
+        kept = []
+        for address in addresses:
+            try:
+                ip = ipaddress.ip_address(str(address))
+            except ValueError:
+                raise ValueError("'%s' is not an address." % address)
+            # Only a neighbour on the NIC's own LAN: this is a host route,
+            # and the one thing it must not do is capture anywhere else.
+            if not any(ip in subnet for subnet in subnets):
+                raise ValueError("Refusing %s: it is not on %s's LAN." % (ip, nic))
+            kept.append(str(ip))
+        wanted[nic] = sorted(set(kept))
+    return wanted
 
 
 def _clean_routes(raw, prefixes):

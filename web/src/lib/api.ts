@@ -1,4 +1,5 @@
 import type {
+  ClusterLogPage, LogFilters, LogPage, LoggingSettings, LoggingStatus, LoggingTest,
   ApiToken, AuthInfo, CreatedApiToken, HealthReport, LocalUser, Role,
   ClusterContainers, ClusterInfo, ClusterNode, ClusterNodeDetail, JoinCode, JoinResult,
   AutoGroupResult, DriftReport, EvictResult, LeaveResult,
@@ -6,7 +7,7 @@ import type {
   InstanceRef, ScopedStateResult,
   BootstrapModule, BootstrapProfile, BootstrapResult, BootstrapSelection, BulkStateResult,
   AppCheckOutput, Container, ModuleSource,
-  ContainerDetail, CreateProgress, CreateRequest, ExecResult, ImageBrowse, ImageJob, Images, NetworkDetail, PublishRequest,
+  ContainerDetail, CreateProgress, CreateRequest, ExecResult, ImageBrowse, ImageInventory, ImageJob, Images, LanEverywhere, LanInterfaces, LanStep, NetworkDeleteEverywhere, NetworkPresence, NetworkDetail, PublishRequest,
   InstanceTemplate, NetworkRequest, NetworkSummary, SubnetInUse, Resources, SetupResult, Snapshot, SshKey,
   StateAction, Status, StorageOverview, StoragePoolDetail, StoragePoolRequest,
   StorageVolume, StorageVolumeRequest, TemplateRequest, TemplateRun,
@@ -19,6 +20,12 @@ import type {
   FabricChangeResult,
   FabricDeleteResult,
   MaintenanceResult,
+  ImagePin,
+  PinResult,
+  PruneResult,
+  NodeSetupState,
+  ConfigureNodeRequest,
+  ConfigureNodeResult,
 } from './types'
 
 /** Error carrying the HTTP status so callers can react to 401/409 specifically. */
@@ -64,7 +71,9 @@ async function request<T>(
   path: string,
   options: { method?: string; body?: unknown; signal?: AbortSignal } = {},
 ): Promise<T> {
-  const headers: Record<string, string> = {}
+  // Lets the server log this as the web UI rather than a script: attribution
+  // only, never trusted for anything.
+  const headers: Record<string, string> = { 'X-Lemondx-Client': 'web' }
   if (options.body !== undefined) headers['Content-Type'] = 'application/json'
   if (authToken) headers['Authorization'] = `Bearer ${authToken}`
 
@@ -124,6 +133,14 @@ const seg = encodeURIComponent
  * against the same endpoint's role before forwarding. That is what lets the
  * container drawer manage an instance wherever it lives.
  */
+function logQuery(params: object) {
+  const query = new URLSearchParams()
+  for (const [key, value] of Object.entries(params) as [string, unknown][]) {
+    if (value !== undefined && value !== '') query.set(key, String(value))
+  }
+  return query.toString()
+}
+
 function on(node: string | undefined, path: string) {
   return node ? `/nodes/${encodeURIComponent(node)}${path}` : path
 }
@@ -165,6 +182,15 @@ export const calls = {
 
   deleteNetwork: (name: string): ApiCall =>
     ({ method: 'DELETE', path: `/networks/${seg(name)}` }),
+
+  createLanNetwork: (body: { nic: string; mode: 'bridge' | 'macvlan'; name: string }): ApiCall =>
+    ({ method: 'POST', path: '/lan/networks', body }),
+
+  createLanEverywhere: (name: string): ApiCall =>
+    ({ method: 'POST', path: '/lan/networks', body: { mode: 'macvlan', name, everywhere: true } }),
+
+  convertNic: (nic: string, bridge: string): ApiCall =>
+    ({ method: 'POST', path: '/lan/convert', body: { nic, bridge } }),
 
   createFabric: (body: { name: string; prefix: string; nat: boolean }): ApiCall =>
     ({ method: 'POST', path: '/fabrics', body }),
@@ -222,6 +248,22 @@ export const calls = {
   createInvite: (body: { expires_minutes: number; note?: string }): ApiCall =>
     ({ method: 'POST', path: '/cluster/invites', body }),
 
+  /** Pins and fetches the build everywhere chosen, in the background. */
+  pinImage: (body: { image: string; serial?: string; nicknames?: string[]; note?: string;
+    nodes?: string[] }): ApiCall =>
+    ({ method: 'POST', path: '/images/pins', body: { ...body, background: true } }),
+
+  /** Without `apply` a preview; with it, deletes only what `only` lists per node. */
+  pruneImages: (body: { nodes?: string[]; apply?: boolean; only?: Record<string, string[]> }):
+    ApiCall => ({ method: 'POST', path: '/cluster/images/prune', body }),
+
+  /** Logging is a cluster setting: saved here and pushed to every member. */
+  saveLogging: (settings: LoggingSettings): ApiCall =>
+    ({ method: 'PUT', path: '/logging', body: { settings } }),
+
+  configureNode: (body: ConfigureNodeRequest): ApiCall =>
+    ({ method: 'POST', path: '/configure', body }),
+
   saveNodeGroup: (name: string, body: { members: string[]; description?: string }): ApiCall =>
     ({ method: 'PUT', path: `/cluster/groups/${seg(name)}`, body }),
 
@@ -239,6 +281,36 @@ export const api = {
 
   setup: (options: { storage_driver: string; pool_size?: string; ipv6?: boolean }) =>
     request<SetupResult>('/setup', { method: 'POST', body: options }),
+
+  nodeSetup: (signal?: AbortSignal) => request<NodeSetupState>('/configure', { signal }),
+
+  /** One node's logging: the cluster's settings as it applied them, and how each
+   *  destination is doing there. */
+  logging: (node?: string, signal?: AbortSignal) =>
+    request<LoggingStatus>(on(node, '/logging'), { signal }),
+
+  saveLogging: (settings: LoggingSettings) =>
+    send<Synced<{ name: string; value: LoggingSettings }>>(calls.saveLogging(settings)),
+
+  /** One node's live tail: events after `after`, waiting up to `wait` seconds. */
+  logs: (params: LogFilters & { after?: string; wait?: number; limit?: number },
+         node?: string, signal?: AbortSignal) =>
+    request<LogPage>(on(node, `/logs?${logQuery(params)}`), { signal }),
+
+  /** The cluster's live tail, merged by time; `cursor` is the last answer's. */
+  clusterLogs: (params: LogFilters & { cursor?: string; wait?: number; limit?: number;
+                                       nodes?: string[]; group?: string },
+                signal?: AbortSignal) =>
+    request<ClusterLogPage>(`/cluster/logs?${logQuery({
+      ...params, nodes: params.nodes?.join(',') })}`, { signal }),
+
+  /** Send a test line to every destination of one node, now. */
+  testLogging: (node?: string) =>
+    request<LoggingTest>(on(node, '/logging/test'), { method: 'POST', body: {} }),
+
+  /** Answers, then restarts the server: nothing more will answer on this URL. */
+  configureNode: (body: ConfigureNodeRequest) =>
+    send<ConfigureNodeResult>(calls.configureNode(body)),
 
   listContainers: (signal?: AbortSignal) =>
     request<Container[]>('/containers', { signal }),
@@ -302,6 +374,43 @@ export const api = {
   publishSnapshot: (name: string, snapshot: string, body: PublishRequest, node?: string) =>
     send<ImageJob>(calls.publishSnapshot(name, snapshot, body, node)),
 
+  /** Every member's images and snapshots, for the Images tab. */
+  imageInventory: (signal?: AbortSignal) =>
+    request<ImageInventory>('/cluster/images', { signal }),
+
+  /** Copy `node`'s image `alias` to `nodes`, in the background; see `imageJobs()`. */
+  copyImage: (alias: string, nodes: string[], node?: string) =>
+    request<ImageJob>(on(node, `/images/${seg(alias)}/copy`),
+      { method: 'POST', body: { nodes, background: true } }),
+
+  /** Remove one node's copy of an image; refused while a template launches it. */
+  deleteImage: (fingerprint: string, node?: string) =>
+    request<{ deleted: string; aliases: string[] }>(on(node, `/images/${seg(fingerprint)}`),
+      { method: 'DELETE' }),
+
+  imagePins: (signal?: AbortSignal) => request<ImagePin[]>('/images/pins', { signal }),
+
+  pruneImages: (body: { nodes?: string[]; apply?: boolean; only?: Record<string, string[]> }) =>
+    send<PruneResult>(calls.pruneImages(body)),
+
+  pinImage: (body: { image: string; serial?: string; nicknames?: string[]; note?: string;
+    nodes?: string[] }) =>
+    send<PinResult>(calls.pinImage(body)),
+
+  /** A pin's nicknames and note: everything about it but the build. */
+  editPin: (name: string, body: { nicknames?: string[]; note?: string }) =>
+    request<ImagePin>(`/images/pins/${seg(name)}`, { method: 'PATCH', body }),
+
+  /** Forget a pin everywhere; builds already fetched stay as images. */
+  unpinImage: (name: string) =>
+    request<{ unpinned: string; kept: string }>(`/images/pins/${seg(name)}`,
+      { method: 'DELETE' }),
+
+  /** Fetch a pinned build onto `nodes`, run by `node`: one that holds it. */
+  fetchPin: (name: string, nodes: string[], node?: string) =>
+    request<ImageJob>(on(node, `/images/pins/${seg(name)}/fetch`),
+      { method: 'POST', body: { nodes, background: true } }),
+
   /** Image jobs held by one node: the one the image is on. */
   imageJobs: (node?: string, signal?: AbortSignal) =>
     request<ImageJob[]>(on(node, '/image-jobs'), { signal }),
@@ -361,7 +470,36 @@ export const api = {
     send<NetworkDetail>(calls.updateNetwork(name, body)),
 
   deleteNetwork: (name: string) =>
-    send<{ deleted: string }>(calls.deleteNetwork(name)),
+    send<{ deleted: string; notes?: string[] }>(calls.deleteNetwork(name)),
+
+  /** Which members have a managed network called `name`. */
+  networkPresence: (name: string, signal?: AbortSignal) =>
+    request<NetworkPresence>(`/cluster/networks/${seg(name)}`, { signal }),
+
+  /** Delete network `name` on every member that has it; each answers for itself. */
+  deleteNetworkEverywhere: (name: string) =>
+    request<NetworkDeleteEverywhere>(`/cluster/networks/${seg(name)}`, { method: 'DELETE' }),
+
+  /** This host's NICs, and which ways each can put instances on its LAN. */
+  lanInterfaces: (signal?: AbortSignal) => request<LanInterfaces>('/lan', { signal }),
+
+  createLanNetwork: (body: { nic: string; mode: 'bridge' | 'macvlan'; name: string }) =>
+    send<NetworkDetail & { notes?: string[] }>(calls.createLanNetwork(body)),
+
+  /** macvlan under one name on every member, each on its own default-route NIC. */
+  createLanEverywhere: (name: string) => send<LanEverywhere>(calls.createLanEverywhere(name)),
+
+  /** What converting `nic` would run -- for reading first, or running by hand. */
+  lanPlan: (nic: string, bridge: string, signal?: AbortSignal) =>
+    request<LanStep[]>(`/lan/plan?nic=${seg(nic)}&bridge=${seg(bridge)}`, { signal }),
+
+  /** Moves the host's connection: slow, and undone by the server if it fails. */
+  convertNic: (nic: string, bridge: string) =>
+    send<{ bridge: string; nic: string; notes: string[] }>(calls.convertNic(nic, bridge)),
+
+  revertLanBridge: (bridge: string) =>
+    request<{ reverted: string; notes: string[] }>('/lan/revert',
+      { method: 'POST', body: { bridge } }),
 
   // Fabrics. `/fabrics` is the whole cluster and asks every member; `/fabric`
   // is this node's half. Status and plan need no privilege on the host, so

@@ -102,11 +102,10 @@ export function SnapshotPicker({ value, onChange, disabled }: Props) {
       <span className="hint" style={{ marginTop: -8 }}>
         {error ? <span style={{ color: 'var(--danger)' }}>{error}</span> : (
           <>
-            Instances are clones of the snapshot, made on
-            {node ? <> <span className="mono">{node}</span></> : ' its node'} — the only
-            place it exists. To launch it on other nodes, use <em>Make image</em> on the
-            snapshot and template <span className="mono">local:&lt;alias&gt;</span> instead.
-            Whether it is a container or a VM is the snapshot&apos;s.
+            On {node ? <span className="mono">{node}</span> : 'its node'}, instances are
+            clones of the snapshot. Other nodes launch it from an image made from the
+            snapshot — use <em>Make image</em> on it and copy the image to them (the Images
+            tab shows where it is). Whether it is a container or a VM is the snapshot&apos;s.
           </>
         )}
       </span>

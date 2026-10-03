@@ -15,10 +15,14 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
 import os
+import shutil
 import socket
+import tempfile
 import urllib.parse
 
+from . import eventlog
 from .websocket import WebSocketError, connect_unix
 
 LXD = "lxd"
@@ -52,6 +56,52 @@ CLIENT_BINARY = {LXD: "lxc", INCUS: "incus"}
 
 # The group that grants access to the socket, for error messages.
 ADMIN_GROUP = {LXD: "lxd", INCUS: "incus-admin"}
+
+# The oldest daemon a node may run to join a cluster: each project's current
+# long-term release. Older ones differ in what the API accepts and how new
+# guests behave under them (Ubuntu 26.04's systemd cannot start its network
+# under LXD 5.0's AppArmor profile), and a cluster is only as dependable as
+# its oldest member. Checked by the joiner before it redeems a code and again
+# by the member admitting it.
+MIN_CLUSTER_VERSION = {LXD: (5, 21), INCUS: (6, 0)}
+# How to get there, for the refusal.
+UPGRADE_HINT = {
+    LXD: "install the snap (`snap install lxd --channel=5.21/stable`, then "
+         "`sudo lxd.migrate` to bring over a distribution package's instances)",
+    INCUS: "install it from your distribution's backports or the Zabbly repository",
+}
+
+
+def parse_version(text):
+    """``(major, minor, ...)`` from a daemon version such as "5.21.8", or None."""
+    parts = []
+    for piece in str(text or "").strip().split("."):
+        digits = ""
+        for char in piece:
+            if not char.isdigit():
+                break
+            digits += char
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) if parts else None
+
+
+def cluster_version_problem(flavor, version):
+    """Why a daemon may not be a cluster member, or "" when it may."""
+    minimum = MIN_CLUSTER_VERSION.get(flavor)
+    product = "Incus" if flavor == INCUS else "LXD"
+    if minimum is None:
+        return "%s is not a daemon lemondx knows." % (flavor or "The daemon")
+    found = parse_version(version)
+    wanted = ".".join(str(n) for n in minimum)
+    if found is None:
+        return ("%s did not report a version lemondx can read (%r); a cluster "
+                "member needs %s %s or later." % (product, version, product, wanted))
+    if found[:len(minimum)] < minimum:
+        return ("%s %s is older than %s, the oldest a cluster member may run. To "
+                "upgrade, %s." % (product, version, wanted, UPGRADE_HINT[flavor]))
+    return ""
 
 # What a container's cgroup is named on the host, before the instance name.
 # Both run containers through liblxc, which picks the name; the Incus entry is
@@ -163,7 +213,25 @@ class LXDClient:
 
     # -- transport ---------------------------------------------------------
 
-    def _request(self, method, path, body=None, params=None, raw=False, timeout=None):
+    def _request(self, method, path, body=None, params=None, raw=False, timeout=None,
+                 logged=True):
+        """One call to the daemon; every mutation is logged as a change.
+
+        ``logged=False`` is for `_async()`, which logs once the operation has
+        actually finished -- the request itself only says it was accepted.
+        """
+        if method == "GET" or not logged:
+            return self._send(method, path, body, params, raw, timeout)
+        change = _change_of(method, path, body)
+        try:
+            result = self._send(method, path, body, params, raw, timeout)
+        except LXDError as exc:
+            _log_change(change, exc)
+            raise
+        _log_change(change)
+        return result
+
+    def _send(self, method, path, body=None, params=None, raw=False, timeout=None):
         query = dict(params or {})
         # Every instance-scoped call must carry the project or LXD assumes default.
         if self.project and self.project != "default":
@@ -215,13 +283,22 @@ class LXDClient:
         Returns the finished operation metadata when ``wait`` is set, otherwise
         the operation record so the caller can poll it.
         """
-        result = self._request(method, path, body, params)
-        operation = result.get("operation") or ""
-        if not operation:
-            return result.get("metadata")
-        if not wait:
-            return result.get("metadata")
-        return self.wait_for_operation(operation.rsplit("/", 1)[-1], timeout)
+        change = _change_of(method, path, body)
+        try:
+            result = self._request(method, path, body, params, logged=False)
+            operation = result.get("operation") or ""
+            if not operation:
+                _log_change(change)
+                return result.get("metadata")
+            if not wait:
+                _log_change(change, started=True)
+                return result.get("metadata")
+            finished = self.wait_for_operation(operation.rsplit("/", 1)[-1], timeout)
+        except LXDError as exc:
+            _log_change(change, exc)
+            raise
+        _log_change(change)
+        return finished
 
     def wait_for_operation(self, operation_id, timeout=None):
         """Block until an operation finishes; raise LXDError if it failed."""
@@ -558,13 +635,38 @@ class LXDClient:
             raise LXDError("Publishing gave no image fingerprint.", 502)
         return fingerprint
 
-    def open_image_export(self, fingerprint):
-        """``(stream, length, close)`` for an image's tarball, read as it arrives.
+    def pull_image(self, server, fingerprint, protocol="simplestreams", timeout=3600):
+        """Download one exact image from a remote into this daemon's store.
 
-        Streamed rather than read whole: an image is routinely gigabytes. Only
-        a unified image (one tarball) is accepted -- which is what publishing
-        makes -- because a split one comes back as multipart and would need
-        taking apart to import anywhere else.
+        By fingerprint, never by alias -- an alias is whatever the remote
+        built last, which is the drift a pinned image exists to stop -- and
+        with auto-update off, so the daemon does not swap it for a newer
+        build of the same name either. Returns the fingerprint.
+        """
+        metadata = self._async("POST", "/1.0/images", {
+            "source": {"type": "image", "mode": "pull", "server": server,
+                       "protocol": protocol, "fingerprint": fingerprint},
+            "auto_update": False,
+            "public": False,
+        }, timeout=timeout)
+        got = ((metadata or {}).get("metadata") or {}).get("fingerprint") or fingerprint
+        self.update_image(got, auto_update=False)
+        return got
+
+    def update_image(self, fingerprint, **changes):
+        """PATCH an image's settable fields, e.g. ``auto_update``."""
+        return self._sync("PATCH", "/1.0/images/%s" % _seg(fingerprint), dict(changes))
+
+    def open_image_export(self, fingerprint, spool_dir=None):
+        """``(stream, length, close, content_type)`` for an image, read as it arrives.
+
+        Streamed rather than read whole: an image is routinely gigabytes. A
+        unified image (what publishing makes) is one tarball with a length. A
+        split one -- metadata and rootfs, as remotes serve them -- comes back
+        multipart and chunked, with no length to send it on with, so it is
+        spooled to a temporary file in ``spool_dir`` first. Its content type
+        is returned with it, boundary and all: `import_image()` given the same
+        bytes and type imports both parts as they were.
         """
         conn = _UnixHTTPConnection(self.socket_path, self.timeout)
         try:
@@ -573,11 +675,19 @@ class LXDClient:
             if response.status >= 400:
                 raise LXDError(_decode_error(response.read(), response.status),
                                response.status)
-            if "multipart" in (response.getheader("Content-Type") or ""):
-                raise LXDError("Image %s is split into metadata and rootfs; only "
-                               "unified images can be copied between nodes."
-                               % fingerprint[:12], 409)
+            content_type = response.getheader("Content-Type") or "application/octet-stream"
             length = response.getheader("Content-Length")
+            if "multipart" in content_type and not (length and length.isdigit()):
+                spool = tempfile.TemporaryFile(dir=spool_dir, prefix=".image-")
+                try:
+                    shutil.copyfileobj(response, spool, 1024 * 1024)
+                    size = spool.tell()
+                    spool.seek(0)
+                except BaseException:
+                    spool.close()
+                    raise
+                conn.close()
+                return spool, size, spool.close, content_type
             if not length or not length.isdigit():
                 raise LXDError("The daemon did not say how large image %s is."
                                % fingerprint[:12], 502)
@@ -587,17 +697,17 @@ class LXDClient:
         except BaseException:
             conn.close()
             raise
-        return response, int(length), conn.close
+        return response, int(length), conn.close, content_type
 
-    def import_image(self, stream, length, properties=None, timeout=1800):
+    def import_image(self, stream, length, properties=None, timeout=1800,
+                     content_type="application/octet-stream"):
         """Upload an image tarball from ``stream``; returns its fingerprint.
 
         The fingerprint is the daemon's own SHA-256 of what arrived, so a
         caller comparing it with the source's fingerprint has checked the
         whole transfer end to end.
         """
-        headers = {"Content-Type": "application/octet-stream",
-                   "Content-Length": str(length)}
+        headers = {"Content-Type": content_type, "Content-Length": str(length)}
         encoded = urllib.parse.urlencode(dict(properties or {}))
         # Both spellings, as for files: each daemon ignores the other's.
         for prefix in ("X-LXD", "X-Incus"):
@@ -627,6 +737,7 @@ class LXDClient:
         fingerprint = (metadata.get("metadata") or {}).get("fingerprint")
         if not fingerprint:
             raise LXDError("Importing gave no image fingerprint.", 502)
+        eventlog.event("change", "image.import", image=fingerprint[:12], result="ok")
         return fingerprint
 
     def _path(self, path):
@@ -748,11 +859,11 @@ class LXDClient:
         except LXDError:
             return []          # not supported on every driver
 
-    def create_network(self, name, config=None, description=""):
+    def create_network(self, name, config=None, description="", kind="bridge"):
         return self._async(
             "POST",
             "/1.0/networks",
-            {"name": name, "type": "bridge", "description": description or "",
+            {"name": name, "type": kind, "description": description or "",
              "config": config or {}},
             timeout=120,
         )
@@ -790,3 +901,87 @@ def _decode_error(data, status):
         return json.loads(data).get("error") or "HTTP %d" % status
     except ValueError:
         return data.decode("utf-8", "replace")[:200] or "HTTP %d" % status
+
+
+# -- the change log ------------------------------------------------------------
+#
+# Every daemon mutation is logged from here, whichever path asked for it, so a
+# new feature's changes are recorded without anyone remembering to. What it is
+# comes from the URL rather than a table of calls: /1.0/instances/web/state is
+# instance.state with instance=web. Only names and which keys changed go in,
+# never values -- an instance's config can hold anything.
+
+_NOUNS = {"instances": "instance", "snapshots": "snapshot", "images": "image",
+          "aliases": "image.alias", "networks": "network", "storage-pools": "storage.pool",
+          "volumes": "storage.volume", "profiles": "profile", "projects": "project",
+          "network-acls": "network.acl", "certificates": "certificate",
+          "operations": "operation"}
+# Exec, files and the like are how lemondx works inside an instance -- every
+# health probe and bootstrap step -- not changes to it; the action that wanted
+# them is logged where it was asked for.
+_PLUMBING = {"exec", "console", "files", "logs", "operations", "metadata", "export",
+             "sftp"}
+
+
+def _change_of(method, path, body):
+    """``(action, level, fields)`` for one daemon mutation."""
+    path = path.split("?", 1)[0]
+    parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")[1:]]
+    fields = {}
+    noun, item, tail = "daemon", False, None
+    index = 0
+    while index < len(parts):
+        segment = parts[index]
+        if segment in _NOUNS:
+            noun, item, tail = _NOUNS[segment], False, None
+            key = noun.rsplit(".", 1)[-1]
+            if segment == "volumes" and index + 2 < len(parts):
+                fields["volume_type"], fields[key] = parts[index + 1], parts[index + 2]
+                item, index = True, index + 3
+            elif index + 1 < len(parts) and parts[index + 1] not in _NOUNS:
+                fields[key], item, index = parts[index + 1], True, index + 2
+            else:
+                index += 1
+            continue
+        tail = segment
+        index += 1
+    body = body if isinstance(body, dict) else {}
+    level = logging.INFO
+    if tail:
+        action = "%s.%s" % (noun, tail)
+        if tail in _PLUMBING:
+            level = logging.DEBUG
+        if tail == "state":
+            fields["state"] = body.get("action")
+    elif method == "POST" and not item:
+        action = "%s.create" % noun
+        fields["name"] = body.get("name") if isinstance(body.get("name"), str) else None
+        source = body.get("source") if isinstance(body.get("source"), dict) else {}
+        fields["source"] = source.get("alias") or (source.get("fingerprint") or "")[:12] \
+            or source.get("type")
+    elif method == "POST":
+        action = "%s.%s" % (noun, "rename" if body.get("name") else "post")
+        fields["new_name"] = body.get("name") if isinstance(body.get("name"), str) else None
+    elif method == "DELETE":
+        action = "%s.delete" % noun
+        if noun == "operation":
+            level = logging.DEBUG
+    elif body.get("restore"):
+        action, fields["snapshot"] = "%s.restore" % noun, body.get("restore")
+    else:
+        action = "%s.update" % noun
+        config = body.get("config") if isinstance(body.get("config"), dict) else {}
+        devices = body.get("devices") if isinstance(body.get("devices"), dict) else {}
+        fields["config_keys"] = sorted(config)
+        fields["devices"] = sorted(devices)
+    return action, level, fields
+
+
+def _log_change(change, error=None, started=False):
+    action, level, fields = change
+    if error is not None:
+        eventlog.event("change", action, level=max(level, logging.WARNING), result="failed",
+                       error=getattr(error, "message", str(error)), **fields)
+    else:
+        eventlog.event("change", action, level=level,
+                       result="started" if started else "ok", **fields)

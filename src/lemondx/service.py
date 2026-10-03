@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import sys
@@ -16,17 +17,24 @@ import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
+from . import eventlog
 from . import health as health_checks
+from . import hostnet
 from . import store
-from .bootstrap import (BootstrapError, BootstrapRunner, delete_module,
+from .bootstrap import (MAX_OCCURRENCES, BootstrapError, BootstrapRunner, delete_module,
                         discover_modules, effective_params,
-                        list_host_ssh_keys, module_source,
-                        normalise_module_id, parse_public_key,
+                        list_host_ssh_keys, missing_secrets, module_source,
+                        normalise_module_id, occurrences, param_key, parse_public_key,
                         public_modules, save_module, secret_param_names,
-                        check_shell_syntax)
+                        split_param, unrepeatable, check_shell_syntax)
 from .lxd import (CGROUP_PAYLOAD_PREFIX, INCUS, NO_SECUREBOOT_CONFIG, LXDClient, LXDError,
                   window_resize_message)
 from .simplestreams import CatalogError, fetch_catalog
+
+# `pin:<id or nickname>` names a pinned build wherever an image is named.
+PIN_REMOTE = "pin"
+# What makes a pin the build it is; a record changing any of them is refused.
+PIN_BUILD = ("image", "serial", "arch", "fingerprint", "vm_fingerprint")
 
 VALID_NAME = re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,61}$")
 # Launched instances are named <prefix>-<n>; 50 leaves room for the number.
@@ -48,6 +56,7 @@ STACK_REVISION_KEY = "user.lemondx.stack-revision"
 LEMONDX_CONFIG_PREFIX = "user.lemondx."
 # Image aliases lemondx makes: what `local:<alias>` must then parse as.
 VALID_ALIAS = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+_MULTIPART = re.compile(r"^multipart/form-data; boundary=[A-Za-z0-9'()+_,./:=?-]{1,70}$")
 # What a template can change without its instances being any different: its
 # label, how new instances are named, and the app check, which is read from
 # the template every round rather than baked into the instance.
@@ -394,11 +403,21 @@ class ContainerService:
         # Set by ClusterService too: (name, iface, bridge) -> configure the
         # fabric NIC inside a started instance. The device only gives it a link.
         self.fabric_configure = None
+        # Set by ClusterService likewise: routes to every fabric in a new
+        # macvlan instance, and telling the fabric a LAN network came or went.
+        self.lan_configure = None
+        self.lan_changed = None
         # Template app checks on their own intervals; `serve` only, like the
         # sampler. Without it a round runs each check itself.
         self._app_checker = None
 
     # -- readiness ---------------------------------------------------------
+
+    def daemon_identity(self):
+        """{"flavor", "product", "version"} of the daemon this node runs."""
+        environment = (self.lxd.server_info() or {}).get("environment") or {}
+        return {"flavor": self.lxd.flavor, "product": self.lxd.product_name,
+                "version": str(environment.get("server_version") or "")}
 
     def status(self):
         """Server info plus whether LXD is actually usable for containers."""
@@ -613,7 +632,7 @@ class ContainerService:
             "name": name,
             "type": instance_type,
             "source": ({"type": "copy", "source": source_snapshot, "instance_only": True}
-                       if source_snapshot else _image_source(image, self.lxd.remotes)),
+                       if source_snapshot else self.image_source(image, instance_type)),
             "profiles": profiles or ["default"],
             "config": instance_config,
             "ephemeral": bool(ephemeral),
@@ -688,6 +707,9 @@ class ContainerService:
                 if fabric_key and self.fabric_configure:
                     self.fabric_configure(name, fabric_key,
                                           payload["devices"][fabric_key].get("network"))
+                elif self.lan_configure:
+                    # A no-op unless its NIC is on a macvlan network.
+                    self.lan_configure(name)
 
             container = self.get_container(name)
             if modules:
@@ -719,15 +741,51 @@ class ContainerService:
         finally:
             self._create_stage(record, stage="done", finished_at=time.time())
 
-    def _check_source(self, template):
-        """Refuse a snapshot template on a node without the snapshot.
+    def resolve_source(self, template):
+        """``(template, notes)`` as this node can make it: from its snapshot, or an image of it.
 
-        Before anything is created -- or, for a recreate, deleted: finding out
-        per instance would be after each one had gone.
+        On the snapshot's own node, the snapshot. Anywhere else, an image
+        published from it, which is how a snapshot runs on other nodes --
+        published once and copied to them -- without a second template. The
+        image says what it was made from itself (`lemondx.source`, carried in
+        the image file, so copies say it too), and the template is placed to
+        launch from it by fingerprint. Refused, with what to do, when there is
+        neither: checked before anything is created -- or, for a recreate,
+        deleted -- since finding out per instance would be after each one had gone.
         """
         source = template.get("snapshot")
-        if source:
-            self.snapshot_type("%s/%s" % (source["instance"], source["name"]))
+        if not source:
+            return template, []
+        name = "%s/%s" % (source["instance"], source["name"])
+        try:
+            self.snapshot_type(name)
+            return template, []
+        except ServiceError as exc:
+            if exc.code != 404:
+                raise
+        image = self.snapshot_image(source)
+        if image is None:
+            raise ServiceError(
+                "No snapshot '%s' on this node, and no image made from it. Make "
+                "an image of it on %s and copy it here (Images tab, or `lemondx "
+                "snapshot-publish`)." % (name, source["node"] or "its node"), 404)
+        alias = next(iter(image["aliases"]), image["fingerprint"][:12])
+        note = ("Launched from image %s, made from snapshot %s on %s."
+                % (alias, name, source["node"] or "its node"))
+        _log(note)
+        return dict(template, snapshot=None, image="local:%s" % image["fingerprint"]), [note]
+
+    def snapshot_image(self, source):
+        """The newest image here published from ``source`` ({node, instance, name}), or None.
+
+        An image that names the node it was published on must name the
+        snapshot's; one from before that was recorded is taken on the
+        instance and snapshot names alone.
+        """
+        wanted = "%s/%s" % (source["instance"], source["name"])
+        found = [i for i in self.image_inventory()["images"]
+                 if i["source"] == wanted and i.get("source_node") in ("", None, source["node"])]
+        return max(found, key=lambda i: i["created_at"] or "") if found else None
 
     def snapshot_type(self, source):
         """The instance type of ``instance/snapshot``, or 404 if it is not here."""
@@ -831,7 +889,8 @@ class ContainerService:
                 pass
         # A daemon thread, so it cannot keep a stopped server alive by itself;
         # serve() waits on pending_work() instead, where it can say what for.
-        threading.Thread(target=target, name="lemondx-%s" % label, daemon=True).start()
+        threading.Thread(target=eventlog.carry(target), name="lemondx-%s" % label,
+                         daemon=True).start()
 
     def pending_work(self):
         """Human descriptions of every create and template run still going."""
@@ -912,7 +971,7 @@ class ContainerService:
             # Each probe opens its own socket to the daemon, as template
             # launches do, so a slow instance only holds up its own slot.
             with ThreadPoolExecutor(max_workers=min(8, len(running))) as pool:
-                for sample, (probe, app) in zip(running, pool.map(check, running)):
+                for sample, (probe, app) in zip(running, pool.map(eventlog.carry(check), running)):
                     probes[sample["name"]] = probe
                     apps[sample["name"]] = app
 
@@ -925,6 +984,7 @@ class ContainerService:
             records = [health_checks.fold_app(base, app_status(sample), settings,
                                               self._health_records.get(base["name"]))
                        for base, sample in zip(bases, samples)]
+            previous = dict(self._health_records)
             if names is None:
                 self._health_base = {b["name"]: b for b in bases}
                 self._health_records = {r["name"]: r for r in records}
@@ -932,6 +992,7 @@ class ContainerService:
                 self._health_base.update((b["name"], b) for b in bases)
                 self._health_records.update((r["name"], r) for r in records)
             self._health_checked_at = time.time()
+        _note_health_changes(previous, records)
         return sorted(records, key=lambda r: r["name"])
 
     def health(self):
@@ -967,12 +1028,15 @@ class ContainerService:
                 try:
                     self.check_health(window=0, settings=settings)
                 except Exception as exc:                    # noqa: BLE001
-                    print("[lemondx] health check failed: %s" % exc)
+                    eventlog.message("health check failed: %s" % exc, level=logging.WARNING)
                 elapsed = time.time() - started
                 # Rounds never overlap: a slow one just starts the next later.
                 time.sleep(max(1.0, settings["interval_seconds"] - elapsed))
 
-        threading.Thread(target=loop, name="lemondx-health", daemon=True).start()
+        def run():
+            with eventlog.system("health"):
+                loop()
+        threading.Thread(target=run, name="lemondx-health", daemon=True).start()
 
     # Runs the template's script inside the instance with its own watchdog, so
     # a hung check is stopped where it runs: the daemon giving up on waiting
@@ -1108,10 +1172,11 @@ class ContainerService:
             if base is None or previous is None or previous["app"] is None:
                 return                  # not running at the last round; the next says
             # No result: a check just swapped in (pending) or removed (ok).
-            self._health_records[name] = health_checks.fold_app(
+            record = self._health_records[name] = health_checks.fold_app(
                 base, self._app_status(name, previous["app"]["template"], result,
                                        checker.has_target(name)),
                 settings, previous)
+        _note_health_changes({name: previous}, [record])
 
     def _app_checks(self, samples):
         """``(checks, configured)``: the app checks to run now, by instance name,
@@ -1455,7 +1520,7 @@ class ContainerService:
                 "underscores, starting with a letter or digit (max 64 chars)." % alias)
         return alias
 
-    def publish_snapshot(self, name, snapshot, alias, description=""):
+    def publish_snapshot(self, name, snapshot, alias, description="", node=""):
         """Make a snapshot into an image here, under ``alias``; returns the image.
 
         An alias already in use on this node is refused rather than moved:
@@ -1467,9 +1532,13 @@ class ContainerService:
         alias = self.check_publish(name, snapshot, alias)
         description = str(description or "").strip()[:200] or \
             "%s/%s, published by lemondx" % (name, snapshot)
-        fingerprint = self.lxd.publish_snapshot(name, snapshot, {
-            "description": description,
-            "lemondx.source": "%s/%s" % (name, snapshot)})
+        properties = {"description": description,
+                      "lemondx.source": "%s/%s" % (name, snapshot)}
+        if node:
+            # Which node's snapshot: instance names are only unique per node.
+            # Kept in the image file like the rest, so every copy says it too.
+            properties["lemondx.source-node"] = node
+        fingerprint = self.lxd.publish_snapshot(name, snapshot, properties)
         self.lxd.set_alias(alias, fingerprint, description)
         return self._image_summary(fingerprint, alias)
 
@@ -1511,7 +1580,8 @@ class ContainerService:
         self.lxd.set_alias(alias, fingerprint, str(description or "")[:200])
         return self._image_summary(fingerprint, alias)
 
-    def receive_image(self, stream, length, fingerprint, alias, description=""):
+    def receive_image(self, stream, length, fingerprint, alias, description="",
+                      content_type=None):
         """Import an image sent from another node, and check it arrived whole.
 
         The daemon fingerprints what it received; anything other than the
@@ -1520,7 +1590,14 @@ class ContainerService:
         """
         fingerprint = str(fingerprint or "").strip().lower()
         alias = self.image_alias(alias)
-        got = self.lxd.import_image(stream, length, {"description": str(description or "")[:200]})
+        # A split image arrives as the multipart body its export was; anything
+        # else that claims a type is refused rather than handed to the daemon.
+        content_type = str(content_type or "").strip()
+        if content_type and not _MULTIPART.match(content_type):
+            raise ServiceError("Not an image body type: %r." % content_type[:80])
+        got = self.lxd.import_image(stream, length,
+                                    {"description": str(description or "")[:200]},
+                                    content_type=content_type or "application/octet-stream")
         if got != fingerprint:
             try:
                 self.lxd.delete_image(got)
@@ -1530,6 +1607,139 @@ class ContainerService:
                                "and was discarded." % (got[:12], fingerprint[:12]), 502)
         self.lxd.set_alias(alias, fingerprint, str(description or "")[:200])
         return self._image_summary(fingerprint, alias)
+
+    def image_inventory(self):
+        """This node's images, and every snapshot here that could become one.
+
+        One listing each: the instance listing already carries every
+        instance's snapshots, so no call per instance is needed.
+        """
+        images = []
+        for image in self.lxd.list_images():
+            properties = image.get("properties") or {}
+            images.append({
+                "fingerprint": image.get("fingerprint") or "",
+                "aliases": sorted(a.get("name") for a in image.get("aliases") or []
+                                  if a.get("name")),
+                "description": properties.get("description") or "",
+                "size": image.get("size") or 0,
+                "architecture": image.get("architecture") or "",
+                "type": image.get("type") or "container",
+                # Pulled from a remote to launch something, rather than made
+                # or copied here -- the daemon expires those by itself.
+                "cached": bool(image.get("cached")),
+                "created_at": image.get("uploaded_at") or image.get("created_at"),
+                "source": properties.get("lemondx.source") or None,
+                "source_node": properties.get("lemondx.source-node") or None,
+            })
+        snapshots = []
+        for instance in self.lxd.list_instances():
+            for snapshot in instance.get("snapshots") or []:
+                snapshots.append({
+                    "instance": instance.get("name"),
+                    "name": (snapshot.get("name") or "").split("/")[-1],
+                    "created_at": snapshot.get("created_at"),
+                    "stateful": bool(snapshot.get("stateful")),
+                    "type": instance.get("type") or "container",
+                })
+        return {"images": images, "snapshots": snapshots}
+
+    def delete_image(self, fingerprint):
+        """Remove an image from this node, unless a template launches it by name.
+
+        Only this node's copy: another node's is its own, and removed there.
+        A template naming ``local:<alias>`` is refused rather than broken,
+        since it would fail every launch here afterwards -- the same rule as
+        deleting anything else a saved record names.
+        """
+        fingerprint = str(fingerprint or "").strip().lower()
+        image = self.lxd.get_image(fingerprint) if re.match(r"^[0-9a-f]{64}$", fingerprint) \
+            else None
+        if image is None:
+            raise ServiceError("This node has no image %s." % fingerprint[:12], 404)
+        aliases = sorted(a.get("name") for a in image.get("aliases") or [] if a.get("name"))
+        names = {"local:%s" % a for a in aliases}
+        users = sorted(t["name"] for t in store.load_templates().values()
+                       if t["image"] in names)
+        if users:
+            raise ServiceError("Template%s %s launch%s %s, so it cannot be deleted. "
+                               "Point %s at another image first." % (
+                                   "s" if len(users) > 1 else "",
+                                   ", ".join("'%s'" % u for u in users),
+                                   "" if len(users) > 1 else "es",
+                                   " / ".join(sorted(names)),
+                                   "them" if len(users) > 1 else "it"), 409)
+        self.lxd.delete_image(fingerprint)
+        return {"deleted": fingerprint, "aliases": aliases}
+
+    def prune_images(self, apply=False, only=None):
+        """Delete downloaded images nothing needs; ``apply=False`` only says which.
+
+        Downloaded means pulled from a remote -- the daemon's cache, an image
+        with a remote to update from, or a pinned build kept after its pin went
+        -- never one made here from a snapshot, which is somebody's work rather
+        than a copy of the internet. Kept, whatever else: anything an instance
+        was made from (its `volatile.base_image`, which both daemons set and
+        which `used_by` is not reliable for), the build any pin names, and an
+        image a template launches as `local:<alias>` or `local:<fingerprint>`.
+
+        ``only`` limits the run to fingerprints a preview listed, so a prune a
+        person confirmed never deletes something they were not shown.
+        """
+        in_use = {}
+        for instance in self.lxd.list_instances():
+            base = (instance.get("config") or {}).get("volatile.base_image")
+            if base:
+                in_use.setdefault(base, []).append(instance.get("name"))
+        pinned = {}
+        for pin in store.load_pins().values():
+            for fingerprint in (pin["fingerprint"], pin["vm_fingerprint"]):
+                if fingerprint:
+                    pinned[fingerprint] = pin["name"]
+        launched = {}
+        for template in store.load_templates().values():
+            remote, _, alias = (template.get("image") or "").partition(":")
+            if remote == "local" and alias:
+                launched.setdefault(alias, []).append(template["name"])
+        wanted = None if only is None else {str(f).strip().lower() for f in only}
+
+        deleted, kept, failed = [], [], []
+        for image in self.lxd.list_images():
+            fingerprint = image.get("fingerprint") or ""
+            properties = image.get("properties") or {}
+            aliases = sorted(a.get("name") for a in image.get("aliases") or [] if a.get("name"))
+            row = {"fingerprint": fingerprint, "aliases": aliases,
+                   "description": properties.get("description") or "",
+                   "size": image.get("size") or 0,
+                   "type": image.get("type") or "container"}
+            templates = sorted({t for a in aliases + [fingerprint] for t in launched.get(a, [])})
+            downloaded = bool(image.get("cached") or (image.get("update_source") or {}).get("server")
+                              or any(a.startswith("pin-") for a in aliases))
+            if properties.get("lemondx.source") or not downloaded:
+                reason = "made here, not downloaded"
+            elif fingerprint in in_use:
+                reason = "used by %s" % ", ".join(sorted(in_use[fingerprint]))
+            elif fingerprint in pinned:
+                reason = "pinned: %s" % pinned[fingerprint]
+            elif templates:
+                reason = "launched by template %s" % ", ".join(templates)
+            else:
+                reason = ""
+            if reason:
+                kept.append(dict(row, reason=reason))
+                continue
+            if wanted is not None and fingerprint not in wanted:
+                kept.append(dict(row, reason="not in the preview that was confirmed"))
+                continue
+            if apply:
+                try:
+                    self.lxd.delete_image(fingerprint)
+                except LXDError as exc:
+                    failed.append(dict(row, error=exc.message))
+                    continue
+            deleted.append(row)
+        return {"applied": bool(apply), "deleted": deleted, "kept": kept, "failed": failed,
+                "freed": sum(r["size"] for r in deleted)}
 
     def _image_summary(self, fingerprint, alias):
         image = self.lxd.get_image(fingerprint) or {}
@@ -1542,6 +1752,268 @@ class ContainerService:
         catalog = (IMAGE_CATALOG_INCUS if self.lxd.flavor == INCUS
                    else IMAGE_CATALOG_LXD)
         return catalog[0]["alias"]
+
+    # -- pinned images -----------------------------------------------------
+    #
+    # A remote alias is whatever the remote built last, so `images:debian/12`
+    # launched in March is not the one launched in January: base OS drift. A
+    # pin is one build of a remote image, by fingerprint, and a launch naming
+    # `pin:<id>` (or `pin:<nickname>`) takes exactly that build, from this
+    # node's store where pinning puts it with auto-update off. A pin's build
+    # never changes -- a newer one is another pin -- so what a template makes
+    # changes only when the template does, which is also what marks its
+    # instances stale. Pins are shared definitions, so every member launches
+    # the same base; getting the image itself onto each member is a job
+    # (`ClusterService.fetch_pin()`), since it is a download per node.
+
+    def pin_image_name(self, image):
+        """``remote:alias`` for a remote image as a template or a create names it."""
+        image = str(image or "").strip()
+        remote, sep, alias = image.partition(":")
+        if not sep:
+            remote, alias = _default_remote(self.lxd.remotes), image
+        name = "%s:%s" % (remote, alias)
+        if remote in ("local", PIN_REMOTE):
+            raise ServiceError("Only a remote image (images:debian/12, ubuntu:24.04) "
+                               "can be pinned; %s is one build already." % image)
+        if not store.PIN_IMAGE.match(name):
+            raise ServiceError("'%s' is not a remote image name such as images:debian/12."
+                               % image)
+        return name
+
+    def list_image_pins(self):
+        """Every pin, with whether this node holds its build and what launches it."""
+        held = {i.get("fingerprint") for i in self.lxd.list_images()}
+        templates = store.load_templates()
+        pins = sorted(store.load_pins().values(),
+                      key=lambda p: (p["image"], -p["pinned_at"], p["name"]))
+        return [dict(pin, held=bool(pin["fingerprint"]) and pin["fingerprint"] in held,
+                     held_vm=bool(pin["vm_fingerprint"]) and pin["vm_fingerprint"] in held,
+                     local_alias=pin_alias(pin["name"]), used_by=pin_users(pin, templates))
+                for pin in pins]
+
+    def find_pin(self, ref):
+        """The pin ``ref`` names (``pin:`` optional, id or nickname), or None.
+
+        An id wins over a nickname. Two pins claiming one nickname -- a copied
+        file, or two nodes naming at once -- is refused rather than guessed
+        at, since guessing is exactly the drift a pin exists to stop.
+        """
+        ref = str(ref or "").strip()
+        if ref.startswith(PIN_REMOTE + ":"):
+            ref = ref[len(PIN_REMOTE) + 1:]
+        pins = store.load_pins()
+        if ref in pins:
+            return pins[ref]
+        claims = [p for p in pins.values() if ref in p["nicknames"]]
+        if len(claims) > 1:
+            raise ServiceError("Pins %s all answer to '%s'. Take the nickname off all but "
+                               "one." % (", ".join(sorted(p["name"] for p in claims)), ref),
+                               409)
+        return claims[0] if claims else None
+
+    def _pin(self, ref):
+        pin = self.find_pin(ref)
+        if pin is None:
+            ref = str(ref or "").strip()
+            raise ServiceError("No pin called '%s'." % (
+                ref if ref.startswith(PIN_REMOTE + ":") else "%s:%s" % (PIN_REMOTE, ref)), 404)
+        return pin
+
+    def image_versions(self, image, refresh=False):
+        """The builds a remote still serves of ``image``, newest first, and its pins."""
+        entry = self._catalog_entry(self.pin_image_name(image), refresh=refresh)
+        return {"image": "%s:%s" % (entry["remote"], entry["alias"]), "entry": entry,
+                "versions": entry["versions"],
+                "pins": [p for p in store.load_pins().values()
+                         if p["remote"] == entry["remote"] and p["arch"] == entry["arch"]
+                         and entry["alias"] in p["aliases"]]}
+
+    def _catalog_entry(self, name, refresh=False):
+        remote, _, alias = name.partition(":")
+        remotes = self.lxd.remotes
+        if remote not in remotes:
+            raise ServiceError("Unknown remote '%s'. This daemon knows: %s"
+                               % (remote, ", ".join(sorted(remotes))), 404)
+        arch = self.host_architecture()
+        try:
+            catalog = fetch_catalog(remote, remotes[remote], refresh=refresh)
+        except CatalogError as exc:
+            raise ServiceError(str(exc), 502)
+        for entry in catalog:
+            if (not arch or entry["arch"] == arch) and alias in entry["aliases"]:
+                return entry
+        raise ServiceError("%s publishes no image called '%s' for %s."
+                           % (remote, alias, arch or "this architecture"), 404)
+
+    def pin_image(self, image, serial=None, nicknames=None, note="", by=""):
+        """Pin one build of ``image``: ``serial``, or the newest the remote has now.
+
+        Only records the pin; fetching the build is the job that follows. The
+        catalog is read fresh, because "pin what I would get today" has to
+        mean today's build and not the one cached a quarter of an hour ago.
+        A build pinned already is refused, not re-pinned: its id is what
+        templates name, and it already means this build.
+        """
+        entry = self._catalog_entry(self.pin_image_name(image), refresh=True)
+        builds = entry["versions"]
+        build = builds[0] if not serial else \
+            next((b for b in builds if b["serial"] == str(serial).strip()), None)
+        if build is None:
+            raise ServiceError("%s:%s has no build %s any more; the remote still serves %s."
+                               % (entry["remote"], entry["alias"], serial,
+                                  ", ".join(b["serial"] for b in builds)), 404)
+        name = pin_id(entry["remote"], entry["alias"], build["serial"])
+        existing = store.load_pins().get(name)
+        if existing:
+            raise ServiceError("Build %s of %s is pinned already, as pin:%s." % (
+                build["serial"], existing["image"], name), 409)
+        nicknames = self._free_nicknames(name, nicknames)
+        return self.save_pin_record(name, {
+            "image": "%s:%s" % (entry["remote"], entry["alias"]),
+            "aliases": entry["aliases"], "serial": build["serial"], "arch": entry["arch"],
+            "server": self.lxd.remotes[entry["remote"]],
+            "fingerprint": build["container_fingerprint"] or "",
+            "vm_fingerprint": build["vm_fingerprint"] or "",
+            "label": entry["label"], "nicknames": nicknames, "note": str(note or "").strip(),
+            "pinned_at": int(time.time()), "pinned_by": str(by or "")})
+
+    def _free_nicknames(self, name, nicknames):
+        """``nicknames`` checked for a person: well formed, and no other pin's name."""
+        if nicknames is None:
+            return []
+        if isinstance(nicknames, str):
+            nicknames = nicknames.replace(",", " ").split()
+        if not isinstance(nicknames, list):
+            raise ServiceError("'nicknames' must be a list of names.")
+        wanted = list(dict.fromkeys(str(n).strip() for n in nicknames if str(n).strip()))
+        bad = [n for n in wanted if not store.PIN_ID.match(n)]
+        if bad:
+            raise ServiceError("Invalid nickname %s. Use lower-case letters, digits and "
+                               ". _ -, starting with a letter or digit."
+                               % ", ".join("'%s'" % n for n in bad))
+        if len(wanted) > 16:
+            raise ServiceError("A pin takes at most 16 nicknames.")
+        for other in store.load_pins().values():
+            if other["name"] == name:
+                continue
+            taken = [n for n in wanted if n == other["name"] or n in other["nicknames"]]
+            if taken:
+                raise ServiceError("'%s' already names pin %s." % (taken[0], other["name"]),
+                                   409)
+        return [n for n in wanted if n != name]
+
+    def edit_pin(self, ref, nicknames=None, note=None):
+        """Change what a person may change on a pin: its nicknames and its note."""
+        pin = self._pin(ref)
+        changes = {}
+        if nicknames is not None:
+            changes["nicknames"] = self._free_nicknames(pin["name"], nicknames)
+        if note is not None:
+            changes["note"] = str(note).strip()
+        return store.save_pin(pin["name"], dict(pin, **changes))
+
+    def save_pin_record(self, name, record):
+        """Save a pin as given: a person's, or one a member pushed.
+
+        A record for a pin held here already may change only what `edit_pin`
+        could: a different build under the same id is a different pin, and
+        accepting it would change what every template naming it launches.
+        """
+        name = str(name or "").strip()
+        if not store.PIN_ID.match(name):
+            raise ServiceError("'%s' is not a pin id." % name)
+        record = dict(record if isinstance(record, dict) else {}, name=name)
+        existing = store.load_pins().get(name)
+        if existing:
+            clean = store.clean_pin(record, name)
+            if any(clean[k] != existing[k] for k in PIN_BUILD):
+                raise ServiceError("Pin %s already holds build %s of %s; a pin's build "
+                                   "never changes. Pin the other build beside it."
+                                   % (name, existing["serial"], existing["image"]), 409)
+            record = dict(existing, **{k: clean[k] for k in store.PIN_EDITABLE})
+        saved = store.save_pin(name, record)
+        if not saved["image"] or not (saved["fingerprint"] or saved["vm_fingerprint"]):
+            if not existing:
+                store.delete_pin(name, note=False)
+            raise ServiceError("A pin needs the image it is a build of, and the "
+                               "fingerprint of that build.")
+        return saved
+
+    def unpin_image(self, ref):
+        """Forget a pin. The build it fetched is kept, as an ordinary image."""
+        pin = self._pin(ref)
+        store.delete_pin(pin["name"])
+        return {"unpinned": pin["name"], "kept": pin_alias(pin["name"])}
+
+    def fetch_pin(self, ref):
+        """Put the pinned build on this node, if it is not here already.
+
+        Under a `pin-...` alias with auto-update off, so it is neither expired
+        as a cache entry nor replaced by a newer build. The container image,
+        or the VM one for an image that has no container build.
+        """
+        pin = self._pin(ref)
+        self._check_pin_arch(pin)
+        vm = not pin["fingerprint"]
+        fingerprint = pin["vm_fingerprint"] if vm else pin["fingerprint"]
+        alias = pin_alias(pin["name"]) + ("-vm" if vm else "")
+        description = "%s %s, pinned" % (pin["image"], pin["serial"])
+        image = self.lxd.get_image(fingerprint)
+        state = "present"
+        if image is None:
+            server = pin["server"] or self.lxd.remotes.get(pin["remote"])
+            if not server:
+                raise ServiceError("This node has no remote called '%s' to fetch %s from."
+                                   % (pin["remote"], pin["image"]), 409)
+            try:
+                self.lxd.pull_image(server, fingerprint)
+            except LXDError as exc:
+                raise ServiceError(
+                    "Could not fetch build %s of %s from %s: %s. A remote keeps only "
+                    "its last few builds, and LXD's and Incus's are different servers; "
+                    "fetch it from a node that holds it (`lemondx image-fetch` there)."
+                    % (pin["serial"], pin["image"], server, exc.message),
+                    exc.code if isinstance(exc.code, int) and 400 <= exc.code < 600 else 502)
+            image = self.lxd.get_image(fingerprint) or {}
+            state = "pulled"
+        elif image.get("auto_update"):
+            self.lxd.update_image(fingerprint, auto_update=False)
+        self.lxd.set_alias(alias, fingerprint, description)
+        return {"name": pin["name"], "image": pin["image"], "serial": pin["serial"],
+                "fingerprint": fingerprint, "alias": alias, "state": state,
+                "size": image.get("size") or 0}
+
+    def _check_pin_arch(self, pin):
+        arch = self.host_architecture()
+        if pin["arch"] and arch and pin["arch"] != arch:
+            raise ServiceError("Pin %s is a %s build, and this node is %s."
+                               % (pin["name"], pin["arch"], arch), 409)
+
+    def image_source(self, image, instance_type="container"):
+        """The source block a create sends; ``pin:<name>`` is that pin's build."""
+        image = str(image or "").strip()
+        if not image.startswith(PIN_REMOTE + ":"):
+            return _image_source(image, self.lxd.remotes)
+        pin = self._pin(image)
+        vm = instance_type == "virtual-machine"
+        fingerprint = pin["vm_fingerprint"] if vm else pin["fingerprint"]
+        if not fingerprint:
+            raise ServiceError("Pin %s is build %s of %s, which has no %s image. Pin a "
+                               "build that has one." % (pin["name"], pin["serial"],
+                                                        pin["image"], "VM" if vm
+                                                        else "container"), 409)
+        self._check_pin_arch(pin)
+        if self.lxd.get_image(fingerprint) is not None:
+            return {"type": "image", "fingerprint": fingerprint}
+        # Not fetched here yet (a member that was off when it was pinned):
+        # the same build from the remote, while the remote still has it.
+        server = pin["server"] or self.lxd.remotes.get(pin["remote"])
+        if not server:
+            raise ServiceError("Pin %s is not on this node, and it has no remote called "
+                               "'%s' to fetch it from." % (pin["name"], pin["remote"]), 409)
+        return {"type": "image", "protocol": "simplestreams", "server": server,
+                "fingerprint": fingerprint, "mode": "pull"}
 
     # -- bootstrap ---------------------------------------------------------
 
@@ -1626,14 +2098,26 @@ class ContainerService:
         after those change, and a file copied to another machine brings its
         values along.
         """
-        modules = list(dict.fromkeys(str(m) for m in modules or []))
-        unknown = [m for m in modules if m not in available]
+        modules = [str(m) for m in modules or []]
+        unknown = list(dict.fromkeys(m for m in modules if m not in available))
         if unknown:
             raise ServiceError("Unknown module(s): %s" % ", ".join(unknown))
-        selected = [available[m] for m in modules]
+        counted = occurrences(modules)
+        if any(n > MAX_OCCURRENCES for _, n in counted):
+            raise ServiceError("A module can be added at most %d times." % MAX_OCCURRENCES)
+        once = unrepeatable(available, modules)
+        if once:
+            raise ServiceError("%s can only be added once; only a module whose header "
+                               "says `repeatable: yes` can be added again."
+                               % ", ".join(available[m]["name"] for m in once))
+        selected = [available[m] for m in dict.fromkeys(modules)]
 
+        # NAME@n is the nth occurrence's NAME, so it is only a parameter while
+        # some module declaring NAME is selected at least n times.
+        declared = {param_key(p["name"], n) for m, n in counted
+                    for p in available[m]["params"]}
         given = {str(k): "" if v is None else str(v) for k, v in (params or {}).items()}
-        undeclared = sorted(set(given) - {p["name"] for m in selected for p in m["params"]})
+        undeclared = sorted(set(given) - declared)
         if undeclared:
             raise ServiceError(
                 "%s is not a parameter of the selected modules."
@@ -1641,8 +2125,10 @@ class ContainerService:
 
         settings = store.load()
         values = {}
-        for module_id, module in zip(modules, selected):
-            values.update(effective_params(module_id, module, settings))
+        for module_id, n in counted:
+            for name, value in effective_params(module_id, available[module_id],
+                                                settings).items():
+                values[param_key(name, n)] = value
         values.update(given)
 
         keys = []
@@ -1657,7 +2143,7 @@ class ContainerService:
         secret = secret_param_names(selected)
         return {
             "modules": modules,
-            "params": {k: v for k, v in values.items() if k not in secret},
+            "params": {k: v for k, v in values.items() if split_param(k)[0] not in secret},
             "ssh_keys": list(dict.fromkeys(keys)),
         }
 
@@ -1679,7 +2165,8 @@ class ContainerService:
                 continue
         return {
             "modules": record["modules"],
-            "params": {k: v for k, v in record["params"].items() if k not in secret},
+            "params": {k: v for k, v in record["params"].items()
+                       if split_param(k)[0] not in secret},
             "ssh_keys": list(dict.fromkeys(keys)),
         }
 
@@ -1872,7 +2359,12 @@ class ContainerService:
         selected = [available[m] for m in selection["modules"]]
         values = dict(selection["params"])
         values.update({str(k): str(v) for k, v in (params or {}).items()})
-        missing = sorted(n for n in secret_param_names(selected) if not values.get(n))
+        once = unrepeatable(available, selection["modules"])
+        if once:
+            raise ServiceError(
+                "Template '%s' runs %s more than once, which it no longer allows; edit "
+                "the template." % (template["name"], ", ".join(once)), 409)
+        missing = missing_secrets(available, selection["modules"], values)
         if missing:
             raise ServiceError(
                 "Supply a value for %s -- secrets are never saved in a "
@@ -2053,7 +2545,7 @@ class ContainerService:
             return []
         limit = min(len(names), workers or self.LAUNCH_WORKERS)
         with ThreadPoolExecutor(max_workers=limit) as pool:
-            return list(pool.map(work, names))
+            return list(pool.map(eventlog.carry(work), names))
 
     def prepare_launch(self, name, count=1, prefix=None, params=None, names=None,
                        place=True):
@@ -2101,10 +2593,15 @@ class ContainerService:
                 "Invalid name prefix '%s'. Use letters, digits and dashes, "
                 "starting with a letter (max 50 chars)." % prefix)
         bootstrap = self._launch_bootstrap(template, params)
+        if template["image"].startswith(PIN_REMOTE + ":") and not template["snapshot"]:
+            # A pin that is gone, or has no build of this type or arch, fails
+            # every instance alike.
+            self.image_source(template["image"], template["type"])
         notes = []
         if place:
-            self._check_source(template)
+            template, source_notes = self.resolve_source(template)
             template, notes = self.place_template(template)
+            notes = source_notes + notes
         return template, bootstrap, names, count, prefix, notes
 
     def launch_instances(self, template, bootstrap, names, stack=None):
@@ -2214,8 +2711,9 @@ class ContainerService:
         template = self._template(name)
         names = self._confirmed_instances(name, instances, stale=stale)
         bootstrap = self._launch_bootstrap(template, params)
-        self._check_source(template)
+        template, source_notes = self.resolve_source(template)
         template, notes = self.place_template(template)
+        notes = source_notes + notes
         # A recreated instance stays in the stack it was launched by, at the
         # stack revision it had: recreating applies the template, not the stack.
         stacks = {c["name"]: (c["stack"], c["revisions"]["stack"])
@@ -2247,7 +2745,7 @@ class ContainerService:
         names = self._confirmed_instances(name, instances, stale=stale)
         template = self._template(name)
         self._launch_bootstrap(template, params)
-        self._check_source(template)
+        self.resolve_source(template)
         return self.track_run(name, "recreate", len(names),
                               lambda: self.recreate_instances(name, names, params, stale),
                               background)
@@ -2442,10 +2940,11 @@ class ContainerService:
         settings = store.load()
         available = discover_modules()
         merged = {}
-        for module_id in modules:
+        for module_id, n in occurrences(modules):
             module = available.get(module_id)
             if module:
-                merged.update(effective_params(module_id, module, settings))
+                for key, value in effective_params(module_id, module, settings).items():
+                    merged[param_key(key, n)] = value
         merged.update(params or {})
 
         try:
@@ -2512,6 +3011,14 @@ class ContainerService:
             arch = self.host_architecture()
 
         local = {img.get("fingerprint") for img in self.lxd.list_images()}
+        # A pin is for one architecture's build; matched to the entry by any of
+        # its aliases, since an older pin may have been made under another.
+        pins = {}
+        for pin in sorted(store.load_pins().values(), key=lambda p: -p["pinned_at"]):
+            for alias in pin["aliases"]:
+                pins.setdefault((pin["remote"], pin["arch"], alias), []).append(
+                    {"name": pin["name"], "serial": pin["serial"],
+                     "nicknames": pin["nicknames"]})
 
         entries, errors = [], {}
         for name in wanted:
@@ -2524,6 +3031,7 @@ class ContainerService:
                 if arch and arch != "all" and entry["arch"] != arch:
                     continue
                 entry = dict(entry)
+                entry["pins"] = pins.get((name, entry["arch"], entry["alias"]), [])
                 entry["cached"] = entry["container_fingerprint"] in local
                 entry["cached_vm"] = bool(entry["vm_fingerprint"]) and \
                     entry["vm_fingerprint"] in local
@@ -2576,6 +3084,7 @@ class ContainerService:
                 "attachable": _attachable(network),
                 "manageable": not reason,
                 "read_only_reason": reason,
+                "lan": self._lan_info(network),
             })
         summaries.sort(key=lambda n: (not n["managed"], n["name"]))
         return summaries
@@ -2618,6 +3127,11 @@ class ContainerService:
             reason = _network_read_only_reason(current, clustered)
             if reason:
                 raise ServiceError("Network '%s' is read-only: %s" % (name, reason), 409)
+            if _lan_kind(current):
+                raise ServiceError(
+                    "'%s' puts instances on the LAN, where the router hands out "
+                    "addresses; it has no settings to change here. Delete it and "
+                    "make another to change which NIC it uses." % name, 409)
             values = dict(current.get("config") or {})
             self._check_subnets_free(name, {
                 key: value for key, value in changes.items()
@@ -2657,7 +3171,248 @@ class ContainerService:
                 % (name, " and ".join(parts) or "other resources",
                    "them" if len(instances) + len(profiles) != 1 else "it"), 409)
         self.lxd.delete_network(name)
+        if (_lan_kind(current) or {}).get("kind") == "macvlan" and self.lan_changed:
+            self.lan_changed()
+        if (_lan_kind(current) or {}).get("kind") == "bridge":
+            # Its Docker exception has nothing left to let through.
+            return {"deleted": name, "notes": self.sync_lan_firewall()}
         return {"deleted": name}
+
+    # -- containers on the LAN ---------------------------------------------
+    #
+    # Instances on the network a host NIC is on, addressed by its router rather
+    # than the daemon: a bridge over a spare NIC, macvlan on any wired one, or
+    # the NIC the host uses turned into a bridge port. Which of those a NIC
+    # allows depends on it, so the choice is offered per NIC -- see
+    # docs/networking.md and hostnet.py.
+
+    LAN_MODES = ("bridge", "macvlan", "convert")
+
+    def lan_interfaces(self):
+        """This host's wired and wireless NICs, and what each can do for the LAN."""
+        defaults = hostnet.default_route_devices()
+        helper = hostnet.available()
+        found = []
+        for network in self.lxd.list_networks():
+            nic = network.get("name") or ""
+            if network.get("managed") or not hostnet.nic_facts(nic)["physical"]:
+                continue
+            state = self.lxd.get_network_state(nic) or {}
+            addresses = ["%s/%s" % (a.get("address"), a.get("netmask"))
+                         for a in state.get("addresses") or [] if a.get("scope") == "global"]
+            found.append(self._lan_nic(nic, addresses, state, nic in defaults, helper))
+        found.sort(key=lambda n: (not n["default_route"], n["name"]))
+        return {"interfaces": found, "helper": helper, "docker": hostnet.docker_present(),
+                "default_nic": hostnet.default_route_device()}
+
+    @staticmethod
+    def _lan_nic(nic, addresses, state, default_route, helper):
+        facts = hostnet.nic_facts(nic)
+        manager = hostnet.nm_device(nic)
+        modes = {}
+        for mode in ContainerService.LAN_MODES:
+            if facts["wireless"]:
+                why = ("Wi-Fi cannot carry them: an access point drops frames from "
+                       "any MAC that did not associate with it.")
+            elif facts["master"]:
+                why = ("It is already a port of %s; instances can join %s directly."
+                       % (facts["master"], facts["master"]))
+            elif mode == "bridge" and addresses:
+                why = ("It holds this host's addresses, which a bridge port cannot "
+                       "keep. Convert it instead, or use macvlan.")
+            elif mode == "convert" and not addresses:
+                why = "It has no address to move; bridge it instead."
+            elif mode == "convert" and manager is None:
+                why = ("NetworkManager does not run it, so lemondx cannot move its "
+                       "address. Make the bridge in your network configuration.")
+            else:
+                why = ""
+            # Converting without the helper is still possible, by hand: the
+            # plan is the same commands, so it is offered to read and run.
+            manual = mode == "convert" and not why and not helper
+            if manual:
+                why = ("lemondx cannot run its helper as root here, so the commands "
+                       "are shown for you to run.")
+            modes[mode] = {"available": not why, "reason": why, "manual": manual}
+        return {
+            "name": nic,
+            "hwaddr": state.get("hwaddr") or "",
+            "up": state.get("state") == "up",
+            "addresses": addresses,
+            "default_route": default_route,
+            "wireless": facts["wireless"],
+            "master": facts["master"],
+            "network_manager": manager["connection"] if manager else "",
+            "modes": modes,
+        }
+
+    def _lan_nic_record(self, nic):
+        record = next((n for n in self.lan_interfaces()["interfaces"] if n["name"] == nic),
+                      None)
+        if record is None:
+            raise ServiceError("'%s' is not a network card on this host." % nic, 404)
+        return record
+
+    def create_lan_network(self, nic, mode, name, description="", default=False):
+        """A daemon network putting instances on ``nic``'s LAN: ``bridge`` or ``macvlan``.
+
+        Neither has an address of its own, so the daemon runs no DHCP and no
+        NAT on it; whatever serves that LAN addresses the instances.
+
+        ``default`` takes the NIC the default route leaves by instead of a
+        name, which is how one request means the same thing on every node.
+        Asking again for a LAN network that is already there, on the same NIC
+        and the same way, returns it (``existing``) rather than refusing: that
+        is re-running a cluster-wide create after a node was added or off.
+        """
+        if default:
+            nic = hostnet.default_route_device()
+            if not nic:
+                raise ServiceError("This host has no IPv4 default route, so it has no "
+                                   "default interface to use.", 409)
+        if mode not in ("bridge", "macvlan"):
+            raise ServiceError("A LAN network is 'bridge' or 'macvlan'; converting the "
+                               "NIC the host uses is its own action.")
+        if not VALID_NETWORK_NAME.match(name or ""):
+            raise ServiceError(
+                "Invalid network name '%s'. Use letters, digits and dashes, starting "
+                "with a letter (max 15 chars, the kernel's limit for an interface)."
+                % name)
+        self._network_mutation_context()
+        record = self._lan_nic_record(nic)
+        if not record["modes"][mode]["available"]:
+            raise ServiceError("%s cannot be used for %s: %s"
+                               % (nic, mode, record["modes"][mode]["reason"]), 409)
+        with self._networks_lock:
+            existing = next((n for n in self.lxd.list_networks() if n.get("name") == name),
+                            None)
+            if existing is not None:
+                same = _lan_kind(existing) == {"kind": mode, "nic": nic}
+                if not same:
+                    raise ServiceError(
+                        "An interface called '%s' already exists on this host." % name, 409)
+                return dict(self.get_network(name), existing=True)
+            description = str(description or "")[:200] or "%s's LAN" % nic
+            if mode == "bridge":
+                self.lxd.create_network(name, {
+                    "bridge.external_interfaces": nic,
+                    "ipv4.address": "none", "ipv6.address": "none",
+                }, description)
+            else:
+                self.lxd.create_network(name, {"parent": nic}, description, kind="macvlan")
+        network = dict(self.get_network(name), existing=False)
+        if mode == "bridge":
+            network["notes"] = self.sync_lan_firewall()
+        elif self.lan_changed:
+            self.lan_changed()
+        return network
+
+    def lan_convert_plan(self, nic, bridge):
+        """The commands converting ``nic`` would run, for a person to read or run."""
+        return [c.record() for c in hostnet.lan_convert_plan(nic, bridge)[0]]
+
+    def convert_nic(self, nic, bridge):
+        """Make the NIC the host uses a port of a new bridge that keeps its address.
+
+        Through the root helper and NetworkManager, which keeps it across
+        reboots. The helper undoes it by itself if the bridge comes up without
+        the address, or the way out, the NIC had -- so a failure here leaves
+        the host as it was, and says so.
+        """
+        if not VALID_NETWORK_NAME.match(bridge or ""):
+            raise ServiceError("Invalid bridge name '%s' (letters, digits and dashes, "
+                               "max 15 chars)." % bridge)
+        record = self._lan_nic_record(nic)
+        if not record["modes"]["convert"]["available"]:
+            raise ServiceError("%s cannot be converted: %s"
+                               % (nic, record["modes"]["convert"]["reason"]), 409)
+        if not hostnet.available():
+            raise ServiceError("lemondx cannot run its helper as root here, so it "
+                               "cannot convert %s. Run the commands it shows yourself, "
+                               "or install the sudo rule (docs/networking.md)." % nic, 503)
+        answer = hostnet.delegate({"lan": {"action": "convert", "nic": nic,
+                                           "bridge": bridge}}, timeout=300)
+        if not answer.get("ok"):
+            raise ServiceError(answer.get("error") or "Converting %s failed." % nic, 502)
+        return {"bridge": bridge, "nic": nic, "applied": answer.get("applied") or [],
+                "notes": self.sync_lan_firewall()}
+
+    def revert_lan_bridge(self, bridge):
+        """Give a converted bridge's NIC back its own connection, if nothing is on it."""
+        if bridge not in hostnet.nm_lan_bridges():
+            raise ServiceError("'%s' is not a bridge lemondx converted a NIC into." % bridge,
+                               404)
+        users = self._bridge_users(bridge)
+        if users:
+            raise ServiceError("%s is still used by %s. Move them off it first: "
+                               "reverting takes the bridge away." % (bridge, ", ".join(users)),
+                               409)
+        if not hostnet.available():
+            raise ServiceError("lemondx cannot run its helper as root here, so it "
+                               "cannot revert %s." % bridge, 503)
+        answer = hostnet.delegate({"lan": {"action": "revert", "bridge": bridge}},
+                                  timeout=300)
+        if not answer.get("ok"):
+            raise ServiceError(answer.get("error") or "Reverting %s failed." % bridge, 502)
+        return {"reverted": bridge, "applied": answer.get("applied") or [],
+                "notes": self.sync_lan_firewall()}
+
+    def _bridge_users(self, bridge):
+        """Instances and profiles with a NIC on ``bridge``, managed or not."""
+        def on_it(devices):
+            return any(d.get("type") == "nic" and bridge in (d.get("parent"), d.get("network"))
+                       for d in (devices or {}).values())
+        users = ["instance %s" % i.get("name") for i in self.lxd.list_instances()
+                 if on_it(i.get("expanded_devices") or i.get("devices"))]
+        users += ["profile %s" % p.get("name") for p in self.lxd.list_profiles()
+                  if on_it(p.get("devices"))]
+        return users
+
+    def sync_lan_firewall(self):
+        """Keep Docker's FORWARD drop from swallowing LAN bridges; returns notes.
+
+        Docker loads br_netfilter, which puts bridged frames through iptables,
+        where its DROP policy ends them: a LAN bridge would carry nothing,
+        silently. macvlan never passes a bridge and needs no exception.
+        Best-effort, like the fabric's: a host without Docker gets nothing.
+        """
+        if not hostnet.docker_present():
+            return []
+        bridges = sorted(set(self.lan_bridges()))
+        if not hostnet.available():
+            if not bridges:
+                return []
+            return ["Docker is installed here, and its FORWARD drop blocks bridged "
+                    "traffic. lemondx cannot run its helper as root, so allow it "
+                    "yourself: %s" % "; ".join(
+                        "sudo iptables -I DOCKER-USER -%s %s -j ACCEPT" % (way, bridge)
+                        for bridge in bridges for way in "io")]
+        try:
+            answer = hostnet.delegate({"lan": {"action": "docker", "bridges": bridges}})
+        except hostnet.HostNetError as exc:
+            return ["Could not let the LAN bridges through Docker's firewall: %s"
+                    % exc.message]
+        if not answer.get("ok"):
+            return ["Could not let the LAN bridges through Docker's firewall: %s"
+                    % (answer.get("error") or "the helper failed")]
+        return []
+
+    def lan_bridges(self):
+        """Every bridge here with a physical port that lemondx made or knows of."""
+        bridges = [n.get("name") for n in self.lxd.list_networks()
+                   if (_lan_kind(n) or {}).get("kind") == "bridge"]
+        return bridges + list(hostnet.nm_lan_bridges())
+
+    def _lan_info(self, network):
+        """How a network reaches the LAN, or None: see `_lan_kind()`."""
+        kind = _lan_kind(network)
+        if kind or network.get("managed") or network.get("type") != "bridge":
+            return kind
+        ports = hostnet.lan_bridge_ports(network.get("name") or "")
+        if not ports:
+            return None
+        converted = network.get("name") in hostnet.nm_lan_bridges()
+        return {"kind": "converted" if converted else "host", "nic": ports[0]}
 
     def _clustered(self):
         environment = (self.lxd.server_info() or {}).get("environment") or {}
@@ -2846,6 +3601,7 @@ class ContainerService:
             },
             "dns_domain": config.get("dns.domain") or ("lxd" if managed else ""),
             "dns_mode": config.get("dns.mode") or "managed",
+            "lan": self._lan_info(network),
             "mtu": state.get("mtu") or config.get("bridge.mtu") or "",
             "hwaddr": state.get("hwaddr") or "",
             "state": state.get("state") or "",
@@ -3363,13 +4119,26 @@ def _is_true(value):
     return str(value).lower() in ("true", "yes", "1", "on")
 
 
-def _log(message):
-    """Say something worth keeping. Under systemd this is the journal.
+def _note_health_changes(previous, records):
+    """Log an instance whose health changed: transitions only, never each round,
+    which would be one line per instance every interval."""
+    for record in records:
+        before = (previous.get(record["name"]) or {}).get("status")
+        if before is None or before == record["status"]:
+            continue
+        good = record["status"] in (health_checks.HEALTHY, health_checks.STARTING)
+        eventlog.event("system", "instance.health",
+                       level=eventlog.NOTICE if good else logging.WARNING,
+                       instance=record["name"], was=before, now=record["status"],
+                       reasons="; ".join(record.get("reasons") or []))
 
-    stderr rather than stdout: a launch runs from the CLI as well as the
-    server, and there stdout may be a --json payload a script is reading.
-    """
-    print("[lemondx] %s" % message, file=sys.stderr, flush=True)
+
+def _log(message, level=None):
+    """Say something worth keeping, through eventlog (never stdout: a launch
+    runs from the CLI too, where stdout may be a --json payload)."""
+    if level is None:
+        level = logging.WARNING if "fail" in message.lower() else logging.INFO
+    eventlog.message(message, level=level)
 
 
 # A failed module keeps this much of its output in a run record, for the UI.
@@ -3415,9 +4184,24 @@ def _network_read_only_reason(network, clustered):
         return "clustered networks are shown read-only."
     if not network.get("managed"):
         return "not managed by the daemon."
-    if network.get("type") != "bridge":
-        return "only bridge networks are managed here."
+    if network.get("type") not in ("bridge", "macvlan"):
+        return "only bridge and macvlan networks are managed here."
     return ""
+
+
+def _lan_kind(network):
+    """{'kind', 'nic'} for a daemon network on the LAN, from its own config.
+
+    ``bridge`` is one over a spare NIC, ``macvlan`` one on a NIC's side. The
+    host bridges -- a converted NIC, or one made by hand -- need /sys to tell,
+    so `ContainerService._lan_info()` adds those.
+    """
+    config = network.get("config") or {}
+    if network.get("managed") and network.get("type") == "macvlan":
+        return {"kind": "macvlan", "nic": config.get("parent") or ""}
+    if network.get("managed") and config.get("bridge.external_interfaces"):
+        return {"kind": "bridge", "nic": config["bridge.external_interfaces"]}
+    return None
 
 
 def _attachable(network):
@@ -3591,15 +4375,43 @@ def _instance_allocation(instance, memory_total, pool_config):
     }
 
 
+def _default_remote(remotes):
+    """The remote a bare alias means: `ubuntu:` where it exists (LXD), else the
+    daemon's general-purpose image server."""
+    return "ubuntu" if "ubuntu" in remotes else "images"
+
+
+def pin_alias(name):
+    """The local alias a pinned build is kept under: pin-<its id>."""
+    return "pin-" + name
+
+
+def pin_id(remote, alias, serial):
+    """A pin's id: the image and the build, e.g. images-debian-12-20261001-0524."""
+    text = "%s-%s-%s" % (remote, alias, serial)
+    slug = re.sub(r"[^a-z0-9.]+", "-", text.lower()).strip("-.")
+    return slug[:80].rstrip("-.")
+
+
+def pin_users(pin, templates=None):
+    """The templates that launch ``pin``, by its id or any of its nicknames."""
+    refs = {"%s:%s" % (PIN_REMOTE, n) for n in [pin["name"]] + pin["nicknames"]}
+    return sorted(t["name"] for t in (templates if templates is not None
+                                      else store.load_templates()).values()
+                  if t["image"] in refs)
+
+
 def _image_source(image, remotes):
     """Turn ``remote:alias`` (or a bare alias) into an image source block."""
     image = image.strip()
     remote, _, alias = image.partition(":")
     if not alias:
-        # No remote given. Prefer `ubuntu:` where it exists (LXD), else the
-        # daemon's general-purpose image server.
-        remote, alias = ("ubuntu" if "ubuntu" in remotes else "images"), image
+        remote, alias = _default_remote(remotes), image
     if remote == "local":
+        # A whole fingerprint names one image exactly, whatever its aliases
+        # here: how a snapshot template launches from an image of it.
+        if re.match(r"^[0-9a-f]{64}$", alias):
+            return {"type": "image", "fingerprint": alias}
         return {"type": "image", "alias": alias}
     if remote not in remotes:
         raise ServiceError(

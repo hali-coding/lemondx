@@ -20,8 +20,11 @@ DOWNLOAD_DATATYPE = "image-downloads"
 CACHE_TTL = 900          # 15 minutes; these catalogs change daily at most
 USER_AGENT = "lemondx/0.1"
 
-# ftype of the metadata item that carries the combined fingerprints.
-METADATA_FTYPE = "lxd.tar.xz"
+# ftype of the metadata item that carries the combined fingerprints: each
+# project's image server names it after its own daemon (images.lxd.canonical.com
+# and cloud-images.ubuntu.com say lxd.tar.xz, images.linuxcontainers.org says
+# incus.tar.xz), and reading only one left the other's catalog empty.
+METADATA_FTYPES = ("lxd.tar.xz", "incus.tar.xz")
 # Keys holding the fingerprint of the finished image, per instance type.
 CONTAINER_HASH = "combined_squashfs_sha256"
 VM_HASHES = ("combined_disk-kvm-img_sha256", "combined_disk1-img_sha256")
@@ -84,29 +87,48 @@ def fetch_catalog(remote, base_url, timeout=30, refresh=False):
     return entries
 
 
-def _parse_product(remote, product):
-    versions = product.get("versions") or {}
-    if not versions:
-        return None
-    serial = max(versions)
-    items = (versions[serial].get("items") or {})
+# How many builds of one product to offer for pinning. Remotes keep only a
+# few anyway (images: about three days' worth), and the list rides on every
+# catalog entry.
+MAX_VERSIONS = 8
 
+
+def _parse_version(serial, version):
+    """One build of a product: its fingerprints and sizes, or None if unusable."""
+    items = version.get("items") or {}
     metadata = next(
-        (i for i in items.values() if i.get("ftype") == METADATA_FTYPE), None)
+        (i for i in items.values() if i.get("ftype") in METADATA_FTYPES), None)
     if not metadata:
         return None
-
     container_fp = metadata.get(CONTAINER_HASH)
     vm_fp = next((metadata[k] for k in VM_HASHES if metadata.get(k)), None)
     if not container_fp and not vm_fp:
         return None
+    rootfs = next((i for i in items.values() if i.get("ftype") == "squashfs"), None)
+    disk = next((i for i in items.values() if i.get("ftype") == "disk-kvm.img"), None)
+    return {
+        "serial": serial,
+        "container_fingerprint": container_fp,
+        "vm_fingerprint": vm_fp,
+        "size": (rootfs or {}).get("size") or 0,
+        "vm_size": (disk or {}).get("size") or 0,
+    }
 
+
+def _parse_product(remote, product):
+    # Every build the remote still serves, newest first: the newest is what
+    # an alias launches, and the others are what a pin can hold on to.
+    builds = [b for b in (_parse_version(serial, version) for serial, version in
+                          sorted((product.get("versions") or {}).items(), reverse=True))
+              if b]
+    if not builds:
+        return None
+    newest = builds[0]
+
+    aliases = _aliases(product.get("aliases", ""))
     alias = _best_alias(product.get("aliases", ""))
     if not alias:
         return None
-
-    rootfs = next((i for i in items.values() if i.get("ftype") == "squashfs"), None)
-    disk = next((i for i in items.values() if i.get("ftype") == "disk-kvm.img"), None)
 
     os_name = product.get("os") or ""
     title = product.get("release_title") or product.get("release") or ""
@@ -121,14 +143,22 @@ def _parse_product(remote, product):
         "release_title": title,
         "variant": product.get("variant") or "default",
         "arch": product.get("arch") or "",
-        "serial": serial,
-        "size": (rootfs or {}).get("size") or 0,
-        "vm_size": (disk or {}).get("size") or 0,
-        "container_fingerprint": container_fp,
-        "vm_fingerprint": vm_fp,
+        "serial": newest["serial"],
+        "size": newest["size"],
+        "vm_size": newest["vm_size"],
+        "container_fingerprint": newest["container_fingerprint"],
+        "vm_fingerprint": newest["vm_fingerprint"],
+        # Every name this product answers to, so `images:debian/12/default`
+        # and `images:debian/12` are known to be one image.
+        "aliases": aliases,
+        "versions": builds[:MAX_VERSIONS],
         "supported": product.get("supported"),
         "eol": product.get("support_eol"),
     }
+
+
+def _aliases(aliases):
+    return [a.strip() for a in (aliases or "").split(",") if a.strip()]
 
 
 def _best_alias(aliases):

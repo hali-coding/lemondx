@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from 'react'
 import type { DragEvent, ReactNode } from 'react'
 import { api, ApiError } from '../lib/api'
+import { occurrenceKey, occurrences } from '../lib/bootstrap'
 import { madeFrom } from '../lib/instance'
 import type {
   BootstrapModule, ClusterNode, InstanceTemplate, NodeGroup, Stack, StackLaunchStep,
@@ -853,8 +854,15 @@ function LaunchParams({ step, template, modules, earlier, entered, onChange }: {
   entered: string[]
   onChange: (change: Partial<StackLaunchStep>) => void
 }) {
-  const used = modules.filter((m) => template?.bootstrap.modules.includes(m.id))
-  const declared = new Set(used.flatMap((m) => m.params).map((p) => p.name))
+  // One group per time a module is in the template: a repeat's parameters
+  // are its own, under NAME@n.
+  const used = occurrences(template?.bootstrap.modules ?? []).flatMap(([id, n]) => {
+    const module = modules.find((m) => m.id === id)
+    return module ? [{ module, n }] : []
+  })
+  const repeated = new Set(used.filter(({ n }) => n > 1).map(({ module }) => module.id))
+  const declared = new Set(used.flatMap(({ module, n }) =>
+    module.params.map((p) => occurrenceKey(p.name, n))))
   // Names offered to `{{params.…}}`: every secret in the stack, plus whatever
   // this step already refers to, so a second step reuses the same input.
   const inputs = [...new Set([...entered, ...Object.values(step.params)
@@ -895,35 +903,36 @@ function LaunchParams({ step, template, modules, earlier, entered, onChange }: {
 
       {!template && <p className="hint">Pick a template to see its parameters.</p>}
 
-      {used.map((module) => (
-        <div className="stack-param-group" key={module.id}>
+      {used.map(({ module, n }) => (
+        <div className="stack-param-group" key={`${module.id}@${n}`}>
           <h5>
-            {module.name}
+            {module.name}{repeated.has(module.id) ? ` #${n}` : ''}
             <span className="faint">{module.params.length} parameter(s)</span>
           </h5>
           {module.params.length === 0 && (
             <p className="hint">This module declares none.</p>
           )}
           {module.params.map((param) => {
-            const overridden = param.name in step.params
-            const value = step.params[param.name] ?? ''
+            const key = occurrenceKey(param.name, n)
+            const overridden = key in step.params
+            const value = step.params[key] ?? ''
             // What it would be without an override: the template's saved answer,
             // else the module's own effective default. A secret has neither --
             // it is never stored anywhere, so it is asked for at launch.
-            const inherited = template?.bootstrap.params[param.name] ?? param.value ?? param.default
+            const inherited = template?.bootstrap.params[key] ?? param.value ?? param.default
             const refs = [...value.matchAll(PLACEHOLDER)].map((m) => m[1])
             const literal = value.replace(PLACEHOLDER, '').trim()
             const badRef = refs.find((ref) => !INPUT_REF.test(ref) && !referenceOk(ref, earlier))
             const secretLiteral = param.secret && overridden
               && (literal !== '' || refs.some((ref) => !INPUT_REF.test(ref)))
             return (
-              <div className={`stack-param-row${overridden ? ' is-set' : ''}`} key={param.name}>
+              <div className={`stack-param-row${overridden ? ' is-set' : ''}`} key={key}>
                 <div className="stack-param-head">
-                  <span className="mono stack-param-name">{param.name}</span>
+                  <span className="mono stack-param-name">{key}</span>
                   {overridden && <span className="badge badge-dim">set here</span>}
                 </div>
                 <ReferenceInput
-                  id={`param-${step.id}-${param.name}`}
+                  id={`param-${step.id}-${key}`}
                   value={value}
                   secret={param.secret}
                   invalid={Boolean(badRef) || secretLiteral}
@@ -931,12 +940,12 @@ function LaunchParams({ step, template, modules, earlier, entered, onChange }: {
                     ? 'asked for when the stack is launched'
                     : inherited || 'no default'}
                   suggestions={suggestions}
-                  onChange={(next) => (next === '' ? clear(param.name) : set(param.name, next))}
+                  onChange={(next) => (next === '' ? clear(key) : set(key, next))}
                 />
                 {param.description && <span className="hint">{param.description}</span>}
                 {!overridden && !param.secret && (
                   <span className="hint faint">
-                    {template?.bootstrap.params[param.name] !== undefined
+                    {template?.bootstrap.params[key] !== undefined
                       ? 'from the template'
                       : 'the module’s default'}
                   </span>

@@ -26,7 +26,7 @@ import re
 import subprocess
 import time
 
-from . import store
+from . import eventlog, store
 
 PRELUDE_NAME = "_prelude.sh"
 MODULE_SUFFIX = ".sh"
@@ -42,6 +42,12 @@ SSH_KEY_TYPES = (
 _HEADER_LINE = re.compile(r"^#\s*([a-zA-Z][a-zA-Z0-9_-]*)\s*:\s*(.*)$")
 _PARAM = re.compile(r"^([A-Z][A-Z0-9_]*)=(\S*)\s*(.*)$")
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+# A selection may name a module more than once (two NFS mounts). Its first
+# occurrence reads its parameters as NAME, as a single one always has, and the
+# nth reads NAME@n -- so a repeat rides through every place a selection already
+# goes (records, sync, stacks, --param) as one more key in the same dict.
+_OCCURRENCE_KEY = re.compile(r"^([A-Z][A-Z0-9_]*)@([1-9][0-9]?)$")
+MAX_OCCURRENCES = 16
 
 
 class BootstrapError(Exception):
@@ -158,6 +164,10 @@ def parse_module(path):
         "order": order,
         "params": meta["param"],
         "uses_ssh_keys": "ssh-keys" in meta["uses"],
+        # Whether one run may hold it more than once. Off unless the header
+        # says so: most modules install something, and installing it twice
+        # (two PostgreSQL servers on one port) fails or worse.
+        "repeatable": meta.get("repeatable", "").strip().lower() in ("yes", "true", "1"),
         "path": path,
         "body": text,
     }
@@ -183,6 +193,56 @@ def _parse_param(value, secret=False, multiline=False):
 def secret_param_names(modules):
     """Names of every secret parameter the given module records declare."""
     return {p["name"] for m in modules for p in m["params"] if p.get("secret")}
+
+
+def split_param(key):
+    """``(NAME, n)`` for a selection's parameter key: NAME is occurrence 1."""
+    match = _OCCURRENCE_KEY.match(str(key))
+    if match and int(match.group(2)) > 1:
+        return match.group(1), int(match.group(2))
+    return str(key), 1
+
+
+def param_key(name, occurrence):
+    """The key occurrence ``n`` of a module keeps parameter ``name`` under."""
+    return name if occurrence == 1 else "%s@%d" % (name, occurrence)
+
+
+def occurrences(module_ids):
+    """``(module_id, n)`` per entry, n counting that module's entries so far."""
+    seen = {}
+    result = []
+    for module_id in module_ids:
+        seen[module_id] = seen.get(module_id, 0) + 1
+        result.append((module_id, seen[module_id]))
+    return result
+
+
+def occurrence_value(values, name, occurrence, secret=False):
+    """What occurrence ``n`` gets for ``name``: its own value, else the first's.
+
+    A secret is never stored, so a repeat that has none of its own shares the
+    one entered for the first -- and for a secret, blank counts as none.
+    """
+    own = values.get(param_key(name, occurrence))
+    if occurrence == 1 or (own is not None and not (secret and own == "")):
+        return own
+    return values.get(name)
+
+
+def unrepeatable(available, module_ids):
+    """Modules listed more than once that do not declare ``repeatable: yes``."""
+    return sorted({m for m, n in occurrences(module_ids)
+                   if n > 1 and m in available and not available[m]["repeatable"]})
+
+
+def missing_secrets(available, module_ids, values):
+    """Secret parameters some selected occurrence would run without."""
+    return sorted({param["name"] for module_id, n in occurrences(module_ids)
+                   if module_id in available
+                   for param in available[module_id]["params"]
+                   if param.get("secret")
+                   and not occurrence_value(values, param["name"], n, secret=True)})
 
 
 def public_modules(settings=None):
@@ -332,6 +392,7 @@ def save_module(name, content, overwrite=False):
     os.chmod(target, 0o644)
 
     store.note_change("modules", module_id)
+    eventlog.event("change", "definition.save", kind="modules", name=module_id)
     parsed = parse_module(target)
     parsed["shadows_builtin"] = bool(existing) and (
         existing["builtin"] or existing["shadows_builtin"])
@@ -360,6 +421,7 @@ def delete_module(module_id):
     os.unlink(target)
 
     store.note_change("modules", module_id, deleted=True)
+    eventlog.event("change", "definition.delete", kind="modules", name=module_id)
     # A shadow's removal brings the built-in back under the same id, so the
     # defaults and profiles naming it still have something to run.
     if not module["shadows_builtin"]:
@@ -463,30 +525,45 @@ class BootstrapRunner:
                 % (", ".join(unknown), ", ".join(sorted(available)))
             )
 
-        selected = sorted((available[m] for m in module_ids),
-                          key=lambda m: (m["order"], m["id"]))
+        counted = occurrences(module_ids)
+        if any(n > MAX_OCCURRENCES for _, n in counted):
+            raise BootstrapError("A module can run at most %d times in one run."
+                                 % MAX_OCCURRENCES)
+        once = unrepeatable(available, module_ids)
+        if once:
+            raise BootstrapError("%s can only run once per instance."
+                                 % ", ".join(available[m]["name"] for m in once))
+        # Repeats of a module run one after another, in the order they were
+        # added, at that module's place in the order.
+        selected = sorted(((available[m], n) for m, n in counted),
+                          key=lambda entry: (entry[0]["order"], entry[0]["id"], entry[1]))
+        modules = [module for module, _ in selected]
         keys = [parse_public_key(k)["line"] for k in (ssh_keys or [])]
 
-        needs_keys = [m["id"] for m in selected if m["uses_ssh_keys"]]
+        needs_keys = list(dict.fromkeys(m["id"] for m in modules if m["uses_ssh_keys"]))
         if needs_keys and not keys:
             raise BootstrapError(
                 "Module(s) %s need SSH keys, but none were supplied."
                 % ", ".join(needs_keys)
             )
 
-        environment = _clean_env(params or {})
+        params = {str(k): v for k, v in (params or {}).items()}
+        environment = _clean_env({k: v for k, v in params.items() if split_param(k)[1] == 1})
+        scoped = {k: "" if v is None else str(v) for k, v in params.items()
+                  if split_param(k)[1] > 1}
         if keys:
             environment["LEMONDX_SSH_KEYS"] = "\n".join(keys)
 
         # Secrets have no default, so an empty one is always a mistake -- and
         # far cheaper to catch here than halfway through a package install.
-        missing = sorted(n for n in secret_param_names(selected)
-                         if not environment.get(n))
+        values = dict(environment, **scoped)
+        missing = missing_secrets(available, module_ids, values)
         if missing:
             raise BootstrapError(
                 "Supply a value for %s -- secret parameters have no default."
                 % ", ".join(missing))
-        secrets = [environment[n] for n in secret_param_names(selected)]
+        secret_names = secret_param_names(modules)
+        secrets = [v for k, v in values.items() if split_param(k)[0] in secret_names]
 
         self._wait_until_reachable(name)
         self._require_connectivity(name)
@@ -496,8 +573,14 @@ class BootstrapRunner:
 
         prelude = load_prelude()
         results = []
-        for module in selected:
-            result = self._run_one(name, module, prelude, environment, timeout)
+        for module, occurrence in selected:
+            env = dict(environment)
+            for param in module["params"]:
+                value = occurrence_value(values, param["name"], occurrence,
+                                         secret=param.get("secret", False))
+                if value is not None:
+                    env[param["name"]] = value
+            result = self._run_one(name, module, prelude, env, timeout, occurrence)
             results.append(result)
             if result["exit_code"] != 0 and stop_on_error:
                 break
@@ -514,12 +597,17 @@ class BootstrapRunner:
             "ok": all(r["exit_code"] == 0 for r in results),
         }
 
-    def _run_one(self, name, module, prelude, environment, timeout):
+    def _run_one(self, name, module, prelude, environment, timeout, occurrence=1):
         script = "%s\n\n# --- module: %s ---\n%s" % (prelude, module["id"], module["body"])
         remote = "%s/lemondx-%s.sh" % (REMOTE_DIR, module["id"])
+        label = module["name"] if occurrence == 1 else "%s (%d)" % (module["name"], occurrence)
 
         env = dict(environment)
         env["LEMONDX_MODULE"] = module["id"]
+        env["LEMONDX_OCCURRENCE"] = str(occurrence)
+        # The daemon's name for it, which the guest's own hostname need not be:
+        # what a module must use when it tells someone what to run on the host.
+        env["LEMONDX_INSTANCE"] = name
         for param in module["params"]:
             env.setdefault(param["name"], param["default"])
 
@@ -531,7 +619,7 @@ class BootstrapRunner:
             )
         except Exception as exc:                      # noqa: BLE001
             return {
-                "id": module["id"], "name": module["name"], "exit_code": 1,
+                "id": module["id"], "name": label, "occurrence": occurrence, "exit_code": 1,
                 "stdout": "", "stderr": str(exc),
                 "duration": round(time.time() - started, 1),
             }
@@ -540,7 +628,8 @@ class BootstrapRunner:
 
         return {
             "id": module["id"],
-            "name": module["name"],
+            "name": label,
+            "occurrence": occurrence,
             "exit_code": outcome.get("exit_code", 0),
             "stdout": outcome.get("stdout", ""),
             "stderr": outcome.get("stderr", ""),
