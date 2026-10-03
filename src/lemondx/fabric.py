@@ -35,12 +35,14 @@ past what a flat, leaderless design is good for anyway, and at least four.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
+import re
 import sys
 import threading
 import time
 
-from . import hostnet, store
+from . import eventlog, hostnet, store
 from .lxd import LXDError
 from .service import ServiceError, free_nic
 
@@ -56,7 +58,18 @@ DEFAULT_SETTINGS = {
     # fabric is NAT'd. Written when a claim is accepted, never by hand -- an
     # empty map is "on no fabric", which is how every node starts.
     "fabrics": {},
+    # The LAN subnets this node has macvlan networks on. Published on its
+    # member record, because a macvlan instance here reaches every other
+    # node's fabric from that subnet, and each of them has to admit it.
+    "lan": [],
+    # What this node's fabric firewall admits from outside the fabric: the
+    # union of every member's `lan`. Kept here, not read from peers, so the
+    # root helper builds the firewall from this node's own settings alone.
+    "admit": [],
 }
+
+# At most this many LAN subnets per node, and admitted per fabric firewall.
+MAX_LAN_SUBNETS = 16
 
 # What a new fabric is called and where it goes when nobody says: the first
 # free lemonfabN, and the first /16 in these ranges that no member uses. 10/8
@@ -128,6 +141,87 @@ done
 exit 1
 """
 
+# What makes a macvlan instance reach every fabric: a static route to each
+# node's /24 via that node's LAN address (its own host's via the host's fabric
+# gateway, on-link, which the host's shim answers for -- see hostnet). Written
+# where the guest's network manager keeps it: a systemd-networkd drop-in for
+# the interface's own .network file, which networkd would otherwise clear as
+# foreign routes on its next reload; or an ifupdown hook. Then applied at once,
+# removing what an earlier run added and no longer wants. @IFACE@ and @ROUTES@
+# are filled in by lemondx, from a device name and addresses it checked.
+_CONFIGURE_LAN = r"""
+set -u
+iface=@IFACE@
+wanted=/etc/lemondx/fabric-routes
+applied=/run/lemondx-fabric-routes
+mkdir -p /etc/lemondx
+cat > "$wanted" <<'LEMONDX'
+@ROUTES@
+LEMONDX
+i=0
+while ! ip -o -4 addr show "$iface" 2>/dev/null | grep -q inet; do
+    i=$((i + 1)); [ $i -gt 30 ] && exit 2; sleep 1
+done
+file=""
+if [ -d /run/systemd/system ] && command -v networkctl >/dev/null 2>&1; then
+    file=$(networkctl status "$iface" 2>/dev/null | sed -n 's/^ *Network File: //p' | head -1)
+fi
+if [ -n "$file" ] && [ "$file" != "n/a" ]; then
+    dir="/etc/systemd/network/$(basename "$file").d"
+    mkdir -p "$dir"
+    {
+        echo "# lemondx: routes to the cluster's fabrics"
+        while read -r dst gw how; do
+            [ -n "$dst" ] || continue
+            printf '\n[Route]\nDestination=%s\nGateway=%s\n' "$dst" "$gw"
+            [ "$how" = onlink ] && echo "GatewayOnLink=yes"
+        done < "$wanted"
+    } > "$dir/50-lemondx-fabrics.conf"
+    # networkd owns them from here, stale ones included: adding them by hand
+    # as well would leave a second, unowned copy of each.
+    if [ -f "$applied" ]; then
+        while read -r dst gw how; do
+            [ -n "$dst" ] && ip route del "$dst" dev "$iface" proto boot 2>/dev/null
+        done < "$applied"
+        rm -f "$applied"
+    fi
+    networkctl reload >/dev/null 2>&1 && exit 0
+    exit 1
+elif [ -d /etc/network/if-up.d ]; then
+    cat > /etc/network/if-up.d/lemondx-fabrics <<'LEMONDX'
+#!/bin/sh
+# lemondx: routes to the cluster's fabrics, when the LAN interface comes up.
+[ "${IFACE:-}" = "@IFACE@" ] || exit 0
+while read -r dst gw how; do
+    [ -n "$dst" ] || continue
+    if [ "$how" = onlink ]; then ip route replace "$dst" via "$gw" dev "$IFACE" onlink
+    else ip route replace "$dst" via "$gw" dev "$IFACE"; fi
+done < /etc/lemondx/fabric-routes
+LEMONDX
+    chmod 755 /etc/network/if-up.d/lemondx-fabrics
+fi
+if [ -f "$applied" ]; then
+    while read -r dst gw how; do
+        [ -n "$dst" ] || continue
+        grep -q "^$dst " "$wanted" || ip route del "$dst" dev "$iface" 2>/dev/null
+    done < "$applied"
+fi
+status=0
+while read -r dst gw how; do
+    [ -n "$dst" ] || continue
+    if [ "$how" = onlink ]; then ip route replace "$dst" via "$gw" dev "$iface" onlink || status=1
+    else ip route replace "$dst" via "$gw" dev "$iface" || status=1; fi
+done < "$wanted"
+cp "$wanted" "$applied"
+exit $status
+"""
+
+# Seconds to wait for the daemon to report a new macvlan instance's address.
+SHIM_ADDRESS_WAIT = 15
+
+# A device name as it may appear in the script above.
+_IFACE_NAME = re.compile(r"^[a-zA-Z0-9_.-]{1,15}$")
+
 # How long to let the guest pick up a lease. DHCP on a local bridge is fast;
 # this is a ceiling on a guest that will never answer, not an expected wait.
 CONFIGURE_TIMEOUT = 45
@@ -169,7 +263,7 @@ def clean_settings(raw):
     raw = dict(raw or {})
     if "fabrics" not in raw and any(k in raw for k in ("enabled", "prefix", "bridge", "subnet")):
         raw = _from_version_1(raw)
-    settings = {"via": "", "fabrics": {}}
+    settings = {"via": "", "fabrics": {}, "lan": [], "admit": []}
     for key, value in raw.items():
         if key == "version":
             continue
@@ -204,7 +298,25 @@ def clean_settings(raw):
         cleaned[name] = {"prefix": str(prefix), "subnet": str(subnet),
                          "nat": claim.get("nat") is not False}
     settings["fabrics"] = cleaned
+    for key in ("lan", "admit"):
+        settings[key] = clean_lan_subnets(settings[key], "fabric settings: '%s'" % key)
     return settings
+
+
+def clean_lan_subnets(value, what="LAN subnets"):
+    """A sorted list of IPv4 subnets, or raise FabricError."""
+    if not isinstance(value, list) or len(value) > MAX_LAN_SUBNETS * 8:
+        raise FabricError("%s must be a list of subnets." % what)
+    subnets = set()
+    for item in value:
+        try:
+            network = ipaddress.ip_network(str(item), strict=False)
+        except ValueError:
+            raise FabricError("%s: '%s' is not a subnet." % (what, item))
+        if network.version != 4:
+            raise FabricError("%s: %s is not IPv4." % (what, network))
+        subnets.add(str(network))
+    return sorted(subnets)
 
 
 def _from_version_1(raw):
@@ -276,7 +388,7 @@ def load_settings():
     except ValueError as exc:
         raise FabricError("Cannot use the saved fabric settings: %s" % exc, 500)
     if raw is None:
-        return {"via": "", "fabrics": {}}
+        return {"via": "", "fabrics": {}, "lan": [], "admit": []}
     return clean_settings(raw)
 
 
@@ -303,11 +415,13 @@ def local_claim(default_via=""):
     try:
         settings = load_settings()
     except FabricError:
-        return {"via": "", "fabrics": {}}
+        return {"via": "", "fabrics": {}, "lan": []}
+    # `lan` travels even from a node on no fabric: its macvlan instances
+    # still reach every fabric elsewhere, and those nodes have to know.
     if not settings["fabrics"]:
-        return {"via": "", "fabrics": {}}
+        return {"via": "", "fabrics": {}, "lan": settings["lan"]}
     return {"via": settings["via"] or str(default_via or ""),
-            "fabrics": settings["fabrics"]}
+            "fabrics": settings["fabrics"], "lan": settings["lan"]}
 
 
 def _unreachable_message(nodes):
@@ -325,6 +439,17 @@ def _unreachable_message(nodes):
             "tab, or `lemondx cluster evict NAME`) to go on without %s."
             % (", ".join(nodes), "it" if one else "them", "it" if one else "them",
                "it" if one else "them"))
+
+
+def route_sources(fabrics):
+    """{prefix: this node's gateway in it}, from {name: claim} settings.
+
+    What the host sends into a fabric leaves from here; see
+    `hostnet.route_commands()`. Settings, not a request, decide it -- the
+    helper derives it the same way it derives the firewall.
+    """
+    return {f["prefix"]: str(next(ipaddress.ip_network(f["subnet"]).hosts()))
+            for f in fabrics.values() if f.get("prefix") and f.get("subnet")}
 
 
 def firewall_spec(fabrics):
@@ -565,12 +690,14 @@ class FabricService:
     # -- the plan ------------------------------------------------------
 
     def _route_plan(self, current, desired):
-        commands = hostnet.route_commands(desired, current, self.prefixes())
+        commands = hostnet.route_commands(desired, current, self.prefixes(),
+                                          route_sources(self.fabrics()),
+                                          hostnet.current_route_sources())
         return commands + hostnet.forwarding_commands(sorted(self.fabrics()))
 
     def _plan(self, current, desired):
         return self._route_plan(current, desired) + hostnet.firewall_commands(
-            firewall_spec(self.fabrics()))
+            firewall_spec(self.fabrics()), hostnet.connected_subnets(self.settings()["admit"]))
 
     def plan(self):
         """The host commands that would bring this node's routes up to date."""
@@ -653,6 +780,31 @@ class FabricService:
         thread, where a node that cannot program a route must not take down the
         membership change that prompted it. The failure is visible in status().
         """
+        # Before anything that needs privilege: publishing which LAN this
+        # node's macvlan instances are on is only a settings change.
+        try:
+            if self.sync_lan():
+                threading.Thread(target=eventlog.carry(self._announce), name="lan-announce",
+                                 daemon=True).start()
+        except Exception as exc:                    # noqa: BLE001
+            eventlog.message("lan: could not publish this node's LAN: %s" % exc,
+                             level=logging.WARNING)
+        try:
+            return self._reapply()
+        finally:
+            try:
+                self.refresh_lan()
+            except Exception as exc:                # noqa: BLE001
+                eventlog.message("lan: could not refresh macvlan instances: %s" % exc,
+                                 level=logging.WARNING)
+
+    def _announce(self):
+        try:
+            self.cluster.sync_members()
+        except Exception:                           # noqa: BLE001 - peers catch up hourly
+            pass
+
+    def _reapply(self):
         try:
             if not hostnet.available():
                 return None
@@ -680,18 +832,33 @@ class FabricService:
         def run():
             time.sleep(delay)
             while True:
-                try:
-                    self.reapply()
-                except Exception as exc:           # noqa: BLE001 - a chore thread
-                    # reapply() means not to raise, but one miss must not end
-                    # the loop: routes then stay wrong until `serve` restarts.
-                    print("[lemondx] fabric: reapply failed: %s" % exc,
-                          file=sys.stderr, flush=True)
+                with eventlog.system("fabric"):
+                    self._reapply_round()
                 time.sleep(interval)
 
         thread = threading.Thread(target=run, name="fabric", daemon=True)
         thread.start()
         return thread
+
+    def _reapply_round(self):
+        try:
+            self.reapply()
+        except Exception as exc:           # noqa: BLE001 - a chore thread
+            # reapply() means not to raise, but one miss must not end
+            # the loop: routes then stay wrong until `serve` restarts.
+            eventlog.message("fabric: reapply failed: %s" % exc,
+                             level=logging.WARNING)
+        # Docker rebuilds its chain when it restarts, taking the LAN
+        # bridges' exceptions with it, the same way a reboot takes
+        # fabric routes -- so they are put back on the same clock.
+        try:
+            if hostnet.docker_present() and hostnet.available() \
+                    and self.service.lan_bridges():
+                for note in self.service.sync_lan_firewall():
+                    eventlog.message("lan: %s" % note)
+        except Exception as exc:           # noqa: BLE001 - a chore thread
+            eventlog.message("lan: firewall sync failed: %s" % exc,
+                             level=logging.WARNING)
 
     # -- the bridges ---------------------------------------------------
 
@@ -1428,6 +1595,146 @@ class FabricService:
                 "error": "" if ok else
                          "%s did not come up in the instance; its image may need "
                          "the interface configured by hand." % iface}
+
+    # -- macvlan instances ---------------------------------------------
+
+    def _macvlan_parents(self):
+        """{network: parent NIC} for this node's macvlan networks."""
+        return {n.get("name"): (n.get("config") or {}).get("parent") or ""
+                for n in self.service.lxd.list_networks()
+                if n.get("managed") and n.get("type") == "macvlan"}
+
+    def lan_subnets(self):
+        """The LAN subnets this node's macvlan networks are on."""
+        return sorted({str(net) for parent in self._macvlan_parents().values() if parent
+                       for net in hostnet.nic_subnets(parent)})
+
+    def sync_lan(self):
+        """Save this node's LAN subnets and admit every member's. True if ours changed.
+
+        The admit list is the union of every member's, so a macvlan instance on
+        any node's LAN is let into this node's fabrics (and the helper then
+        keeps only the ones this host is attached to).
+        """
+        own = self.lan_subnets()
+        admit = set(own)
+        for member in self.cluster.members():
+            admit.update((member.get("fabric") or {}).get("lan") or [])
+        settings = self.settings()
+        if settings["lan"] == own and settings["admit"] == sorted(admit):
+            return False
+        changed = settings["lan"] != own
+        self._save(lan=own, admit=sorted(admit))
+        return changed
+
+    def macvlan_instances(self):
+        """(instance, iface, parent, [addresses]) for running instances on a macvlan here.
+
+        Leaves out an instance that also has a fabric NIC: that one's route
+        to the whole prefix already goes through the fabric.
+        """
+        parents = self._macvlan_parents()
+        if not parents:
+            return []
+        bridges = set(self.fabrics())
+        found = []
+        for instance in self.service.lxd.list_instances():
+            if instance.get("status") != "Running":
+                continue
+            nics = [(key, d) for key, d in (instance.get("expanded_devices") or {}).items()
+                    if d.get("type") == "nic"]
+            if any(d.get("network") in bridges for _, d in nics):
+                continue
+            nic = next(((k, d) for k, d in nics if d.get("network") in parents), None)
+            if nic is None:
+                continue
+            iface = nic[1].get("name") or nic[0]
+            state = ((instance.get("state") or {}).get("network") or {}).get(iface) or {}
+            addresses = [a.get("address") for a in state.get("addresses") or []
+                         if a.get("family") == "inet" and a.get("scope") == "global"]
+            found.append((instance.get("name"), iface, parents[nic[1]["network"]], addresses))
+        return found
+
+    def lan_guest_routes(self, parent):
+        """[(subnet, gateway, onlink)] for a macvlan instance on ``parent`` to reach every fabric.
+
+        Each node's /24 via that node's LAN address, where the instance can
+        reach it directly; its own host's via the host's fabric gateway, on
+        link, answered by the host's shim -- the host's LAN address cannot be,
+        as macvlan never passes frames to its parent.
+        """
+        local = self.cluster.local_name()
+        lans = hostnet.nic_subnets(parent)
+        shim = hostnet.available()
+        routes = {}
+        for node, name, _, subnet, via in self._claims():
+            if not subnet or subnet in routes:
+                continue
+            if node == local:
+                if shim and name in self.fabrics():
+                    routes[subnet] = (self._gateway(subnet), True)
+                continue
+            try:
+                reachable = via and any(ipaddress.ip_address(via) in lan for lan in lans)
+            except ValueError:
+                reachable = False
+            if reachable:
+                routes[subnet] = (via, False)
+        return sorted((subnet, gw, onlink) for subnet, (gw, onlink) in routes.items())
+
+    def configure_lan_guest(self, name, iface, parent):
+        """Give one macvlan instance its routes to every fabric. Reported, never raised."""
+        if not _IFACE_NAME.match(iface or ""):
+            return {"ok": False, "interface": iface, "error": "unusable interface name"}
+        routes = self.lan_guest_routes(parent)
+        script = _CONFIGURE_LAN.replace("@IFACE@", iface).replace("@ROUTES@", "\n".join(
+            "%s %s %s" % (subnet, gw, "onlink" if onlink else "-")
+            for subnet, gw, onlink in routes))
+        try:
+            result = self.service.lxd.exec_command(name, ["/bin/sh", "-c", script],
+                                                   timeout=CONFIGURE_TIMEOUT)
+        except Exception as exc:                    # noqa: BLE001
+            return {"ok": False, "interface": iface,
+                    "error": getattr(exc, "message", str(exc))}
+        ok = (result or {}).get("exit_code") == 0
+        return {"ok": ok, "interface": iface, "routes": len(routes),
+                "error": "" if ok else "the routes to the fabrics could not all be set "
+                                       "in %s: %s" % (name, ((result or {}).get("stderr")
+                                                             or "").strip()[-200:])}
+
+    def configure_new_lan_instance(self, name):
+        """After a launch: routes in the instance if it is on a macvlan, then the shim."""
+        mine = next((m for m in self.macvlan_instances() if m[0] == name), None)
+        if mine is None:
+            return None
+        result = self.configure_lan_guest(name, mine[1], mine[2])
+        # The guest has its lease by now, but the daemon's view of it can lag
+        # a moment; a shim refreshed before it shows would route nothing here.
+        for _ in range(SHIM_ADDRESS_WAIT):
+            if any(m[0] == name and m[3] for m in self.macvlan_instances()):
+                break
+            time.sleep(1)
+        self.refresh_shims()
+        return result
+
+    def refresh_shims(self):
+        """Keep the host's shims routing to every macvlan instance here."""
+        if not hostnet.available():
+            return None
+        wanted = {}
+        for _, _, parent, addresses in self.macvlan_instances():
+            if parent:
+                wanted.setdefault(parent, set()).update(addresses)
+        if not wanted and not hostnet.current_shims():
+            return None
+        return hostnet.delegate({"lan": {"action": "shim", "parents": {
+            parent: sorted(addresses) for parent, addresses in wanted.items()}}})
+
+    def refresh_lan(self):
+        """Routes into every macvlan instance here, then the shims: fabrics come and go."""
+        for name, iface, parent, _ in self.macvlan_instances():
+            self.configure_lan_guest(name, iface, parent)
+        self.refresh_shims()
 
     def detach(self, name, fabric=None):
         """Take an instance's NIC off one fabric, or off every fabric.

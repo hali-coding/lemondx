@@ -19,6 +19,15 @@ credentials get `401`, too little access `403`, too many failed logins `429`.
 | --- | --- | --- |
 | `GET` | `/api/status` | daemon flavor/version, readiness, pools, networks |
 | `POST` | `/api/setup` | create pool + bridge, attach to default profile |
+| `GET` | `/api/configure` | how this node is reached: `unconfigured`, bound `host`/`port`, `tls`, `auth`, `pinned` flags, saved `certificate`, `admins`, and `blocked` (why configuring is refused now, or `""`) |
+| `POST` | `/api/configure` | leave [unconfigured mode](security.md#unconfigured-mode): `{"username","password","tls":{"mode":"generate","host"}\|{"mode":"upload","cert","key"}\|{"mode":"keep"},"host":"0.0.0.0"}` → what was saved, then the server restarts; `409` in a cluster or while work is running |
+| `GET` | `/api/logging` | this node's [logging](logging.md): the cluster's `settings` as applied here, whether any were `saved`, `local_fallback` (no syslog socket), and each destination's `sent` count and last `error` |
+| `PUT` | `/api/logging` | `{"settings":{"level","local":{"facility"},"destinations":[{"type":"syslog","enabled","host","port","protocol":"udp"\|"tcp","facility"}]}}` → saved and pushed to every member; returns `synced` |
+| `GET` | `/api/logs` | this node's [live tail](logging.md#watching-it-live): `?after=<cursor>&wait=0..25&limit=&level=&kind=&actor=&req=&channel=&instance=&q=` → `{node, boot, cursor, events, reset, truncated}`; without `after`, the latest events. Any logged-in user |
+| `GET` | `/api/cluster/logs` | every node's tail merged by time: same filters, `cursor` (opaque, from the last answer), `wait` (≤20), `nodes`/`group` → `{cursor, events (each with node), nodes: [{node, ok, error, pending, reset, truncated}]}`; returns as soon as any node has something |
+| `POST` | `/api/logging/test` | send a test line to every destination of this node now → per-destination `results` |
+| `PUT` | `/api/settings/{name}` | a cluster setting as stored — cluster members only (sync) |
+| `DELETE` | `/api/settings/{name}` | back to the default — cluster members only (sync) |
 | `GET` | `/api/containers` | list with live state |
 | `POST` | `/api/containers` | create (and optionally start); `"background":true` returns progress at once |
 | `GET` | `/api/creates` | creates in progress (stage: creating/starting/bootstrapping) or finished in the last 10 minutes |
@@ -44,11 +53,31 @@ credentials get `401`, too little access `403`, too many failed logins `429`.
 | `GET` | `/api/images` | cached images, suggested catalog, remotes |
 | `GET` | `/api/images/browse` | full remote catalogs, flagged with what is local |
 | `POST` | `/api/images/{alias}/copy` | `{"nodes":[...]}` → copy this node's image to other nodes |
-| `GET` | `/api/image-jobs` | publishes and copies held by this node, running or finished in the last 10 minutes |
+| `DELETE` | `/api/images/{fingerprint}` | remove this node's copy of an image (`409` while a template launches it as `local:<alias>`) |
+| `GET` | `/api/images/inventory` | this node's images (full fingerprints) and every snapshot on it |
+| `GET` | `/api/cluster/images` | the same from every member, each entry tagged `node`, plus `errors` for members that did not answer |
+| `GET` | `/api/image-jobs` | publishes, copies and pinned-build fetches held by this node, running or finished in the last 3 minutes |
 | `POST` | `/api/images/adopt` | "have you got this image?" — name it if so — cluster members only |
-| `PUT` | `/api/images/receive` | an image tarball, streamed and checked by fingerprint — cluster members only |
+| `PUT` | `/api/images/receive` | an image, streamed and checked by fingerprint (`?content_type=` carries a split image's multipart type) — cluster members only |
+| `POST` | `/api/images/prune` | `{"apply"?,"only"?}` → this node's downloaded images that nothing uses, pins or launches (`deleted`, `kept` with a `reason`, `freed`); deleted only with `"apply": true`, and then only the fingerprints in `only` when given |
+| `POST` | `/api/cluster/images/prune` | the same on `nodes` (default all), per node; `only` is `{node: [fingerprint, …]}` from a preview |
+| `GET` | `/api/images/pins` | every [pinned build](daemons-and-storage.md#pinned-images), with whether this node `held` it and the templates that launch it (`used_by`); `{pin}` below is its id or a nickname |
+| `GET` | `/api/images/versions` | `?image=images:debian/12` → the builds its remote still serves, newest first, and its `pins` |
+| `POST` | `/api/images/pins` | `{"image","serial"?,"nicknames"?,"note"?,"nodes"?}` → pin that build (newest by default) everywhere, then fetch it onto `nodes` (default all) as an image job; 409 if the build is pinned already; `"background":true` returns the job at once |
+| `PATCH` | `/api/images/pins/{pin}` | `{"nicknames"?,"note"?}` → the only things a pin may change; a nickname a template launches by cannot be removed |
+| `DELETE` | `/api/images/pins/{pin}` | unpin, everywhere unless `?everywhere=false`; refused while a template launches it; fetched builds stay |
+| `POST` | `/api/images/pins/{pin}/fetch` | `{"nodes"?}` → fetch the pinned build here (if needed) and send it to those nodes |
+| `POST` | `/api/images/pins/{pin}/pull` | fetch the pinned build onto this node only |
+| `PUT` | `/api/images/pins/{id}` | a pin as stored — cluster members only (sync); refused if it changes the build |
 | `GET`/`POST` | `/api/networks` | every interface the daemon can see / create a managed bridge |
 | `GET` | `/api/subnets` | every subnet already on the host, which a new bridge must not overlap |
+| `GET` | `/api/cluster/networks/{name}` | which members have a managed network of that name, and whether it is a fabric |
+| `DELETE` | `/api/cluster/networks/{name}` | delete it on every member that has it (`?nodes=` narrows), reported per node; refused for a fabric |
+| `GET` | `/api/lan` | the host's NICs, and which ways each can put instances on its LAN (see [LAN](lan.md)) |
+| `POST` | `/api/lan/networks` | `{"nic","mode":"bridge\|macvlan","name"}` → a network on that NIC's LAN; `"default": true` instead of `nic` uses the default-route NIC; `"everywhere": true` makes a macvlan of that name on every member's default-route NIC, reported per node |
+| `GET` | `/api/lan/plan` | `?nic=&bridge=` → the commands converting that NIC would run |
+| `POST` | `/api/lan/convert` | `{"nic","bridge"}` → make the host's NIC a bridge port, keeping its address; undone if it fails |
+| `POST` | `/api/lan/revert` | `{"bridge"}` → give a converted bridge's NIC back its own connection |
 | `GET`/`PATCH`/`DELETE` | `/api/networks/{name}` | config, state, DHCP leases, attachments / change or delete a managed bridge |
 | `GET` | `/api/cluster` | this node's name, address and certificate fingerprint |
 | `GET` | `/api/cluster/nodes` | federated nodes and their state (`?probe=false` skips contacting them) |
@@ -79,7 +108,7 @@ credentials get `401`, too little access `403`, too many failed logins `429`.
 | `DELETE` | `/api/cluster/invites/{id}` | withdraw a join code |
 | `POST` | `/api/cluster/sync` | push templates, modules or profiles to other nodes |
 | `POST` | `/api/cluster/fingerprint` | what certificate an address presents right now |
-| `POST` | `/api/cluster/enroll` | redeem a join code — node to node, no token (see [Nodes](cluster.md)) |
+| `POST` | `/api/cluster/enroll` | redeem a join code — node to node, no token (see [Nodes](cluster.md)); refused (`409`) unless `node.daemon` reports LXD ≥ 5.21 or Incus ≥ 6.0 |
 | `GET` | `/api/modules` | bootstrap modules with their parameters |
 | `GET` | `/api/ssh-keys` | public keys found in `~/.ssh` |
 | `POST` | `/api/ssh-keys/validate` | check one pasted public key |

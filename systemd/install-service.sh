@@ -106,6 +106,8 @@ install_user() {
     fi
     echo
     echo "lemondx is running: http://127.0.0.1:8099"
+    echo "A first start is in unconfigured mode (this host only, no login, no HTTPS);"
+    echo "press Configure node there to add a login and a certificate and open it up."
     echo "Logs:   journalctl --user -u lemondx -f"
     echo "Status: systemctl --user status lemondx"
 
@@ -161,6 +163,8 @@ install_system() {
     systemctl enable --now lemondx.service
     echo
     echo "lemondx is running: http://127.0.0.1:8099"
+    echo "A first start is in unconfigured mode (this host only, no login, no HTTPS);"
+    echo "press Configure node there to add a login and a certificate and open it up."
     echo "Logs:   journalctl -u lemondx -f"
     echo "Status: systemctl status lemondx"
     echo
@@ -209,11 +213,23 @@ install_fabric() {
     echo "  the daemon, so this adds no access it did not have."
     echo
     echo "Next: lemondx fabric create   (on one node, or New fabric in the Network tab)"
-    if [ "$mode" = user ] && [ -f "$HOME/.config/systemd/user/lemondx.service" ]; then
+    # This runs under sudo, where $HOME is root's: the user unit is in the
+    # invoking user's home, and looking in root's never found it.
+    local user_home=""
+    [ -n "${SUDO_USER:-}" ] && user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    if [ -n "$user_home" ] && [ -f "$user_home/.config/systemd/user/lemondx.service" ] \
+            && [ ! -f "$user_home/.config/systemd/user/lemondx.service.d/privilege.conf" ]; then
         echo
-        echo "Note: the unit sets NoNewPrivileges=yes, which stops sudo from raising"
-        echo "privilege. Set NoNewPrivileges=no for lemondx.service if you want"
-        echo "\`serve\` to program routes itself -- see docs/service.md."
+        echo "Note: the user unit cannot run sudo, so its \`serve\` will not program"
+        echo "routes: NoNewPrivileges=yes stops sudo, and the unit's filesystem sandbox"
+        echo "runs it in a user namespace where sudo cannot work either. Add the drop-in"
+        echo "in docs/service.md (\"A user unit that can raise privilege\") as $SUDO_USER,"
+        echo "or run \`lemondx fabric apply\` after each boot."
+    elif [ -f /etc/systemd/system/lemondx.service ]; then
+        echo
+        echo "Note: the system unit sets NoNewPrivileges=yes, which stops sudo from"
+        echo "raising privilege. Set NoNewPrivileges=no for it if you want \`serve\`"
+        echo "to program routes itself -- see docs/service.md."
     fi
 }
 

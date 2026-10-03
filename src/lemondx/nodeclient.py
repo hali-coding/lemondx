@@ -27,6 +27,7 @@ import socket
 import ssl
 import urllib.parse
 
+from . import eventlog
 from .websocket import WebSocketError, client_handshake
 
 DEFAULT_TIMEOUT = 20
@@ -209,6 +210,7 @@ class NodeClient:
             headers["Content-Type"] = "application/json"
         if self.token:
             headers["Authorization"] = "Bearer %s" % self.token
+        headers.update(eventlog.relay_headers())
 
         conn = self._connect(timeout or self.timeout)
         try:
@@ -253,6 +255,7 @@ class NodeClient:
                    "Content-Length": str(length)}
         if self.token:
             headers["Authorization"] = "Bearer %s" % self.token
+        headers.update(eventlog.relay_headers())
         conn = self._connect(timeout or self.timeout)
         try:
             conn.request("PUT", target, body=stream, headers=headers)
@@ -296,6 +299,7 @@ class NodeClient:
         sock, conn.sock = conn.sock, None
         host = "[%s]" % self.host if ":" in self.host else self.host
         headers = {"Authorization": "Bearer %s" % self.token} if self.token else {}
+        headers.update(eventlog.relay_headers())
         try:
             return client_handshake(sock, "%s:%d" % (host, self.port), target, headers)
         except WebSocketError as exc:
@@ -335,6 +339,18 @@ class NodeClient:
 
     def save_group(self, name, body):
         return self.request("PUT", "/api/cluster/groups/%s" % _seg(name), body)
+
+    def save_setting(self, name, body):
+        return self.request("PUT", "/api/settings/%s" % _seg(name), body)
+
+    def delete_setting(self, name):
+        return self.request("DELETE", "/api/settings/%s" % _seg(name))
+
+    def save_pin(self, name, body):
+        return self.request("PUT", "/api/images/pins/%s" % _seg(name), body)
+
+    def delete_pin(self, name):
+        return self.request("DELETE", "/api/images/pins/%s" % _seg(name))
 
     def adopt_user(self, name, body):
         """Hand a peer a local account as stored, password hash included."""
@@ -455,16 +471,24 @@ class NodeClient:
     def health(self):
         return self.request("GET", "/api/health")
 
+    def image_inventory(self):
+        return self.request("GET", "/api/images/inventory")
+
     def adopt_image(self, fingerprint, alias, description=""):
         return self.request("POST", "/api/images/adopt", {
             "fingerprint": fingerprint, "alias": alias, "description": description})
 
-    def send_image(self, stream, length, fingerprint, alias, description=""):
+    def send_image(self, stream, length, fingerprint, alias, description="",
+                   content_type=None):
         # Each read waits on the sender's disk and each write on this link, but
-        # the answer waits on the far daemon unpacking what it was sent.
-        return self.upload("/api/images/receive", stream, length, params={
-            "fingerprint": fingerprint, "alias": alias, "description": description},
-            timeout=IMAGE_TIMEOUT)
+        # the answer waits on the far daemon unpacking what it was sent. A
+        # split image's multipart type rides as a parameter, since the body
+        # itself always goes as one opaque upload.
+        params = {"fingerprint": fingerprint, "alias": alias, "description": description}
+        if content_type and content_type.startswith("multipart/"):
+            params["content_type"] = content_type
+        return self.upload("/api/images/receive", stream, length, params=params,
+                           timeout=IMAGE_TIMEOUT)
 
 
 def _seg(value):

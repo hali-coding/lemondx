@@ -19,11 +19,18 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 @LEMONDX_PATH@/lemondx serve --host 127.0.0.1 --port 8099
-# Authentication is off until configured: run `lemondx configure auth` as
-# this user and restart; serve reads the saved settings. Flags appended here
-# (--auth local, --token-file PATH, ...) override them. --auth pam also needs
-# the NoNewPrivileges change noted below; see docs/service.md#authentication.
+ExecStart=/usr/bin/python3 @LEMONDX_PATH@/lemondx serve
+# Starts in unconfigured mode -- 127.0.0.1:8099, no login, plain HTTP -- until
+# Configure node in the UI (or `lemondx configure node` as this user, then a
+# restart) adds an admin login, HTTPS and the address to listen on. Pressing
+# it restarts the server in place, under the same PID. No --host/--port here:
+# a flag would override the saved address. Flags appended here (--auth local,
+# --token-file PATH, ...) override saved settings. --auth pam also needs the
+# NoNewPrivileges change noted below; see docs/service.md#authentication.
+# Unbuffered, or the startup warnings (a fabric that cannot program
+# routes, PAM that cannot work) sit in a block buffer and never reach
+# the journal, which is where they are meant to be read.
+Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=5
 

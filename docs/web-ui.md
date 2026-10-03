@@ -21,6 +21,21 @@ result, not a failure for the rest. The notification afterwards says so,
 naming only the ones that did not do as asked. `lemondx start`/`stop` take
 several names for the same reason and go through the same code.
 
+## Configuring a new node
+
+A node starts in [unconfigured mode](security.md#unconfigured-mode) — this
+host only, no login, plain HTTP — and says so in a banner with a **Configure
+node** button. The dialog asks for an admin login, a certificate (generate a
+self-signed one, upload one with its key, or keep the one already saved) and
+whether to listen on every interface. Pressing **Configure and restart** saves
+all of it and restarts the server, so the page stops working; the dialog then
+shows the certificate's fingerprint to compare with the browser's warning and
+a button to carry on at `https://` — by the same host and port the browser
+used, so an SSH tunnel keeps working — where the login gate asks for the new
+account. On the Cluster tab, an unconfigured node's **Invite new node** and
+**Join cluster** stay disabled, and a configured node not yet in a cluster
+offers **Change** beside what it serves.
+
 ## Logging in and the Access view
 
 With `--auth` on, the UI asks for a username and password (or an API token,
@@ -114,16 +129,36 @@ one offers to remove it from the others too, ticked by default; untick it to
 leave their copies alone.
 
 A node that was switched off when something changed catches up on its own when
-it comes back: see [Nodes view](#nodes-view) and
+it comes back: see [Cluster view](#cluster-view) and
 [A node that was switched off catches itself up](cluster.md#a-node-that-was-switched-off-catches-itself-up).
 
-## Nodes view
+## Logs view
 
-Only interesting once this lemondx is federated with another; on its own it
-shows this host and not much else. It has four parts:
+A live tail of what lemondx does on every node, merged by time: each change,
+who made it and how, and the requests behind it. Filter by node or group,
+level, kind, who, instance or text; **Pause** stops it moving, and **Follow**
+keeps the newest event, at the top, in view unless you have scrolled down to read.
+
+- **A request id** (at the end of a row) filters to everything that one action
+  did, on every node it reached. A click in the UI on one node that changed
+  something on another shows up as one thread.
+- **A person, or an instance name,** filters to them.
+
+Each node keeps its last 5000 events in memory since it started; a node that
+restarts or cannot be reached says so above the list. The tail stops polling
+while the browser tab is hidden. An instance's **Activity** tab, in its
+details panel, is the same thing for that instance alone. See
+[Logging](logging.md#watching-it-live).
+
+## Cluster view
+
+The nodes, and the settings they share. The node parts are only interesting
+once this lemondx is federated with another; on its own it shows this host and
+its settings. It has five parts:
 
 - **This node** — the name, address and certificate fingerprint peers know it
-  by, and a warning naming whatever is stopping another node from joining it.
+  by, what it is serving (scheme, bound address, whether logins are on), and a
+  warning naming whatever is stopping another node from joining it.
   **Leave cluster** takes this host out and has every member forget it.
 - **Nodes** — a card per node with its daemon, instance counts and groups, and
   a dot for reachable / not set up / unreachable. *Show instances* lists what is
@@ -140,8 +175,14 @@ shows this host and not much else. It has four parts:
   trust the absence of.
 - **Node groups** — a name for a set of nodes, so a launch or a sync can say
   "everywhere" once. A member that is not a node here is marked in red.
+- **Configuration** — settings for the whole cluster, saved here and pushed to
+  every member. **Logging** sets the log level and any remote syslog hosts
+  (UDP or TCP). **Send test message** reports how each destination took a test
+  line. A table shows each node's level and whether its destinations are
+  working. A node that was off when the settings changed is marked **behind**,
+  with **Push to …** to send them again. See [Logging](logging.md).
 
-Each of the four listings loads on its own, so a call that fails leaves the rest
+Each of the listings loads on its own, so a call that fails leaves the rest
 of the view working. That matters here more than anywhere: this is the tab a
 broken cluster is fixed from, and **Leave cluster** is the way out of one. A
 node whose credential is gone but which still lists peers shows a banner saying
@@ -290,6 +331,41 @@ Allocations cover the current project; host figures cover the whole host.
 curl -s localhost:8099/api/resources | jq '.memory, .instances[].memory'
 ```
 
+## Images view
+
+**Workloads → Images** shows the cluster's images as one list: each image once,
+with a badge per node saying where it is and where it is missing. Images the
+daemon pulled from a remote to make an instance are hidden unless asked for;
+those it caches and expires by itself.
+
+- **Copy to…** sends a named image to the nodes that lack it, from a node that
+  has it -- the same streamed, checked copy described in
+  [Templates](templates.md#from-a-snapshot).
+- **Delete…** removes it from the nodes ticked. Instances already made from it
+  are unaffected; a node where a template launches it as `local:<alias>`
+  refuses, and says which template.
+- **Snapshots** lists every snapshot on every node, each with **Make image**.
+- **Prune images…** asks every node which downloaded images nothing uses,
+  pins or launches, lists them with their sizes (and, if asked, what is kept
+  and why), and deletes exactly those; see
+  [Pruning images](daemons-and-storage.md#pruning-images).
+- **Search remotes** searches the remotes' full catalogs (every word must
+  match: `debian 12`, `ubuntu 24.04`), showing each image's newest build and
+  how many builds the remote still has and how many are pinned. **Pin a
+  build…** pins one of those builds for the whole cluster, with optional
+  nicknames, and fetches it onto the nodes chosen; builds pinned already are
+  not offered again. See [Pinned images](daemons-and-storage.md#pinned-images).
+- **Pinned builds** lists each pin by the name templates use (`pin:` and its
+  first nickname, else its id), its other names, the templates that launch it,
+  who pinned it and why, a badge per node that holds the build, a hint when the
+  remote has a newer one nobody pinned yet, and **Fetch on …** for nodes that
+  lack it, **Nicknames…** and **Unpin…** (disabled while a template launches it).
+
+Publishes, copies and pin fetches in progress, or finished in the last three minutes, are
+listed at the top with each node's progress; the × on a row hides it sooner
+(the job carries on, and is still reported when it ends). The tab reads every member, so
+it refreshes on its own slower clock (10 s), and at once when a job finishes.
+
 ## Storage view
 
 The Storage and Network views, like **This node** on Home, are about the host
@@ -329,6 +405,27 @@ an instance-specific root disk override; it does not change the profile.
 
 ## Network view
 
+**New network** is the one way to make any network. Its first step asks what
+instances on it should reach, and carries on in the form for the answer, with
+**Back** to change it:
+
+- **Private to this node** -- each other and the internet, NAT'd behind the
+  host, like `lxdbr0`. The usual choice; see [Managing networks](#managing-networks).
+- **Shared across the cluster (fabric)** -- each other on every node, by their
+  own addresses; see [Fabrics](#fabrics) below.
+- **On your LAN** -- addressed by your router and reachable like any machine on
+  it: macvlan, a bridge over a spare NIC, or the host's own NIC turned into a
+  bridge, offered per NIC as it allows; see [Containers on your LAN](lan.md).
+  Such networks are labelled *LAN* here and in the instance form's network
+  picker, and a converted bridge has **Revert**.
+
+**Delete** on a network that other members also have -- the same name,
+managed there too, as a LAN network made on every node is -- asks whether to
+delete it on this node only or on all of them, and lists the nodes. Each node
+still refuses while something there uses it, and a refusal on one does not stop
+the others. Fabrics are not offered this: they are deleted from the Fabrics
+section, which also removes their routes.
+
 The **Network** tab explains how container networking is actually wired up,
 rather than just listing interfaces: the bridge's IPv4/IPv6 subnets, whether
 NAT and DHCP are on, the DNS domain, MTU and bridge MAC — followed by a
@@ -352,13 +449,13 @@ Each row is the node's own report, fetched from it, so a missing bridge or
 route on another host shows up here rather than as lost packets. The card
 polls every 10 seconds, because every poll asks each member.
 
-**New fabric** opens a dialog pre-filled with the first free name and /16,
+The fabric step of **New network** is pre-filled with the first free name and /16,
 checked against every interface and route on every node. Editing either field
 checks again, shows the /24 each node would get, and names the node and
 interface that any overlap is with. The fabric is created on every node at
-once, so every node must be reachable: while one is not, **New fabric** is
-disabled and the section says which node it is and that the way on without it
-is to evict it on the Nodes tab.
+once, so every node must be reachable: while one is not, the step says which
+node it is, that the way on without it is to evict it on the Cluster tab, and
+will not create.
 **Add missing nodes** gives a subnet to members that lack one, and **Delete**
 removes the fabric everywhere once no instance is attached to it. **Apply**
 and **Show plan** act on this node's routes and firewall.
@@ -372,7 +469,7 @@ picker says which of the two you get.
 
 ### Managing networks
 
-**New network** creates a managed bridge. Each address family is *Pick a free
+**New network** → *Private to this node* creates a managed bridge. Each address family is *Pick a free
 subnet for me* (the daemon's `auto`), *Choose the CIDR block…*, or *Disabled*,
 with NAT and DHCP toggles.
 
@@ -431,6 +528,16 @@ straight from their simplestreams indexes.
 - filter by remote, or tick **Downloaded only**
 - images already on this host are marked **Downloaded**; everything else shows
   its download size
+- images with [pinned builds](daemons-and-storage.md#pinned-images) are marked
+  **Pinned** — picking one here still follows the remote; the pins themselves
+  are in the short list
+
+The same applies to the template dialog, which shares the form. Pinned builds
+come first in the short list, each as `pin:<nickname>` (or its id) with the
+build's date. Under a pin picked, a note names the build and image, and whether
+this node holds it or will fetch it at launch. It is an error if the pinned
+build has no image of the chosen type (container or VM). A pin never changes
+build, so a template naming one makes the same base until it is edited.
 
 "Downloaded" is exact, not a guess: simplestreams publishes the same combined
 SHA256 that the daemon stores as an image fingerprint, so container and VM

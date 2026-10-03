@@ -241,6 +241,8 @@ export interface BootstrapModule {
   order: number
   params: ModuleParam[]
   uses_ssh_keys: boolean
+  /** May be added more than once to one selection (`# repeatable: yes`). */
+  repeatable: boolean
 }
 
 export interface SshKey {
@@ -292,10 +294,93 @@ export interface RemoteImage {
   vm_fingerprint: string | null
   supported: boolean | null
   eol: string | null
+  /** Every name the product answers to; any of them launches it. */
+  aliases: string[]
+  /** The builds the remote still serves, newest first: what a pin can hold. */
+  versions: RemoteImageVersion[]
+  /** The builds of this image pinned so far, newest pin first. */
+  pins: { name: string; serial: string; nicknames: string[] }[]
   /** The container image is already on this host. */
   cached: boolean
   /** The VM image is already on this host. */
   cached_vm: boolean
+}
+
+export interface RemoteImageVersion {
+  serial: string
+  container_fingerprint: string | null
+  vm_fingerprint: string | null
+  size: number
+  vm_size: number
+}
+
+/**
+ * One build of a remote image, shared across the cluster like a template. A
+ * launch takes it by naming `pin:<name>` or `pin:<nickname>`; the build never
+ * changes, so a newer one is another pin beside it.
+ */
+export interface ImagePin {
+  /** Derived from image and build, e.g. images-debian-12-20261001-0524. */
+  name: string
+  /** The image it is a build of: `remote:alias`, e.g. images:debian/12. */
+  image: string
+  /** Other names it answers to; the only thing about a pin that can change. */
+  nicknames: string[]
+  remote: string
+  alias: string
+  aliases: string[]
+  serial: string
+  arch: string
+  /** The server the build came from: `images:` differs between LXD and Incus. */
+  server: string
+  fingerprint: string
+  vm_fingerprint: string
+  label: string
+  note: string
+  pinned_at: number
+  pinned_by: string
+  /** This node holds the container (VM) build. */
+  held: boolean
+  held_vm: boolean
+  /** The name the build is kept under here: local:<local_alias>. */
+  local_alias: string
+  /** Templates that launch it, by any of its names; unpinning is refused while any do. */
+  used_by: string[]
+}
+
+export interface PrunedImage {
+  fingerprint: string
+  aliases: string[]
+  description: string
+  size: number
+  type: 'container' | 'virtual-machine'
+  /** Why it stays: in use, pinned, launched by a template, made here. */
+  reason?: string
+  error?: string
+}
+
+/** One node's answer to a prune: what goes (or went), and what stays and why. */
+export interface PruneNode {
+  node: string
+  ok: boolean
+  error: string | null
+  applied: boolean
+  deleted: PrunedImage[]
+  kept: PrunedImage[]
+  failed: PrunedImage[]
+  freed: number
+}
+
+export interface PruneResult {
+  applied: boolean
+  nodes: PruneNode[]
+  freed: number
+  ok: boolean
+}
+
+export interface PinResult {
+  pin: ImagePin & { synced?: unknown }
+  job: ImageJob
 }
 
 export interface ImageBrowse {
@@ -323,6 +408,77 @@ export interface NetworkSummary {
   /** A managed bridge lemondx can edit and delete. */
   manageable: boolean
   read_only_reason: string
+  /** How it puts instances on a host NIC's LAN, or null when it does not. */
+  lan: LanInfo | null
+}
+
+/**
+ * A network whose instances are addressed by the LAN's own DHCP (the
+ * router), not by the daemon. `bridge`: a daemon bridge over a spare NIC.
+ * `macvlan`: beside a NIC, so the host cannot reach them over it.
+ * `converted`: the NIC the host uses, made a port of a bridge by lemondx.
+ * `host`: a bridge with a NIC in it that was made some other way.
+ */
+export interface LanInfo {
+  kind: 'bridge' | 'macvlan' | 'converted' | 'host'
+  nic: string
+}
+
+export type LanMode = 'bridge' | 'macvlan' | 'convert'
+
+/** Which members have a managed network of one name: what a delete may span. */
+export interface NetworkPresence {
+  name: string
+  /** A fabric's bridge: deleted from the Fabrics section, never here. */
+  fabric: boolean
+  nodes: { node: string; present: boolean | null; type: string; lan: LanInfo | null;
+           used_by: number; error: string | null }[]
+}
+
+export interface NetworkDeleteEverywhere {
+  name: string
+  ok: boolean
+  nodes: { node: string; ok: boolean; error: string | null }[]
+}
+
+/** A host NIC, and which ways it can put instances on its LAN. */
+export interface LanInterface {
+  name: string
+  hwaddr: string
+  up: boolean
+  addresses: string[]
+  /** The host's own way out: converting it moves the host's connection. */
+  default_route: boolean
+  wireless: boolean
+  /** The bridge it is already a port of, or blank. */
+  master: string
+  /** The NetworkManager connection running it, blank when NM does not. */
+  network_manager: string
+  /** `manual`: possible, but lemondx cannot run it as root, so it shows the commands. */
+  modes: Record<LanMode, { available: boolean; reason: string; manual: boolean }>
+}
+
+export interface LanInterfaces {
+  interfaces: LanInterface[]
+  /** lemondx can run its helper as root. */
+  helper: boolean
+  /** Docker is here, so LAN bridges need an exception in its firewall. */
+  docker: boolean
+  /** The NIC this host's preferred default route leaves by; blank without one. */
+  default_nic: string
+}
+
+/** A LAN network made on every member, each on its own default-route NIC. */
+export interface LanEverywhere {
+  name: string
+  mode: 'macvlan'
+  ok: boolean
+  nodes: { node: string; ok: boolean; nic: string; existing: boolean; error: string | null }[]
+}
+
+export interface LanStep {
+  command: string
+  why: string
 }
 
 /** A subnet already on the host, which a new bridge must not overlap. */
@@ -364,6 +520,7 @@ export interface NetworkDetail {
   manageable: boolean
   read_only_reason: string
   config: Record<string, string>
+  lan: LanInfo | null
   ipv4: NetworkFamily
   ipv6: NetworkFamily
   dns_domain: string
@@ -464,7 +621,7 @@ export type TemplateRequest = Partial<InstanceSpec> & {
 export interface ImageJobNode {
   node: string
   /** `present`: it had the image already, so only the alias was set there. */
-  state: 'waiting' | 'sending' | 'importing' | 'done' | 'present' | 'failed'
+  state: 'waiting' | 'pulling' | 'sending' | 'importing' | 'done' | 'present' | 'failed'
   /** Bytes sent so far, of the job's `size`. */
   sent: number
   error: string | null
@@ -485,12 +642,49 @@ export interface ImageJob {
   /** Null until publishing has made the image. */
   fingerprint: string | null
   size: number | null
-  stage: 'publishing' | 'copying' | 'done'
+  /** `pulling`: a pinned build being fetched from its remote, before copying. */
+  stage: 'publishing' | 'pulling' | 'copying' | 'done'
   started_at: number
   finished_at: number | null
   ok: boolean | null
   error: string | null
   nodes: ImageJobNode[]
+}
+
+/** One node's copy of an image, as the Images tab lists it. */
+export interface NodeImage {
+  node: string
+  /** Full, 64 hex digits: what a delete names. */
+  fingerprint: string
+  /** Launched as `local:<alias>`; a node may know one image by several. */
+  aliases: string[]
+  description: string
+  size: number
+  architecture: string
+  type: 'container' | 'virtual-machine'
+  /** Pulled from a remote to launch something, not made or copied here. */
+  cached: boolean
+  created_at: string | null
+  /** `instance/snapshot` when lemondx published it from one. */
+  source: string | null
+}
+
+/** A snapshot on some node, which could be made into an image. */
+export interface NodeSnapshot {
+  node: string
+  instance: string
+  name: string
+  created_at: string | null
+  stateful: boolean
+  type: 'container' | 'virtual-machine'
+}
+
+export interface ImageInventory {
+  /** Every member asked, this node included. */
+  nodes: string[]
+  images: NodeImage[]
+  snapshots: NodeSnapshot[]
+  errors: { node: string; error: string }[]
 }
 
 export interface PublishRequest {
@@ -836,6 +1030,66 @@ export interface AuthInfo {
   methods: ('local' | 'pam' | 'proxy' | 'token')[]
   password_login: boolean
   principal: Principal | null
+}
+
+/**
+ * How this node is reached, from `GET /api/configure`. A node starts in
+ * unconfigured mode -- loopback only, no login, plain HTTP -- and leaves it
+ * with `POST /api/configure`, which restarts the server.
+ */
+export interface NodeSetupState {
+  unconfigured: boolean
+  /** What this process is bound to and serving, not what is saved. */
+  host: string
+  port: number
+  tls: boolean
+  auth: boolean
+  auth_methods: string[]
+  /** Bound to something other than loopback, so other hosts may reach it. */
+  public: boolean
+  in_cluster: boolean
+  /** Command-line flags overriding saved settings, which a restart keeps. */
+  pinned: string[]
+  certificate: {
+    path: string
+    fingerprint: string
+    fingerprint_pretty: string
+    error: string
+  } | null
+  /** Local accounts with the admin role; one is needed before logins go on. */
+  admins: string[]
+  /** This host's address towards the rest of the network, for the certificate. */
+  suggested_address: string
+  /** Why configuring is refused right now, or ''. */
+  blocked: string
+}
+
+export interface ConfigureNodeRequest {
+  /** Creates this admin, or sets a new password if the account exists. */
+  username?: string
+  password?: string
+  tls:
+    | { mode: 'generate'; host?: string }
+    | { mode: 'upload'; cert: string; key: string }
+    | { mode: 'keep' }
+  host: string
+  port?: number
+}
+
+export interface ConfigureNodeResult {
+  admin: string | null
+  certificate: { path: string; mode: string; fingerprint: string; fingerprint_pretty: string }
+  auth_methods: string[]
+  /** What was saved. */
+  host: string
+  port: number
+  restarting: boolean
+  /** What the restarted server will actually do, flags included. */
+  scheme: 'http' | 'https'
+  serving_host: string
+  serving_port: number
+  /** Saved choices a flag on serve's command line will go on overriding. */
+  overridden: string[]
 }
 
 export interface ApiToken {
@@ -1252,6 +1506,12 @@ export interface JoinResult {
   warning: string
   /** The cluster's accounts: taken, or left alone because this node had its own. */
   users: { adopted: string[]; kept: string[]; failed: string[] }
+  /** The reconciliation run on joining: `kind name` of what was taken and shared. */
+  definitions: { taken: string[]; shared: string[]; conflicts: string[]; unreachable: string[];
+                 error: string | null }
+  /** The cluster's macvlan networks, made here on this node's default NIC. */
+  lan: { made: { name: string; nic: string }[]; existing: string[];
+         failed: { name: string; error: string }[] }
 }
 
 export interface MemberSync {
@@ -1342,6 +1602,8 @@ export interface DriftReport {
 }
 
 export type SyncKind = 'templates' | 'modules' | 'profiles' | 'groups' | 'users' | 'stacks'
+  | 'pins'
+  | 'settings'
 
 export interface SyncOutcome {
   node: string
@@ -1412,4 +1674,91 @@ export interface InstanceRef {
 export interface ScopedStateResult {
   ok: boolean
   instances: { node: string; name: string; ok: boolean; error: string | null }[]
+}
+
+/** Where log lines go besides the local syslog; one editor per `type`. */
+export interface SyslogDestination {
+  type: 'syslog'
+  enabled: boolean
+  host: string
+  port: number
+  protocol: 'udp' | 'tcp'
+  facility: string
+}
+
+export type LogDestination = SyslogDestination
+
+export type LogLevel = 'debug' | 'info' | 'notice' | 'warning' | 'error'
+
+/** The cluster's logging setting, as `eventlog.clean_settings()` returns it. */
+export interface LoggingSettings {
+  level: LogLevel
+  local: { facility: string }
+  destinations: LogDestination[]
+}
+
+/** One node's view: what it applied, and how each destination is doing. */
+export interface LoggingStatus {
+  settings: LoggingSettings
+  /** Whether a setting has been saved at all, rather than the defaults. */
+  saved: boolean
+  levels: LogLevel[]
+  facilities: string[]
+  destination_types: string[]
+  local_socket: string
+  /** No syslog socket here: lines go to stderr instead. */
+  local_fallback: boolean
+  echo: boolean
+  destinations: { label: string; sent: number; error: string | null; error_at: number | null }[]
+}
+
+export interface LoggingTest {
+  ok: boolean
+  results: { label: string; ok: boolean; detail: string }[]
+}
+
+export type LogKind = 'request' | 'change' | 'auth' | 'system' | 'access'
+
+/** One event from a node's live tail: the same fields its syslog line has. */
+export interface LogEvent {
+  seq: number
+  /** Unix seconds, with fractions. */
+  ts: number
+  node: string
+  level: LogLevel
+  kind: LogKind
+  action: string
+  fields: Record<string, string | number | boolean | string[]>
+  /** `cli` when a CLI command on that node forwarded it. */
+  source: 'serve' | 'cli'
+}
+
+export interface LogFilters {
+  level?: LogLevel
+  kind?: string
+  actor?: string
+  req?: string
+  channel?: string
+  instance?: string
+  q?: string
+}
+
+/** One node's page: events after a cursor, and where to ask from next. */
+export interface LogPage {
+  node: string
+  boot: string
+  cursor: string
+  events: LogEvent[]
+  /** The node restarted since the cursor: these start from its new beginning. */
+  reset: boolean
+  /** Events were dropped between the cursor and these: more than its buffer holds. */
+  truncated: boolean
+}
+
+/** The cluster's tail: every node merged by time, with one opaque cursor. */
+export interface ClusterLogPage {
+  cursor: string
+  events: LogEvent[]
+  nodes: { node: string; ok: boolean; error?: string; pending?: boolean; reset?: boolean;
+    truncated?: boolean }[]
 }

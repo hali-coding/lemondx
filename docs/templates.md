@@ -271,20 +271,28 @@ cannot be reached before it boots, so a VM clone keeps its source's
 machine-id; so does anything else the image generated once, like SSH host
 keys, which a bootstrap module can regenerate.
 
-**A snapshot exists on one node,** so that is where the template's instances
-are made. The template records the node (the one it was saved on, unless
-`--snapshot-node` says otherwise); a launch that names no node goes there, and
-one naming any other node or group is refused. Its saved snapshot is checked
-before anything is created -- or, for a recreate, deleted.
+**A snapshot exists on one node,** so the template records it (the one it was
+saved on, unless `--snapshot-node` says otherwise), and a launch that names no
+node goes there. **Any other node launches it from an image made from that
+snapshot**: publish the snapshot and copy the image to the nodes you want, and
+the same template launches on them -- no second template. Each such node
+picks the newest image it holds that was published from that snapshot (the
+image records its source, and copies carry that with them), and the run says
+so in its notes. A launch naming a node with neither the snapshot nor an image
+of it is refused before anything is created -- or, for a recreate, deleted --
+and names the nodes that lack one.
 
-To run it anywhere else, make an image of it and copy that to the nodes you
-choose: **Make image** on the snapshot in the container drawer, or
+To make and copy the image: **Make image** on the snapshot in the container
+drawer or the Images tab, or
 
 ```bash
 lemondx snapshot-publish golden base golden-base --to node2 --to node3
 lemondx image-copy golden-base --to node4          # later, to one that was missed
-lemondx template-save "Golden anywhere" -i local:golden-base
+lemondx launch "Golden" --group edge              # from the image on those nodes
 ```
+
+A template of `local:golden-base` works too, if you would rather the image
+than the snapshot be what it names.
 
 The image is made on the snapshot's node and kept there, then sent whole to
 each chosen node over the cluster's own pinned connection, a few at a time,
@@ -295,8 +303,10 @@ node it is copied to, an image already called that is replaced by the copy, as
 a pushed template replaces a copy. Copying is never done for a launch, because
 it is a full image per node: you choose once where it should be.
 
-The work runs in the background on the snapshot's node and carries on if the
-page is closed; the drawer shows each node's progress, and a notification says
+The **Images** tab (see [Web UI](web-ui.md#images-view)) shows every node's
+images and snapshots in one place, with where each image is missing, and
+copies or deletes them from there. The work runs in the background on the
+image's node and carries on if the page is closed; the drawer shows each node's progress, and a notification says
 how it ended. `serve` waits for it at Ctrl-C like a template run.
 
 ## Parameters, keys and secrets
@@ -304,7 +314,9 @@ how it ended. `serve` waits for it at Ctrl-C like a template run.
 Saving fills in every non-secret parameter the selected modules declare — from
 your input, then the module settings as they are at that moment, then the
 module's own default — so a template keeps launching the same thing after
-those settings change, and a copied file brings its values along. Launching
+those settings change, and a copied file brings its values along. A
+repeatable module added twice keeps its second copy's parameters as `NAME@2`;
+see [Adding a module more than once](modules.md#adding-a-module-more-than-once). Launching
 from a template never rewrites your saved module settings.
 
 SSH public keys are stored in the template, and a template whose modules

@@ -106,9 +106,13 @@ tar xzf lemondx-<version>.tar.gz && cd lemondx-<version>
 ./lemondx serve --open
 ```
 
-Then open <http://127.0.0.1:8099>. On a host whose daemon has never been
-initialised, the UI offers **Initialize**; the CLI equivalent is
-`./lemondx init`.
+Then open <http://127.0.0.1:8099>. A first start is *unconfigured mode*:
+this host only, no login, plain HTTP. **Configure node** adds an admin login
+and a certificate and can listen on every interface, then restarts lemondx on
+those terms (`lemondx configure node` from a shell) — see
+[Security](docs/security.md#unconfigured-mode). On a host whose daemon has
+never been initialised, the UI also offers **Initialize**; the CLI equivalent
+is `./lemondx init`.
 
 From a clone instead, build the UI once — `./build.sh` checks for a usable
 Node toolchain, installs the frontend dependencies and builds; it is the only
@@ -143,8 +147,9 @@ lemondx modules                  # module-add FILE.sh, module-set ID --param K=V
 lemondx profiles                 # profile-save NAME -b base -b docker
 
 # the cluster
+lemondx configure node           # leave unconfigured mode: admin login, HTTPS, 0.0.0.0
 lemondx cluster invite           # start a cluster here and print a one-time join code
-lemondx cluster join CODE        # join it -- needs no setup on this host
+lemondx cluster join CODE        # join it -- nothing else to set up on this host
 lemondx cluster status           # this node and every member
 lemondx cluster containers       # every instance on every node, with health
 lemondx cluster group auto       # size nodes into large/small groups
@@ -156,6 +161,8 @@ lemondx top                      # live view of nodes, instances, stacks and tem
                                  # console, bootstrap, stack and template actions
 lemondx health                   # are instances responsive, overloaded, near limits?
 lemondx status                   # daemon, readiness, cluster membership
+lemondx logs -f                  # live tail of what every node does, and who asked
+lemondx logging                  # every change is logged to syslog; logging-set adds a remote host
 
 # single instances, on this node
 lemondx ls                       # info NAME for one; create NAME -i ubuntu:24.04 -c 2
@@ -164,11 +171,14 @@ lemondx exec NAME -- uname -a    # shell NAME for an interactive one
 lemondx bootstrap NAME -b docker # run modules on an existing instance
 lemondx snapshot NAME SNAP       # snapshots, restore, snap-delete
 lemondx snapshot-publish NAME SNAP ALIAS --to NODE   # as an image, copied to nodes
+lemondx image-search debian 12   # the remotes' catalogs; image-pin IMAGE keeps one build as pin:NAME
+lemondx image-prune --dry-run    # downloaded images nothing uses or pins, on every node
 
 # this host, to get it ready
 lemondx init                     # storage pool + bridge + default profile
 lemondx resources                # what instances have claimed against the host
 lemondx storage pools            # storage volumes; network ls|create|set|delete
+lemondx network lan              # put instances on a NIC's LAN: lan-create, convert, revert
 
 lemondx serve                    # web UI + API
 ```
@@ -194,20 +204,23 @@ CPU is a core count; memory and disk take a unit like `4GiB` or `512MiB` — see
 | [Bootstrap modules](docs/modules.md) | writing and uploading modules, parameters, secrets, profiles, the shipped modules |
 | [Nodes and federation](docs/cluster.md) | joining nodes, node groups, maintenance, sync and reconciliation, `lemondx top` |
 | [Networking between nodes](docs/networking.md) | fabrics: routed networks shared by every node |
+| [Containers on your LAN](docs/lan.md) | addresses from your router: a bridge, macvlan, or the host's own NIC bridged |
 | [Web UI tour](docs/web-ui.md) | Home, health checks, bulk actions, the Storage, Network and Access views |
 | [Security](docs/security.md) | logins (local users, PAM, proxy), roles, API tokens, TLS |
 | [Running as a service](docs/service.md) | systemd units, user vs system install |
+| [Logging](docs/logging.md) | what is logged and who did it, the live tail (UI, CLI, API), levels, local and remote syslog |
 | [REST API](docs/api.md) | every endpoint, request and response shapes, curl examples |
 | [Daemons, images and storage](docs/daemons-and-storage.md) | LXD vs Incus, socket discovery, image remotes, disk quotas, units |
 | [Development](docs/development.md) | Vite dev server, building `web/dist`, how releases are cut |
 
 ## Security
 
-`serve` binds to `127.0.0.1` by default with authentication off — anyone who
-can reach the port controls your instances. Run `lemondx configure auth` to
-turn on logins — local users, PAM, a trusted proxy or API tokens, with read,
-operator and admin roles — and `lemondx configure tls` (or a TLS proxy) before
-exposing it. A cluster member refuses other hosts without a credential even
+`serve` starts in unconfigured mode — bound to `127.0.0.1`, no login, plain
+HTTP — so only this host can reach it. **Configure node** (or `lemondx
+configure node`) turns on logins and HTTPS together before it opens the port.
+`lemondx configure auth` goes further — PAM, a trusted proxy, API tokens,
+read, operator and admin roles — and `configure tls` names your own
+certificate. A cluster member refuses other hosts without a credential even
 with logins off. Members share one credential, so every node in a cluster is
 an admin of every other: federate hosts you administer. See
 [Security](docs/security.md).

@@ -44,13 +44,14 @@ record *around* those, kept in memory like them (one per ``serve`` process).
 from __future__ import annotations
 
 import ipaddress
+import logging
 import re
 import sys
 import threading
 import time
 
-from . import store
-from .bootstrap import BootstrapError, discover_modules, secret_param_names
+from . import eventlog, store
+from .bootstrap import BootstrapError, discover_modules, secret_param_names, split_param
 from .cluster import ClusterError
 from .lxd import LXDError
 from .nodeclient import NodeError
@@ -90,8 +91,10 @@ PENDING, RUNNING, READY, DONE, FAILED, SKIPPED, CANCELLED = (
     "pending", "running", "ready", "done", "failed", "skipped", "cancelled")
 
 
-def _log(message):
-    print("[lemondx] stack: %s" % message, file=sys.stderr, flush=True)
+def _log(message, level=None):
+    if level is None:
+        level = logging.WARNING if "fail" in message.lower() else logging.INFO
+    eventlog.message("stack: %s" % message, level=level)
 
 
 class _Cancelled(Exception):
@@ -261,7 +264,7 @@ class StackService:
                 raise ServiceError("Step '%s': the value of %s must be text."
                                    % (step_id, key))
             value = str(value)
-            if key in secrets and not _input_only(value):
+            if split_param(key)[0] in secrets and not _input_only(value):
                 raise ServiceError(
                     "Step '%s' sets %s, a secret. Secrets are never saved: give it "
                     "{{params.NAME}} to use a value entered at launch." % (step_id, key))
@@ -393,7 +396,7 @@ class StackService:
             return self._snapshot(run)
 
         if background:
-            threading.Thread(target=self._guarded, args=(run, work),
+            threading.Thread(target=eventlog.carry(self._guarded), args=(run, work),
                              name="lemondx-stack-%s" % name, daemon=True).start()
             return self._snapshot(run)
         return self._guarded(run, work)
@@ -467,7 +470,7 @@ class StackService:
             threads = []
             for step, record in zip(stage["steps"], records):
                 thread = threading.Thread(
-                    target=self._run_step,
+                    target=eventlog.carry(self._run_step),
                     args=(run, step, record, context, params, earlier, followers),
                     name="lemondx-stack-step-%s" % step["id"], daemon=True)
                 thread.start()
@@ -579,7 +582,7 @@ class StackService:
                 self._update(record, state=FAILED, finished_at=time.time(),
                              error="Unexpected error: %s" % exc)
 
-        thread = threading.Thread(target=follow, daemon=True,
+        thread = threading.Thread(target=eventlog.carry(follow), daemon=True,
                                   name="lemondx-stack-follow-%s" % step["id"])
         with self._lock:
             followers.append((step["id"], name, thread))
@@ -1027,7 +1030,7 @@ def public_stack(stack, templates, modules):
                     [modules[m] for m in template["bootstrap"]["modules"] if m in modules]
                     if template is not None else modules.values())
                 kept = {k: v for k, v in params.items()
-                        if k not in secrets or _input_only(v)}
+                        if split_param(k)[0] not in secrets or _input_only(v)}
                 if len(kept) != len(params):
                     step = dict(step, params=kept)
             steps.append(step)

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useCanOperate, useCanWrite } from '../hooks/useAuth'
 import { api, calls } from '../lib/api'
+import { moduleSummary } from '../lib/bootstrap'
 import { keyOf, madeFrom } from '../lib/instance'
 import { syncDetail, syncKind } from '../lib/sync'
 import type {
@@ -251,8 +252,7 @@ export function TemplatesView({
             const secrets = secretParams(template, modules)
             const gone = template.bootstrap.modules.filter(
               (id) => modules.length > 0 && !modules.some((m) => m.id === id))
-            const moduleNames = template.bootstrap.modules.map(
-              (id) => modules.find((m) => m.id === id)?.name ?? id)
+            const moduleNames = moduleSummary(template.bootstrap.modules, modules)
             const members = membersOf(template)
             const running = members.filter((c) => c.status === 'Running').length
             const staleCount = members.filter((c) => c.stale?.includes('template')).length

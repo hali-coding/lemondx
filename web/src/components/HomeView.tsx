@@ -8,12 +8,12 @@ import type {
 } from '../lib/types'
 import { ResourcesView } from './ResourcesView'
 
-// Every listing here asks each member, like the Nodes tab, so it keeps that
+// Every listing here asks each member, like the Cluster tab, so it keeps that
 // tab's slower pace rather than App's 3s one; runs come from App's poll.
 const POLL_INTERVAL = 10000
 
 type Instance = ClusterContainers['instances'][number]
-type Destination = 'containers' | 'templates' | 'stacks' | 'nodes'
+type Destination = 'containers' | 'templates' | 'stacks' | 'cluster'
 
 interface Props {
   templateRuns: TemplateRun[]
@@ -135,7 +135,7 @@ export function HomeView({ templateRuns, stackRuns, onNavigate }: Props) {
 
           {data.nodes.length > 1 && (
             <NodesCard nodes={data.nodes} instances={instances} health={health}
-              onOpen={() => onNavigate('nodes')} />
+              onOpen={() => onNavigate('cluster')} />
           )}
         </>
       )}
@@ -178,7 +178,7 @@ function Tiles({ data, health, onNavigate }: {
       <Tile label="Nodes" value={`${reachable}/${data.nodes.length}`}
         detail={reachable === data.nodes.length ? 'all answering' : `${data.nodes.length - reachable} not answering`}
         tone={reachable === data.nodes.length ? undefined : 'warn'}
-        onClick={() => onNavigate('nodes')} />
+        onClick={() => onNavigate('cluster')} />
       <Tile label="Containers" value={`${running}/${instances.length}`}
         detail={`running${loose ? ` · ${loose} made by hand` : ''}`}
         onClick={() => onNavigate('containers')} />

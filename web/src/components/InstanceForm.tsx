@@ -3,8 +3,9 @@ import { api } from '../lib/api'
 import { keyModules, savableSelection } from '../lib/bootstrap'
 import { subnetStatus } from '../lib/cidr'
 import { DEFAULT_CPU, DEFAULT_MEMORY, specProblems } from '../lib/instance'
+import { pinFor, pinRef, shortSerial } from '../lib/pins'
 import type {
-  BootstrapModule, BootstrapProfile, BootstrapSelection, FabricLocal, Images,
+  BootstrapModule, BootstrapProfile, BootstrapSelection, FabricLocal, ImagePin, Images,
   InstanceSpec, NetworkSummary,
   SshKey, Status, SubnetInUse,
 } from '../lib/types'
@@ -40,6 +41,8 @@ interface Props {
    * snapshot decides container or VM, so neither is asked.
    */
   fromSnapshot?: boolean
+  /** Editing a template: launched later, so a pin changed meanwhile applies then. */
+  forTemplate?: boolean
 }
 
 /**
@@ -49,7 +52,7 @@ interface Props {
  */
 export function InstanceForm({
   value, onChange, modules, profiles, hostKeys, reloadProfiles, onError, disabled,
-  secretsAtLaunch = false, fromSnapshot = false,
+  secretsAtLaunch = false, fromSnapshot = false, forTemplate = false,
 }: Props) {
   const [images, setImages] = useState<Images | null>(null)
   const [status, setStatus] = useState<Status | null>(null)
@@ -67,6 +70,9 @@ export function InstanceForm({
   // This node's fabrics. Every member holds the same ones once a fabric is
   // created, so this node's list is the cluster's in all but a broken case.
   const [fabrics, setFabrics] = useState<FabricLocal[]>([])
+  // Pinned builds: offered first, as `pin:<nickname>`, and described under
+  // the image when one is picked.
+  const [pins, setPins] = useState<ImagePin[]>([])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -75,6 +81,7 @@ export function InstanceForm({
     api.networks(controller.signal).then(setNetworks).catch(() => {})
     api.fabric(controller.signal)
       .then((state) => setFabrics(state.fabrics)).catch(() => {})
+    api.imagePins(controller.signal).then(setPins).catch(() => {})
     api.browseImages({}, controller.signal)
       .then((browse) => setCachedAliases(
         new Set(browse.entries.filter((e) => e.cached).map((e) => e.full_alias))))
@@ -190,6 +197,15 @@ export function InstanceForm({
   const installsKeys = keyModules(modules, selection)
   const { keysMissing, secretsMissing } = specProblems(value, modules, secretsAtLaunch)
   const isVm = value.type === 'virtual-machine'
+  const pinOf = (image: string) => pinFor(image, pins)
+  const selectedPin = fromSnapshot ? null : pinOf(value.image)
+  // Every pinned build first -- a pin is a decision someone made about what
+  // to launch -- then the suggestions, which follow their remote.
+  const catalog = images?.catalog ?? []
+  const choices = [
+    ...pins.map((pin) => ({ alias: pinRef(pin), label: pin.label || pin.image, pin })),
+    ...catalog.map((c) => ({ alias: c.alias, label: c.label, pin: null })),
+  ]
 
   return (
     <>
@@ -198,24 +214,30 @@ export function InstanceForm({
         {!customImage ? (
           <>
             <div className="image-choices">
-              {(images?.catalog ?? []).map((choice) => (
+              {choices.map((choice) => (
                 <button
                   type="button"
                   key={choice.alias}
                   className="image-choice"
-                  aria-pressed={value.image === choice.alias}
+                  aria-pressed={value.image === choice.alias
+                    || (!!choice.pin && pinOf(value.image) === choice.pin)}
                   onClick={() => set({ image: choice.alias })}
                   disabled={disabled}
                 >
                   <strong>{choice.label}</strong>
                   <span>{choice.alias}</span>
-                  {cachedAliases.has(choice.alias) && (
+                  {choice.pin ? (
+                    <span className="badge choice-cached"
+                      title={`Build ${choice.pin.serial} of ${choice.pin.image}`}>
+                      Pinned {shortSerial(choice.pin.serial)}
+                    </span>
+                  ) : cachedAliases.has(choice.alias) && (
                     <span className="badge badge-ok choice-cached">Downloaded</span>
                   )}
                 </button>
               ))}
             </div>
-            {images && !images.catalog.some((c) => c.alias === value.image) && value.image && (
+            {images && value.image && !choices.some((c) => c.alias === value.image) && (
               <span className="hint">Selected: <span className="mono">{value.image}</span></span>
             )}
             <button
@@ -237,6 +259,7 @@ export function InstanceForm({
             onBack={() => setCustomImage(false)}
           />
         )}
+        {selectedPin && <PinNote pin={selectedPin} isVm={isVm} template={forTemplate} />}
       </div>}
 
       <div className="grid-2">
@@ -276,6 +299,7 @@ export function InstanceForm({
               {attachable.filter((n) => n.managed).map((n) => (
                 <option key={n.name} value={n.name}>
                   {n.name}{n.ipv4_address && n.ipv4_address !== 'none' ? ` (${n.ipv4_address})` : ''}
+                  {n.lan ? ` (LAN via ${n.lan.nic})` : ''}
                   {n.default ? ' (default)' : ''}
                 </option>
               ))}
@@ -283,7 +307,9 @@ export function InstanceForm({
             {attachable.some((n) => !n.managed) && (
               <optgroup label="Host bridges">
                 {attachable.filter((n) => !n.managed).map((n) => (
-                  <option key={n.name} value={n.name}>{n.name}{n.default ? ' (default)' : ''}</option>
+                  <option key={n.name} value={n.name}>
+                    {n.name}{n.lan ? ` (LAN via ${n.lan.nic})` : ''}{n.default ? ' (default)' : ''}
+                  </option>
                 ))}
               </optgroup>
             )}
@@ -324,7 +350,17 @@ export function InstanceForm({
           {' '}A node not on the fabric launches it on its default network instead.
         </span>
       )}
-      {selectedNetwork && !selectedNetwork.managed && (
+      {selectedNetwork?.lan && (
+        <span className="hint" style={{ marginTop: -8 }}>
+          On <span className="mono">{selectedNetwork.lan.nic}</span>&apos;s LAN: the instance gets
+          its address from that network&apos;s own DHCP, usually your router.
+          {selectedNetwork.lan.kind === 'macvlan' && (
+            <> This host cannot reach it over <span className="mono">{selectedNetwork.lan.nic}</span>;
+              other machines on the LAN can.</>
+          )}
+        </span>
+      )}
+      {selectedNetwork && !selectedNetwork.managed && !selectedNetwork.lan && (
         <span className="hint" style={{ marginTop: -8, color: 'var(--warn)' }}>
           <span className="mono">{selectedNetwork.name}</span> is a host bridge: the instance
           gets its address from whatever serves that network, not from the daemon.
@@ -517,5 +553,30 @@ export function InstanceForm({
         </span>
       )}
     </>
+  )
+}
+
+/** What a pin means for the image picked: which build it launches, and from where. */
+function PinNote({ pin, isVm, template }: { pin: ImagePin; isVm: boolean; template: boolean }) {
+  const fingerprint = isVm ? pin.vm_fingerprint : pin.fingerprint
+  if (!fingerprint) {
+    return (
+      <span className="field-error">
+        Build {pin.serial} of {pin.image} has no {isVm ? 'VM' : 'container'} image: a launch is
+        refused. Pick the other type, or pin a build that has one on the Images tab.
+      </span>
+    )
+  }
+  const held = isVm ? pin.held_vm : pin.held
+  return (
+    <span className="hint">
+      Pinned: build <span className="mono">{pin.serial}</span> of{' '}
+      <span className="mono">{pin.image}</span>{' '}
+      (<span className="mono">{fingerprint.slice(0, 12)}</span>)
+      {pin.note ? ` — ${pin.note}` : ''}.{' '}
+      {held ? 'This node holds it.'
+        : 'This node does not hold it yet, and fetches it from the remote at launch while the remote still has it.'}
+      {template ? ' A pin never changes build, so this template launches the same base until it is edited to name another.' : ''}
+    </span>
   )
 }

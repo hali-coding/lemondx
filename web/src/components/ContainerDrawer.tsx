@@ -5,13 +5,16 @@ import { absoluteTime, bytes, cpuTime, relativeTime, secondsAgo } from '../lib/f
 import type { ContainerDetail, HealthRecord, ImageJob, StateAction } from '../lib/types'
 import { CameraIcon, CloseIcon, PauseIcon, PlayIcon, RestartIcon, StopIcon, TrashIcon } from './Icons'
 import { BootstrapPanel } from './BootstrapPanel'
+import { useLogTail } from '../hooks/useLogTail'
+import { LogList } from './LogList'
 import { ExecConsole } from './ExecConsole'
+import { ImageJobRow } from './ImageJobRow'
 import { PublishDialog } from './PublishDialog'
 import { AppCheckLabel, HealthLabel } from './HealthDot'
 import { StatusBadge } from './StatusBadge'
 import { staleSummary } from '../lib/stale'
 
-type Tab = 'overview' | 'snapshots' | 'bootstrap' | 'console'
+type Tab = 'overview' | 'snapshots' | 'bootstrap' | 'console' | 'activity'
 
 interface Props {
   name: string
@@ -34,6 +37,7 @@ interface Props {
   onShowAppCheck: () => void
   /** Images being made from this instance's snapshots, or made lately. */
   imageJobs: ImageJob[]
+  onDismissImageJob: (job: ImageJob) => void
   /** A publish started here, for the page to follow until it finishes. */
   onImageJob: (job: ImageJob) => void
   refreshToken: number
@@ -41,7 +45,7 @@ interface Props {
 
 export function ContainerDrawer({
   name, node, health, healthPending, busy, onClose, onAction, onDelete, onNotify, onShowAppCheck,
-  imageJobs, onImageJob, refreshToken,
+  imageJobs, onDismissImageJob, onImageJob, refreshToken,
 }: Props) {
   const canWrite = useCanWrite()
   const canOperate = useCanOperate()
@@ -164,7 +168,7 @@ export function ContainerDrawer({
         </div>
 
         <div className="tabs" role="tablist">
-          {(['overview', 'snapshots', 'bootstrap', 'console'] as Tab[]).map((id) => (
+          {(['overview', 'snapshots', 'bootstrap', 'console', 'activity'] as Tab[]).map((id) => (
             <button
               key={id}
               className="tab"
@@ -175,7 +179,8 @@ export function ContainerDrawer({
               {id === 'overview' ? 'Overview'
                 : id === 'snapshots' ? `Snapshots${detail?.snapshots.length ? ` (${detail.snapshots.length})` : ''}`
                 : id === 'bootstrap' ? 'Bootstrap'
-                : 'Console'}
+                : id === 'console' ? 'Console'
+                : 'Activity'}
             </button>
           ))}
         </div>
@@ -468,7 +473,8 @@ export function ContainerDrawer({
           {detail && tab === 'snapshots' && imageJobs.length > 0 && (
             <div style={{ marginTop: 14 }}>
               <h4 className="dim" style={{ fontSize: 12, margin: '0 0 6px' }}>Images</h4>
-              {imageJobs.map((job) => <ImageJobRow key={job.id} job={job} />)}
+              {imageJobs.map((job) => <ImageJobRow key={job.id} job={job}
+                onDismiss={() => onDismissImageJob(job)} />)}
             </div>
           )}
 
@@ -481,6 +487,8 @@ export function ContainerDrawer({
             /* key: remount per container so output never leaks across them */
             <ExecConsole key={name} name={name} node={node} running={running} />
           )}
+
+          {tab === 'activity' && <Activity key={`${node ?? ''}/${name}`} name={name} node={node} />}
         </div>
 
         <div className="drawer-actions">
@@ -521,39 +529,6 @@ export function ContainerDrawer({
   )
 }
 
-const JOB_STATES: Record<ImageJob['nodes'][number]['state'], string> = {
-  waiting: 'waiting', sending: 'sending', importing: 'importing',
-  done: 'copied', present: 'had it already', failed: 'failed',
-}
-
-function ImageJobRow({ job }: { job: ImageJob }) {
-  const stage = job.finished_at === null
-    ? (job.stage === 'publishing' ? 'publishing…' : 'copying…')
-    : job.ok ? 'ready' : 'failed'
-  return (
-    <div className="list-row">
-      <div className="list-row-main">
-        <strong className="mono">local:{job.alias}</strong>
-        <div className="faint" style={{ fontSize: 12 }}>
-          {job.source ? `from ${job.source.split('/')[1]} · ` : ''}
-          {stage}{job.size ? ` · ${bytes(job.size)}` : ''}
-        </div>
-        {job.nodes.map((entry) => (
-          <div key={entry.node} className="faint" style={{ fontSize: 12 }}>
-            {entry.node}: {JOB_STATES[entry.state]}
-            {entry.state === 'sending' && job.size
-              ? ` ${Math.floor((entry.sent / job.size) * 100)}% of ${bytes(job.size)}` : ''}
-            {entry.error && <span style={{ color: 'var(--danger)' }}> — {entry.error}</span>}
-          </div>
-        ))}
-        {job.error && !job.nodes.some((e) => e.error) && (
-          <div style={{ fontSize: 12, color: 'var(--danger)' }}>{job.error}</div>
-        )}
-      </div>
-    </div>
-  )
-}
-
 function appCheckDetail(app: NonNullable<HealthRecord['app']>): string {
   if (!app.configured) return 'no app check configured'
   if (app.status === 'pending') return `from template ${app.template} · waiting for its first run`
@@ -571,4 +546,25 @@ function loadTitle(load: NonNullable<HealthRecord['load']>): string {
   if (load.warming) return `Load average ${one.toFixed(2)}; still gathering its first minute of samples`
   if (five === null || fifteen === null) return `Load average ${one.toFixed(2)}`
   return `Load average: ${one.toFixed(2)} (1 min), ${five.toFixed(2)} (5 min), ${fifteen.toFixed(2)} (15 min)`
+}
+
+/**
+ * What happened to this instance and who did it, from its node's live tail:
+ * creates, state changes, snapshots, bootstrap runs. Back to that node's last
+ * restart; syslog has the rest.
+ */
+function Activity({ name, node }: { name: string; node?: string }) {
+  const { events, error } = useLogTail({
+    scope: { kind: 'node', node }, filters: { instance: name }, backlog: 100, max: 300,
+  })
+  return (
+    <>
+      {error && <span className="field-error">{error}</span>}
+      <LogList events={events} showNode={false} follow compact
+        empty={`Nothing recorded for ${name} since ${node ?? 'this node'} last started.`} />
+      <p className="hint" style={{ marginTop: 8 }}>
+        Kept in memory since the node last started. The Logs tab has everything.
+      </p>
+    </>
+  )
 }

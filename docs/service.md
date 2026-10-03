@@ -13,25 +13,43 @@ your `lxd`/`incus-admin` group membership to reach the daemon, reads your
 `~/.ssh/*.pub` for the SSH-key picker, and keeps its state under your
 `~/.local/share/lemondx` — a system service running as a separate account
 would need all three set up by hand for an account with no login shell to set
-them up with. Both units bind to `127.0.0.1:8099` and run under
-`ProtectSystem=strict`/`ProtectHome=read-only` with the state directory as the
-one exception, since lemondx has no other reason to touch the filesystem.
+them up with. Both units start in
+[unconfigured mode](security.md#unconfigured-mode) on `127.0.0.1:8099` and run
+under `ProtectSystem=strict`/`ProtectHome=read-only` with the state directory
+as the one exception, since lemondx has no other reason to touch the
+filesystem.
 
 ```bash
 systemctl --user status lemondx     # or plain systemctl for --system
 journalctl --user -u lemondx -f
+journalctl -t lemondx -f            # what lemondx did and who asked, from any process
 ```
+
+lemondx logs to syslog, which is the journal here, so both work under the
+sandboxed units. The second also shows CLI commands, which run outside the
+unit. See [Logging](logging.md) for the levels and a remote syslog host.
 
 A user service only starts after you log in; for it to survive to boot with no
 session open, `sudo loginctl enable-linger $USER` (the installer prints this
-when it applies). The unit files are in `systemd/` if you want to edit the
-host/port or turn on authentication before installing.
+when it applies). The unit files are in `systemd/` if you want to edit them
+before installing.
+
+## Configuring the node
+
+Press **Configure node** in the UI: it saves an admin login, a certificate and
+the address to listen on, then restarts the server in place — the same PID, so
+systemd sees nothing but a running service. From a shell, `lemondx configure
+node` as the account the service runs as saves the same, and a restart applies
+it. The units pass no `--host`/`--port`, because a flag would override the
+saved address; a unit installed before that setting existed passes both, so
+re-run the installer (or drop them from `ExecStart`) for the address to apply.
 
 ## Authentication
 
-Run `lemondx configure auth` as the account the service runs as, then restart
-it; the unit's `serve` picks the saved settings up with no change to the unit
-file (see [Security](security.md)):
+For more than one admin login — PAM, a trusted proxy, API tokens — run
+`lemondx configure auth` as the account the service runs as, then restart it;
+the unit's `serve` picks the saved settings up with no change to the unit file
+(see [Security](security.md)):
 
 ```bash
 lemondx configure auth && systemctl --user restart lemondx
