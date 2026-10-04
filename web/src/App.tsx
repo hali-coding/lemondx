@@ -3,7 +3,7 @@ import type { ReactNode } from 'react'
 import { ApiError, api, hasToken, setToken } from './lib/api'
 import type {
   AuthInfo, CreateProgress, CreateRequest, HealthRecord, HealthStatus, InstanceRef,
-  ImageJob, ScopedContainer, StackRun, StateAction, Status, TemplateRun,
+  ImageJob, NodeSetupState, ScopedContainer, StackRun, StateAction, Status, TemplateRun,
 } from './lib/types'
 import { keyOf } from './lib/instance'
 import { AuthContext } from './hooks/useAuth'
@@ -13,17 +13,20 @@ import { useToasts } from './hooks/useToasts'
 import type { ToastKind } from './hooks/useToasts'
 import { AccessView } from './components/AccessView'
 import { AppCheckDialog } from './components/AppCheckDialog'
+import { ConfigureNodeDialog } from './components/ConfigureNodeDialog'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { ContainerDrawer } from './components/ContainerDrawer'
 import { ContainerTable } from './components/ContainerTable'
 import { CreateDialog } from './components/CreateDialog'
 import {
-  BoxIcon, DatabaseIcon, HelpIcon, HomeIcon, MenuIcon, MoonIcon, NetworkIcon, PlusIcon, PuzzleIcon,
-  RefreshIcon, ServerIcon, ShieldIcon, StackIcon, SunIcon, TemplateIcon,
+  BoxIcon, DatabaseIcon, HelpIcon, HomeIcon, LayersIcon, MenuIcon, MoonIcon, NetworkIcon, PlusIcon, PuzzleIcon,
+  LogsIcon, RefreshIcon, ServerIcon, ShieldIcon, StackIcon, SunIcon, TemplateIcon,
 } from './components/Icons'
+import { ImagesView } from './components/ImagesView'
 import { ModulesView } from './components/ModulesView'
 import { NetworkView } from './components/NetworkView'
-import { NodesView } from './components/NodesView'
+import { ClusterView } from './components/ClusterView'
+import { LogsView } from './components/LogsView'
 import { HomeView } from './components/HomeView'
 import { ScopePicker } from './components/ScopePicker'
 import { SetupBanner } from './components/SetupBanner'
@@ -36,8 +39,8 @@ import { Toasts } from './components/Toasts'
 
 const POLL_INTERVAL = 3000
 
-type View = 'home' | 'containers' | 'templates' | 'stacks' | 'nodes' | 'storage'
-  | 'network' | 'modules' | 'access'
+type View = 'home' | 'containers' | 'templates' | 'stacks' | 'images' | 'cluster' | 'storage'
+  | 'network' | 'modules' | 'access' | 'logs'
 
 // Grouped by what a person comes to do: run things, or look after the hosts
 // they run on and who may reach them.
@@ -56,7 +59,7 @@ const NAV: {
   { label: 'Workloads',
     help: {
       intro: 'Everything here ends in containers, and each part builds on the one before it.',
-      order: ['modules', 'templates', 'stacks', 'containers'],
+      order: ['images', 'modules', 'templates', 'stacks', 'containers'],
       chain: true,
     },
     items: [
@@ -69,6 +72,9 @@ const NAV: {
       { id: 'stacks', label: 'Stacks', icon: <StackIcon size={16} />,
         about: 'Templates run in stages, so a database is up before the app that needs it. '
           + 'Each step can hand its addresses and values to the next.' },
+      { id: 'images', label: 'Images', icon: <LayersIcon size={16} />,
+        about: 'What containers are made from: images on each node, and snapshots that can '
+          + 'become one. Copy an image to other nodes so templates launch it there.' },
       { id: 'modules', label: 'Modules', icon: <PuzzleIcon size={16} />,
         about: 'Shell scripts that set up a container once it starts: install packages, add '
           + 'SSH keys, start services. Templates pick which ones run.' },
@@ -76,14 +82,14 @@ const NAV: {
   { label: 'Infrastructure',
     help: {
       intro: 'Where containers run, what they run on, and who may reach them.',
-      order: ['nodes', 'storage', 'network', 'access'],
+      order: ['cluster', 'storage', 'network', 'access', 'logs'],
       chain: false,
     },
     items: [
-      { id: 'nodes', label: 'Nodes', icon: <ServerIcon size={16} />,
+      { id: 'cluster', label: 'Cluster', icon: <ServerIcon size={16} />,
         about: 'The hosts running lemondx, each with its own LXD or Incus. Joined into a '
           + 'cluster they share templates, stacks and modules, and launches can spread '
-          + 'across them.' },
+          + 'across them. Settings for the whole cluster, such as logging, are here too.' },
       { id: 'storage', label: 'Storage', icon: <DatabaseIcon size={16} />,
         about: 'Pools that hold containers’ disks, and extra volumes to attach to them.' },
       { id: 'network', label: 'Network', icon: <NetworkIcon size={16} />,
@@ -92,6 +98,9 @@ const NAV: {
       { id: 'access', label: 'Access', icon: <ShieldIcon size={16} />,
         about: 'Users and API tokens, and whether each may only look, operate what exists, '
           + 'or change everything.' },
+      { id: 'logs', label: 'Logs', icon: <LogsIcon size={16} />,
+        about: 'Everything lemondx does and who asked for it, live from every node: '
+          + 'follow one request across the cluster, or one instance’s history.' },
     ] },
 ]
 
@@ -105,6 +114,12 @@ export default function App() {
   const { scope, choose: chooseScope, nodes, groups, federated, reload: reloadCluster } = useScope()
   // Where this lemondx sits, so a row here can be told apart from one elsewhere.
   const localNode = nodes.find((n) => n.self)?.name ?? ''
+
+  // Which node a tab is on, in the tab itself: with several nodes' UIs open
+  // side by side, "lemondx" six times tells them apart by nothing.
+  useEffect(() => {
+    document.title = localNode ? `${localNode} (lemondx)` : 'lemondx'
+  }, [localNode])
   // Refused by the server anyway; said up front so nobody fills in a create first.
   const localMaintenance = nodes.find((n) => n.self)?.maintenance ?? null
   const nodeUrls = Object.fromEntries(nodes.map((n) => [n.name, n.url]))
@@ -119,6 +134,13 @@ export default function App() {
   const [templateRuns, setTemplateRuns] = useState<TemplateRun[]>([])
   const [stackRuns, setStackRuns] = useState<StackRun[]>([])
   const [imageJobs, setImageJobs] = useState<ImageJob[]>([])
+  // Rows closed with their ×, by node/id. Only hidden: the server forgets a
+  // finished job by itself after a few minutes, and one still running is
+  // reported when it ends whether or not its row is showing.
+  const [dismissedJobs, setDismissedJobs] = useState<Set<string>>(new Set())
+  const shownJobs = imageJobs.filter((job) => !dismissedJobs.has(`${job.node}/${job.id}`))
+  const dismissJob = useCallback((job: ImageJob) => setDismissedJobs(
+    (current) => new Set(current).add(`${job.node}/${job.id}`)), [])
   const [health, setHealth] = useState<Record<string, HealthRecord>>({})
   // Nodes that check health at all, keyed as rows are ('' for this host
   // alone), so a running instance not yet checked there shows as pending.
@@ -137,6 +159,12 @@ export default function App() {
   const [authInfo, setAuthInfo] = useState<AuthInfo | null>(null)
   // Set while the server refuses us; holds what it accepts instead.
   const [gate, setGate] = useState<AuthInfo | null>(null)
+  // How this node is reached, and whether it is still in unconfigured mode.
+  const [nodeSetup, setNodeSetup] = useState<NodeSetupState | null>(null)
+  const [configuring, setConfiguring] = useState(false)
+  // Set once a configuration is applied: the server is going away to restart
+  // on new terms, and polling it would only report it lost.
+  const [restarting, setRestarting] = useState(false)
   const [view, setView] = useState<View>('home')
   // Only matters on a narrow screen, where the menu slides over the page.
   const [navOpen, setNavOpen] = useState(false)
@@ -423,10 +451,25 @@ export default function App() {
     if (info?.enabled && !info.principal) setGate(info)
   }, [])
 
+  // Asked again whenever who we are changes: a read-only login may see it,
+  // and the answer before logging in was a refusal.
+  useEffect(() => {
+    if (gate || !authInfo) return
+    const controller = new AbortController()
+    api.nodeSetup(controller.signal).then(setNodeSetup).catch(() => {})
+    return () => controller.abort()
+  }, [gate, authInfo])
+
+  const openConfigure = useCallback(async () => {
+    // Fresh, since what blocks it (work in flight, a cluster) changes.
+    setNodeSetup(await api.nodeSetup().catch(() => nodeSetup))
+    setConfiguring(true)
+  }, [nodeSetup])
+
   useEffect(() => {
     // Nothing to poll for while the login gate is up: every request is refused,
     // and every refusal asks the server again what it accepts.
-    if (gate) return
+    if (gate || restarting) return
     const controller = new AbortController()
     // oxlint-disable-next-line react/set-state-in-effect -- async fetch, not a sync setState
     refresh(controller.signal)
@@ -437,7 +480,7 @@ export default function App() {
       controller.abort()
       window.clearInterval(timer)
     }
-  }, [refresh, gate])
+  }, [refresh, gate, restarting])
 
   /** Run a mutation with busy tracking, toasts and a refresh afterwards. */
   const mutate = useCallback(async (
@@ -731,7 +774,7 @@ export default function App() {
               <p style={{ margin: 0 }}>
                 No new instances or fabric changes here until it ends
                 {localMaintenance.reason ? ` — ${localMaintenance.reason}` : ''}. Running
-                instances can still be started, stopped and destroyed. End it on the Nodes tab.
+                instances can still be started, stopped and destroyed. End it on the Cluster tab.
               </p>
             </div>
           </div>
@@ -760,14 +803,36 @@ export default function App() {
           </div>
         )}
 
+        {nodeSetup?.unconfigured && canWrite && (
+          <div className="banner">
+            <div className="banner-body">
+              <h3>This node is unconfigured</h3>
+              <p>
+                It listens on this host only, with no login and no HTTPS — fine for trying
+                lemondx here, but no other host can reach it, so it cannot join a cluster
+                either. Configuring it adds an admin login and a certificate, and can open
+                it to other hosts.
+              </p>
+              <div>
+                <button className="btn btn-primary" onClick={openConfigure}>
+                  <ShieldIcon size={14} /> Configure node
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {status && !status.ready && canWrite && (
           <SetupBanner status={status} onSetup={runSetup} />
         )}
 
         {view === 'access' ? (
           <AccessView onNotify={notify} />
-        ) : view === 'nodes' ? (
-          <NodesView onNotify={notify} onMembershipChanged={reloadCluster} />
+        ) : view === 'logs' ? (
+          <LogsView nodes={nodes} groups={groups} federated={federated} />
+        ) : view === 'cluster' ? (
+          <ClusterView onNotify={notify} onMembershipChanged={reloadCluster}
+            setup={nodeSetup} onConfigure={openConfigure} />
         ) : view === 'modules' ? (
           <ModulesView onNotify={notify} />
         ) : view === 'templates' ? (
@@ -792,6 +857,17 @@ export default function App() {
               refresh()
             }}
           />
+        ) : view === 'images' ? (
+          <>
+            <div className="section-head">
+              <h2>Images</h2>
+              <span className="faint" style={{ fontSize: 12.5 }}>
+                on every node, and the snapshots they can be made from
+              </span>
+            </div>
+            <ImagesView localNode={localNode} jobs={shownJobs} onDismissJob={dismissJob}
+              onJobStarted={followImageJob} onNotify={notify} />
+          </>
         ) : view === 'stacks' ? (
           <StacksView
             localNode={localNode}
@@ -915,8 +991,9 @@ export default function App() {
           onDelete={() => setPendingDelete(selected)}
           onNotify={notify}
           onShowAppCheck={() => setAppCheckFor(selected)}
-          imageJobs={imageJobs.filter((job) => job.node === (selected.node || localNode)
+          imageJobs={shownJobs.filter((job) => job.node === (selected.node || localNode)
             && job.source?.startsWith(`${selected.name}/`))}
+          onDismissImageJob={dismissJob}
           onImageJob={(job) => followImageJob(job,
             selected.node && selected.node !== localNode ? selected.node : undefined)}
         />
@@ -933,6 +1010,10 @@ export default function App() {
       )}
 
       {gate && <LoginGate info={gate} onDone={signedIn} />}
+      {configuring && nodeSetup && (
+        <ConfigureNodeDialog state={nodeSetup} onClose={() => setConfiguring(false)}
+          onRestarting={() => setRestarting(true)} />
+      )}
 
       {showCreate && (
         <CreateDialog onCancel={() => setShowCreate(false)} onCreate={create}

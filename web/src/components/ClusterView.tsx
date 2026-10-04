@@ -3,13 +3,15 @@ import { useCanWrite } from '../hooks/useAuth'
 import { api, calls } from '../lib/api'
 import type {
   AutoGroupResult, ClusterInfo, ClusterNode, ClusterNodeDetail, DriftReport, EvictResult,
-  JoinCode, LeaveResult, MaintenanceResult, NodeGroup, NodeTold, ReconcileRow, SyncKind, SyncResult,
+  JoinCode, LeaveResult, MaintenanceResult, NodeGroup, NodeSetupState, NodeTold, ReconcileRow,
+  SyncKind, SyncResult,
 } from '../lib/types'
 import { ConfirmDialog } from './ConfirmDialog'
 import { CopyButton } from './CopyButton'
+import { LoggingSettings } from './LoggingSettings'
 import {
-  EjectIcon, KeyIcon, LogoutIcon, PlusIcon, RefreshIcon, ScalesIcon, ServerIcon, TrashIcon,
-  UploadIcon, WrenchIcon,
+  EjectIcon, KeyIcon, LogoutIcon, PlusIcon, RefreshIcon, ScalesIcon, ServerIcon, ShieldIcon,
+  TrashIcon, UploadIcon, WrenchIcon,
 } from './Icons'
 import { Modal } from './Modal'
 
@@ -22,7 +24,15 @@ interface Props {
    * survive a `leave` that emptied the cluster, until a reload.
    */
   onMembershipChanged: () => void
+  /** How this node is reached; null until known. */
+  setup: NodeSetupState | null
+  onConfigure: () => void
 }
+
+// Joining and inviting both need this node reachable from the others, which
+// in unconfigured mode it is not; the server refuses either way.
+const CONFIGURE_FIRST = 'Configure this node first: it listens on this host only, so no '
+  + 'other node could reach it'
 
 // Reachability comes from the server's own probe, which it caches for a few
 // seconds; polling faster than that would only re-read the same answer.
@@ -34,6 +44,8 @@ const SYNC_KINDS: { id: SyncKind; label: string; hint: string; warn?: string }[]
   { id: 'profiles', label: 'Bootstrap profiles', hint: 'named module selections' },
   { id: 'groups', label: 'Node groups', hint: 'including the sized large and small' },
   { id: 'stacks', label: 'Stacks', hint: 'with the templates they launch' },
+  { id: 'pins', label: 'Pinned images', hint: 'pinned builds and their nicknames' },
+  { id: 'settings', label: 'Cluster settings', hint: 'logging: the level and remote syslog hosts' },
   {
     id: 'users', label: 'Users', hint: 'local accounts, so the same logins work there',
     warn: 'Each account is copied with its password hash and role, replacing any '
@@ -125,8 +137,9 @@ function actionLine(row: ReconcileRow, local: string) {
 }
 
 /** Nodes this lemondx federates with, the groups they form, and what spans them. */
-export function NodesView({ onNotify, onMembershipChanged }: Props) {
+export function ClusterView({ onNotify, onMembershipChanged, setup, onConfigure }: Props) {
   const canWrite = useCanWrite()
+  const unconfigured = !!setup?.unconfigured
   const [info, setInfo] = useState<ClusterInfo | null>(null)
   const [nodes, setNodes] = useState<ClusterNode[] | null>(null)
   const [groups, setGroups] = useState<NodeGroup[]>([])
@@ -279,9 +292,9 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
   return (
     <>
       <div className="section-head">
-        <h2>Nodes</h2>
+        <h2>Cluster</h2>
         <span className="faint" style={{ fontSize: 12.5 }}>
-          this host and the lemondx nodes it federates with
+          this host, the lemondx nodes it federates with, and settings they share
         </span>
       </div>
 
@@ -292,7 +305,8 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
       )}
 
       {info && (
-        <ThisNode info={info} peers={peers.length} />
+        <ThisNode info={info} peers={peers.length} setup={setup}
+          onConfigure={canWrite ? onConfigure : undefined} />
       )}
 
       <section className="card access-card">
@@ -318,9 +332,10 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
                 ? 'Nothing to sync to yet' : 'Copy templates and modules to other nodes'}>
               <UploadIcon /> Sync
             </button>
-            <button className="btn btn-sm" disabled={!canWrite}
+            <button className="btn btn-sm" disabled={!canWrite || unconfigured}
               onClick={() => setDialog('invite')}
-              title="Make a code for another host to join this cluster with">
+              title={unconfigured ? CONFIGURE_FIRST
+                : 'Make a code for another host to join this cluster with'}>
               <KeyIcon /> Invite new node
             </button>
             {/* Join and leave share a slot because exactly one of them applies:
@@ -336,9 +351,10 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
                 <LogoutIcon /> {info.in_cluster ? 'Leave cluster' : 'Clear cluster state'}
               </button>
             ) : (
-              <button className="btn btn-sm btn-primary" disabled={!canWrite || !info}
+              <button className="btn btn-sm btn-primary" disabled={!canWrite || !info || unconfigured}
                 onClick={() => setDialog('join')}
-                title="Paste a code from another node to make this host a member">
+                title={unconfigured ? CONFIGURE_FIRST
+                  : 'Paste a code from another node to make this host a member'}>
                 <PlusIcon /> Join cluster
               </button>
             )}
@@ -444,6 +460,14 @@ export function NodesView({ onNotify, onMembershipChanged }: Props) {
           </div>
         )}
       </section>
+
+      <div className="section-head" style={{ marginTop: 8 }}>
+        <h2>Configuration</h2>
+        <span className="faint" style={{ fontSize: 12.5 }}>
+          settings every member of the cluster shares
+        </span>
+      </div>
+      <LoggingSettings nodes={nodes ?? []} canWrite={canWrite} onNotify={onNotify} />
 
       {dialog === 'join' && (
         <JoinDialog onCancel={() => setDialog(null)}
@@ -592,12 +616,34 @@ function DriftPanel({ report }: { report: DriftReport }) {
 }
 
 /** What this node looks like to the others, and whether anything can join it. */
-function ThisNode({ info, peers }: {
+function ThisNode({ info, peers, setup, onConfigure }: {
   info: ClusterInfo
   peers: number
+  setup: NodeSetupState | null
+  /** Offered while not in a cluster, whose peers pin what it would change. */
+  onConfigure?: () => void
 }) {
   return (
     <section className="card node-self">
+      {setup?.unconfigured && (
+        <div className="banner banner-warn node-self-note">
+          <div className="banner-body">
+            <h3>Unconfigured: other nodes cannot reach this one</h3>
+            <p>
+              It listens on this host only, with no login and no HTTPS, so it can neither
+              invite a node nor join a cluster. Configure it first — an admin login, a
+              certificate, and listening on every interface.
+            </p>
+            {onConfigure && (
+              <div>
+                <button className="btn btn-sm btn-primary" onClick={onConfigure}>
+                  <ShieldIcon size={14} /> Configure node
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
       <div className="node-self-main">
         <h3>
           <ServerIcon size={16} /> {info.node.name}
@@ -618,6 +664,22 @@ function ThisNode({ info, peers }: {
             <dt>Cluster</dt>
             <dd>{info.in_cluster ? `${peers + 1} nodes` : 'not in a cluster'}</dd>
           </div>
+          {setup && (
+            <div>
+              <dt>Serving</dt>
+              <dd className="mono">
+                {setup.tls ? 'https' : 'http'} on {setup.host}:{setup.port}
+                {setup.auth ? '' : ', no login'}
+                {/* Not in a cluster, where the address and certificate are pinned. */}
+                {onConfigure && !setup.unconfigured && !info.in_cluster && (
+                  <button className="btn btn-ghost btn-sm" onClick={onConfigure}
+                    title="Change the admin login, certificate or listening address">
+                    Change
+                  </button>
+                )}
+              </dd>
+            </div>
+          )}
         </dl>
       </div>
       {info.leftovers && (
@@ -851,10 +913,23 @@ function JoinDialog({ onCancel, onDone }: {
       const accounts = result.users.adopted.length > 0
         ? ` Its accounts (${result.users.adopted.join(', ')}) can now log in here from other hosts.`
         : ''
+      const taken = result.definitions?.taken.length
+        ? ` Took ${result.definitions.taken.length} shared definition(s).` : ''
+      const lan = result.lan?.made.length
+        ? ` Made LAN network${result.lan.made.length === 1 ? '' : 's'} ${result.lan.made.map(
+          (m) => `${m.name} on ${m.nic}`).join(', ')}.` : ''
+      const problems = [
+        ...(result.definitions?.conflicts.length
+          ? [`${result.definitions.conflicts.join(', ')} differ from the cluster's copy.`] : []),
+        ...(result.definitions?.unreachable.length
+          ? [`Definitions from ${result.definitions.unreachable.join(', ')} arrive at the next reconciliation.`] : []),
+        ...(result.lan?.failed ?? []).map((f) => `LAN network ${f.name}: ${f.error}`),
+      ]
       const detail = (result.warning
         || (result.unreachable.length > 0
           ? `${result.unreachable.join(', ')} could not be told about this node yet.`
-          : `Now a member alongside ${result.members.length - 1} other node(s).`)) + accounts
+          : `Now a member alongside ${result.members.length - 1} other node(s).`))
+        + accounts + taken + lan + (problems.length ? ` ${problems.join(' ')}` : '')
       onDone(`Joined the cluster through ${result.node.name}`, detail)
     } catch (cause) {
       setError((cause as Error).message)

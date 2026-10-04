@@ -30,12 +30,16 @@ credential and its entire member list, and announces itself to every node in it.
 Which node issued the code does not matter, and nothing has to be arranged in
 the other direction.
 
-**Only the first node needs any setup**, and barely that: `lemondx cluster
-invite` is the setup. A node's name, the address peers reach it on and its TLS
-certificate are all worked out and provisioned the first time it federates —
-its hostname, the address on its default route, and a self-signed certificate.
-`lemondx configure cluster` exists to *override* those, not to make federation
-work. The one thing it is needed for is a **name clash**: a name is how calls
+**Each node needs one step of setup**: leaving
+[unconfigured mode](security.md#unconfigured-mode), in which it listens on
+loopback only and no peer could reach it. **Configure node** in the UI (or
+`lemondx configure node` and a restart) adds an admin login and a certificate
+and listens on every interface; inviting and joining are refused until then.
+Beyond that, `lemondx cluster invite` is the setup. A node's name and the
+address peers reach it on are worked out the first time it federates — its
+hostname and the address on its default route — and a certificate is
+generated if it has none. `lemondx configure cluster` exists to *override*
+those, not to make federation work. The one thing it is needed for is a **name clash**: a name is how calls
 are routed to a node, so two hosts that share a hostname cannot both be members
 — a join under a name the cluster already uses is refused, and renaming either
 side with `lemondx configure cluster` and issuing a fresh code settles it.
@@ -57,7 +61,7 @@ runs here.
 
 ## Starting a cluster
 
-Nothing. On the node you want to start from:
+Configure each node first (above). Then, on the node you want to start from:
 
 ```bash
 lemondx cluster invite
@@ -72,14 +76,16 @@ and prints a code:
 
     lemondx-join.eyJjb2RlIjoibG1keGpvaW5fMDQ4ZDc3NTg4N2M5X19…
 
-Run `lemondx cluster join '<code>'` on the node that should join -- it needs no
-setup of its own.
+Run `lemondx cluster join '<code>'` on the node that should join, once it is
+out of unconfigured mode (Configure node, or `lemondx configure node`).
 ```
 
-The first time it generates a certificate it will also tell you to restart
-`lemondx serve`, which then picks the certificate up by itself. The code stays
-valid across that restart. Peers only speak HTTPS, so a node has to be serving
-it — bind somewhere they can reach, `lemondx serve --host 0.0.0.0`.
+A configured node already serves its certificate on every interface, so a peer
+can reach it at once. One configured to stay on loopback, or started with
+`--host 127.0.0.1`, is one no peer can reach: the invite says so, as does
+`cluster status`, and if it has to generate a certificate it tells you to
+restart `lemondx serve` to pick it up. The code stays valid across that
+restart.
 
 `lemondx cluster status` says where a node stands, and names anything that would
 stop a peer reaching it:
@@ -110,15 +116,24 @@ being self-signed costs nothing.
 
 ## Joining
 
-On the joining node — which needs **no** setup, no certificate and no
-configuration:
+On the joining node — configured, and nothing else: no certificate to make and
+no cluster settings:
 
 ```bash
 lemondx cluster join 'lemondx-join.eyJjb2RlIjoibG1keGpvaW5f…'
 ```
 
 In the web UI the same pair is **Invite new node** and **Join cluster** on the
-Nodes tab.
+Cluster tab.
+
+**A member must run LXD 5.21 or later, or Incus 6.0 or later** -- each
+project's current long-term release. The joining node checks its own daemon
+before it redeems the code, and the member admitting it checks again from what
+the joiner reports, so a node on an older daemon -- or an older lemondx that
+does not report one -- is refused either way. Both refusals happen before the
+code is spent: upgrade, then join again with the same code. The table is
+`MIN_CLUSTER_VERSION` in `lxd.py`. Nodes that are members already are not
+checked again.
 
 ```
 + joined the cluster through nodeA -- now a member alongside nodeA, nodeB
@@ -144,6 +159,17 @@ What happens:
    running `lemondx token-create` there. An account added later reaches it
    with `lemondx cluster sync --kind users`.
 5. The joiner announces itself to every member it just learned about.
+6. It runs one [reconciliation](#a-node-that-was-switched-off-catches-itself-up)
+   pass straight away, rather than waiting for the hourly one: having no
+   deletions on record, it takes every member's templates, modules, profiles,
+   stacks and groups, and shares any of its own. What differs on both sides is
+   reported, never overwritten.
+7. It makes every **macvlan** network a member has, under the same name, on
+   its own default-route NIC -- so a template naming `lan` gets the LAN on the
+   new node too. Bridges over a spare NIC and converted NICs belong to one
+   host's hardware and are not copied.
+
+The join's answer (and `--json`) says what was taken, shared and made.
 
 So joining *any* member joins the cluster. A member that was down when you
 joined finds out later, from `lemondx cluster refresh` on either side.
@@ -174,7 +200,7 @@ other nodes, and its node groups. Instances, templates and modules stay. A
 member that could not be reached still lists this node — the command names it,
 and the fix is `lemondx cluster evict <name>` there.
 
-The Nodes tab has the same thing: **Leave cluster**, next to this node's name.
+The Cluster tab has the same thing: **Leave cluster**, next to this node's name.
 
 ### Leaving a cluster that is already broken
 
@@ -193,7 +219,7 @@ $ lemondx cluster leave
   Any that still list 'orange' need `lemondx cluster evict orange` run there.
 ```
 
-The Nodes tab shows the same state as a banner, with the button reading **Clear
+The Cluster tab shows the same state as a banner, with the button reading **Clear
 cluster state** instead. Instances, templates and modules are untouched either
 way — only the federation records go.
 
@@ -309,7 +335,7 @@ lemondx cluster maintenance on --node prdev2 --reason "disk swap"
 lemondx cluster maintenance off --node prdev2
 ```
 
-or with **Maintenance** / **End maintenance** on its card in the Nodes tab.
+or with **Maintenance** / **End maintenance** on its card in the Cluster tab.
 While it lasts:
 
 - **No new instances there.** Creating a container, launching a template or a
@@ -541,7 +567,8 @@ the template, exactly as a single-node run is.
 
 ## Shared definitions stay level by themselves
 
-Templates, modules, bootstrap profiles, node groups and [stacks](stacks.md) are things the whole
+Templates, modules, bootstrap profiles, node groups, [stacks](stacks.md),
+pinned images and cluster settings ([logging](logging.md)) are things the whole
 cluster is meant to agree on, so **saving one pushes it to every member there
 and then** — no sync step to remember. The same goes for deleting one, since a
 copy left behind on one node is drift that a push-only sync can never clear.
@@ -581,7 +608,7 @@ lemondx cluster reconcile              # settle this node against every member
 lemondx cluster reconcile --dry-run    # report what differs, change nothing
 ```
 
-The Nodes tab has the same thing behind **Reconcile**, and a **Shared
+The Cluster tab has the same thing behind **Reconcile**, and a **Shared
 definitions** panel showing what the last pass found.
 
 Each member is asked for a digest of everything shared — one SHA-256 per
@@ -638,8 +665,10 @@ lemondx cluster sync --name web --node nodeB             # just this one
 lemondx cluster sync --kind users --kind groups --group edge
 ```
 
-`--kind` takes any of `templates`, `modules`, `profiles`, `groups` and `users`,
-repeated; the UI has the same list behind **Sync** on the Nodes tab.
+`--kind` takes any of `templates`, `modules`, `profiles`, `groups`, `stacks`,
+`pins` (pinned images), `settings` (cluster settings such as
+[logging](logging.md)) and `users`, repeated; the UI has the same list behind
+**Sync** on the Cluster tab.
 
 Notes:
 
@@ -717,6 +746,7 @@ refuse it — with a message saying exactly that. Re-join it with a fresh code.
   tls/node-cert.pem        generated on first federating
   runtime.json             what `serve` is listening on, so the CLI can advertise it
   changes.json             when this node last saved or deleted each shared artifact
+  cluster-settings/<name>.json  settings every member shares: `logging` so far
 ```
 
 `changes.json` is the change ledger reconciliation reads. Unlike everything else

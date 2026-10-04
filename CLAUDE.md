@@ -88,12 +88,55 @@ command.
 
 Supporting modules: `bootstrap.py` (module discovery, validation, SSH-key parsing, the
 runner), `simplestreams.py` (remote image catalogs, 15-minute in-process cache),
-`store.py` (atomic JSON state under `~/.local/share/lemondx`).
+`store.py` (atomic JSON state under `~/.local/share/lemondx`), `nodesetup.py`
+(the bind address and leaving unconfigured mode -- see below), `eventlog.py`
+(who did what, to syslog -- see below).
+
+### Event log
+
+`eventlog.py` is the one log: stdlib `logging` behind a queue, delivered to
+local syslog (`/dev/log`, journald's `lemondx[PID]:` form) always and to the
+cluster's remote destinations (RFC 5424 over UDP/TCP). Who is acting lives in a
+ContextVar opened *once per entry point* with `eventlog.acting()`:
+`_handle_api()` (per request, with the caller's principal and channel ui/api,
+or for a member's call the actor it relays), `cli.main()` (channel cli),
+`_handle_upgrade()`, and `eventlog.system(task)` for every `serve` chore thread.
+Hooks that record a change never take an actor; they read the context:
+- `lxd.py` `_request()`/`_async()` log every daemon mutation, classified from the URL
+  by `_change_of()` (exec/files/operations at debug)
+- `hostnet.py` logs the commands the fabric helper reports applying (`delegate()`),
+  or ones run in-process
+- `store.py` `_tracked` save/delete and `save_config`
+- `auth.py` logins, users and tokens
+Because the context is a ContextVar, **a thread or pool loses it**: wrap the target in
+`eventlog.carry()` (every existing `Thread(`/`pool.map` site does), or that work is
+logged as nobody. `NodeClient` sends `X-Lemondx-Request`/`X-Lemondx-Actor` from the
+context on every peer call, and the receiver believes them only from `from_peer()`,
+so one `req` id follows an action across nodes. A new mutating path that bypasses
+these hooks must log itself with `eventlog.event("change", ...)`. **Never pass a
+value that could be a secret**: callers pass names and outcomes, request bodies only
+through `server._LOGGED_FIELDS` (an allowlist), CLI positionals only through
+`LOGGED_ARGS`. `_quote()` strips newlines so a name cannot forge a line. Settings are
+a cluster setting (`CLUSTER_SETTINGS` in cluster.py, `store.save_setting()`, sync
+kind `settings`); `eventlog.refresh()` re-reads them on an inode/mtime change, so a
+CLI save or a peer's push reaches `serve`. A broken record falls back to defaults:
+logging must never stop `serve`. **The live tail** is `EventBuffer`, a destination
+`serve` always has (`setup(buffer=True)`; it survives `apply()` and takes info and up
+whatever syslog's level): each event is also kept as structured `fields`, a cursor is
+`<boot>:<seq>`, and `read()` long-polls on its Condition. `ClusterService.logs()` fans
+out to every node's `/api/logs` and returns once any has something, leaving stragglers
+`pending` with their cursor unadvanced -- so it never loses or repeats an event. CLI
+processes forward their events to the local `serve` over `events.sock`
+(`ServeForwarder`/`start_ingest()`), and those only ever enter the buffer. The tail's
+own routes are logged with `_buffered=False` (`server._UNBUFFERED`) or it would mostly
+show itself. Destinations are types in `eventlog.DESTINATIONS`,
+mirrored by `DESTINATION_EDITORS` in `LoggingSettings.tsx`. Another log stream is
+one entry in each.
 
 ### Errors and the response envelope
 
 Every layer raises an exception carrying an HTTP-ish `.code`: `LXDError`, `ServiceError`,
-`BootstrapError`, `AuthError`. `_handle_api()` turns those into `{"error": msg}` with that status and
+`BootstrapError`, `AuthError`, `SetupError`. `_handle_api()` turns those into `{"error": msg}` with that status and
 everything else into a generic 500 — tracebacks never reach a client. Success is always
 `{"data": ...}`. `cli.main()` catches the same exception types and exits 1. So raising the
 right exception with the right code is all that either front end needs.
@@ -130,6 +173,29 @@ answer meet the same rules. `serve` merges saved settings under its flags with
 distinguishable, and a new flag needs a `DEFAULT_SETTINGS` key to match. A saved
 file that fails validation must stop `serve` (`load_settings()` raises): skipping it
 would start the server with auth off. Keep it that way for any security section.
+
+### Unconfigured mode
+
+`nodesetup.py` owns how a node is reached. A first start is *unconfigured
+mode* -- loopback, no auth, no TLS -- judged on what the process serves
+(`unconfigured()`), not on which files exist. `NodeSetup.configure()` (the
+UI's Configure node, `POST /api/configure`) and the `node` configure section
+both go through `check()` then `apply()`: `check()` refuses everything that
+can be refused before the first write (an uploaded pair is loaded by
+`cluster.check_certificate()` the way `serve` would), and `apply()` writes
+admin, certificate, auth method, then `listen` -- that order is what keeps
+the port from ever being open without a login, so keep new steps out of the
+middle. Each part lands where it already lived (the cluster section's
+`tls_cert`, the auth section); only the bind address is new, as the `listen`
+section, and `--host`/`--port` default to `None` so a flag can be told from
+it. Nothing re-reads those at runtime: `serve()` gives `NodeSetup` a
+`restart` that shuts the accept loop down and `_reexec()`s `sys.orig_argv` --
+same PID for systemd, every startup decision made again -- which is also why
+a flag still wins afterwards and the response lists it under `overridden`.
+`serve` records `unconfigured` in `runtime.json`, and
+`ClusterService.refuse_unconfigured()` reads it (via `store.live_runtime()`,
+which ignores a dead PID's file) to refuse invite and join: a loopback node
+enrolled as a member is one nobody can call back.
 
 ### Federation
 
@@ -307,9 +373,14 @@ minutes an image pull takes.
 
 A template may clone a snapshot (`snapshot: {node, instance, name}`) instead
 of naming an image. A snapshot is on one node, so `template_targets()` sends
-every launch there -- with nothing named, that node; naming any other,
-refused -- and stacks resolve a step's targets through it too, or they would
-follow the wrong node's listing. `_detach_clone()` strips the source's
+a launch naming no node there, and stacks resolve a step's targets through it
+too, or they would follow the wrong node's listing. Any other node launches
+from an image published from the snapshot: `resolve_source()` swaps the
+template to `local:<fingerprint>` on that node, matching the image's own
+`lemondx.source`/`lemondx.source-node` properties (in the image file, so
+copies carry them), and `template_targets()` refuses a node holding neither.
+A share arriving with `names` is a coordinator's, already placed, and skips
+the redirect. `_detach_clone()` strips the source's
 `user.lemondx.*` keys (the daemon merges ours over the copied config, so a
 key we do not set would survive -- a stack tag being the dangerous one) and
 empties a container's `/etc/machine-id`, without which every clone asks DHCP
@@ -318,7 +389,32 @@ for the source's address. Running it elsewhere is deliberately explicit:
 chosen peer (`/api/images/adopt` first, so a node holding it only gets the
 alias, then the `stream=True` route `/api/images/receive`, whose body the
 handler reads on demand). The far daemon's fingerprint of what arrived is the
-integrity check. Jobs live in memory on the image's node, like template runs.
+integrity check. A split image (metadata + rootfs, as every remote serves them)
+exports as chunked multipart with no length, so `open_image_export()` spools
+it to a temp file in the data dir and returns its content type, which rides to
+the receiver as `?content_type=` and back into `import_image()` -- the daemon
+then imports both parts as they were.
+
+**Pinned images** (`pins/`, a `SYNC_KINDS` member) are each one build of a
+remote image by fingerprint, named `pin:<id>` or `pin:<nickname>` wherever an
+image is named. The id is derived from image and serial (`pin_id()`), and the
+build is immutable: a newer build is another pin, so a template changes base
+only when its own record changes (which is what makes its instances stale).
+`save_pin_record()` refuses any record changing `PIN_BUILD` under an existing
+id, peers' included; only `PIN_EDITABLE` (nicknames, note) moves. Nicknames
+share the id namespace, are unique cluster-wide on a person's save, and
+`find_pin()` refuses an ambiguous one rather than guessing. Unpinning and
+dropping a nickname go through `refuse_in_use("pins", ...)` for every name the
+pin answers to. `ContainerService.image_source()` is the one place a create's
+image becomes a source block and the only reader of `pin:`; a plain remote
+alias is never redirected to a pin. A pin
+records the *server* the build came from, because `images:` is a different
+server with different builds on LXD and on Incus. Pinning is a fetch job
+(`ClusterService.fetch_pin()`): pull here by fingerprint, then `_send_image()`
+to the rest, never a pull per node -- remotes keep about a day's builds and a
+mixed cluster has no common remote. PUT of a pin record is members-only;
+people pin through POST, which reads the fingerprint from the catalog, and
+PATCH only nicknames and the note. Jobs live in memory on the image's node, like template runs.
 
 `place_template()` is why a template written for one host launches on another: a
 pool, network or profile the node lacks falls back to the default profile's, and
@@ -431,6 +527,36 @@ inode/mtime change, like `AuthService`: a fabric created from the CLI writes
 this node's claim, and a `serve` holding the old copy would route nothing for
 it.
 
+**LAN networks are per NIC, not per cluster.** `lan_interfaces()` says what
+each host NIC allows -- a daemon bridge over a spare NIC
+(`bridge.external_interfaces`), a managed macvlan, or converting the NIC the
+host uses -- because the safe answer depends on the NIC: a bridge port cannot
+keep an address, and Wi-Fi carries neither. Converting goes through
+NetworkManager as root, via the fabric helper's `{"lan": ...}` request:
+`hostnet.lan_convert_plan()` copies the connection's addresses and MAC onto a
+`lemondx-<bridge>` connection, and the helper undoes it all
+(`apply_all()`, which does not stop at a failure) if the bridge comes up
+without an address or the default route it had. The `lemondx-` prefix is the
+ownership, as proto 133 is for routes. `create_lan_everywhere()` names no NIC
+at all -- each member resolves `hostnet.default_route_device()` itself, since
+NIC names differ between machines -- and a create that finds the same LAN
+network already there returns it (`existing`) so re-running fills gaps. LAN bridges get their own
+`DOCKER-USER` tag, since each tagged set is kept level by deleting what it did
+not ask for.
+
+**Fabrics reach macvlan and hosts, not only instances.** Fabric routes carry
+the node's own fabric gateway as `src` (`route_sources()`), so a host's own
+traffic is inside the prefix on every peer; forwarded traffic ignores the hint.
+Macvlan instances get guest routes to every node's /24 (`lan_guest_routes()`,
+`_CONFIGURE_LAN`), and every fabric firewall admits the LAN subnets members
+publish on their fabric record (`lan` -> each node's own `admit`, so the helper
+still builds the firewall from its own settings, and keeps only subnets this
+host is attached to). A macvlan instance cannot reach its own parent host, so
+`hostnet.shim_commands()` adds an address-less macvlan sibling on the host with
+/32 routes (proto 134, never touched by the fabric's proto-133 pass) and an
+SNAT table ahead of the fabric's masquerade -- a device with no address gets
+whatever source the kernel finds first, usually in another subnet.
+
 A stack spanning nodes works because `_reachable_address()` hands on the fabric
 address when there is one, so `{{step.ip}}` means something on another host.
 
@@ -505,12 +631,22 @@ goes through the pinned `_connect()` like every other peer call.
 ### Bootstrap modules
 
 A module is a POSIX shell script with a `# key: value` metadata header (`name`,
-`description`, `order`, `uses`, `param`, `secret`, `text`). `BootstrapRunner` sorts by `order`, prepends
+`description`, `order`, `uses`, `param`, `secret`, `text`, `repeatable`). `BootstrapRunner` sorts by `order`, prepends
 `modules/_prelude.sh` to each script, pushes it to `/tmp` in the container, runs it with
 declared params as environment variables, and deletes it. Modules run under `/bin/sh`
 (dash, busybox ash) because minimal images often have no bash — **keep them POSIX**, and
 put anything distro-specific behind a prelude helper (`pkg_install`, `svc_enable`,
 `install_ssh_keys`) rather than in the module.
+
+A selection may list a module more than once if its header says `repeatable:
+yes` (`unrepeatable()` refuses the rest on save, launch and run). The nth
+occurrence's params
+are `NAME@n` in the same flat `params` dict (the first keeps plain `NAME`), so
+a repeat rides through records, sync, stacks and `--param` with no new field;
+`bootstrap.occurrences()`, `param_key()` and `split_param()` are the one
+definition of that, and anything comparing a param key with module metadata
+(secret checks especially) must go through `split_param()`. The runner sets
+each occurrence's own values as plain `NAME`, falling back to the first's.
 
 `secret:` declares a param that must never persist. Params carry `"secret": True`, and
 every path that stores or reports a value checks it: `effective_params()` ignores a saved
@@ -549,7 +685,9 @@ local disk).
 `LEMONDX_CONFIG_DIR` is still honoured as the name it had before the move):
 `settings.json` for default modules and remembered params, `profiles/` for one
 JSON file per bootstrap profile, `templates/` for one per instance template,
-`nodes/` and `node-groups/` for federation, `modules/` for uploads, `auth/`
+`nodes/` and `node-groups/` for federation, `pins/` for pinned images,
+`cluster-settings/` for settings the cluster shares (`logging`), `events.sock` (the
+running `serve`'s socket for CLI events, 0600), `modules/` for uploads, `auth/`
 (0700) for local users, API token hashes, the cluster credential and join-code
 hashes, `runtime.json` for what `serve` is listening on, `changes.json` for
 when this node last saved or deleted each shared artifact (the one file here
@@ -604,7 +742,7 @@ layout change.
 ### Frontend
 
 Vite + React 19 + TypeScript, no UI framework or state library; plain CSS in
-`web/src/index.css` with theme variables. The Nodes tab (`NodesView.tsx`) polls on its own 10s interval rather than App's
+`web/src/index.css` with theme variables. The Cluster tab (`ClusterView.tsx`) polls on its own 10s interval rather than App's
 3s one, because every listing probes each peer; the server caches those probes
 for a few seconds so an open tab is not a load generator.
 `web/src/lib/types.ts` hand-mirrors the payload

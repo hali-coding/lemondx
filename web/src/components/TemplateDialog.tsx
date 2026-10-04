@@ -212,6 +212,7 @@ export function TemplateDialog({ template, onCancel, onSaved }: Props) {
           onError={setError}
           disabled={busy}
           secretsAtLaunch
+          forTemplate
         />
 
         <details className="bootstrap-section" open={hasCheck}>

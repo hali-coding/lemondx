@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useCanOperate } from '../hooks/useAuth'
 import { api } from '../lib/api'
-import { missingSecrets } from '../lib/bootstrap'
+import { missingSecrets, paramName } from '../lib/bootstrap'
 import { useBootstrapData } from '../hooks/useBootstrapData'
 import type { BootstrapResult, BootstrapSelection } from '../lib/types'
 import { BootstrapLog } from './BootstrapLog'
@@ -42,12 +42,13 @@ export function BootstrapPanel({ name, node, running, onFinished }: Props) {
       setError((cause as Error).message)
     } finally {
       setBusy(false)
-      // Don't leave a password sitting in the form once it has been used.
+      // Don't leave a password sitting in the form once it has been used,
+      // a repeat's NAME@n included.
       setSelection((current) => ({
         ...current,
         params: Object.fromEntries(Object.entries(current.params).filter(
-          ([param]) => !modules.some((m) => m.params.some(
-            (p) => p.secret && p.name === param)))),
+          ([key]) => !modules.some((m) => m.params.some(
+            (p) => p.secret && p.name === paramName(key))))),
       }))
     }
   }
