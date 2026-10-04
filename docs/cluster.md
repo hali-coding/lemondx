@@ -238,7 +238,7 @@ once:
 ```bash
 lemondx cluster group set edge --node nodeA --node nodeB
 lemondx cluster groups
-lemondx cluster group delete edge
+lemondx cluster group delete edge -y
 ```
 
 Deleting a group is refused (`409`) while a stack's launch step targets it.
@@ -351,6 +351,20 @@ While it lasts:
 - **Definitions still sync.** Templates, stacks, modules, profiles and groups
   are pushed to it as usual, so it comes back level with everyone.
 - Its running instances can still be started, stopped and destroyed.
+
+**A node whose launches keep failing puts itself into maintenance.** After 5
+instance launches in a row fail on it, it marks itself (`by: lemondx`, the
+last error in the reason) and tells the cluster, so launches to a group go
+elsewhere until someone looks. Only failures that point at the node count: the
+daemon failing to create or start an instance (storage, its network, an image
+server it cannot reach). A refused request does not -- a bad name, a 4xx from
+the daemon, an image or source that does not exist -- since a broken template
+fails the same on every node and would otherwise take the whole cluster out
+with one launch; nor does a failing bootstrap module, which runs after the
+launch worked. A launch that works ends the streak, and so does ending
+maintenance. `cluster nodes` and `cluster show` give the reason and who set it
+(`by lemondx` for this), and the Cluster tab shows it on the node's card. The count is kept in `launch-failures.json` in the data
+directory, so CLI launches and `serve`'s add up.
 
 The mark belongs to the node, like its fabric claims: it is kept in the node's
 own data directory and reaches the others on its member record, so marking

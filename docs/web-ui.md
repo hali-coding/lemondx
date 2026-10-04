@@ -150,6 +150,36 @@ while the browser tab is hidden. An instance's **Activity** tab, in its
 details panel, is the same thing for that instance alone. See
 [Logging](logging.md#watching-it-live).
 
+## Monitor view
+
+CPU, memory and network over time, on every node and in every instance --
+the page to keep open during a load test. Each node's `serve` samples itself
+every two seconds and keeps the last 30 minutes in memory, so the page opens
+with the history already there rather than starting from the moment it was
+opened, and a reload loses nothing.
+
+- **Four charts** -- CPU, memory, network in and out -- with a line per node.
+  Host CPU is the whole host's, from `/proc/stat` (a load generator running
+  on the host shows); network is the interface the default route leaves by.
+  Hovering one chart shows that moment on all four.
+- **A node's own view**: click its name above the charts, or its row in the
+  node table, to see that node alone, with CPU, memory and network charted
+  per instance (the eight busiest by CPU over the range; the table below
+  still lists every one). **← All nodes** goes back. A single node always
+  shows its instances this way.
+- **Instances**, sorted by CPU, with a sparkline of the last five minutes.
+  An instance's CPU is a share of one core, as in `lemondx top`, so a busy
+  one can pass 100%. Click a row for its own CPU, memory and network charts.
+
+Pick the nodes or a group, 5, 15 or 30 minutes, and how often the page
+refreshes (every 2 to 30 seconds -- nodes sample every 2 whatever it is, so a
+slower refresh loses no detail, it only arrives in bigger steps). The range and
+refresh rate are remembered in this browser. **Pause** holds the
+charts still; resuming catches up on what was sampled meanwhile. A restarted
+`serve` starts its history again, and the page stops polling while the
+browser tab is hidden. [`lemondx top`](cluster.md#watching-it-from-a-terminal) is the terminal's
+equivalent, without the history.
+
 ## Cluster view
 
 The nodes, and the settings they share. The node parts are only interesting

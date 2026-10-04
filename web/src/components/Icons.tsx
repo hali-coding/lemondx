@@ -272,3 +272,7 @@ export const LogsIcon = ({ size = 15 }: Props) => (
     <path d="M4 6h2M9 6h11M4 12h2M9 12h11M4 18h2M9 18h7" />
   </svg>
 )
+
+export const PulseIcon = ({ size = 16 }: Props) => (
+  <svg {...base(size)}><path d="M3 12h4l3-8 4 16 3-8h4" /></svg>
+)

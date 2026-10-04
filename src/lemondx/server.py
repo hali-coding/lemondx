@@ -212,6 +212,8 @@ def build_router(service, auth=None, cluster=None, stacks=None, setup=None):
           role=OPERATOR)
 
     # The latest app check run in full; health records carry only its first line.
+    r.add("POST", r"/api/containers/%s/import" % NAME,
+          lambda body, q, name: service.import_instance(name, template=body.get("template")))
     r.add("GET", r"/api/containers/%s/app-check" % NAME,
           lambda body, q, name: service.app_check_output(name))
     r.add("GET", r"/api/containers/%s/snapshots" % NAME,
@@ -235,6 +237,13 @@ def build_router(service, auth=None, cluster=None, stacks=None, setup=None):
     # The monitor's latest results; there is deliberately no way to trigger a
     # round from here, so checks stay at the configured interval.
     r.add("GET", r"/api/health", lambda body, q: service.health())
+    # The Monitor page: usage history after `since`, kept by this `serve`; and
+    # the same from every node at once, each one's place held in the cursor.
+    r.add("GET", r"/api/metrics", lambda body, q: service.metrics(
+        since=q.get("since"), window=q.get("window")))
+    r.add("GET", r"/api/cluster/metrics", lambda body, q: cluster.metrics(
+        cursor=q.get("cursor"), window=q.get("window"), nodes=_list(q.get("nodes")),
+        groups=_list(q.get("groups"))))
 
     r.add("GET", r"/api/storage", lambda body, q: service.storage())
     r.add("GET", r"/api/storage/pools", lambda body, q: service.storage()["pools"])
@@ -583,6 +592,11 @@ def build_router(service, auth=None, cluster=None, stacks=None, setup=None):
     r.add("POST", r"/api/cluster/rotate", lambda body, q: cluster.rotate_secret())
     r.add("PUT", r"/api/cluster/secret",
           lambda body, q: cluster.accept_secret(body.get("secret")))
+    # Instances made outside lemondx, on every node, listed now; and adopting
+    # them, on whichever node each is (the per-node route is what that calls).
+    r.add("GET", r"/api/cluster/inventory", lambda body, q: cluster.inventory())
+    r.add("POST", r"/api/cluster/inventory/import", lambda body, q: cluster.import_instances(
+        body.get("instances"), template=body.get("template")))
     r.add("GET", r"/api/cluster/containers", lambda body, q: cluster.containers(
         nodes=_list(q.get("nodes")), groups=_list(q.get("groups")),
         everything=_flag(q.get("all")) if "all" in q else False))
@@ -1288,7 +1302,7 @@ _RELAYED = ("Only a cluster member relays a removal. Use `lemondx cluster "
             "evict` or `lemondx cluster leave`, which tell every member.")
 _COMPARED = ("Only a cluster member compares what this node holds. Run `lemondx "
              "cluster reconcile` on a node to settle its own copies against the "
-             "rest; what the last pass found is on the Nodes tab and at "
+             "rest; what the last pass found is on the Cluster tab and at "
              "GET /api/cluster/drift.")
 
 _FABRIC_CLAIM = ("Only a cluster member hands out or takes back a fabric subnet. "
@@ -1611,6 +1625,8 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
         service.start_health_monitor(health_settings)
         print("Health checks: %s" % ("every %gs" % health_settings["interval_seconds"]
                                      if health_settings["enabled"] else "off"))
+
+    service.start_metrics()
 
     if open_browser:
         threading.Timer(0.5, _open, args=(url,)).start()

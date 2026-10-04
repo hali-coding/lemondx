@@ -330,7 +330,12 @@ goes through the proxy to that node. It stops new instances
 create route, recreate) and fabric changes (`FabricService.refuse_here()` on
 the node, `_refuse_members()` from a coordinator), never definition sync.
 Coordinator and node both check, so a stale copy of the record still stops at
-the node.
+the node. A node also marks itself after `LAUNCH_FAILURE_LIMIT` launches in a
+row fail there (`_note_launch()` in `_run_create()`, streak in
+`store.load_launch_failures()`, tripped through the `launches_failing` hook so
+`set_maintenance()` tells peers). `_node_fault()` decides what counts, and must
+stay narrow: anything a broken *template* causes fails on every node alike,
+and counting it would put the whole cluster into maintenance at once.
 
 `leave()` also clears the half-state a broken cluster leaves behind -- peer
 records and groups with no credential to use them with. Refusing that as "not
@@ -574,7 +579,7 @@ calls the daemon; `service.py` gathers them (one `list_instances()` plus a
 second `serve` thread, every 5s like the kernel's LOAD_FREQ) counts R and D threads in
 the container's cgroup on the host (`cgroup_dir()`, prefix from `CGROUP_PAYLOAD_PREFIX`
 in `lxd.py`) and keeps 1/5/15 minute averages; the CLI averages over its window with
-`measure_load()`. This is the one place lemondx reads host kernel state instead of the
+`measure_load()`. This and `metrics.py` are the places lemondx reads host kernel state instead of the
 API, which relies on being on the daemon's host. VMs use the guest's load via the
 probe, and a container whose cgroup is missing falls back to the probe, judged only when
 `load_scope()` says it is the instance's own. The load threshold is absolute
@@ -603,6 +608,21 @@ made the check vanish for a whole interval -- and `_why_no_app_check()` asks
 the daemon which reason applies when there is none. A run's full
 stdout/stderr (`APP_DETAIL_KEYS`) stays in the checker and is stripped from
 records by `_app_status()`; `app_check_output()` serves it on request.
+
+### Usage history
+
+`metrics.py` (`Recorder`) is the Monitor page's memory: `serve` starts
+`ContainerService.start_metrics()`, a thread that every `PERIOD` seconds takes
+one `list_instances()` and reads host CPU, memory and uplink counters from
+`/proc` -- not `/1.0/resources`, which walks sysfs (~150ms) and has no CPU usage
+-- and keeps `RETENTION` seconds of rates per host and per instance. `metrics()`
+only reads memory, so `/api/metrics` is safe to poll; `?since=` makes each poll
+carry only new points, and `ClusterService.metrics()` fans out with a
+per-node cursor like the log tail, answers side by side since each node is on
+its own clock. Instance CPU is a share of one core (as `top`), host CPU of all
+threads. An instance gone from the listing drops its history, so a new one of
+the same name is never rated against it. The CLI has none (503); `top` is its
+live view.
 
 ### Two daemons
 
@@ -763,9 +783,14 @@ template runs with `background: true` -- the service validates, records the job
 (`_begin_create()`, `_tracked()`), runs it on a daemon thread and returns the record at
 once -- and `App.tsx` follows every job through the same 3s poll, reporting each one
 exactly once when a poll finds it finished. Without the flag the same calls block, which
-is what the CLI and scripts get. `serve()` waits on `pending_work()` at Ctrl-C. Template exec is the same
-kind of run (action `exec`); its output is cut to `EXEC_OUTPUT_LIMIT` per stream
-because run records are re-sent on every poll.
+is what scripts get. The CLI's `launch` and `stack-launch` hand their run to this node's
+`serve` when one answers (`serve_for_run()` in cli.py, the `top` approach): a run lives in
+the process that started it, so one run in the CLI was invisible to the UI and died with
+the ssh session. The probe is a GET; once the POST is sent a failure is reported, never
+retried in-process, since it may already have started. `--no-serve` keeps the old path.
+`serve()` waits on `pending_work()` at Ctrl-C. Template exec is the same kind of run
+(action `exec`); its output is cut to `EXEC_OUTPUT_LIMIT` per stream because run records
+are re-sent on every poll.
 `BootstrapPanel` (modules on an existing container) still keeps its progress in component
 state.
 

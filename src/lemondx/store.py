@@ -24,6 +24,8 @@ Writes are atomic so a crash mid-save cannot leave a truncated file behind.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import ipaddress
 import json
 import os
@@ -1094,6 +1096,62 @@ def save_maintenance(record):
         return None
     _write_json(maintenance_path(), record)
     return record
+
+
+def launch_failures_path():
+    return os.path.join(data_dir(), "launch-failures.json")
+
+
+def load_launch_failures():
+    """``{count, error, at}``: this node's launches that have failed in a row.
+
+    On disk rather than in a process, so a CLI launch and `serve`'s count as
+    one streak, and a restart does not wipe a node's record clean.
+    """
+    try:
+        with open(launch_failures_path(), encoding="utf-8") as handle:
+            stored = json.load(handle)
+        count = int(stored.get("count") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {"count": 0, "error": "", "at": 0}
+    return {"count": max(0, count), "error": _text(stored.get("error"), 300),
+            "at": _epoch(stored.get("at"))}
+
+
+@contextlib.contextmanager
+def _launch_failures_locked():
+    # The streak is one count for every process on the node -- a CLI launch
+    # and `serve` launching at once -- so a thread lock cannot guard its
+    # read-add-write. The lock is a file of its own: the record is replaced
+    # by rename, and a lock on the file renamed away guards nothing. flock()
+    # belongs to the open file, so threads that each open it exclude one
+    # another too.
+    path = launch_failures_path() + ".lock"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def add_launch_failure(error=""):
+    """Lengthen the streak by one failed launch and return its new length."""
+    with _launch_failures_locked():
+        count = load_launch_failures()["count"] + 1
+        _write_json(launch_failures_path(), {"count": count, "error": str(error)[:300],
+                                             "at": int(time.time())})
+    return count
+
+
+def clear_launch_failures():
+    """End the streak: a launch worked, or someone took the node out of maintenance."""
+    with _launch_failures_locked():
+        try:
+            os.unlink(launch_failures_path())
+        except FileNotFoundError:
+            pass
 
 
 def clear_runtime():

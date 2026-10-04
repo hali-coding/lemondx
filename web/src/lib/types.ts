@@ -33,6 +33,9 @@ export interface Container {
   template: string | null
   /** The stack that launched it, if any; kept on the instance itself. */
   stack: string | null
+  /** Who made it: lemondx, a person importing it, or null when it was made some
+   *  other way (`lxc launch`, a script) and the inventory flags it. */
+  origin: 'lemondx' | 'imported' | null
   /** Which version of each it was made from; blank when made before this was kept. */
   revisions: { template: string; stack: string }
   /** Which of its template and stack have changed since it was made. */
@@ -811,6 +814,10 @@ export interface Stack {
   /** Values a launch must be given, because a step says `{{params.NAME}}`. */
   inputs: string[]
 }
+
+/** A save's answer: the stack, how sync went, and what it names that this node
+ *  lacks -- saved regardless, since sync may bring it later. */
+export type SavedStack = Synced<Stack> & { warnings: string[] }
 
 /** An instance a stack launched, found by its tag on whichever node holds it. */
 export interface StackInstance {
@@ -1761,4 +1768,73 @@ export interface ClusterLogPage {
   events: LogEvent[]
   nodes: { node: string; ok: boolean; error?: string; pending?: boolean; reset?: boolean;
     truncated?: boolean }[]
+}
+
+/** One sample: `[at, cpu %, memory bytes, rx B/s, tx B/s]`. Rates are null on
+ *  the first sample after a start, and a host's CPU is of all its threads
+ *  where an instance's is of one core (so it can pass 100). */
+export type MetricPoint = [number, number | null, number | null, number | null, number | null]
+
+export interface InstanceMetrics {
+  name: string
+  status: string
+  type: 'container' | 'virtual-machine' | string
+  template: string | null
+  stack: string | null
+  processes: number
+  points: MetricPoint[]
+}
+
+/** One node's usage history after the cursor, as its `serve` sampled it. */
+export interface NodeMetrics {
+  node: string
+  self: boolean
+  ok: boolean
+  error: string | null
+  /** Seconds between samples, and how far back the node keeps them. */
+  period?: number
+  retention?: number
+  started_at?: number
+  /** The latest sample, on that node's clock. */
+  at?: number | null
+  host?: {
+    cpu_threads: number
+    memory_total: number
+    /** The interface the default route leaves by, whose traffic `points` count. */
+    uplink: string
+    points: MetricPoint[]
+  }
+  instances?: InstanceMetrics[]
+}
+
+export interface ClusterMetrics {
+  cursor: string
+  nodes: NodeMetrics[]
+}
+
+/** An instance lemondx did not make or import, as the inventory found it. */
+export interface ForeignInstance {
+  node: string
+  name: string
+  status: string
+  type: string
+  image: string
+  created_at: string | null
+  ipv4: string[]
+}
+
+/** Every node listed just now, and what on them lemondx did not make. */
+export interface Inventory {
+  /** Unix seconds. */
+  checked_at: number
+  nodes: string[]
+  foreign: ForeignInstance[]
+  /** Nodes that could not be listed, or run a lemondx too old to tell. */
+  errors: { node: string; error: string }[]
+}
+
+export interface ImportResult {
+  ok: boolean
+  template: string | null
+  instances: { node: string; name: string; ok: boolean; error: string | null }[]
 }

@@ -251,6 +251,7 @@ src/lemondx/
   fabric.py        # fabrics: routed networks across nodes
   hostnet.py       # the host's routes and firewall -- the one place that shells out
   health.py        # health judgement, load sampling, app checks
+  metrics.py       # the Monitor page's usage history, sampled by serve
   auth.py, pam.py  # logins, roles, API tokens
   server.py        # HTTP routing, JSON API, terminals, static hosting
   cli.py, top.py   # argparse front end; the live `lemondx top` view

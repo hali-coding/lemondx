@@ -147,7 +147,34 @@ class StackService:
         cleaned = self._check_stages(stages)
         saved = store.save_stack(name, {"description": str(description or "")[:200],
                                         "stages": cleaned})
-        return self.cluster._with_sync(saved, "stacks", saved["name"], propagate)
+        result = self.cluster._with_sync(saved, "stacks", saved["name"], propagate)
+        result["warnings"] = self._unknown_references(cleaned)
+        return result
+
+    def _unknown_references(self, stages):
+        """Groups and nodes the stack names that do not exist here: said, not refused.
+
+        A template must exist to be saved against (`_check_stages()`), but a
+        group or a node may come later -- a member still joining, a group made
+        after the stack -- so a save cannot require them. A typo would
+        otherwise be heard about only when a launch fails, so the save says so.
+        """
+        groups = set(store.load_node_groups())
+        nodes = set(self.cluster.all_nodes())
+        warnings = []
+        for stage in stages:
+            for step in stage["steps"]:
+                if step["type"] != "launch":
+                    continue
+                for group in step["groups"]:
+                    if group not in groups:
+                        warnings.append("Step '%s' launches on group '%s', which does "
+                                        "not exist here." % (step["id"], group))
+                for node in step["nodes"]:
+                    if node not in nodes:
+                        warnings.append("Step '%s' launches on node '%s', which is not "
+                                        "a member." % (step["id"], node))
+        return warnings
 
     def delete_stack(self, name, everywhere=True):
         with self._lock:
@@ -866,7 +893,7 @@ class StackService:
         while True:
             verdicts = self._health_of(keys)
             green = [k for k in keys if verdicts[k] is None]
-            self._update(record, detail="%d of %d healthy" % (len(green), len(keys)))
+            self._update(record, detail=_waiting_detail(keys, verdicts, len(green)))
             if len(green) == len(keys):
                 self._update(record, state=DONE, finished_at=time.time(), until=None)
                 return
@@ -963,6 +990,23 @@ def _not_green(record):
     if app and app.get("status") != "ok":
         return "app check %s" % app.get("status")
     return None
+
+
+def _waiting_detail(keys, verdicts, green):
+    """"2 of 4 healthy; waiting on web-1 on lxd2 (unhealthy: ...)".
+
+    The reasons, not just the count: a gate that will only ever time out --
+    an app check failing the same way every round -- says so from its first
+    round rather than after its whole timeout. Two named at most, since every
+    client re-reads this on each poll.
+    """
+    pending = [k for k in keys if verdicts[k] is not None]
+    text = "%d of %d healthy" % (green, len(keys))
+    if not pending:
+        return text
+    named = "; ".join("%s (%s)" % (_label(k, keys), verdicts[k]) for k in pending[:2])
+    more = " and %d more" % (len(pending) - 2) if len(pending) > 2 else ""
+    return ("%s; waiting on %s%s" % (text, named, more))[:400]
 
 
 def _label(key, keys):

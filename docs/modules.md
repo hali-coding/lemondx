@@ -28,6 +28,7 @@ has a **Bootstrap** tab with the same picker and a live log.
 | `postgresql` | PostgreSQL, a role with a password, optional database | `POSTGRES_PASSWORD` (secret), `POSTGRES_USER`, `POSTGRES_DB`, `LISTEN_ADDRESSES` |
 | `apache2` | Apache httpd, optionally with a virtual host you paste in | `VHOST_CONFIG` (text), `VHOST_NAME`, `ENABLE_MODULES`, `DISABLE_DEFAULT_SITE` |
 | `nfs-mount` | the NFS client, and a remote export mounted now and at every boot; add it once per mount | `NFS_SOURCE`, `NFS_MOUNTPOINT`, `NFS_OPTIONS` |
+| `mdns` | Avahi announcing the instance as `<name>.local`, optionally advertising services, and resolving other `.local` names | `MDNS_HOSTNAME`, `MDNS_SERVICES`, `MDNS_RESOLVE` |
 
 Modules run in `order`, low to high, so `base` (10) precedes `ssh-access` (20)
 whatever sequence you tick them in. A failing module stops the run and its
@@ -212,7 +213,7 @@ From the CLI:
 
 ```bash
 ./lemondx module-add ./redis.sh --default
-./lemondx module-remove redis
+./lemondx module-remove redis -y
 ```
 
 Uploads are validated before they are stored: the name is reduced to a safe id
@@ -361,6 +362,25 @@ drop-in directory (`sites-available` plus `a2ensite` on Debian/Ubuntu,
 `IncludeOptional` for `/etc/httpd/conf/lemondx.d`. A `DocumentRoot` that does
 not exist yet is created with a placeholder `index.html`.
 
+Apache 2.4 serves no directory it is not told to. Debian's main config allows
+all of `/var/www`, but Alpine, Fedora and Arch allow only their own default
+root, so a vhost without a `<Directory>` block answers **403** to everything
+there while passing the config test. So for each `DocumentRoot` that nothing
+but the default `<Directory />` covers, the module appends a
+`<Directory ...> Require all granted` block to the same file (marked `Added by
+lemondx`; a rerun rewrites the file, so it never piles up). A root that a
+`<Directory>` or `<DirectoryMatch>` block covers -- one for the root itself or
+any directory above it, in the vhost or anywhere in the server's config -- is
+left to that block: a `Require` in a deeper block replaces its parent's rather
+than adding to it, so a grant there would open what the parent restricts. If
+the module cannot list Apache's config files it grants nothing and warns.
+
+Once Apache is running, the module asks the site itself, on the vhost's port
+with its `ServerName`, and logs the status. A 403 or 5xx is a warning, not a
+failure, since a vhost may refuse this host on purpose (`Require ip ...`); a
+template's [app check](templates.md#app-health-checks) is the place to insist.
+Port 443 and `SSLEngine on` vhosts are not asked.
+
 The new config must pass Apache's config test before anything reloads. If it
 does not, the previous file is put back (or the new one removed), the test's
 error is shown, and the run fails, so a typo never takes down a server that
@@ -413,6 +433,49 @@ a mount fails the module tries 4.1, 4.0 and 3 in turn and writes the one that
 worked into fstab as `vers=`. Naming `vers=` in `NFS_OPTIONS` skips that. On
 Alpine, OpenRC's `netmount` does not run in a container, so the module adds
 `/etc/local.d/lemondx-nfs.start` to mount NFS at boot instead.
+
+## The mDNS module
+
+`mdns` installs Avahi and announces the instance by name over multicast DNS,
+so `web-1` answers as `web-1.local` with no DNS server to configure.
+Verified with Debian 12, Ubuntu 24.04, Fedora 44, Arch, openSUSE Tumbleweed
+and Alpine 3.22 containers, Alpine across a reboot.
+
+```bash
+lemondx create web-1 -i images:debian/12 -b mdns --param MDNS_SERVICES="http:80 ssh:22"
+ping web-1.local                    # from the host, or another instance on the bridge
+avahi-browse -rt _http._tcp         # the advertised services
+```
+
+- **`MDNS_HOSTNAME`** blank announces the instance's name on the daemon. Set
+  it only for one instance at a time: as a saved default, every instance
+  would claim the same name. If another host already answers for a name,
+  Avahi takes `name-2` and the module warns with the name it got.
+- **`MDNS_SERVICES`** advertises DNS-SD services as `type:port` (`/udp` for
+  UDP), named after the host, in `/etc/avahi/services/lemondx.service`.
+  Running the module again replaces the list; blank removes it.
+- **`MDNS_RESOLVE=yes`** also installs nss-mdns, so the instance resolves
+  other `.local` names (instances of a stack finding each other, say). On
+  Alpine it cannot: musl has no Name Service Switch, so no package adds mDNS
+  to its resolver (Alpine's `nss` is Mozilla's crypto library, unrelated).
+  There the module installs `avahi-tools` instead, so a script can ask
+  `avahi-resolve -n4 db-1.local`; programs that look names up themselves
+  still see only DNS. Announcing works the same on Alpine as anywhere.
+
+mDNS is link-local multicast: a name reaches what shares the instance's
+network segment. That covers the host and every instance on the same bridge,
+and the LAN for an instance on a [LAN network](lan.md) (macvlan or a bridged
+NIC). It does **not** cross a fabric -- a fabric routes between nodes, and
+multicast is not routed -- so across nodes use the addresses
+`{{step.ip}}` hands on in a [stack](stacks.md). For the host to resolve
+`.local` names it needs nss-mdns itself (`libnss-mdns` on Debian and Ubuntu,
+installed on most desktops).
+
+Where systemd-resolved runs, the module turns its own mDNS off
+(`/etc/systemd/resolved.conf.d/lemondx-mdns.conf`), so only Avahi answers on
+port 5353. It also comments out Avahi's `rlimit-nproc`: on host kernels
+before 5.14 that limit was counted across every container sharing the
+daemon's ID map, so a second instance running Avahi could not start it.
 
 ## If modules cannot install anything
 

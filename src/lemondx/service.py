@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from . import eventlog
 from . import health as health_checks
 from . import hostnet
+from . import metrics as metric_history
 from . import store
 from .bootstrap import (MAX_OCCURRENCES, BootstrapError, BootstrapRunner, delete_module,
                         discover_modules, effective_params,
@@ -51,6 +52,14 @@ STACK_CONFIG_KEY = "user.lemondx.stack"
 # would call every instance stale after any of them.
 TEMPLATE_REVISION_KEY = "user.lemondx.template-revision"
 STACK_REVISION_KEY = "user.lemondx.stack-revision"
+# Who made an instance: "lemondx" on everything lemondx creates, "imported"
+# once a person adopts one made some other way (`lxc launch`, a script). An
+# instance with neither this nor a template or stack tag is foreign, and the
+# inventory flags it. The instance carries it, like the tags, because lemondx
+# keeps no list of its own -- the daemon's listing is the inventory.
+ORIGIN_KEY = "user.lemondx.origin"
+ORIGIN_LEMONDX = "lemondx"
+ORIGIN_IMPORTED = "imported"
 # Every key lemondx sets on an instance starts with this. A clone inherits its
 # source's, so the ones the new instance should not carry are taken off again.
 LEMONDX_CONFIG_PREFIX = "user.lemondx."
@@ -395,6 +404,8 @@ class ContainerService:
         # Per-container load averages, sampled every few seconds; only `serve`
         # runs one, and a one-off check measures over its window instead.
         self._load_sampler = None
+        # The Monitor page's history; only `serve` keeps one (start_metrics()).
+        self._metrics = None
         # Set by ClusterService: (fabric) -> this node's bridge for that
         # fabric, or "" when it is not on it. The service does not read fabric
         # settings itself -- a template names a fabric, and each node resolves
@@ -407,6 +418,12 @@ class ContainerService:
         # macvlan instance, and telling the fabric a LAN network came or went.
         self.lan_configure = None
         self.lan_changed = None
+        # Set by ClusterService: (reason) -> put this node into maintenance and
+        # tell the cluster, once launches here keep failing. See
+        # _note_launch().
+        self.launches_failing = None
+        self._launch_streak_lock = threading.Lock()
+        self._tripping = False
         # Template app checks on their own intervals; `serve` only, like the
         # sampler. Without it a round runs each check itself.
         self._app_checker = None
@@ -563,6 +580,38 @@ class ContainerService:
     def list_containers(self):
         return self._mark_stale([_summarize(i) for i in self.lxd.list_instances()])
 
+    def import_instance(self, name, template=None):
+        """Adopt an instance made outside lemondx; optionally into a template.
+
+        Always marks it, so the inventory stops flagging it. With a template it
+        is also tagged as one of that template's, so the template's runs take
+        it in -- exec, its app check, and Recreate, which deletes it and makes
+        it again from the template, losing what is on it. It gets no revision,
+        since it was not made from any version of the template, so it is never
+        called stale. A stack is never offered: a stack's teardown destroys
+        whatever carries its tag.
+        """
+        instance = self.lxd.get_instance(name)
+        config = instance.get("config") or {}
+        if _origin(config) is not None:
+            raise ServiceError("'%s' is already lemondx's; there is nothing to import." % name,
+                               409)
+        changes = {ORIGIN_KEY: ORIGIN_IMPORTED}
+        if template:
+            record = self._template(template)
+            kind = instance.get("type") or "container"
+            if record["type"] != kind:
+                raise ServiceError(
+                    "Template '%s' makes %ss and '%s' is a %s: Recreate would replace "
+                    "it with the other kind." % (record["name"], record["type"].replace(
+                        "virtual-machine", "virtual machine"), name,
+                        kind.replace("virtual-machine", "virtual machine")), 409)
+            changes[TEMPLATE_CONFIG_KEY] = record["name"]
+        self.lxd.update_instance(name, {"config": changes})
+        eventlog.event("change", "instance.import", instance=name,
+                       template=changes.get(TEMPLATE_CONFIG_KEY))
+        return self.get_container(name)
+
     def get_container(self, name):
         instance = self.lxd.get_instance(name)
         summary = self._mark_stale([_summarize(instance)])[0]
@@ -617,6 +666,10 @@ class ContainerService:
             instance_type = self.snapshot_type(source_snapshot)
 
         instance_config = dict(config or {})
+        # Every path that makes an instance comes through here -- create,
+        # template and stack launches, recreate, clones (whose copy of the
+        # source's mark is replaced by this one) -- so this is the one place.
+        instance_config[ORIGIN_KEY] = ORIGIN_LEMONDX
         if cpu:
             instance_config["limits.cpu"] = str(cpu).strip()
         if memory:
@@ -695,21 +748,28 @@ class ContainerService:
         name = payload["name"]
         modules = (bootstrap or {}).get("modules") or []
         try:
-            self.lxd.create_instance(payload, wait=True)
-            if cloned:
-                self._detach_clone(name, payload)
-            if start:
-                self._create_stage(record, stage="starting")
-                self.lxd.set_state(name, "start")
-                # Before bootstrap, not after: a module may well want to reach
-                # another node, and an interface with no address is not there
-                # yet as far as anything inside the instance is concerned.
-                if fabric_key and self.fabric_configure:
-                    self.fabric_configure(name, fabric_key,
-                                          payload["devices"][fabric_key].get("network"))
-                elif self.lan_configure:
-                    # A no-op unless its NIC is on a macvlan network.
-                    self.lan_configure(name)
+            try:
+                self.lxd.create_instance(payload, wait=True)
+                if cloned:
+                    self._detach_clone(name, payload)
+                if start:
+                    self._create_stage(record, stage="starting")
+                    self.lxd.set_state(name, "start")
+                    # Before bootstrap, not after: a module may well want to reach
+                    # another node, and an interface with no address is not there
+                    # yet as far as anything inside the instance is concerned.
+                    if fabric_key and self.fabric_configure:
+                        self.fabric_configure(name, fabric_key,
+                                              payload["devices"][fabric_key].get("network"))
+                    elif self.lan_configure:
+                        # A no-op unless its NIC is on a macvlan network.
+                        self.lan_configure(name)
+            except Exception as exc:                        # noqa: BLE001
+                self._note_launch(exc)
+                raise
+            # Launched: what bootstrap makes of it is the modules' doing, not
+            # this node's, so it ends a streak of failures whatever happens next.
+            self._note_launch(None)
 
             container = self.get_container(name)
             if modules:
@@ -740,6 +800,64 @@ class ContainerService:
             raise
         finally:
             self._create_stage(record, stage="done", finished_at=time.time())
+
+    # -- launches that keep failing ----------------------------------------
+    #
+    # A node whose launches keep failing is one to stop sending work to, and
+    # maintenance is exactly that: launches spread over a group skip it, and
+    # one naming it is refused with the reason. Only failures that say
+    # something about this node count, though. A template naming an image that
+    # does not exist fails the same on every node, and counting it would put
+    # the whole cluster into maintenance with one launch. So a refusal of the
+    # request -- lemondx's own (ServiceError), the daemon's 4xx, an image or
+    # source not found -- neither counts nor ends a streak, and neither does a
+    # failing bootstrap module, which comes after the launch succeeded.
+
+    LAUNCH_FAILURE_LIMIT = 5
+    _NOT_THE_NODE = ("could not be found", "not found")
+
+    def _note_launch(self, error):
+        """Count one launch here: None for one that worked, else what failed it."""
+        if error is not None and not self._node_fault(error):
+            return
+        with self._launch_streak_lock:
+            if error is None:
+                if store.load_launch_failures()["count"]:
+                    store.clear_launch_failures()
+                return
+            message = getattr(error, "message", None) or str(error) or type(error).__name__
+            count = store.add_launch_failure(message)
+            # A launch of several fails on several threads at once; one trips it.
+            if count < self.LAUNCH_FAILURE_LIMIT or self._tripping or store.load_maintenance():
+                return
+            self._tripping = True
+        reason = ("%d launches failed in a row here; the last: %s"
+                  % (count, message))[:200]
+        eventlog.event("change", "node.maintenance.auto", level=logging.WARNING,
+                       failures=count, error=message[:200])
+        try:
+            if self.launches_failing:
+                self.launches_failing(reason)
+            else:
+                store.save_maintenance({"since": int(time.time()), "reason": reason,
+                                        "by": "lemondx"})
+        except Exception as exc:                            # noqa: BLE001
+            # The launch has already failed and says why; this must not
+            # replace its error with one about maintenance.
+            eventlog.message("could not put this node into maintenance: %s" % exc,
+                             level=logging.WARNING)
+        finally:
+            self._tripping = False
+
+    def _node_fault(self, error):
+        if isinstance(error, ServiceError):
+            return False
+        if isinstance(error, LXDError):
+            if 400 <= (error.code or 500) < 500:
+                return False
+            text = (error.message or "").lower()
+            return not any(phrase in text for phrase in self._NOT_THE_NODE)
+        return True
 
     def resolve_source(self, template):
         """``(template, notes)`` as this node can make it: from its snapshot, or an image of it.
@@ -1037,6 +1155,46 @@ class ContainerService:
             with eventlog.system("health"):
                 loop()
         threading.Thread(target=run, name="lemondx-health", daemon=True).start()
+
+    # -- performance history -------------------------------------------------
+
+    def start_metrics(self):
+        """Keep a rolling history of host and instance usage, for `serve`."""
+        self._metrics = metric_history.Recorder()
+        self._metrics.start(self._metric_readings)
+
+    def _metric_readings(self):
+        readings = []
+        for instance in self.lxd.list_instances():
+            state = instance.get("state") or {}
+            config = instance.get("config") or {}
+            network = _network_totals(state)
+            readings.append({
+                "name": instance.get("name"),
+                "status": instance.get("status") or state.get("status") or "Unknown",
+                "type": instance.get("type") or "container",
+                "template": config.get(TEMPLATE_CONFIG_KEY) or None,
+                "stack": config.get(STACK_CONFIG_KEY) or None,
+                "processes": state.get("processes") or 0,
+                "cpu_ns": (state.get("cpu") or {}).get("usage") or 0,
+                "memory": (state.get("memory") or {}).get("usage") or 0,
+                "rx": network["rx"], "tx": network["tx"],
+            })
+        return readings
+
+    def metrics(self, since=None, window=None):
+        """This node's usage history after ``since``, from memory.
+
+        Only a running `serve` samples, since history is the point: a one-off
+        CLI process has none to give, and `lemondx top` is its live view.
+        """
+        if self._metrics is None:
+            raise ServiceError("Usage history is kept by `lemondx serve`; this process "
+                               "has none. `lemondx top` is the live view.", 503)
+        try:
+            return self._metrics.read(since=since, window=window)
+        except ValueError as exc:
+            raise ServiceError(str(exc))
 
     # Runs the template's script inside the instance with its own watchdog, so
     # a hung check is stopped where it runs: the daemon giving up on waiting
@@ -4427,6 +4585,23 @@ def _image_source(image, remotes):
     }
 
 
+def _origin(config):
+    """``lemondx``, ``imported``, or None for an instance made some other way.
+
+    A template or stack tag counts as lemondx's own: lemondx before the mark
+    existed set those on everything a template or stack launched, and nobody
+    tags an instance by hand to be taken for one. A plain create from that
+    time carries nothing, so it reads as foreign until imported -- one click
+    clears it, and the alternative was to miss genuinely foreign ones.
+    """
+    origin = config.get(ORIGIN_KEY)
+    if origin in (ORIGIN_LEMONDX, ORIGIN_IMPORTED):
+        return origin
+    if config.get(TEMPLATE_CONFIG_KEY) or config.get(STACK_CONFIG_KEY):
+        return ORIGIN_LEMONDX
+    return None
+
+
 def _summarize(instance):
     config = instance.get("config") or {}
     state = instance.get("state") or {}
@@ -4462,6 +4637,7 @@ def _summarize(instance):
         "snapshot_count": len(instance.get("snapshots") or []),
         "template": config.get(TEMPLATE_CONFIG_KEY) or None,
         "stack": config.get(STACK_CONFIG_KEY) or None,
+        "origin": _origin(config),
         "revisions": {"template": config.get(TEMPLATE_REVISION_KEY) or "",
                       "stack": config.get(STACK_REVISION_KEY) or ""},
     }
