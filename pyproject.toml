@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lemondx"
-version = "0.9.0"
+version = "0.9.1"
 description = "Application orchestration on LXD and Incus: staged, multi-node stacks of instance templates"
 readme = "README.md"
 requires-python = ">=3.10"
