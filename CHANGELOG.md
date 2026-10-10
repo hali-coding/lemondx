@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.2](https://github.com/hali-coding/lemondx/compare/v0.9.1...v0.9.2) (2026-10-10)
+
+
+### Bug fixes
+
+* ui cleanups and tweaks ([4fd4203](https://github.com/hali-coding/lemondx/commit/4fd4203f46091d5274d3002019ce691ea367310b))
+* ui cleanups and tweaks ([c197dd8](https://github.com/hali-coding/lemondx/commit/c197dd8b80697ab7ec23b8359771010d91514ede))
+
 ## [0.9.1](https://github.com/hali-coding/lemondx/compare/v0.9.0...v0.9.1) (2026-10-04)
 
 
