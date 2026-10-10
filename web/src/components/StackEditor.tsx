@@ -5,7 +5,7 @@ import { occurrenceKey, occurrences } from '../lib/bootstrap'
 import { madeFrom } from '../lib/instance'
 import type {
   BootstrapModule, ClusterNode, InstanceTemplate, NodeGroup, Stack, StackLaunchStep,
-  StackStep, StackStepType, Synced,
+  SavedStack, StackStep, StackStepType,
 } from '../lib/types'
 import { ClockIcon, CloseIcon, GripIcon, HeartIcon, PlusIcon, ServerIcon, TrashIcon } from './Icons'
 
@@ -19,7 +19,7 @@ interface Props {
   /** How many instances carry this stack's name as their tag, for a rename. */
   running?: number
   onCancel: () => void
-  onSaved: (stack: Synced<Stack>) => void
+  onSaved: (stack: SavedStack) => void
 }
 
 /** A step as the editor holds it: `key` is React's and the drag's, never saved. */

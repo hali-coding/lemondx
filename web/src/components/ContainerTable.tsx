@@ -268,6 +268,13 @@ export function ContainerTable({
                     {container.ephemeral && <span className="vm-tag">EPH</span>}
                     <StaleBadge stale={container.stale ?? []} template={container.template}
                       stack={container.stack} />
+                    {/* Undefined, from a peer too old to mark, is not flagged: it cannot tell. */}
+                    {container.origin === null && (
+                      <span className="badge badge-warn"
+                        title="Made outside lemondx (lxc, a script, or an older lemondx). Import it from the Cluster tab's Inventory.">
+                        not from lemondx
+                      </span>
+                    )}
                   </div>
                   {container.description && (
                     <div className="cdesc truncate">{container.description}</div>

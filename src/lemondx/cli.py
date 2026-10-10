@@ -11,6 +11,7 @@ import shutil
 import logging
 import sys
 import time
+import urllib.parse
 
 from . import auth, cluster as cluster_mod, configure, nodesetup, pam
 from . import eventlog
@@ -115,6 +116,22 @@ def confirm(prompt, assume_yes=False):
         return assume_yes
     answer = input("%s [y/N] " % prompt).strip().lower()
     return answer in ("y", "yes")
+
+
+def confirm_delete(args, kind, name):
+    """Ask before deleting a shared definition, as destroying instances does.
+
+    A delete is pushed to every member, so it is a cluster-wide act from one
+    command. Without a terminal it needs -y, like every other confirmation:
+    a script that deletes says so.
+    """
+    where = "on this node only" if getattr(args, "local_only", False) else "on every node"
+    if confirm("Delete %s %s %s?" % (kind, name, where), args.yes):
+        return True
+    print(DIM("nothing deleted" + ("" if sys.stdin.isatty()
+                                   else " (pass -y to delete without a terminal)")),
+          file=sys.stderr)
+    return False
 
 
 # -- commands --------------------------------------------------------------
@@ -988,6 +1005,8 @@ def cmd_module_add(args, service):
 
 
 def cmd_module_remove(args, service):
+    if not confirm_delete(args, "module", args.id):
+        return 1
     result = cluster_service(service).remove_module(
         args.id, everywhere=not args.local_only)
     emit(args, result, lambda r: "%s removed module %s%s%s" % (
@@ -1034,6 +1053,8 @@ def cmd_profile_save(args, service):
 
 
 def cmd_profile_delete(args, service):
+    if not confirm_delete(args, "profile", args.name):
+        return 1
     result = cluster_service(service).delete_bootstrap_profile(
         args.name, everywhere=not args.local_only)
     emit(args, result, lambda r: "%s deleted profile %s%s" % (
@@ -1170,6 +1191,8 @@ def cmd_template_save(args, service):
 
 
 def cmd_template_delete(args, service):
+    if not confirm_delete(args, "template", args.name):
+        return 1
     result = cluster_service(service).delete_template(
         args.name, everywhere=not args.local_only)
     emit(args, result, lambda r: "%s deleted template %s%s" % (
@@ -1314,21 +1337,55 @@ def cmd_launch(args, service):
     params = parse_params(args.param)
     fill_secrets(template["bootstrap"]["modules"], params, service)
     cluster = cluster_service(service)
-    targets = cluster.resolve_targets(args.node, args.group)
+    # Where it will go, as the launch decides it: a group member in
+    # maintenance is skipped, and naming it here would promise otherwise.
+    targets, skipped = cluster.launch_targets(args.node, args.group)
     if not args.json:
         # Where only matters once there is more than one: on a host that has
         # never been federated, naming it would be noise about a feature the
         # user is not using.
-        where = "" if targets == [cluster.local_name()] else " on %s" % ", ".join(targets)
+        where = "" if targets == [cluster.local_name()] and not skipped \
+            else " on %s%s" % (", ".join(targets), " (skipping %s, in maintenance)"
+                               % ", ".join(skipped) if skipped else "")
         print(DIM("Launching %d instance(s) from %s%s (%s)..." % (
             args.count, template["name"], where,
             "clones of a snapshot" if template.get("snapshot")
             else "this pulls the image on first use")), flush=True)
+    api = serve_for_run(cluster, args)
+    if api is not None:
+        return launch_on_serve(args, api, template["name"], params)
     result = cluster.launch_template(template["name"], count=args.count,
                                      prefix=args.prefix, params=params,
                                      nodes=args.node, groups=args.group)
     emit(args, result, render_template_run)
     return 0 if result["ok"] else 1
+
+
+def launch_on_serve(args, api, name, params):
+    """Start the launch as a run on this node's serve, and follow it there."""
+    started = api.request("POST", "/api/templates/%s/launch" % urllib.parse.quote(name, safe=""), {
+        "count": args.count, "prefix": args.prefix, "params": params,
+        "nodes": args.node, "groups": args.group, "background": True})
+    if not args.json:
+        print(DIM("running on serve here: it carries on if this command stops, and "
+                  "the Templates tab follows it too"), flush=True)
+    run = started
+    try:
+        while run.get("finished_at") is None:
+            time.sleep(2)
+            run = next((r for r in api.request("GET", "/api/template-runs") or []
+                        if r["template"] == name and r["started_at"] == started["started_at"]),
+                       None)
+            if run is None:
+                raise ServiceError("The launch is no longer recorded on serve (dismissed, "
+                                   "or serve restarted); see the Templates tab.")
+    except KeyboardInterrupt:
+        print(YELLOW("stopped following; the launch carries on in serve"), file=sys.stderr)
+        return 130
+    if run.get("error"):
+        raise ServiceError(run["error"])
+    emit(args, run["result"], render_template_run)
+    return 0 if run["result"]["ok"] else 1
 
 
 # -- stacks ----------------------------------------------------------------
@@ -1443,12 +1500,15 @@ def cmd_stack_save(args, service):
         else raw.get("description", "")
     stack = stack_service(service).save_stack(args.name, stages=raw.get("stages"),
                                               description=description)
-    emit(args, stack, lambda s: "%s saved stack %s: %s%s" % (
-        GREEN("+"), BOLD(s["name"]), describe_stack(s), sync_note(s)))
+    emit(args, stack, lambda s: "%s saved stack %s: %s%s%s" % (
+        GREEN("+"), BOLD(s["name"]), describe_stack(s), sync_note(s), "".join(
+            "\n" + YELLOW("! %s" % warning) for warning in s.get("warnings") or [])))
     return 0
 
 
 def cmd_stack_delete(args, service):
+    if not confirm_delete(args, "stack", args.name):
+        return 1
     result = stack_service(service).delete_stack(args.name, everywhere=not args.local_only)
     emit(args, result, lambda r: "%s deleted stack %s%s" % (
         GREEN("+"), r["deleted"], sync_note(r)))
@@ -1524,29 +1584,139 @@ def cmd_stack_launch(args, service):
                                    % len(replace), args.yes):
             print(DIM("nothing changed"))
             return 1
-    run = stacks.launch_stack(stack["name"], params=params, background=True,
-                              replace=replace)
-    seen = {}
-    try:
-        while run["finished_at"] is None:
-            if not args.json:
-                # Each step once per state it reaches, as it reaches it.
-                for stage in run["stages"]:
-                    for step in stage["steps"]:
-                        if step["state"] != "pending" and seen.get(step["id"]) != step["state"]:
-                            seen[step["id"]] = step["state"]
-                            print(render_step(step), flush=True)
-            time.sleep(1)
-            run = next(r for r in stacks.stack_runs() if r["stack"] == stack["name"])
-    except KeyboardInterrupt:
-        print(YELLOW("cancelling: nothing new starts; launches under way finish "
-                     "(Ctrl-C again to leave them)"), file=sys.stderr)
-        stacks.cancel_stack_run(stack["name"])
-        while run["finished_at"] is None:
-            time.sleep(1)
-            run = next(r for r in stacks.stack_runs() if r["stack"] == stack["name"])
+    name = stack["name"]
+    api = serve_for_run(stacks.cluster, args)
+    if api is not None:
+        path = urllib.parse.quote(name, safe="")
+        run = api.request("POST", "/api/stacks/%s/launch" % path,
+                          {"params": params, "replace": replace, "background": True})
+        if not args.json:
+            print(DIM("running on serve here: it carries on if this command stops, and "
+                      "the Stacks tab follows it too"), flush=True)
+        started_at = run["started_at"]
+
+        def current():
+            found = next((r for r in api.request("GET", "/api/stack-runs") or []
+                          if r["stack"] == name and r["started_at"] == started_at), None)
+            if found is None:
+                raise ServiceError("The stack run is no longer recorded on serve "
+                                   "(dismissed, or serve restarted); see the Stacks tab.")
+            return found
+        run = follow_stack_run(args, run, current,
+                               lambda: api.request("POST", "/api/stack-runs/%s/cancel" % path),
+                               outlives=True)
+    else:
+        run = stacks.launch_stack(name, params=params, background=True, replace=replace)
+        run = follow_stack_run(
+            args, run, lambda: next(r for r in stacks.stack_runs() if r["stack"] == name),
+            lambda: stacks.cancel_stack_run(name))
+    if run is None:
+        return 130
     emit(args, run, render_stack_run)
     return 0 if run["ok"] else 1
+
+
+# A step whose detail keeps changing (a health gate naming what it waits on)
+# is reprinted at most this often; a change of state always prints at once.
+DETAIL_EVERY = 20
+
+
+def follow_stack_run(args, run, current, cancel, outlives=False):
+    """Print each step as it moves until the run ends; returns the final run.
+
+    Ctrl-C cancels it -- nothing new starts, launches under way finish -- and
+    a second one stops waiting: here that leaves those launches cut off with
+    this process, on serve (``outlives``) they carry on there, and None is
+    returned.
+    """
+    seen = {}       # step id -> (state, detail, when printed)
+
+    def report():
+        if args.json:
+            return
+        for stage in run["stages"]:
+            for step in stage["steps"]:
+                if step["state"] == "pending":
+                    continue
+                last = seen.get(step["id"])
+                if last and last[0] == step["state"] and (
+                        last[1] == step["detail"] or time.time() - last[2] < DETAIL_EVERY):
+                    continue
+                seen[step["id"]] = (step["state"], step["detail"], time.time())
+                print(render_step(step), flush=True)
+
+    try:
+        while run["finished_at"] is None:
+            report()
+            time.sleep(1)
+            run = current()
+    except KeyboardInterrupt:
+        print(YELLOW("cancelling: nothing new starts; launches under way finish "
+                     "(Ctrl-C again to %s)" % ("stop waiting -- they finish on serve"
+                                               if outlives else "leave them")),
+              file=sys.stderr)
+        cancel()
+        try:
+            while run["finished_at"] is None:
+                time.sleep(1)
+                run = current()
+        except KeyboardInterrupt:
+            if outlives:
+                return None
+            raise
+    return run
+
+
+def serve_for_run(cluster, args):
+    """This node's running `serve`, to hand a long run to -- or None to run it here.
+
+    A run lives in the memory of the process that started it. Started here,
+    the web UI, `top` and every other client -- which all read runs from
+    `serve` -- never see it, and it stops halfway if the terminal or the ssh
+    session it runs in goes. Handed to `serve`, it is an ordinary run there
+    that outlives this command, which only follows it. ``--no-serve``, or a
+    `serve` that is not running or does not accept this caller, keeps it here.
+
+    Asked with a GET first: once a launch has been sent, a failure is reported
+    rather than retried here, since the request may already have started it.
+    """
+    if getattr(args, "no_serve", False):
+        return None
+    api, _why = cluster.local_api(timeout=30)
+    if api is None:
+        return None
+    try:
+        status = api.request("GET", "/api/status") or {}
+    except NodeError as exc:
+        if not args.json:
+            print(DIM("running in this command: serve here did not accept it (%s)"
+                      % exc.message), file=sys.stderr)
+        return None
+    # serve runs on the daemon and project it was started with, which need not
+    # be this command's: --project or --socket handed over would launch into
+    # whatever serve uses instead.
+    mismatch = serve_mismatch(status, cluster.service.lxd)
+    if mismatch:
+        if not args.json:
+            print(DIM("running in this command: serve here uses %s" % mismatch),
+                  file=sys.stderr)
+        return None
+    return api
+
+
+def serve_mismatch(status, lxd):
+    """How serve's daemon or project differs from this command's, or None."""
+    if (status.get("project") or "default") != (lxd.project or "default"):
+        return "project %s, not %s" % (status.get("project") or "default",
+                                       lxd.project or "default")
+    theirs = status.get("socket") or ""
+    try:
+        # One socket is often reachable by two paths (the snap's and
+        # /var/lib/lxd), so compare what they point at.
+        same = os.path.samefile(theirs, lxd.socket_path)
+    except OSError:
+        same = theirs == lxd.socket_path
+    return None if same else "the daemon at %s, not %s" % (theirs or "?", lxd.socket_path)
 
 
 def fill_secrets(modules, params, service):
@@ -2220,8 +2390,17 @@ def _render_nodes(nodes):
                    (n["state"] or {}).get("server_version") or ""),
         str((n["state"] or {}).get("containers", "-")),
         ", ".join(n["groups"]) or DIM("-"),
-        (n["state"] or {}).get("error") or "",
+        (n["state"] or {}).get("error") or _maintenance_note(n),
     ] for n in nodes], ["node", "url", "state", "daemon", "instances", "groups", "note"])
+
+
+def _maintenance_note(node):
+    """Why a node is in maintenance and who said so: what decides whether to end it."""
+    mark = node.get("maintenance")
+    if not mark:
+        return ""
+    return "%s%s" % (mark.get("reason") or "no reason given",
+                     DIM(" (by %s)" % mark["by"]) if mark.get("by") else "")
 
 
 def cmd_cluster_refresh(args, service):
@@ -2394,6 +2573,8 @@ def cmd_cluster_show(args, service):
                  or DIM("none")),
                 ("state", _node_state(n)),
                 ("groups", ", ".join(n["groups"]) or DIM("-"))]
+        if n.get("maintenance"):
+            rows.append(("maintenance", _maintenance_note(n)))
         if state.get("error"):
             rows.append(("error", RED(state["error"])))
         out = [BOLD(n["name"]), _describe_rows(rows), "", BOLD("Instances")]
@@ -2809,6 +2990,8 @@ def cmd_cluster_group_auto(args, service):
 
 
 def cmd_cluster_group_delete(args, service):
+    if not confirm_delete(args, "group", args.name):
+        return 1
     result = cluster_service(service).delete_group(
         args.name, everywhere=not args.local_only)
     emit(args, result, lambda r: "%s deleted group %s%s" % (
@@ -2833,6 +3016,64 @@ def cmd_cluster_sync(args, service):
         return "\n".join(lines)
 
     emit(args, result, render)
+    return 0 if result["ok"] else 1
+
+
+def render_inventory(r):
+    out = []
+    if r["foreign"]:
+        out.append(table([[BOLD(c["node"]), c["name"],
+                           STATUS_COLORS.get(c["status"], str)(c["status"]),
+                           "VM" if c["type"] == "virtual-machine" else "container",
+                           c["image"] or DIM("-"), (c["created_at"] or "")[:16].replace("T", " ")]
+                          for c in r["foreign"]],
+                         ["node", "name", "status", "type", "image", "created"]))
+        out.append(DIM("not made by lemondx; `lemondx import NAME --node NODE` (or --all) "
+                       "adopts them"))
+    else:
+        out.append(GREEN("+ every instance on %s was made or imported by lemondx"
+                         % ", ".join(r["nodes"])))
+    for failure in r["errors"]:
+        out.append(RED("! %s: %s" % (failure["node"], failure["error"])))
+    return "\n".join(out)
+
+
+def cmd_inventory(args, service):
+    result = cluster_service(service).inventory()
+    emit(args, result, render_inventory)
+    return 0
+
+
+def cmd_import(args, service):
+    cluster = cluster_service(service)
+    if args.all:
+        if args.name:
+            raise ServiceError("Name instances or give --all, not both.")
+        inventory = cluster.inventory()
+        for failure in inventory["errors"]:
+            print(YELLOW("! %s: %s" % (failure["node"], failure["error"])), file=sys.stderr)
+        targets = [{"node": c["node"], "name": c["name"]} for c in inventory["foreign"]]
+        if not targets:
+            print(DIM("nothing to import"))
+            return 0
+    elif args.name:
+        targets = [{"node": args.node or cluster.local_name(), "name": n} for n in args.name]
+    else:
+        raise ServiceError("Name the instances to import, or give --all.")
+    if args.template and not args.json:
+        # The one part of an import that can cost something later.
+        print("Importing into template %s: %s" % (BOLD(args.template), describe_members(targets)))
+        if not confirm("Its Recreate would delete these and make them again from the "
+                       "template, losing what is on them. Continue?", args.yes):
+            print(DIM("nothing imported"), file=sys.stderr)
+            return 1
+    result = cluster.import_instances(targets, template=args.template)
+    emit(args, result, lambda r: "\n".join(
+        ("%s %s on %s%s" % (GREEN("+") if i["ok"] else RED("!"), BOLD(i["name"]), i["node"],
+                            (" -- %s" % i["error"]) if i["error"] else
+                            (" imported into %s" % r["template"]) if r["template"]
+                            else " imported"))
+        for i in r["instances"]))
     return 0 if result["ok"] else 1
 
 
@@ -2943,6 +3184,8 @@ def build_parser():
     only_here.add_argument("--local-only", action="store_true",
                            help="delete only on this node, leaving other members' "
                                 "copies in place")
+    only_here.add_argument("-y", "--yes", action="store_true",
+                           help="do not ask for confirmation")
 
     # Bootstrap selection, shared by `create` and `bootstrap`.
     boot = argparse.ArgumentParser(add_help=False)
@@ -3583,6 +3826,9 @@ def build_parser():
     p.add_argument("--relaunch", action="store_true",
                    help="destroy the stack's current instances first (asks unless -y)")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.add_argument("--no-serve", action="store_true",
+                   help="run it in this command even when serve is running here, "
+                        "rather than as a run on serve that outlives it")
     p.set_defaults(func=cmd_stack_launch)
 
     for action, text in (("start", "start every instance a stack launched"),
@@ -3807,6 +4053,21 @@ def build_parser():
     p.add_argument("url")
     p.set_defaults(func=cmd_cluster_fingerprint, needs_service=False)
 
+    p = add("inventory",
+            help="instances on any node that lemondx did not make or import")
+    p.set_defaults(func=cmd_inventory)
+
+    p = add("import", help="adopt instances made outside lemondx (see `inventory`)")
+    p.add_argument("name", nargs="*")
+    p.add_argument("--node", help="the node they are on (default: this one)")
+    p.add_argument("--all", action="store_true",
+                   help="every instance the inventory finds, on every node")
+    p.add_argument("--template",
+                   help="also make them this template's: its runs take them in, and its "
+                        "Recreate rebuilds them (asks unless -y)")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.set_defaults(func=cmd_import)
+
     p = add("launch", help="create one or more instances from a template")
     p.add_argument("template")
     p.add_argument("-n", "--count", type=int, default=1,
@@ -3820,6 +4081,9 @@ def build_parser():
                         "`lemondx cluster nodes`)")
     p.add_argument("--group", action="append", metavar="NAME",
                    help="launch across every node in this group (repeatable)")
+    p.add_argument("--no-serve", action="store_true",
+                   help="run it in this command even when serve is running here, "
+                        "rather than as a run on serve that outlives it")
     p.set_defaults(func=cmd_launch)
 
     p = add("bootstrap", parents=[common, boot],
@@ -3842,7 +4106,7 @@ READ_ONLY = {
     "cluster_nodes", "cluster_status", "cluster_show", "cluster_invites", "fabric_list",
     "fabric_status", "fabric_plan", "fabric_check", "cluster_groups",
     "cluster_containers", "cluster_cert", "cluster_fingerprint", "images", "logging",
-    "logs",
+    "logs", "inventory",
 }
 # Logged by themselves: `serve` is its own process's log, and the fabric
 # helper's commands are logged by the process that asked for them.

@@ -503,6 +503,8 @@ export function StacksView({ localNode, ready, runs: runList, onRunStarted, onNo
           onSaved={(saved) => {
             onNotify(syncKind(saved.synced), `Saved stack “${saved.name}”`,
               syncDetail(saved.synced))
+            // Saved all the same: what it names may arrive by sync later.
+            for (const warning of saved.warnings ?? []) onNotify('info', 'Worth checking', warning)
             setEditing(null)
             load()
           }}

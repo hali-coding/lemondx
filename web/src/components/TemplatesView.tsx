@@ -9,6 +9,7 @@ import type {
   Scope, ScopedContainer, TemplateRun,
 } from '../lib/types'
 import { ConfirmDialog } from './ConfirmDialog'
+import { DiagnoseButton } from './DiagnoseButton'
 import { CloseIcon, PencilIcon, PlusIcon, RestartIcon, TerminalIcon, TrashIcon } from './Icons'
 import { Modal } from './Modal'
 import { StatusBadge } from './StatusBadge'
@@ -293,101 +294,108 @@ export function TemplatesView({
                 </header>
 
                 <div className="module-card-body template-body">
-                  {template.description && (
-                    <p className="module-desc-full">{template.description}</p>
-                  )}
-                  <dl className="kv template-facts">
-                    <dt>{template.snapshot ? 'Snapshot' : 'Image'}</dt>
-                    <dd className="mono">{madeFrom(template)}</dd>
-                    <dt>Limits</dt>
-                    <dd>{limits || <span className="faint">none</span>}</dd>
-                    <dt>Modules</dt>
-                    <dd>
-                      {moduleNames.length ? moduleNames.join(' → ') : <span className="faint">none</span>}
-                    </dd>
-                    {template.bootstrap.ssh_keys.length > 0 && (
-                      <>
-                        <dt>SSH keys</dt>
-                        <dd>{template.bootstrap.ssh_keys.length} saved</dd>
-                      </>
+                  <div className="template-col">
+                    {template.description && (
+                      <p className="module-desc-full">{template.description}</p>
                     )}
-                    {template.profiles.length > 0 && (
-                      <>
-                        <dt>Profiles</dt>
-                        <dd className="mono">{template.profiles.join(', ')}</dd>
-                      </>
-                    )}
-                    <dt>Instances</dt>
-                    <dd>
-                      {members.length === 0 ? (
-                        <span className="faint">none yet</span>
-                      ) : (
-                        <span className="template-members">
-                          {members.map((c) => (
-                            <button key={`${c.node ?? ''}/${c.name}`} type="button"
-                              className="template-member"
-                              onClick={() => onOpen(c.name, c.node)}
-                              title={c.node && c.node !== localNode
-                                ? `${c.status} on ${c.node} -- open it there`
-                                : c.status}>
-                              <span className={`dot${c.status === 'Running' ? ' dot-ok' : ''}`} />
-                              {c.name}
-                              <StaleBadge stale={c.stale ?? []} template={c.template}
-                                stack={c.stack} />
-                              {/* Which host it is on, once the view spans more
-                                  than one and the name alone is ambiguous. */}
-                              {c.node && c.node !== localNode && (
-                                <span className="badge badge-dim">{c.node}</span>
-                              )}
-                            </button>
-                          ))}
-                          <span className="faint">{running} running</span>
-                        </span>
+                    <dl className="kv template-facts">
+                      <dt>{template.snapshot ? 'Snapshot' : 'Image'}</dt>
+                      <dd className="mono">{madeFrom(template)}</dd>
+                      <dt>Limits</dt>
+                      <dd>{limits || <span className="faint">none</span>}</dd>
+                      <dt>Modules</dt>
+                      <dd>
+                        {moduleNames.length ? moduleNames.join(' → ') : <span className="faint">none</span>}
+                      </dd>
+                      {template.bootstrap.ssh_keys.length > 0 && (
+                        <>
+                          <dt>SSH keys</dt>
+                          <dd>{template.bootstrap.ssh_keys.length} saved</dd>
+                        </>
                       )}
-                    </dd>
-                  </dl>
+                      {template.profiles.length > 0 && (
+                        <>
+                          <dt>Profiles</dt>
+                          <dd className="mono">{template.profiles.join(', ')}</dd>
+                        </>
+                      )}
+                    </dl>
+                  </div>
 
-                  {staleCount > 0 && (
-                    <p className="hint stale-hint">
-                      {staleCount} of {members.length} {staleCount === 1 ? 'was' : 'were'} made
-                      from an older version of this template.
-                      {staleHere > 0 && <> <strong>Replace stale</strong> recreates
-                        {staleHere === staleCount ? (staleCount === 1 ? ' it' : ' them')
-                          : ` the ${staleHere} no stack launched`}.</>}
-                      {staleHere < staleCount && ' A stack’s instances are replaced from the Stacks tab, which keeps the values the stack gave them.'}
-                    </p>
-                  )}
+                  <div className="template-col">
+                    <div className="template-col-label">
+                      Instances
+                      {members.length > 0 && <span className="faint"> · {running} of {members.length} running</span>}
+                    </div>
+                    {members.length === 0 ? (
+                      <span className="faint template-none">none yet</span>
+                    ) : (
+                      <span className="template-members">
+                        {members.map((c) => (
+                          <button key={`${c.node ?? ''}/${c.name}`} type="button"
+                            className="template-member"
+                            onClick={() => onOpen(c.name, c.node)}
+                            title={c.node && c.node !== localNode
+                              ? `${c.status} on ${c.node} -- open it there`
+                              : c.status}>
+                            <span className={`dot${c.status === 'Running' ? ' dot-ok' : ''}`} />
+                            {c.name}
+                            <StaleBadge stale={c.stale ?? []} template={c.template}
+                              stack={c.stack} />
+                            {/* Which host it is on, once the view spans more
+                                than one and the name alone is ambiguous. */}
+                            {c.node && c.node !== localNode && (
+                              <span className="badge badge-dim">{c.node}</span>
+                            )}
+                          </button>
+                        ))}
+                      </span>
+                    )}
 
-                  {gone.length > 0 && (
-                    <p className="hint" style={{ color: 'var(--danger)' }}>
-                      Uses {gone.join(', ')}, which no longer exist. Edit the template
-                      before launching or recreating from it.
-                    </p>
-                  )}
+                    {staleCount > 0 && (
+                      <p className="hint stale-hint">
+                        {staleCount} of {members.length} {staleCount === 1 ? 'was' : 'were'} made
+                        from an older version of this template.
+                        {staleHere > 0 && <> <strong>Replace stale</strong> recreates
+                          {staleHere === staleCount ? (staleCount === 1 ? ' it' : ' them')
+                            : ` the ${staleHere} no stack launched`}.</>}
+                        {staleHere < staleCount && ' A stack’s instances are replaced from the Stacks tab, which keeps the values the stack gave them.'}
+                      </p>
+                    )}
 
-                  <div className="template-launch">
-                    <input
-                      className="input num"
-                      type="number"
-                      min={1}
-                      max={MAX_LAUNCH}
-                      value={counts[template.name] ?? '1'}
-                      aria-label={`How many to launch from ${template.name}`}
-                      disabled={!!busy}
-                      onChange={(event) => setCounts((current) => ({
-                        ...current, [template.name]: event.target.value }))}
-                    />
-                    <button className="btn btn-primary"
-                      disabled={!ready || !canOperate || !!busy || gone.length > 0}
-                      onClick={() => requestLaunch(template)}>
-                      {busy?.action === 'launch' && <span className="spinner" />}
-                      {busy?.action === 'launch' ? `Launching ${busy.count}…` : 'Launch'}
-                    </button>
-                    <span className="hint mono truncate" title={preview.join(', ')}>
-                      {busy ? '' : `→ ${preview.length > 3
-                        ? `${preview.slice(0, 2).join(', ')} … ${preview[preview.length - 1]}`
-                        : preview.join(', ')}`}
-                    </span>
+                    {gone.length > 0 && (
+                      <p className="hint" style={{ color: 'var(--danger)' }}>
+                        Uses {gone.join(', ')}, which no longer exist. Edit the template
+                        before launching or recreating from it.
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="template-col template-col-actions">
+                    <div className="template-launch">
+                      <input
+                        className="input num"
+                        type="number"
+                        min={1}
+                        max={MAX_LAUNCH}
+                        value={counts[template.name] ?? '1'}
+                        aria-label={`How many to launch from ${template.name}`}
+                        disabled={!!busy}
+                        onChange={(event) => setCounts((current) => ({
+                          ...current, [template.name]: event.target.value }))}
+                      />
+                      <button className="btn btn-primary"
+                        disabled={!ready || !canOperate || !!busy || gone.length > 0}
+                        onClick={() => requestLaunch(template)}>
+                        {busy?.action === 'launch' && <span className="spinner" />}
+                        {busy?.action === 'launch' ? `Launching ${busy.count}…` : 'Launch'}
+                      </button>
+                      <span className="hint mono truncate" title={preview.join(', ')}>
+                        {busy ? '' : `→ ${preview.length > 3
+                          ? `${preview.slice(0, 2).join(', ')} … ${preview[preview.length - 1]}`
+                          : preview.join(', ')}`}
+                      </span>
+                    </div>
                     {(members.length > 0 || (busy && busy.action !== 'launch')) && (
                       <div className="template-fleet">
                         <button className="btn btn-sm"
@@ -421,83 +429,93 @@ export function TemplatesView({
                         </button>
                       </div>
                     )}
-                  </div>
-                  {(busy?.action === 'launch' || busy?.action === 'recreate') && (
-                    <span className="hint">
-                      Creating and bootstrapping — this can take a few minutes.
-                    </span>
-                  )}
-                  {busy?.action === 'exec' && run?.command && (
-                    <span className="hint">
-                      Running <span className="mono">{run.command}</span> — output appears here
-                      when every instance has finished.
-                    </span>
-                  )}
-                  {secrets.length > 0 && !busy && (
-                    <span className="hint">
-                      Asks for {secrets.map((p) => p.name).join(' and ')} on launch and recreate.
-                    </span>
-                  )}
-
-                  {finished && (
-                    <div className="template-run-head">
-                      <span className="truncate">
-                        {finished.action === 'exec' ? (
-                          <>Last command <span className="mono">{finished.command}</span></>
-                        ) : <>Last {finished.action}</>}
-                        {finished.finished_at && (
-                          <> · finished {new Date(finished.finished_at * 1000).toLocaleTimeString()}</>
-                        )}
+                    {(busy?.action === 'launch' || busy?.action === 'recreate') && (
+                      <span className="hint">
+                        Creating and bootstrapping — this can take a few minutes.
                       </span>
-                      <button type="button" className="btn btn-ghost btn-icon btn-sm"
-                        aria-label={`Dismiss the last ${finished.action} of ${template.name}`}
-                        title="Dismiss" onClick={() => dismiss(template.name)}>
-                        <CloseIcon size={13} />
-                      </button>
-                    </div>
-                  )}
-                  {finished?.error && (
-                    <p className="hint" style={{ color: 'var(--danger)' }}>{finished.error}</p>
-                  )}
-                  {/* Substitutions a node made rather than failing the launch --
-                      a storage pool or network it does not have. */}
-                  {(run?.notes ?? []).map((note) => (
-                    <p key={note} className="hint" style={{ color: 'var(--warn)' }}>{note}</p>
-                  ))}
-                  {result && finished?.action === 'exec' && (
-                    <ExecResults instances={result.instances} onOpen={onOpen} />
-                  )}
-                  {result && finished?.action !== 'exec' && (
-                    <ul className="template-results">
-                      {result.instances.map((instance) => {
-                        const failedModule = instance.container?.bootstrap?.modules
-                          .find((m) => m.exit_code !== 0)
-                        return (
-                          <li key={instance.name}>
-                            <span className={`badge ${instance.ok ? 'badge-ok' : 'badge-danger'}`}>
-                              {!instance.ok ? 'failed' : instance.container ? 'ok' : 'deleted'}
-                            </span>
-                            {instance.container ? (
-                              <button type="button" className="template-member"
-                                onClick={() => onOpen(instance.name)}>
-                                {instance.name}
-                              </button>
-                            ) : (
-                              <span className="mono">{instance.name}</span>
+                    )}
+                    {busy?.action === 'exec' && run?.command && (
+                      <span className="hint">
+                        Running <span className="mono">{run.command}</span> — output appears here
+                        when every instance has finished.
+                      </span>
+                    )}
+                    {secrets.length > 0 && !busy && (
+                      <span className="hint">
+                        Asks for {secrets.map((p) => p.name).join(' and ')} on launch and recreate.
+                      </span>
+                    )}
+                  </div>
+
+                  {/* The last run across the whole box: its rows are as wide
+                      as their errors, and squeezed into a column they wrap
+                      every line. Empty, and hidden by CSS, when there is none. */}
+                  <div className="template-col-result">
+                      {finished && (
+                        <div className="template-run-head">
+                          <span className="truncate">
+                            {finished.action === 'exec' ? (
+                              <>Last command <span className="mono">{finished.command}</span></>
+                            ) : <>Last {finished.action}</>}
+                            {finished.finished_at && (
+                              <> · finished {new Date(finished.finished_at * 1000).toLocaleTimeString()}</>
                             )}
-                            {instance.node && result.instances.some(
-                              (other) => other.node !== instance.node) && (
-                              <span className="badge badge-dim">{instance.node}</span>
-                            )}
-                            {instance.error && <span className="faint">{instance.error}</span>}
-                            {failedModule && (
-                              <span className="faint">module “{failedModule.name}” failed — open it for the log</span>
-                            )}
-                          </li>
-                        )
-                      })}
-                    </ul>
-                  )}
+                          </span>
+                          <button type="button" className="btn btn-ghost btn-icon btn-sm"
+                            aria-label={`Dismiss the last ${finished.action} of ${template.name}`}
+                            title="Dismiss" onClick={() => dismiss(template.name)}>
+                            <CloseIcon size={13} />
+                          </button>
+                        </div>
+                      )}
+                      {finished?.error && (
+                        <p className="hint" style={{ color: 'var(--danger)' }}>
+                          {finished.error} <DiagnoseButton error={finished.error} />
+                        </p>
+                      )}
+                      {/* Substitutions a node made rather than failing the launch --
+                          a storage pool or network it does not have. */}
+                      {(run?.notes ?? []).map((note) => (
+                        <p key={note} className="hint" style={{ color: 'var(--warn)' }}>{note}</p>
+                      ))}
+                      {result && finished?.action === 'exec' && (
+                        <ExecResults instances={result.instances} onOpen={onOpen} />
+                      )}
+                      {result && finished?.action !== 'exec' && (
+                        <ul className="template-results">
+                          {result.instances.map((instance) => {
+                            const failedModule = instance.container?.bootstrap?.modules
+                              .find((m) => m.exit_code !== 0)
+                            return (
+                              <li key={instance.name}>
+                                <span className={`badge ${instance.ok ? 'badge-ok' : 'badge-danger'}`}>
+                                  {!instance.ok ? 'failed' : instance.container ? 'ok' : 'deleted'}
+                                </span>
+                                {instance.container ? (
+                                  <button type="button" className="template-member"
+                                    onClick={() => onOpen(instance.name)}>
+                                    {instance.name}
+                                  </button>
+                                ) : (
+                                  <span className="mono">{instance.name}</span>
+                                )}
+                                {instance.node && result.instances.some(
+                                  (other) => other.node !== instance.node) && (
+                                  <span className="badge badge-dim">{instance.node}</span>
+                                )}
+                                {instance.error && <span className="faint">{instance.error}</span>}
+                                {failedModule && (
+                                  <span className="faint">module “{failedModule.name}” failed — open it for the log</span>
+                                )}
+                                {!instance.ok && (
+                                  <DiagnoseButton error={instance.error} module={failedModule} />
+                                )}
+                              </li>
+                            )
+                          })}
+                        </ul>
+                      )}
+                  </div>
                 </div>
               </section>
             )

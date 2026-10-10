@@ -1,5 +1,5 @@
 import type {
-  ClusterLogPage, LogFilters, LogPage, LoggingSettings, LoggingStatus, LoggingTest,
+  ClusterLogPage, ClusterMetrics, ImportResult, Inventory, LogFilters, LogPage, LoggingSettings, LoggingStatus, LoggingTest,
   ApiToken, AuthInfo, CreatedApiToken, HealthReport, LocalUser, Role,
   ClusterContainers, ClusterInfo, ClusterNode, ClusterNodeDetail, JoinCode, JoinResult,
   AutoGroupResult, DriftReport, EvictResult, LeaveResult,
@@ -11,7 +11,7 @@ import type {
   InstanceTemplate, NetworkRequest, NetworkSummary, SubnetInUse, Resources, SetupResult, Snapshot, SshKey,
   StateAction, Status, StorageOverview, StoragePoolDetail, StoragePoolRequest,
   StorageVolume, StorageVolumeRequest, TemplateRequest, TemplateRun,
-  Stack, StackInstances, StackRun, StackStage, BulkStateResult as StackStateResult,
+  SavedStack, Stack, StackInstances, StackRun, StackStage, BulkStateResult as StackStateResult,
   FabricStatus,
   FabricPlan,
   FabricApplyResult,
@@ -621,7 +621,7 @@ export const api = {
 
   /** Kept level across a cluster like templates, with the templates it uses. */
   saveStack: (name: string, body: { description: string; stages: StackStage[] }) =>
-    request<Synced<Stack>>(`/stacks/${encodeURIComponent(name)}`, { method: 'PUT', body }),
+    request<SavedStack>(`/stacks/${encodeURIComponent(name)}`, { method: 'PUT', body }),
 
   deleteStack: (name: string, everywhere = true) =>
     request<Synced<{ deleted: string }>>(
@@ -667,6 +667,12 @@ export const api = {
   bootstrap: (name: string, selection: BootstrapSelection, node?: string) =>
     request<BootstrapResult>(on(node, `/containers/${encodeURIComponent(name)}/bootstrap`),
       { method: 'POST', body: selection }),
+
+  /** Usage history after `cursor` from every chosen node; each samples itself. */
+  clusterMetrics: (params: { cursor?: string; window?: number; nodes?: string[]; groups?: string[] },
+                   signal?: AbortSignal) =>
+    request<ClusterMetrics>(`/cluster/metrics?${logQuery({
+      ...params, nodes: params.nodes?.join(','), groups: params.groups?.join(',') })}`, { signal }),
 
   /** The server's latest health checks; they run on its own schedule, not on request. */
   health: (signal?: AbortSignal) => request<HealthReport>('/health', { signal }),
@@ -738,6 +744,14 @@ export const api = {
    */
   drift: (signal?: AbortSignal) =>
     request<DriftReport | null>('/cluster/drift', { signal }),
+
+  /** List every node now for instances lemondx did not make or import. */
+  inventory: (signal?: AbortSignal) => request<Inventory>('/cluster/inventory', { signal }),
+
+  /** Adopt them, wherever each is; optionally as one template's. */
+  importInstances: (instances: InstanceRef[], template?: string) =>
+    request<ImportResult>('/cluster/inventory/import',
+      { method: 'POST', body: { instances, template: template || null } }),
 
   clusterContainers: (targets: { nodes?: string[]; groups?: string[]; all?: boolean } = {},
                       signal?: AbortSignal) => {

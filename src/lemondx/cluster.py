@@ -538,6 +538,8 @@ class ClusterService:
         service.fabric_configure = self._fabric_configure
         service.lan_configure = self._lan_configure
         service.lan_changed = self._lan_changed
+        service.launches_failing = lambda reason: self.set_maintenance(
+            True, reason=reason, by="lemondx")
 
     # -- this node ---------------------------------------------------------
 
@@ -1164,7 +1166,7 @@ class ClusterService:
     def summary(self):
         """Membership and instance counts, here and across the cluster.
 
-        Built on ``list_nodes()`` so the counts are the ones the Nodes tab
+        Built on ``list_nodes()`` so the counts are the ones the Cluster tab
         shows, probe cache included. An unreachable member is named rather than
         counted as zero, since "12 running" that silently leaves out a host is
         a wrong answer, not a partial one. An unfederated node never probes.
@@ -1551,6 +1553,9 @@ class ClusterService:
                 "reason": str(reason or "").strip(), "by": str(by or "")})
         else:
             record = store.save_maintenance(None)
+            # Ending it is someone saying the node is fit again, whatever made
+            # it fail: a streak that put it into maintenance starts over.
+            store.clear_launch_failures()
         if bool(was) != bool(record):
             _log("maintenance %s%s" % ("on" if record else "off",
                                        ": %s" % record["reason"] if record and record["reason"]
@@ -1579,7 +1584,7 @@ class ClusterService:
     def _maintenance_message(self, held, what):
         one = len(held) == 1
         reason = (self.maintenance_of(held[0]) or {}).get("reason") if one else ""
-        return ("Cannot %s: %s %s in maintenance%s. End it on the Nodes tab, or with "
+        return ("Cannot %s: %s %s in maintenance%s. End it on the Cluster tab, or with "
                 "`lemondx cluster maintenance off` on %s."
                 % (what, ", ".join(held), "is" if one else "are",
                    " (%s)" % reason if reason else "", "that node" if one else "those nodes"))
@@ -3634,6 +3639,64 @@ class ClusterService:
             results.extend(outcome)
         return {"ok": all(r["ok"] for r in results), "instances": results}
 
+    # -- inventory: instances made outside lemondx ----------------------------
+    #
+    # lemondx keeps no list of its own instances: each carries its mark
+    # (`origin`, or a template/stack tag) and the daemons' listings are the
+    # inventory. So taking one is listing every node now -- nothing cached --
+    # and a node is only as truthful as its version: a member from before the
+    # mark existed reports no `origin` at all, and every instance there would
+    # look foreign. That node is reported as unable to tell instead.
+
+    def inventory(self):
+        """Every instance on every node that lemondx did not make or import."""
+        listing = self.containers(everything=True)
+        mute = {}
+        for row in listing["instances"]:
+            mute.setdefault(row["node"], "origin" not in row)
+        errors = list(listing["errors"]) + [
+            {"node": node, "error": "runs a lemondx that does not mark its instances, "
+                                    "so it cannot tell its own from others'; upgrade it"}
+            for node, old in sorted(mute.items()) if old]
+        foreign = [{key: row.get(key) for key in (
+                        "node", "name", "status", "type", "image", "created_at", "ipv4")}
+                   for row in listing["instances"]
+                   if not mute.get(row["node"]) and row.get("origin") is None]
+        foreign.sort(key=lambda r: (r["node"], r["name"]))
+        return {"checked_at": time.time(), "nodes": listing["nodes"],
+                "foreign": foreign, "errors": errors}
+
+    def import_instances(self, instances, template=None):
+        """Adopt foreign instances wherever they are; each reports its outcome.
+
+        One template, or none, for the whole batch: the inventory's "import
+        all" is one decision, not one per row.
+        """
+        grouped = self._by_node(instances)
+        template = str(template).strip() if template else None
+
+        def one(node):
+            out = []
+            for name in grouped[node]:
+                try:
+                    if node == self.local_name():
+                        self.service.import_instance(name, template=template)
+                    else:
+                        self.proxy("POST", node, "/api/containers/%s/import"
+                                   % urllib.parse.quote(name, safe=""),
+                                   {"template": template})
+                    out.append({"node": node, "name": name, "ok": True, "error": None})
+                except (ClusterError, NodeError, ServiceError, LXDError) as exc:
+                    out.append({"node": node, "name": name, "ok": False,
+                                "error": getattr(exc, "message", str(exc))})
+            return out
+
+        results = []
+        for outcome in self._fanout(sorted(grouped), one):
+            results.extend(outcome)
+        return {"ok": all(r["ok"] for r in results), "template": template,
+                "instances": results}
+
     def delete_containers(self, instances, force=False):
         """Delete instances that may live on different nodes."""
         grouped = self._by_node(instances)
@@ -3837,6 +3900,39 @@ class ClusterService:
                 monitored.append(node_name)
         return {"nodes": targets, "instances": instances, "health": health,
                 "monitored": monitored, "errors": errors}
+
+    def metrics(self, cursor=None, window=None, nodes=None, groups=None):
+        """Every chosen node's usage history after its place in ``cursor``.
+
+        Each node samples itself and keeps its own history (``metrics.py``),
+        so this only reads: one call per node, the answers side by side
+        rather than merged, since each is on its own clock. A node that does
+        not answer keeps its place, so the next poll asks it from there.
+        """
+        targets = self.resolve_targets(nodes, groups, everything=not nodes and not groups)
+        positions = _decode_cursor(cursor)
+        local = self.local_name()
+
+        def one(node):
+            since = positions.get(node)
+            try:
+                if node == local:
+                    payload = self.service.metrics(since=since, window=window)
+                else:
+                    params = {k: v for k, v in (("since", since), ("window", window)) if v}
+                    payload = self.client(node, timeout=PROBE_TIMEOUT).request(
+                        "GET", "/api/metrics", params=params) or {}
+            except (ClusterError, NodeError, ServiceError) as exc:
+                return {"node": node, "self": node == local, "ok": False,
+                        "error": exc.message}
+            return dict(payload, node=node, self=node == local, ok=True, error=None)
+
+        answers = self._fanout(targets, one)
+        out = dict(positions)
+        for answer in answers:
+            if answer["ok"] and answer.get("at"):
+                out[answer["node"]] = repr(answer["at"])
+        return {"cursor": _encode_cursor(out), "nodes": answers}
 
 
 def _digest(body):

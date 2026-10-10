@@ -7,6 +7,7 @@ import type {
   SyncKind, SyncResult,
 } from '../lib/types'
 import { ConfirmDialog } from './ConfirmDialog'
+import { InventoryPanel } from './InventoryPanel'
 import { CopyButton } from './CopyButton'
 import { LoggingSettings } from './LoggingSettings'
 import {
@@ -308,6 +309,10 @@ export function ClusterView({ onNotify, onMembershipChanged, setup, onConfigure 
         <ThisNode info={info} peers={peers.length} setup={setup}
           onConfigure={canWrite ? onConfigure : undefined} />
       )}
+
+      {/* Above the node list, which loads later and would push it out of
+          view: the Containers tab's prompt sends people here to act. */}
+      <InventoryPanel onNotify={onNotify} />
 
       <section className="card access-card">
         <header className="access-head">

@@ -239,8 +239,11 @@ running but has no IPv4 address after a minute is passed on by name only.
 **Wait until healthy** passes once every instance launched by an earlier stage
 is green on the node it lives on. That means its own [health check](web-ui.md#health-checks)
 says `healthy`, and its template's [app check](templates.md#app-health-checks),
-if it has one, has answered `ok` rather than still being pending. If some are
-not green by the timeout, the step fails and names each one with its reason.
+if it has one, has answered `ok` rather than still being pending. While it
+waits, the step says which instances it is waiting on and why (the first two,
+then a count), so a gate that can only time out -- an app check failing the
+same way every round -- shows it from its first round. If some are not green
+by the timeout, the step fails and names each one with its reason.
 
 The health monitor must be on for each node involved. On a remote node with
 checks off, the step fails straight away rather than waiting out its timeout.
@@ -300,12 +303,25 @@ A stack is saved from a JSON definition, which `stack-show` prints back:
 ./lemondx stacks
 ./lemondx stack-show "Load test" > loadtest.json    # edit, then save again
 ./lemondx stack-launch "Load test"                  # prints each step as it goes
-./lemondx stack-delete "Load test"
+./lemondx stack-delete "Load test" -y
 ```
 
 `stack-launch` waits for the whole stack and exits 1 unless every step
-finished. Ctrl-C cancels it the way the UI's Cancel does. `--param KEY=VALUE`
-supplies a secret, or a value every launch gets.
+finished. When `serve` runs on the node, the run is handed to it and the
+command only follows it: the Stacks tab shows it too, and it carries on if
+the terminal or ssh session goes. Ctrl-C cancels it the way the UI's Cancel
+does; a second Ctrl-C stops waiting, and launches already under way finish on
+`serve`. `--no-serve` runs it in the command instead, as does a `serve` on
+another daemon or project than the command's (`--socket`, `--project`); there
+a second Ctrl-C leaves them cut off. A value a step asks for with `{{params.NAME}}` is read
+from an environment variable of that name, or prompted for, so a password
+need not be on the command line; `--param KEY=VALUE` supplies it too, or a
+value every launch gets.
+
+Saving names any group or node a step launches on that does not exist here,
+as a warning (the UI shows it after saving). The stack is saved regardless,
+since a member may still be joining or a group be made afterwards. A template
+it names must exist. Deleting a stack asks first; `-y` skips the question.
 
 ```json
 {

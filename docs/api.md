@@ -44,6 +44,7 @@ credentials get `401`, too little access `403`, too many failed logins `429`.
 | `POST` | `/api/containers/{name}/snapshots/{snap}/publish` | `{"alias","nodes":[...]}` → make an image of it here and copy it to those nodes (see [Templates](templates.md#from-a-snapshot)) |
 | `GET` | `/api/resources` | host CPU/memory/disk against what instances have allocated |
 | `GET` | `/api/health` | latest health check per running instance (see [Web UI tour](web-ui.md#health-checks)) |
+| `GET` | `/api/metrics` | this node's usage history, sampled every 2 s by `serve` and kept for 30 minutes: `?since=<at>&window=<seconds>` → `{period, retention, started_at, at, host: {cpu_threads, memory_total, uplink, points}, instances: [{name, status, type, template, stack, processes, points}]}`; each point is `[at, cpu %, memory bytes, rx B/s, tx B/s]` (host CPU is of all threads, an instance's of one core). 503 outside `serve` |
 | `GET` | `/api/containers/{name}/app-check` | the latest [app check](templates.md#app-health-checks) run in full: `{template, script, interval_seconds, timeout_seconds, result}`, `result` carrying `stdout`/`stderr` (last 16 KiB each) or null before the first run |
 | `GET` | `/api/storage` | pools, volumes, local-driver availability and management status |
 | `GET`/`POST` | `/api/storage/pools` | list pools / create a local pool |
@@ -98,6 +99,7 @@ credentials get `401`, too little access `403`, too many failed logins `429`.
 | `POST` | `/api/cluster/artifacts` | `{"items":[{"kind","name"}]}` → the bodies behind them — cluster members only |
 | `POST` | `/api/cluster/rotate` | replace the cluster credential on every member |
 | `PUT` | `/api/cluster/secret` | take a rotated credential (node to node) |
+| `GET` | `/api/cluster/metrics` | every node's `/api/metrics` side by side: `cursor` (opaque, from the last answer), `window`, `nodes`/`groups` → `{cursor, nodes: [{node, self, ok, error, ...}]}`; a node that does not answer keeps its place |
 | `GET` | `/api/cluster/containers` | instances across nodes (`?all=true`, `?nodes=`, `?groups=`), with each node's latest health records under `health` |
 | `POST` | `/api/cluster/containers/state` | `{"instances":[{"node","name"}],"action":...}` over several nodes |
 | `POST` | `/api/cluster/containers/delete` | delete instances that sit on several nodes |

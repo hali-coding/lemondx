@@ -22,7 +22,7 @@ built from the steps below and can be rebuilt from them.
 172.30/24 was picked so it can't collide with the 10.x bridges LXD creates or
 with fabric prefixes (10.100/16 and up).
 
-## Current nodes (2026-09-26)
+## Current nodes (2026-10-04, after a firedrill)
 
 | VMID | Name | IP | Spec | Contents |
 |---|---|---|---|---|
@@ -31,17 +31,29 @@ with fabric prefixes (10.100/16 and up).
 | 103 | `lxd3` | 172.30.0.13 | same | same |
 | 104 | `lxd4` | 172.30.0.14 | same | same |
 
-- **Cluster:** 4 members, formed on lxd1. Auth is off, so loopback callers are admin and peers use the cluster credential.
+- **Cluster:** 4 members, re-formed on lxd1 on 2026-10-04. Auth is off, so loopback callers are admin and peers use the cluster credential.
+- **Groups:** `large` and `small` (auto-sized; identical hosts, so both hold all four) and `frontends` = lxd2, lxd3, lxd4.
 - **Fabric:** `lemonfab0`, `10.100.0.0/16` with NAT. Each lxdN has `10.100.N.0/24`, and all 3/3 routes are ok.
-- **Stack:** `lemon3tier`. The steps are:
-  - `db` (`lx-db`: Ubuntu + postgresql) on lxd1
-  - `web` ×2 (`lx-web`: Alpine + apache2) on lxd2 and lxd3
+- **Stack:** `fd-3tier`. Every template puts its instance on the fabric:
+  - `db` (`fd-db`: Debian 12 + base, postgresql, mdns; app check `pg_isready`) on lxd1
+  - `web` ×3 (`fd-web`: Alpine + apache2 with its own vhost, mdns; app check wget) on group `frontends`
   - wait until healthy
-  - `probe` (`lx-probe`: Ubuntu + the `stack-probe` module) on lxd4
+  - `probe` (`fd-probe`: Ubuntu + the uploaded `stack-probe` module) on lxd4
 
-  Every template puts its instance on the fabric. The probe fails the stack
-  unless both web servers and a Postgres login answer across the fabric.
-  Launch it with `--param DB_PASSWORD=...`. It is never stored.
+  The probe fails the stack unless all three web servers and a Postgres login
+  (role `app`, db `appdb`) answer across the fabric. The password is in
+  `~ci/fd/db-password` on lxd1 (0600) and is never stored by lemondx; launch with
+  `DB_PASSWORD=$(cat ~/fd/db-password) ./lemondx stack-launch fd-3tier`.
+- **Also:** template `fd-dev` (Ubuntu + base, ssh-access, nodejs, mise; user
+  `dev`) with one instance per node. Its key is `~ci/.ssh/firedrill_ed25519` on
+  lxd1: `ssh -i ~/.ssh/firedrill_ed25519 dev@<fabric ip>`. Definitions and app
+  checks used to build all this are in `~ci/fd/` on lxd1.
+
+**Before using it:** the VMs may be stopped (`qm list` on the host; `qm start
+102 103 104`), and a rebuilt VM has a new SSH host key. Don't accept a changed
+key blind: read the real one through the guest agent and pin it,
+`qm guest exec <id> -- cat /etc/ssh/ssh_host_ed25519_key.pub` (the JSON has raw
+control characters, so parse it with `strict=False`).
 
 Keep this table current when adding or removing VMs.
 

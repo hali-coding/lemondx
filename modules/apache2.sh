@@ -54,6 +54,62 @@ config_test() {
     if have apache2ctl; then apache2ctl -t 2>&1; else httpd -t 2>&1; fi
 }
 
+# Every <Directory> and <DirectoryMatch> in the files Apache loads, one per
+# line as "path GLOB" or "regex RE", with "/" as an empty path. Fails when
+# the files cannot be listed, so the caller grants nothing rather than guess.
+directory_sections() {
+    if have apache2ctl; then
+        dump=$(apache2ctl -t -D DUMP_INCLUDES 2>/dev/null) || return 1
+    else
+        dump=$(httpd -t -D DUMP_INCLUDES 2>/dev/null) || return 1
+    fi
+    files=$(printf '%s\n' "$dump" | sed -n 's/^[[:space:]]*([^)]*)[[:space:]]*//p')
+    [ -n "$files" ] || return 1
+    printf '%s\n' "$files" |
+    while IFS= read -r f; do cat "$f"; done |
+    awk '{
+        line = $0; sub(/^[ \t]+/, "", line); sub(/>[ \t]*$/, "", line)
+        lower = tolower(line)
+        if (lower ~ /^<directorymatch[ \t]/) kind = "regex"
+        else if (lower ~ /^<directory[ \t]/) kind = "path"
+        else next
+        sub(/^<[^ \t]+[ \t]+/, "", line)
+        if (kind == "path" && line ~ /^~[ \t]/) { kind = "regex"; sub(/^~[ \t]+/, "", line) }
+        gsub(/^"|"$/, "", line)
+        if (kind == "path") sub(/\/+$/, "", line)
+        print kind, line
+    }'
+}
+
+# Whether a section in $sections other than "/" applies to directory $1:
+# one naming it or a directory above it.
+covered() {
+    while read -r kind pattern; do
+        [ -n "$pattern" ] || continue
+        dir=$1
+        while [ -n "$dir" ]; do
+            case "$kind" in
+                # Unquoted on purpose: Apache's <Directory> takes wildcards.
+                path) case "$dir" in $pattern) return 0 ;; esac ;;
+                # Apache's expressions are PCRE; one grep cannot read, or may
+                # read differently (groups with (?, escapes like \d), counts as
+                # a match, since unsure has to mean hands off.
+                regex)
+                    case "$pattern" in *'(?'*|*\\[A-Za-z]*) return 0 ;; esac
+                    grep -qE -e "$pattern" 2>/dev/null <<PATHS && return 0
+$dir
+$dir/
+PATHS
+                    [ $? -eq 2 ] && return 0 ;;
+            esac
+            dir=${dir%/*}
+        done
+    done <<EOF
+$sections
+EOF
+    return 1
+}
+
 # --- modules ---------------------------------------------------------------
 
 # Some modules are separate packages outside Debian and SUSE.
@@ -105,7 +161,8 @@ if [ -n "$vhost" ]; then
     # A missing DocumentRoot is only a warning to the config test, but the
     # site then answers 404 or 403 for everything. Create the directory, with
     # a page to show the vhost is the one answering.
-    printf '%s\n' "$vhost" | awk 'tolower($1) == "documentroot" { print $2 }' | tr -d '"' |
+    roots=$(printf '%s\n' "$vhost" | awk 'tolower($1) == "documentroot" { print $2 }' | tr -d '"')
+    printf '%s\n' "$roots" |
     while IFS= read -r root; do
         case "$root" in /*) ;; *) continue ;; esac
         [ -e "$root" ] && continue
@@ -114,6 +171,36 @@ if [ -n "$vhost" ]; then
             "$vhost_name" "$vhost_name" > "$root/index.html"
         log "created $root"
     done
+
+    # Apache 2.4 refuses every directory it is not told to serve. Debian's
+    # main config allows all of /var/www, so a vhost written there works
+    # without a <Directory> block -- and the same vhost answers 403 to
+    # everything on Alpine, Fedora or Arch, which allow only their own
+    # default root, while its config test passes. So a root nothing covers
+    # is granted here, in the same file, so a re-run rewrites it rather
+    # than adding another.
+    #
+    # Only a root nothing but <Directory /> covers, though. A Require in a
+    # deeper block replaces its parent's rather than adding to it, so
+    # granting a root beneath a block someone wrote -- in the vhost or
+    # anywhere in the server's config -- would open what that block
+    # restricts. Such a root is left to whatever covers it.
+    if sections=$(directory_sections); then
+        printf '%s\n' "$roots" |
+        while IFS= read -r root; do
+            case "$root" in /?*) ;; *) continue ;; esac
+            root="${root%/}"
+            if covered "$root"; then
+                log "left access to $root to the <Directory> block that covers it"
+                continue
+            fi
+            printf '\n# Added by lemondx (apache2): Apache serves no directory it is not\n# told to, and no <Directory> block covers this one.\n<Directory "%s">\n    Require all granted\n</Directory>\n' \
+                "$root" >> "$target"
+            log "granted access to $root (no <Directory> block covers it)"
+        done
+    else
+        warn "could not list Apache's configuration files, so no DocumentRoot was granted access; add a <Directory> block if the site answers 403"
+    fi
 
     # Test before anything reloads, and put the previous config back if the
     # new one does not parse, so a typo cannot take down a working server.
@@ -154,8 +241,42 @@ version=$(httpd -v 2>/dev/null || apache2 -v 2>/dev/null || apache2ctl -v 2>/dev
 version=$(printf '%s\n' "$version" | sed -n 's/^Server version: *//p')
 log "${version:-Apache} running"
 
+# The status a request gets, or nothing when there is no answer (or no client:
+# curl or busybox/GNU wget, whichever the image has). wget exits non-zero on
+# any error status, and curl on no answer, which pipefail and set -e would
+# turn into the module failing.
+http_status() {
+    if have curl; then
+        curl -s -o /dev/null -m 5 -w '%{http_code}' -H "Host: $2" "$1" 2>/dev/null | grep -v '^000$' || true
+    elif have wget; then
+        wget -S -O /dev/null -T 5 --header "Host: $2" "$1" 2>&1 |
+            awk '/^ *HTTP\// { code = $2 } END { if (code) print code }' || true
+    fi
+}
+
 if [ -n "$vhost" ]; then
     server_name=$(printf '%s\n' "$vhost" | awk 'tolower($1) == "servername" { print $2; exit }')
+    port=$(printf '%s\n' "$vhost" | awk 'tolower($1) ~ /^<virtualhost/ {
+        n = split($0, part, ":"); p = part[n]; sub(/[^0-9].*/, "", p)
+        if (p != "") { print p; exit } }')
+    # Ask the site itself: a config test passes a vhost that refuses every
+    # request. Only plain HTTP, and only warned about, since a vhost may
+    # refuse this host on purpose (Require ip ...).
+    if [ "${port:-80}" != 443 ] && ! printf '%s\n' "$vhost" | grep -qi '^[[:space:]]*SSLEngine[[:space:]]*on'; then
+        url="http://127.0.0.1:${port:-80}/"
+        status=""
+        for _ in 1 2 3 4 5; do
+            status=$(http_status "$url" "${server_name:-localhost}")
+            [ -n "$status" ] && break
+            sleep 1
+        done
+        case "$status" in
+            "") warn "could not check the site: no answer from $url, or no curl or wget here" ;;
+            403) warn "the site answers 403 Forbidden: Apache is refusing the request -- check its <Directory> and Require lines (error log: /var/log/apache2 or /var/log/httpd)" ;;
+            5??) warn "the site answers $status: see Apache's error log (/var/log/apache2 or /var/log/httpd)" ;;
+            *) log "the site answers $status on port ${port:-80}" ;;
+        esac
+    fi
     if [ -n "$server_name" ]; then
         log "try: curl -H 'Host: $server_name' http://<container-ip>/"
     fi

@@ -20,13 +20,14 @@ import { ContainerTable } from './components/ContainerTable'
 import { CreateDialog } from './components/CreateDialog'
 import {
   BoxIcon, DatabaseIcon, HelpIcon, HomeIcon, LayersIcon, MenuIcon, MoonIcon, NetworkIcon, PlusIcon, PuzzleIcon,
-  LogsIcon, RefreshIcon, ServerIcon, ShieldIcon, StackIcon, SunIcon, TemplateIcon,
+  LogsIcon, PulseIcon, RefreshIcon, ServerIcon, ShieldIcon, StackIcon, SunIcon, TemplateIcon,
 } from './components/Icons'
 import { ImagesView } from './components/ImagesView'
 import { ModulesView } from './components/ModulesView'
 import { NetworkView } from './components/NetworkView'
 import { ClusterView } from './components/ClusterView'
 import { LogsView } from './components/LogsView'
+import { MonitorView } from './components/MonitorView'
 import { HomeView } from './components/HomeView'
 import { ScopePicker } from './components/ScopePicker'
 import { SetupBanner } from './components/SetupBanner'
@@ -40,7 +41,7 @@ import { Toasts } from './components/Toasts'
 const POLL_INTERVAL = 3000
 
 type View = 'home' | 'containers' | 'templates' | 'stacks' | 'images' | 'cluster' | 'storage'
-  | 'network' | 'modules' | 'access' | 'logs'
+  | 'network' | 'modules' | 'access' | 'logs' | 'monitor'
 
 // Grouped by what a person comes to do: run things, or look after the hosts
 // they run on and who may reach them.
@@ -82,7 +83,7 @@ const NAV: {
   { label: 'Infrastructure',
     help: {
       intro: 'Where containers run, what they run on, and who may reach them.',
-      order: ['cluster', 'storage', 'network', 'access', 'logs'],
+      order: ['cluster', 'monitor', 'storage', 'network', 'access', 'logs'],
       chain: false,
     },
     items: [
@@ -90,6 +91,9 @@ const NAV: {
         about: 'The hosts running lemondx, each with its own LXD or Incus. Joined into a '
           + 'cluster they share templates, stacks and modules, and launches can spread '
           + 'across them. Settings for the whole cluster, such as logging, are here too.' },
+      { id: 'monitor', label: 'Monitor', icon: <PulseIcon size={16} />,
+        about: 'CPU, memory and network over the last half hour on every node and in every '
+          + 'container, live: the page to keep open during a load test.' },
       { id: 'storage', label: 'Storage', icon: <DatabaseIcon size={16} />,
         about: 'Pools that hold containers’ disks, and extra volumes to attach to them.' },
       { id: 'network', label: 'Network', icon: <NetworkIcon size={16} />,
@@ -828,6 +832,8 @@ export default function App() {
 
         {view === 'access' ? (
           <AccessView onNotify={notify} />
+        ) : view === 'monitor' ? (
+          <MonitorView nodes={nodes} groups={groups} federated={federated} />
         ) : view === 'logs' ? (
           <LogsView nodes={nodes} groups={groups} federated={federated} />
         ) : view === 'cluster' ? (
@@ -940,6 +946,28 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {(() => {
+          // The prompt to review instances made outside lemondx; each row
+          // carries a badge too. Null, not undefined: a peer too old to mark
+          // its instances says nothing, rather than calling them all foreign.
+          const foreign = (containers ?? []).filter((c) => c.origin === null).length
+          return foreign > 0 && (
+            <div className="banner banner-warn">
+              <div className="banner-body">
+                <p style={{ margin: 0 }}>
+                  {foreign === 1 ? '1 instance here was' : `${foreign} instances here were`} made
+                  outside lemondx (with <span className="mono">lxc</span>, a script, or an older
+                  lemondx). Import {foreign === 1 ? 'it' : 'them'} to stop the warning, and
+                  optionally attach {foreign === 1 ? 'it' : 'them'} to a template.
+                </p>
+              </div>
+              <button className="btn btn-sm" onClick={() => setView('cluster')}>
+                Review in Inventory
+              </button>
+            </div>
+          )
+        })()}
 
         {containers === null && !connectionError ? (
           <div className="card">

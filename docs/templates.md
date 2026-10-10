@@ -25,6 +25,12 @@ the launch will use are shown beside the button. Instances are created one per
 host CPU core at a time, and each reports its own result, so one that fails to
 create or bootstrap does not stop the rest, and the ones that exist are kept.
 
+A failed instance in the result has a **Diagnose** button, which opens a new
+browser tab searching Google for the error in double quotes -- for a failed
+module, the last line the module printed. Only the error's first line is
+sent, without lemondx's own `error:` prefix or any double quotes inside it;
+it can still name hosts, paths or addresses, so mind what you search for.
+
 Once a template has instances, its card also offers **Run command**,
 **Recreate all** and **Destroy all** — see
 [running commands](#running-a-command-on-every-instance) and
@@ -56,12 +62,22 @@ fills the form from a template, for a one-off variation.
 ./lemondx templates
 ./lemondx launch "Web server" -n 3            # web-1, web-2, web-3
 ./lemondx launch "Web server" --prefix canary # canary-1
-./lemondx template-delete "Pg"
+./lemondx template-delete "Pg" -y
 ```
 
-`launch` exits 1 if any instance failed, and `--json` prints the full result.
-Deleting a template is refused (`409`) while a [stack](stacks.md) launches it;
-the error names the stacks.
+`launch` exits 1 if any instance failed. When `serve` runs on the node, the
+launch is handed to it as an ordinary template run and the command follows it:
+the Templates tab shows it, and it carries on if the terminal or ssh session
+goes (Ctrl-C stops following, not the launch). `--json` then prints the run's
+result as `serve` keeps it, with module output cut to the failed modules'
+tails. `--no-serve` runs it in the command instead, as before, with the full
+result; so does a `serve` on another daemon or project than the command's
+(`--socket`, `--project`). A group member in maintenance is skipped, and the first line says so.
+
+Deleting a template asks first, since the delete reaches every member; `-y`
+skips the question, and without a terminal it is required. A delete is refused
+(`409`) while a [stack](stacks.md) launches the template; the error names the
+stacks.
 
 ```bash
 ./lemondx template-exec "Web server" -- apt-get -y upgrade
