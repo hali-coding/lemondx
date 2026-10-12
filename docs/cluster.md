@@ -346,8 +346,10 @@ While it lasts:
   refused before anything is torn down.
 - **No fabric changes.** Creating, extending or deleting a fabric that would
   touch it waits until it is back, and on the node itself fabric claims,
-  `fabric apply`, attaching and detaching are refused. Its own routes are left
-  exactly as they were, and brought up to date when maintenance ends.
+  attaching and detaching are refused. Its own routes are left exactly as they
+  were, and brought up to date when maintenance ends. `lemondx fabric apply` on
+  the node still works: it only programs what the node already claims, which is
+  how routes come back after a reboot during maintenance.
 - **Definitions still sync.** Templates, stacks, modules, profiles and groups
   are pushed to it as usual, so it comes back level with everyone.
 - Its running instances can still be started, stopped and destroyed.

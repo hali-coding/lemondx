@@ -123,7 +123,11 @@ SIZE_TOLERANCE = 0.05
 EVICT_TIMEOUT = 10
 
 SYNC_KINDS = ("templates", "modules", "profiles", "groups", "users", "stacks", "pins",
-              "settings")
+              "settings", store.STACK_SECRETS_KIND, "tasks", store.TASK_SECRETS_KIND)
+
+# What a task record carries, and so all a member's push of one may set.
+TASK_FIELDS = ("description", "enabled", "template", "bootstrap", "script", "schedule", "nodes",
+               "groups", "timeout_seconds", "overlap", "inputs", "secrets")
 
 # Cluster-wide settings: one record each in store's cluster-settings/, synced
 # like a template. The function is what makes a value valid, and the only
@@ -133,7 +137,10 @@ CLUSTER_SETTINGS = {eventlog.SETTING_NAME: eventlog.clean_settings}
 # What a node reconciles on its own when it comes back. The auto-propagated
 # kinds and only those: `users` crosses as a password hash and is pushed only
 # when somebody asks for it by name, so a pass that runs unattended has no
-# business creating accounts on this host or anywhere else.
+# business creating accounts on this host or anywhere else. Stack secrets are
+# reconciled although they are secrets: they are pushed on every change
+# anyway, and a node that missed a generated password would otherwise
+# generate a different one at its next launch of the stack.
 RECONCILE_KINDS = tuple(k for k in SYNC_KINDS if k != "users")
 # The first pass waits for `serve` to be listening -- a peer reconciling back
 # at us mid-startup would find nothing answering -- and then it is an hourly
@@ -529,6 +536,7 @@ class ClusterService:
         # taken and dropped around each small piece of shared state.
         self._reconcile_lock = threading.Lock()
         self._stacks = None          # set by StackService, for applying a pulled stack
+        self._tasks = None           # set by TaskService, likewise for tasks
         self._fabric_service = None  # set by FabricService, for routes between nodes
         self._serving_fingerprint = ""  # set by serve(), see note_serving()
         # How a template's "put these on the fabric" becomes a device on this
@@ -2254,14 +2262,30 @@ class ClusterService:
         # modules: one that arrives naming a template the far side lacks is
         # accepted there and then refused on its first launch.
         stack_templates = set()
+        if "tasks" in kinds:
+            # A task drags its template, and the template its modules, the
+            # same way; the task's own job modules are added below.
+            for name, task in sorted(store.load_tasks().items()):
+                if wanted is not None and name not in wanted:
+                    continue
+                items.append(("tasks", name, {k: v for k, v in task.items() if k != "name"}))
+                if task["template"]:
+                    stack_templates.add(task["template"])
+                module_ids.update(task["bootstrap"]["modules"])
         if "stacks" in kinds:
             for name, stack in sorted(store.load_stacks().items()):
                 if wanted is not None and name not in wanted:
                     continue
                 items.append(("stacks", name, {"description": stack["description"],
-                                               "stages": stack["stages"]}))
-                stack_templates.update(step["template"] for stage in stack["stages"]
-                                       for step in stage["steps"] if step["type"] == "launch")
+                                               "stages": stack["stages"],
+                                               "variables": stack["variables"],
+                                               "secrets": stack["secrets"],
+                                               "swarms": stack["swarms"]}))
+                # A swarm's too: it is launched from wherever the stack is.
+                stack_templates.update(
+                    step["template"] for stages in [stack["stages"]] + [
+                        swarm["stages"] for swarm in stack.get("swarms") or []]
+                    for stage in stages for step in stage["steps"] if step["type"] == "launch")
 
         for template in self.service.list_templates():
             asked = "templates" in kinds and (wanted is None or template["name"] in wanted)
@@ -2299,6 +2323,34 @@ class ClusterService:
                     continue
                 items.append(("pins", name, {k: v for k, v in pin.items() if k != "name"}))
 
+        if store.STACK_SECRETS_KIND in kinds:
+            # The values in the clear, for the members-only route only -- each
+            # node seals what it receives under its own key. A stack that
+            # declares secrets is listed even with none held, so a value
+            # cleared here is cleared there; and the times ride along so a
+            # copy keeps saying when the value was set, not when it arrived.
+            stacks = store.load_stacks()
+            for name in sorted(set(store.stacks_with_secrets()) | {
+                    n for n, stack in stacks.items() if stack["secrets"]}):
+                if wanted is not None and name not in wanted:
+                    continue
+                items.append((store.STACK_SECRETS_KIND, name, {"values": {
+                    secret: {"value": held["value"], "generated": held["generated"]}
+                    for secret, held in store.load_stack_secrets(name).items()}}))
+
+        if store.TASK_SECRETS_KIND in kinds:
+            # As a stack's, above: the whole set per task, in the clear, for
+            # the members-only route.
+            tasks = store.load_tasks()
+            for name in sorted(set(store.stacks_with_secrets(store.TASK_SECRETS_KIND)) | {
+                    n for n, task in tasks.items() if task["secrets"]}):
+                if wanted is not None and name not in wanted:
+                    continue
+                items.append((store.TASK_SECRETS_KIND, name, {"values": {
+                    secret: {"value": held["value"], "generated": held["generated"]}
+                    for secret, held in store.load_stack_secrets(
+                        name, store.TASK_SECRETS_KIND).items()}}))
+
         if "users" in kinds:
             # As stored, hash and all: an account is only usable on the far
             # side if the hash goes with it, and there is no plaintext kept
@@ -2330,8 +2382,10 @@ class ClusterService:
 
         # Modules and pins first: a template that arrives before the module or
         # pin it names is accepted but cannot be launched until that follows.
+        # A stack's secrets after the stack: the far side checks they are declared.
         order = {"settings": -1, "modules": 0, "pins": 1, "profiles": 2, "templates": 3,
-                 "stacks": 4,
+                 "stacks": 4, store.STACK_SECRETS_KIND: 4.5,
+                 "tasks": 4.6, store.TASK_SECRETS_KIND: 4.7,
                  "groups": 5, "users": 6}
         return sorted(items, key=lambda item: (order[item[0]], item[1]))
 
@@ -2355,6 +2409,12 @@ class ClusterService:
                     client.adopt_user(name, body)
                 elif kind == "stacks":
                     client.save_stack(name, body)
+                elif kind == store.STACK_SECRETS_KIND:
+                    client.adopt_stack_secrets(name, body)
+                elif kind == "tasks":
+                    client.save_task(name, body)
+                elif kind == store.TASK_SECRETS_KIND:
+                    client.adopt_task_secrets(name, body)
                 elif kind == "pins":
                     client.save_pin(name, body)
                 elif kind == "settings":
@@ -2413,6 +2473,12 @@ class ClusterService:
                 client.delete_group(name)
             elif kind == "stacks":
                 client.delete_stack(name)
+            elif kind == store.STACK_SECRETS_KIND:
+                client.adopt_stack_secrets(name, {"values": {}})
+            elif kind == "tasks":
+                client.delete_task(name)
+            elif kind == store.TASK_SECRETS_KIND:
+                client.adopt_task_secrets(name, {"values": {}})
             elif kind == "pins":
                 client.delete_pin(name)
             elif kind == "settings":
@@ -2682,7 +2748,19 @@ class ClusterService:
         elif kind == "stacks":
             self._stack_service().save_stack(name, stages=body.get("stages"),
                                              description=body.get("description", ""),
+                                             variables=body.get("variables"),
+                                             secrets=body.get("secrets"),
+                                             swarms=body.get("swarms"),
                                              propagate=False)
+        elif kind == store.STACK_SECRETS_KIND:
+            self._stack_service().adopt_secrets(name, body)
+        elif kind == "tasks":
+            # Only the record's own fields: a peer's body is untrusted input,
+            # and one carrying `previous` or `propagate` must not steer the save.
+            self._task_service().save_task(name, propagate=False, **{
+                k: v for k, v in body.items() if k in TASK_FIELDS})
+        elif kind == store.TASK_SECRETS_KIND:
+            self._task_service().adopt_secrets(name, body)
         elif kind == "pins":
             self.service.save_pin_record(name, body)
         elif kind == "settings":
@@ -2700,6 +2778,12 @@ class ClusterService:
                               relayed=True)
         elif kind == "stacks":
             self._stack_service().delete_stack(name, everywhere=False)
+        elif kind == store.STACK_SECRETS_KIND:
+            store.drop_stack_secrets(name)
+        elif kind == "tasks":
+            self._task_service().delete_task(name, everywhere=False, relayed=True)
+        elif kind == store.TASK_SECRETS_KIND:
+            store.drop_stack_secrets(name, kind=store.TASK_SECRETS_KIND)
         elif kind == "pins":
             self.service.unpin_image(name)
         elif kind == "settings":
@@ -2717,6 +2801,13 @@ class ClusterService:
             from .stacks import StackService
             self._stacks = StackService(self)
         return self._stacks
+
+    def _task_service(self):
+        """The TaskService, for the same reason as ``_stack_service()``."""
+        if self._tasks is None:
+            from .tasks import TaskService
+            self._tasks = TaskService(self)
+        return self._tasks
 
     def _fabric(self):
         """The FabricService, for the routes that carry traffic between nodes.

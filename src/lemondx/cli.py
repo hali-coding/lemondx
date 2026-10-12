@@ -27,6 +27,8 @@ from .nodeclient import NodeError
 from .service import ContainerService, LOCAL_STORAGE_DRIVERS, ServiceError
 from .server import DEFAULT_HOST, DEFAULT_PORT, serve
 from .stacks import StackService
+from .tasks import TaskService
+from . import tasks as tasks_mod
 
 # ANSI colours, disabled when stdout is not a terminal or NO_COLOR is set.
 _COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
@@ -1400,6 +1402,8 @@ def describe_step(step):
         return "sleep %ds" % step["seconds"]
     if step["type"] == "wait_healthy":
         return "wait healthy (%ds)" % step["timeout_seconds"]
+    if step["type"] == "script":
+        return "%s: script (%ds)" % (step["id"], step["timeout_seconds"])
     where = ", ".join(step["nodes"] + ["group " + g for g in step["groups"]])
     return "%s: %s x%d%s%s" % (step["id"], step["template"], step["count"],
                                "" if step["wait_bootstrap"] else " (no wait)",
@@ -1420,12 +1424,36 @@ def cmd_stacks(args, service):
     for problem in running["errors"]:
         print(YELLOW("! %s did not answer; its instances are not counted: %s"
                      % (problem["node"], problem["error"])), file=sys.stderr)
+    live = {(r.get("stack"), r.get("swarm")) for r in live_runs(stacks)
+            if r.get("action") == "swarm"} if not args.json else set()
+
+    def swarms(s):
+        # A swarm with instances is either running or has left them behind,
+        # and only the second wants doing something about.
+        said = []
+        for w in s["swarms"]:
+            up = sum(1 for i in s["instances"] if i.get("swarm") == w["name"])
+            said.append(w["name"] if not up else "%s (%s)" % (
+                w["name"], "running, %d" % up if (s["name"], w["name"]) in live
+                else YELLOW("%d left" % up)))
+        return ", ".join(said) or "-"
+
+    def own(s):
+        mine = [i for i in s["instances"] if not i.get("swarm")]
+        return "%d (%d running)" % (len(mine), sum(1 for i in mine
+                                                   if i["status"] == "Running")) \
+            if mine else "-"
+
     emit(args, items, lambda rows: table(
-        [[s["name"], describe_stack(s) or "-",
-          "%d (%d running)" % (len(s["instances"]), sum(
-              1 for i in s["instances"] if i["status"] == "Running"))
-          if s["instances"] else "-", s["description"] or "-"] for s in rows],
-        ["name", "stages", "instances", "description"]))
+        [[s["name"], describe_stack(s) or "-", swarms(s), own(s), s["description"] or "-"]
+         for s in rows],
+        ["name", "stages", "swarms", "instances", "description"]))
+    left = [(s["name"], w["name"]) for s in items for w in s["swarms"]
+            if (s["name"], w["name"]) not in live
+            and any(i.get("swarm") == w["name"] for i in s["instances"])]
+    if left and not args.json:
+        print(YELLOW("! instances left behind by a swarm: %s" % "; ".join(
+            "`lemondx stack-swarm-stop %s %s`" % (_shell_word(st), w) for st, w in left)))
     return 0
 
 
@@ -1476,11 +1504,234 @@ def cmd_stack_destroy(args, service):
 
 def cmd_stack_show(args, service):
     stack = stack_service(service).get_stack(args.name)
-    # The definition is the useful output either way: it is what stack-save
-    # takes back, so show, edit and save is the round trip.
-    print(json.dumps({"description": stack["description"], "stages": stack["stages"]},
-                     indent=2))
+    if getattr(args, "json", False):
+        # The definition: what stack-save takes back, so show, edit and save
+        # is the round trip. Secrets as declared, without the status this node
+        # adds -- a definition, not a report, and never a value.
+        print(json.dumps({"description": stack["description"], "stages": stack["stages"],
+                          "variables": stack["variables"],
+                          "secrets": {name: {"description": s["description"],
+                                             "generate": s["generate"]}
+                                      for name, s in stack["secrets"].items()},
+                          "swarms": [{"name": w["name"], "description": w["description"],
+                                      "stages": w["stages"], "sequence": w["sequence"]}
+                                     for w in stack["swarms"]]},
+                         indent=2))
+        return 0
+    templates = {t["name"]: t for t in service.list_templates()}
+    stacks = stack_service(service)
+    members = stacks.stack_instances()["stacks"].get(stack["name"], [])
+    live = {r.get("swarm") for r in live_runs(stacks)
+            if r.get("stack") == stack["name"] and r.get("action") == "swarm"}
+    print("\n".join(render_stack_definition(stack, templates, stacks.filled_by_name(stack),
+                                             members, live)))
     return 0
+
+
+def live_runs(stacks):
+    """Every stack run going on now, wherever: this node's serve and every member.
+
+    A run lives in the process that started it, and this command is not that
+    process; asked only of itself it would think nothing is running.
+    """
+    runs = [r for r in stacks.stack_runs() if r["finished_at"] is None]
+    api, _ = stacks.cluster.local_api(timeout=10)
+    if api is not None:
+        try:
+            runs.extend(r for r in api.request("GET", "/api/stack-runs") or []
+                        if r.get("finished_at") is None)
+        except NodeError:
+            pass
+    runs.extend(stacks.peer_runs())
+    return runs
+
+
+# -- reading a stack: what each step and swarm does -------------------------
+#
+# `stack-show` says in words what the JSON says in fields, and the --dry-run
+# previews say what a start would do with it: where each launch lands, and
+# each parameter with what is known filled in. One renderer per step type,
+# shared by both, so a step reads the same wherever it is shown.
+
+def _explained(value, refs=None):
+    """A parameter value, with where each of its references comes from."""
+    sources = "; ".join("%s: %s" % (r["ref"], r["source"]) for r in refs or [])
+    return value + (DIM("  <- " + sources) if sources else "")
+
+
+def _step_lines(step, templates=None, preview=None, indent="    ", filled=()):
+    """What one step does, as lines: a head line, then details beneath it."""
+    kind = step["type"]
+    head = "%s  %s" % (BOLD(step["id"].ljust(10)), "")
+    lines = []
+    if kind == "sleep":
+        return [head + "sleep %ds" % step["seconds"]]
+    if kind == "wait_healthy":
+        return [head + "wait until everything launched so far is healthy "
+                "(gives up after %ds)" % step["timeout_seconds"]]
+    if kind == "script":
+        node = (preview or {}).get("node")
+        lines.append(head + YELLOW("run a script") + " on %s, as lemondx's account "
+                     "(timeout %ds)" % (node or "the node driving the stack",
+                                         step["timeout_seconds"]))
+        # A preview shows it as it would run: known values filled in.
+        script = (preview or {}).get("script_resolved") or step["script"]
+        body = [line for line in script.splitlines() if line.strip()]
+        for line in body[:6]:
+            lines.append(indent + DIM("| ") + line)
+        if len(body) > 6:
+            lines.append(indent + DIM("| ... %d more line(s)" % (len(body) - 6)))
+        params = (preview or {}).get("params")
+        if params is not None:
+            for p in params:
+                lines.append(indent + "$%s = %s" % (p["name"], _explained(p["resolved"],
+                                                                          p["refs"])))
+            if (preview or {}).get("script_refs"):
+                lines.append(indent + DIM("references in the script: ") + "; ".join(
+                    "%s (%s)" % (r["ref"], r["source"]) for r in preview["script_refs"]))
+        else:
+            for name, value in sorted(step["params"].items()):
+                lines.append(indent + "$%s = %s" % (name, value))
+        return lines
+    template = (templates or {}).get(step["template"]) or {}
+    where = ", ".join(step["nodes"] + ["group " + g for g in step["groups"]]) or "this node"
+    if preview and preview.get("placement"):
+        placed = preview["placement"]
+        where = next(iter(placed)) if len(placed) == 1 else "%s (round robin)" % ", ".join(
+            "%s x%d" % (node, n) for node, n in placed.items())
+    count = (preview or {}).get("count") or step["count"]
+    lines.append(head + CYAN("launch %s x%d" % (step["template"], count))
+                 + " on " + where
+                 + ("" if step["wait_bootstrap"]
+                    else DIM(" (next stage starts once they run; bootstrap carries on)")))
+    image = (preview or {}).get("image") or template.get("image")
+    modules = (preview or {}).get("modules") or template.get("bootstrap", {}).get("modules")
+    detail = []
+    if image:
+        detail.append("image " + image)
+    detail.append("modules: " + (", ".join(modules) if modules else "none"))
+    prefix = step.get("prefix") or template.get("name_prefix")
+    if prefix:
+        detail.append("named %s-N" % prefix)
+    lines.append(indent + DIM(" · ".join(detail)))
+    if preview and preview.get("error"):
+        lines.append(indent + RED("! " + preview["error"]))
+    params = (preview or {}).get("params")
+    if params is not None:
+        for p in params:
+            lines.append(indent + "%s = %s" % (p["name"], _explained(p["resolved"], p["refs"])))
+    else:
+        for name, value in sorted(step["params"].items()):
+            lines.append(indent + "%s = %s" % (name, value))
+        for name in filled:
+            lines.append(indent + "%s = {{secrets.%s}}%s" % (
+                name, name, DIM("  <- the stack secret of the same name")))
+    if preview is None:
+        lines.append(indent + DIM("hands on {{%s.ip}} {{%s.ips}} {{%s.names}} ... and "
+                                  "{{%s.param.NAME}}" % ((step["id"],) * 4)))
+    return lines
+
+
+def _flow_lines(stages, templates=None, previews=None, indent="  ", filled=None):
+    lines = []
+    for index, stage in enumerate(stages):
+        parallel = len(stage["steps"]) > 1
+        lines.append(indent + DIM("stage %d%s" % (index + 1, " (side by side)" if parallel
+                                                    else "")))
+        for position, step in enumerate(stage["steps"]):
+            preview = previews[index]["steps"][position] if previews else None
+            for line_no, line in enumerate(_step_lines(
+                    step, templates, preview, indent + "      ",
+                    (filled or {}).get(step["id"], ()))):
+                lines.append(indent + "  " + line if line_no == 0 else line)
+    return lines
+
+
+def render_stack_definition(stack, templates, filled=None, members=None, live=()):
+    """``members`` are the stack's instances, ``live`` the swarms running now:
+    a swarm with instances and no run is one that left them behind."""
+    lines = [BOLD("Stack %s" % stack["name"]) + (DIM(" -- " + stack["description"])
+                                                 if stack["description"] else "")]
+    if stack["variables"]:
+        lines.append(DIM("variables ({{vars.NAME}}):"))
+        lines.extend("  %s = %s%s" % (name, v["value"], DIM("  " + v["description"])
+                                      if v["description"] else "")
+                     for name, v in sorted(stack["variables"].items()))
+    if stack["secrets"]:
+        lines.append(DIM("secrets ({{secrets.NAME}}):"))
+        lines.extend("  %s  %s%s" % (name, "generated" if s["generated"] else "set" if s["set"]
+                                     else "will be generated" if s["generate"] else "not set",
+                                     DIM("  " + s["description"]) if s["description"] else "")
+                     for name, s in sorted(stack["secrets"].items()))
+    own = [m for m in members or [] if not m.get("swarm")]
+    if own:
+        lines.append(DIM("running: ") + "%d instance(s), %d up" % (
+            len(own), sum(1 for m in own if m["status"] == "Running")))
+    lines.append(DIM("launched by `lemondx stack-launch %s`:" % _shell_word(stack["name"])))
+    lines.extend(_flow_lines(stack["stages"], templates, filled=filled))
+    sequence = [w["name"] for w in stack["swarms"] if w["sequence"]]
+    if stack["swarms"]:
+        lines.append("")
+        lines.append(YELLOW("Sequence: ") + (" -> ".join(
+            "%d %s" % (n, w) for n, w in enumerate(sequence, 1)) or DIM("no swarm is in it")))
+        if sequence:
+            lines.append(DIM("each runs only once the one before it passed, and is torn down "
+                             "before the next; `lemondx stack-swarm %s --sequence` runs it"
+                             % _shell_word(stack["name"])))
+    for swarm in stack["swarms"]:
+        lines.append("")
+        place = ("%d of the sequence" % (sequence.index(swarm["name"]) + 1)
+                 if swarm["name"] in sequence else "not in the sequence")
+        lines.append(YELLOW("Swarm %s" % swarm["name"]) + DIM(" (%s)" % place)
+                     + (DIM(" -- " + swarm["description"]) if swarm["description"] else ""))
+        lines.append(DIM("load against the running stack, started by `lemondx stack-swarm "
+                         "%s %s`; every step of the stack is an earlier step here, and its "
+                         "instances are destroyed when it ends:"
+                         % (_shell_word(stack["name"]), swarm["name"])))
+        lines.extend(_flow_lines(swarm["stages"], templates, filled=filled))
+        lines.append("  " + DIM("then: destroy the swarm's instances"))
+        mine = [m for m in members or [] if m.get("swarm") == swarm["name"]]
+        if mine and swarm["name"] in live:
+            lines.append("  " + YELLOW("running now, with %d instance(s)" % len(mine)))
+        elif mine:
+            lines.append("  " + YELLOW("! %d instance(s) left behind by an earlier run; "
+                                       "`lemondx stack-swarm-stop %s %s` destroys them"
+                                       % (len(mine), _shell_word(stack["name"]),
+                                          swarm["name"])))
+    return lines
+
+
+def render_preview(preview, stages):
+    what = ("swarm %s against stack %s" % (preview["swarm"], preview["stack"])
+            if preview["swarm"] else "launch of stack %s" % preview["stack"])
+    lines = [BOLD("Preview: %s" % what) + DIM("  (nothing has been changed)")]
+    if preview["problems"]:
+        lines.append(RED("Would not start:"))
+        lines.extend("  " + RED("! ") + problem for problem in preview["problems"])
+    else:
+        lines.append(GREEN("Every check a start runs passed."))
+    if preview["against"]:
+        lines.append(DIM("against the running stack:"))
+        lines.extend("  %s: %s" % (a["step"], ", ".join(
+            "%s %s" % (n, DIM(ip)) for n, ip in zip(a["names"], a["ips"] + [""] * len(a["names"]))))
+            for a in preview["against"])
+    if preview["variables"]:
+        lines.append(DIM("variables: ") + ", ".join(
+            "%s=%s" % (k, v) for k, v in sorted(preview["variables"].items())))
+    if preview["secrets"]:
+        lines.append(DIM("secrets: ") + ", ".join(
+            "%s (%s)" % (k, v) for k, v in sorted(preview["secrets"].items())))
+    lines.extend(_flow_lines(stages, None, preview["stages"]))
+    if preview["teardown"]:
+        lines.append("  " + DIM("then: destroy the swarm's instances, however the stages end"))
+    total = sum(s.get("count") or 0 for stage in preview["stages"] for s in stage["steps"]
+                if s["type"] == "launch")
+    lines.append(DIM("%d instance(s) would be created." % total))
+    return "\n".join(lines)
+
+
+def _shell_word(text):
+    return shlex.quote(text)
 
 
 def cmd_stack_save(args, service):
@@ -1499,19 +1750,85 @@ def cmd_stack_save(args, service):
     description = args.description if args.description is not None \
         else raw.get("description", "")
     stack = stack_service(service).save_stack(args.name, stages=raw.get("stages"),
-                                              description=description)
-    emit(args, stack, lambda s: "%s saved stack %s: %s%s%s" % (
-        GREEN("+"), BOLD(s["name"]), describe_stack(s), sync_note(s), "".join(
+                                              description=description,
+                                              variables=raw.get("variables"),
+                                              secrets=raw.get("secrets"),
+                                              swarms=raw.get("swarms"))
+    emit(args, stack, lambda s: "%s saved stack %s: %s%s%s%s" % (
+        GREEN("+"), BOLD(s["name"]), describe_stack(s),
+        "".join("\n  " + YELLOW("swarm %s" % w["name"]) + ": " + describe_stack(w)
+                for w in s.get("swarms") or []),
+        sync_note(s), "".join(
             "\n" + YELLOW("! %s" % warning) for warning in s.get("warnings") or [])))
     return 0
 
 
 def cmd_stack_delete(args, service):
-    if not confirm_delete(args, "stack", args.name):
+    stacks = stack_service(service)
+    name = stacks.get_stack(args.name)["name"]
+    doomed = None
+    if args.destroy:
+        doomed = stack_members(stacks, name)
+        if doomed and not args.json:
+            print("Instances of %s: %s" % (BOLD(name), describe_members(doomed)))
+        if doomed and not confirm("Destroy all %d as well? Their filesystems and snapshots "
+                                  "are deleted." % len(doomed), args.yes):
+            print(DIM("nothing deleted"))
+            return 1
+    elif not args.json:
+        left = stacks.stack_instances()["stacks"].get(name, [])
+        if left:
+            print(YELLOW("! %d instance(s) stay, tagged %s; --destroy removes them too"
+                         % (len(left), name)))
+    if not confirm_delete(args, "stack", name):
         return 1
-    result = stack_service(service).delete_stack(args.name, everywhere=not args.local_only)
-    emit(args, result, lambda r: "%s deleted stack %s%s" % (
-        GREEN("+"), r["deleted"], sync_note(r)))
+    result = stacks.delete_stack(name, everywhere=not args.local_only, instances=doomed)
+    emit(args, result, lambda r: "%s deleted stack %s%s%s" % (
+        GREEN("+"), r["deleted"],
+        " and destroyed %d instance(s)" % len(r["destroyed"]) if r.get("destroyed") else "",
+        sync_note(r)))
+    return 0
+
+
+def cmd_stack_secrets(args, service):
+    found = stack_service(service).secret_status(args.name)
+    emit(args, found, lambda rows: table(
+        [[name, "generated" if s["generated"] else "set" if s["set"] else
+          ("will be generated" if s["generate"] else "not set"),
+          time.strftime("%Y-%m-%d %H:%M", time.localtime(s["updated_at"]))
+          if s["updated_at"] else "-", s["description"] or "-"]
+         for name, s in sorted(rows.items())],
+        ["secret", "value", "updated", "description"]) if rows
+        else DIM("Stack %s declares no secrets." % args.name))
+    return 0
+
+
+def cmd_stack_secret_set(args, service):
+    # Never from argv: it would land in shell history and in `ps`.
+    value = os.environ.get(args.secret)
+    if not value and sys.stdin.isatty():
+        value = getpass.getpass("%s: " % args.secret)
+    if not value and not sys.stdin.isatty():
+        value = sys.stdin.readline().rstrip("\n")
+    result = stack_service(service).set_secret(args.name, args.secret, value)
+    emit(args, result, lambda r: "%s set secret %s of stack %s%s" % (
+        GREEN("+"), BOLD(args.secret), args.name, sync_note(r)))
+    return 0
+
+
+def cmd_stack_secret_clear(args, service):
+    result = stack_service(service).clear_secret(args.name, args.secret)
+    emit(args, result, lambda r: "%s cleared secret %s of stack %s%s" % (
+        GREEN("+"), BOLD(args.secret), args.name, sync_note(r)))
+    return 0
+
+
+def cmd_stack_secret_reveal(args, service):
+    # The CLI runs as the account that owns the data directory -- key and
+    # values both -- so there is nothing a password would add; confirm()
+    # passes it, and the read is still logged like one through the API.
+    result = stack_service(service).reveal_secret(args.name, args.secret, local_principal())
+    emit(args, result, lambda r: r["value"])
     return 0
 
 
@@ -1526,7 +1843,10 @@ def render_step(record):
     elif record["type"] == "sleep":
         what += " (sleep)"
     elif record["type"] == "destroy":
-        what = "destroy %d existing" % record["count"]
+        what = "destroy %d %s" % (record["count"] or 0,
+                                  "swarm instance(s)" if record.get("swarm") else "existing")
+    elif record["type"] == "script":
+        what += " (script)"
     else:
         what += " (wait healthy)"
     line = "%s %s %s" % (STEP_MARK.get(record["state"], DIM("·")), BOLD(what),
@@ -1539,17 +1859,33 @@ def render_step(record):
                                 outputs["ips"] + [""] * len(outputs["names"])))
     if record["error"]:
         line += "\n    " + RED(record["error"])
-    elif record["detail"] and record["state"] not in ("done", "ready"):
+    elif record["detail"] and (record["state"] not in ("done", "ready")
+                               or record["type"] == "launch"):
+        # A finished launch's detail is its notes: a node skipped, failures
+        # the step was allowed.
         line += DIM(" -- %s" % record["detail"])
+    if record["state"] in ("done", "failed", "cancelled"):
+        # A script's own words, and what each instance's modules said last --
+        # a load generator's result, which goes with the instance.
+        if record.get("output"):
+            line += "".join("\n      " + DIM(text)
+                            for text in record["output"].splitlines()[-10:])
+        line += "".join("\n      %s %s" % (DIM(i["name"] + ":"), i["output"])
+                        for i in record.get("instances") or [] if i.get("output"))
     return line
 
 
 def render_stack_run(run):
     lines = []
+    sequence = run.get("swarms") or []
     for index, stage in enumerate(run["stages"], 1):
-        lines.append(DIM("stage %d" % index))
+        lines.append(DIM("stage %d" % index + (" · swarm %s" % stage["swarm"]
+                                               if len(sequence) > 1 and stage.get("swarm")
+                                               else "")))
         lines.extend("  " + render_step(step) for step in stage["steps"])
     what = "stack %s%s" % (run["stack"], "" if run["action"] == "launch"
+                           else " swarms %s" % " then ".join(sequence)
+                           if run["action"] == "swarm" and len(sequence) > 1
                            else " " + run["action"])
     lines.append(GREEN("%s finished" % what) if run["ok"]
                  else RED("%s %s" % (what, "cancelled" if run["cancelled"] else "failed")))
@@ -1561,11 +1897,29 @@ def cmd_stack_launch(args, service):
     stack = next((s for s in stacks.list_stacks() if s["name"] == args.name), None) \
         or stacks.get_stack(args.name)
     params = parse_params(args.param)
+    if args.dry_run:
+        # Nothing asked for: what is missing is one of the problems listed.
+        params.update({n: os.environ[n] for n in stack["inputs"]
+                       if not params.get(n) and os.environ.get(n)})
+        preview = stacks.preview_launch(stack["name"], params=params,
+                                        variables=parse_params(args.var))
+        emit(args, preview, lambda p: render_preview(p, stack["stages"]))
+        return 0 if preview["ok"] else 1
     templates = {t["name"]: t for t in service.list_templates()}
     modules = [m for stage in stack["stages"] for step in stage["steps"]
                if step["type"] == "launch" and step["template"] in templates
                for m in templates[step["template"]]["bootstrap"]["modules"]]
-    fill_secrets(modules, params, service)
+    # Only what some step leaves unset and no stack secret of the same name
+    # fills: the rest has its value already, and asking for it would only
+    # read as though the stack's own secret were being ignored.
+    secret_names = {m["id"]: {p["name"] for p in m["params"] if p.get("secret")}
+                    for m in service.list_modules()}
+    needed = {name for stage in stack["stages"] for step in stage["steps"]
+              if step["type"] == "launch" and step["template"] in templates
+              for m in templates[step["template"]]["bootstrap"]["modules"]
+              for name in secret_names.get(m, ())
+              if name not in step["params"] and name not in stack["secrets"]}
+    fill_secrets(modules, params, service, only=needed)
     # Values the stack's own steps ask for with {{params.NAME}}: likely a
     # password, so never echoed, and never needed on the command line.
     for input_name in [n for n in stack["inputs"] if not params.get(n)]:
@@ -1575,6 +1929,21 @@ def cmd_stack_launch(args, service):
             value = getpass.getpass("%s: " % input_name)
             if value:
                 params[input_name] = value
+    variables = parse_params(args.var)
+    # The stack's own secrets that hold no value and will not make one: kept
+    # once given, so this is asked the first time only. Read like the rest.
+    secrets = {}
+    for secret, declared in sorted(stack["secrets"].items()):
+        if declared["set"] or declared["generate"]:
+            continue
+        if os.environ.get(secret):
+            secrets[secret] = os.environ[secret]
+        elif sys.stdin.isatty():
+            label = "%s (%s, kept for later launches)" % (
+                secret, declared["description"] or "stack secret")
+            value = getpass.getpass("%s: " % label)
+            if value:
+                secrets[secret] = value
     replace = None
     if args.relaunch:
         replace = stack_members(stacks, stack["name"])
@@ -1589,7 +1958,8 @@ def cmd_stack_launch(args, service):
     if api is not None:
         path = urllib.parse.quote(name, safe="")
         run = api.request("POST", "/api/stacks/%s/launch" % path,
-                          {"params": params, "replace": replace, "background": True})
+                          {"params": params, "replace": replace, "background": True,
+                           "variables": variables, "secrets": secrets})
         if not args.json:
             print(DIM("running on serve here: it carries on if this command stops, and "
                       "the Stacks tab follows it too"), flush=True)
@@ -1606,7 +1976,8 @@ def cmd_stack_launch(args, service):
                                lambda: api.request("POST", "/api/stack-runs/%s/cancel" % path),
                                outlives=True)
     else:
-        run = stacks.launch_stack(name, params=params, background=True, replace=replace)
+        run = stacks.launch_stack(name, params=params, background=True, replace=replace,
+                                  variables=variables, secrets=secrets)
         run = follow_stack_run(
             args, run, lambda: next(r for r in stacks.stack_runs() if r["stack"] == name),
             lambda: stacks.cancel_stack_run(name))
@@ -1614,6 +1985,612 @@ def cmd_stack_launch(args, service):
         return 130
     emit(args, run, render_stack_run)
     return 0 if run["ok"] else 1
+
+
+def cmd_stack_swarm(args, service):
+    stacks = stack_service(service)
+    stack = stacks.get_stack(args.name)
+    name = stack["name"]
+    if args.sequence == bool(args.swarm):
+        raise ServiceError("Name the swarm(s) to run, or give --sequence for the stack's own "
+                           "sequence (%s)." % (" -> ".join(
+                               w["name"] for w in stack["swarms"] if w["sequence"])
+                               or "no swarm is in it"))
+    wanted_names = args.swarm or [w["name"] for w in stack["swarms"] if w["sequence"]]
+    if not wanted_names:
+        raise ServiceError("Stack '%s' has no swarms in its sequence; turn some on in the "
+                           "designer, or name the swarms to run." % name)
+    designs = []
+    for wanted in wanted_names:
+        design = next((w for w in stack["swarms"] if w["name"] == wanted), None)
+        if design is None:
+            raise ServiceError("Stack '%s' has no swarm '%s'. It has: %s." % (
+                name, wanted, ", ".join(w["name"] for w in stack["swarms"]) or "none"))
+        designs.append(design)
+    counts = _swarm_counts(designs, parse_params(args.count))
+    variables = parse_params(args.var)
+    params = parse_params(args.param)
+    inputs = sorted({n for design in designs for n in design["inputs"]})
+    if args.dry_run:
+        params.update({n: os.environ[n] for n in inputs
+                       if not params.get(n) and os.environ.get(n)})
+        # One preview a swarm: each is pointed at the stack as it runs now,
+        # which is what every swarm of a sequence starts against.
+        previews = [stacks.preview_swarm(name, d["name"], counts=counts.get(d["name"]),
+                                         variables=variables, params=params)
+                    for d in designs]
+        if len(previews) == 1:
+            emit(args, previews[0], lambda p: render_preview(p, designs[0]["stages"]))
+        else:
+            emit(args, previews, lambda ps: "\n\n".join(
+                render_preview(p, d["stages"]) for p, d in zip(ps, designs)))
+        return 0 if all(p["ok"] for p in previews) else 1
+    for input_name in [n for n in inputs if not params.get(n)]:
+        if os.environ.get(input_name):
+            params[input_name] = os.environ[input_name]
+        elif sys.stdin.isatty():
+            value = getpass.getpass("%s: " % input_name)
+            if value:
+                params[input_name] = value
+    swarms = [d["name"] for d in designs]
+    body = {"swarms": swarms, "counts": counts, "variables": variables, "params": params}
+    # Stopped by any of its swarms' names: Stop ends the whole sequence.
+    stop_path = "/api/stacks/%s/swarms/%s/stop" % (urllib.parse.quote(name, safe=""),
+                                                    urllib.parse.quote(swarms[0], safe=""))
+    api = serve_for_run(stacks.cluster, args)
+    if api is not None:
+        run = api.request("POST", "/api/stacks/%s/swarm-sequence"
+                          % urllib.parse.quote(name, safe=""), dict(body, background=True))
+        if not args.json:
+            print(DIM("running on serve here: Ctrl-C stops the swarm%s (and tears it down); "
+                      "the Stacks tab follows it too" % ("s" if len(swarms) > 1 else "")),
+                  flush=True)
+        started_at = run["started_at"]
+
+        def current():
+            found = next((r for r in api.request("GET", "/api/stack-runs") or []
+                          if r["stack"] == name and r["started_at"] == started_at), None)
+            if found is None:
+                raise ServiceError("The swarm's run is no longer recorded on serve.")
+            return found
+        run = follow_stack_run(args, run, current,
+                               lambda: api.request("POST", stop_path, {}), outlives=True)
+    else:
+        run = stacks.launch_swarms(name, background=True, **body)
+        run = follow_stack_run(
+            args, run, lambda: next(r for r in stacks.stack_runs() if r["stack"] == name),
+            lambda: stacks.stop_swarm(name, swarms[0]))
+    if run is None:
+        return 130
+    emit(args, run, render_stack_run)
+    if args.report:
+        save_report(args, stacks.run_report(name) if api is None else api.request(
+            "GET", "/api/stack-runs/%s/report" % urllib.parse.quote(name, safe="")))
+    return 0 if run["ok"] else 1
+
+
+def save_report(args, report):
+    """Write a run's Markdown report where ``--report`` says: a file, a
+    directory (named as the UI would download it), or - for stdout."""
+    target = args.report
+    if target == "-":
+        sys.stdout.write(report["markdown"])
+        return
+    path = os.path.join(target, report["filename"]) if os.path.isdir(target) else target
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(report["markdown"])
+    print("%s report written to %s" % (GREEN("+"), path), file=sys.stderr)
+
+
+# -- tasks -------------------------------------------------------------------
+
+
+def task_service(service):
+    return TaskService(cluster_service(service))
+
+
+TASK_MARK = {"ok": GREEN("+"), "failed": RED("!"), "timed_out": RED("!"),
+             "cancelled": DIM("-"), "missed": YELLOW("?"), "vetoed": YELLOW("?"),
+             "lost": YELLOW("?"), "running": CYAN("~")}
+
+
+def _task_schedule(task):
+    if not task["schedule"]:
+        return DIM("invoked only")
+    text = "%s%s" % (task["schedule_text"] or task["schedule"]["cron"],
+                     "" if task["schedule"]["timezone"] == "UTC"
+                     else " (%s)" % task["schedule"]["timezone"])
+    return text if task["enabled"] else DIM(text + ", paused")
+
+
+def _task_job(task):
+    if task.get("script"):
+        return "script (%d lines)" % len(task["script"].rstrip("\n").splitlines())
+    return " ".join(task["bootstrap"]["modules"])
+
+
+def cmd_tasks(args, service):
+    items = task_service(service).list_tasks()
+    emit(args, items, lambda rows: table(
+        [[t["name"], t["template"], _task_job(t),
+          ", ".join(t["groups"] + t["nodes"]) or RED("none"),
+          _task_schedule(t), _when(t["next_run"]) if t["next_run"] else "-",
+          ", ".join(n + ("*" if i["required"] else "") for n, i in t["inputs"].items()) or "-"]
+         for t in rows],
+        ["task", "template", "job", "runs on", "schedule", "next run", "inputs"]))
+    return 0
+
+
+def render_task_run(run, full=True):
+    took = (run["finished_at"] or time.time()) - run["started_at"]
+    head = "%s task %s run %s on %s: %s" % (
+        TASK_MARK.get(run["status"], DIM("·")), BOLD(run["task"]), run["id"], run["node"],
+        run["status"].replace("_", " ") + (" (exit %s)" % run["exit_code"]
+                                           if run.get("exit_code") else ""))
+    lines = [head, DIM("  %s%s, %s, %ds%s" % (
+        run["trigger"], " for %s" % _when(run["slot"]) if run.get("slot") else "",
+        _when(run["started_at"]), took,
+        ", instance %s" % run["instance"] if run.get("instance") else ""))]
+    if run.get("inputs"):
+        lines.append(DIM("  inputs: ") + ", ".join(
+            "%s=%s" % (k, short_value(v)) for k, v in sorted(run["inputs"].items())))
+    for note in run.get("notes") or []:
+        lines.append(DIM("  note: %s" % note))
+    for part in ("setup", "job"):
+        result = run.get(part)
+        for module in (result or {}).get("modules") or []:
+            ok = module["exit_code"] == 0
+            lines.append("  %s %s %s" % (GREEN("+") if ok else RED("!"), DIM(part),
+                                         module["name"]))
+            text = module.get("summary") if not full else \
+                (module.get("stdout") or "") + (module.get("stderr") or "")
+            for line in (text or "").rstrip("\n").splitlines()[-200:]:
+                lines.append("      " + (line if ok else RED(line)))
+    if run.get("error"):
+        lines.append("  " + RED(run["error"]))
+    return "\n".join(lines)
+
+
+def cmd_task_show(args, service):
+    tasks = task_service(service)
+    task = tasks.get_task(args.name)
+    runs = tasks.runs(task=task["name"])["runs"][:args.runs]
+
+    def render(t):
+        lines = ["%s  %s" % (BOLD(t["name"]), t["description"] or "")]
+        lines.append("  template:  %s" % t["template"])
+        lines.append("  job:       %s" % _task_job(t))
+        for line in (t.get("script") or "").rstrip("\n").splitlines()[:args.lines]:
+            lines.append(DIM("             | ") + line)
+        for key, value in sorted(t["bootstrap"]["params"].items()):
+            lines.append("             %s=%s" % (key, short_value(value)))
+        lines.append("  schedule:  %s%s" % (_task_schedule(t), "  next %s" % _when(t["next_run"])
+                                            if t["next_run"] else ""))
+        if t["schedule_problem"]:
+            lines.append("             " + RED(t["schedule_problem"]))
+        where = ", ".join(["group " + g for g in t["groups"]] + t["nodes"])
+        lines.append("  runs on:   %s%s" % (where or RED("nothing"), DIM(
+            "  (%s)" % ", ".join(t["eligible"])) if t["eligible"] else ""))
+        if t["placement_problem"]:
+            lines.append("             " + RED(t["placement_problem"]))
+        lines.append("  timeout:   %ds, overlap %s" % (t["timeout_seconds"], t["overlap"]))
+        for name, spec in sorted(t["inputs"].items()):
+            lines.append("  input:     %s%s%s%s  %s" % (
+                name, "=" + spec["default"] if spec["default"] else "",
+                " (required)" if spec["required"] else "", " (secret)" if spec["secret"] else "",
+                DIM("as $%s" % tasks_mod.env_name(name))))
+        for name in sorted(t["secrets"]):
+            lines.append("  secret:    %s  %s" % (name, "set" if name in t["secret_status"]
+                                                  else YELLOW("not set")))
+        if runs:
+            lines.append("")
+            lines.extend(render_task_run(r, full=False) for r in runs)
+        return "\n".join(lines)
+    emit(args, dict(task, runs=runs), render)
+    return 0
+
+
+def _task_definition(args, existing):
+    """The record to save: a file's, or the existing task's with the flags applied."""
+    if args.file:
+        try:
+            if args.file == "-":
+                raw = json.load(sys.stdin)
+            else:
+                with open(args.file, encoding="utf-8") as handle:
+                    raw = json.load(handle)
+        except (OSError, ValueError) as exc:
+            raise ServiceError("Cannot read the task definition: %s" % exc)
+        if not isinstance(raw, dict):
+            raise ServiceError("A task definition is a JSON object; see docs/tasks.md.")
+        return raw
+    record = dict(existing or {})
+    bootstrap = dict(record.get("bootstrap") or {"modules": [], "params": {}, "ssh_keys": []})
+    if args.template:
+        record["template"] = args.template
+    if args.script and args.bootstrap:
+        raise ServiceError("A task's job is modules (-b) or a script (--script), not both.")
+    if args.script:
+        # A script replaces the modules, and modules replace a script: a job
+        # is one or the other.
+        try:
+            if args.script == "-":
+                record["script"] = sys.stdin.read()
+            else:
+                with open(args.script, encoding="utf-8") as handle:
+                    record["script"] = handle.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ServiceError("Cannot read the script: %s" % exc)
+        bootstrap = {"modules": [], "params": {}, "ssh_keys": []}
+    if args.bootstrap:
+        bootstrap["modules"] = [m for item in args.bootstrap for m in item.split(",") if m]
+        record["script"] = ""
+    if args.param:
+        bootstrap["params"] = dict(bootstrap.get("params") or {}, **parse_params(args.param))
+    record["bootstrap"] = bootstrap
+    if args.no_schedule:
+        record["schedule"] = None
+    elif args.cron:
+        record["schedule"] = {"cron": args.cron, "timezone": args.tz or "UTC"}
+    elif args.tz and record.get("schedule"):
+        record["schedule"] = dict(record["schedule"], timezone=args.tz)
+    inputs = dict(record.get("inputs") or {})
+    for item in args.input or []:
+        name, has_default, default = item.partition("=")
+        inputs[name] = dict(inputs.get(name) or {}, default=default if has_default else "")
+    for name in args.require or []:
+        inputs[name] = dict(inputs.get(name) or {}, required=True)
+    for name in args.secret_input or []:
+        inputs[name] = dict(inputs.get(name) or {}, secret=True, default="")
+    for name in args.drop_input or []:
+        inputs.pop(name, None)
+    record["inputs"] = inputs
+    secrets = dict(record.get("secrets") or {})
+    for name in args.secret or []:
+        secrets.setdefault(name, {})
+    record["secrets"] = secrets
+    for key in ("nodes", "groups"):
+        given = getattr(args, key)
+        if given is not None:
+            record[key] = [v for item in given for v in item.split(",") if v]
+    if args.timeout is not None:
+        record["timeout_seconds"] = args.timeout
+    if args.overlap:
+        record["overlap"] = args.overlap
+    if args.description is not None:
+        record["description"] = args.description
+    if args.disable:
+        record["enabled"] = False
+    elif args.enable:
+        record["enabled"] = True
+    return record
+
+
+def cmd_task_save(args, service):
+    tasks = task_service(service)
+    existing = store_tasks().get(args.name)
+    record = _task_definition(args, existing)
+    record.pop("name", None)
+    saved = tasks.save_task(args.name, **{k: v for k, v in record.items() if k in (
+        "template", "bootstrap", "script", "description", "schedule", "nodes", "groups",
+        "timeout_seconds", "overlap", "inputs", "secrets", "enabled")})
+    emit(args, saved, lambda t: "%s saved task %s: %s on %s, %s%s%s" % (
+        GREEN("+"), BOLD(t["name"]), _task_job(t), t["template"],
+        _task_schedule(t), sync_note(t), "".join(
+            "\n" + YELLOW("! %s" % w) for w in t.get("warnings") or [])))
+    return 0
+
+
+def store_tasks():
+    from . import store
+    return store.load_tasks()
+
+
+def cmd_task_delete(args, service):
+    tasks = task_service(service)
+    name = tasks.get_task(args.name)["name"]
+    if not confirm_delete(args, "task", name):
+        return 1
+    result = tasks.delete_task(name, everywhere=not args.local_only)
+    emit(args, result, lambda r: "%s deleted task %s%s" % (GREEN("+"), r["deleted"],
+                                                         sync_note(r)))
+    return 0
+
+
+def cmd_task_enable(args, service):
+    saved = task_service(service).set_enabled(args.name, args.enabled)
+    emit(args, saved, lambda t: "%s %s task %s%s" % (
+        GREEN("+"), "resumed" if t["enabled"] else "paused", BOLD(t["name"]), sync_note(t)))
+    return 0
+
+
+def _task_inputs(task, given):
+    """Values for a run: --input, then for a secret one $NAME or a prompt -- never argv."""
+    inputs = parse_params(given)
+    for name, spec in sorted(task["inputs"].items()):
+        if name in inputs:
+            if spec["secret"]:
+                print(YELLOW("! input %s is secret; --input puts it in shell history. "
+                             "Use $%s or the prompt." % (name, name)), file=sys.stderr)
+            continue
+        if not spec["secret"]:
+            continue
+        if os.environ.get(name):
+            inputs[name] = os.environ[name]
+        elif sys.stdin.isatty() and spec["required"]:
+            value = getpass.getpass("%s%s: " % (name, " (%s)" % spec["description"]
+                                                if spec["description"] else ""))
+            if value:
+                inputs[name] = value
+    return inputs
+
+
+def _task_payload(args):
+    if not args.payload:
+        return None
+    try:
+        if args.payload == "-":
+            text = sys.stdin.read()
+        else:
+            with open(args.payload, encoding="utf-8") as handle:
+                text = handle.read()
+    except OSError as exc:
+        raise ServiceError("Cannot read the payload: %s" % exc)
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text                         # a message need not be JSON
+
+
+def cmd_task_run(args, service):
+    tasks = task_service(service)
+    task = tasks.get_task(args.name)
+    inputs = _task_inputs(task, args.input)
+    payload = _task_payload(args)
+    path = urllib.parse.quote(task["name"], safe="")
+    api = serve_for_run(tasks.cluster, args)
+    if api is not None:
+        run = api.request("POST", "/api/tasks/%s/invoke" % path,
+                          {"inputs": inputs, "payload": payload, "node": args.node})
+
+        def current():
+            found = next((r for r in api.request(
+                "GET", "/api/task-runs", params={"task": task["name"], "detail": "1"})["runs"]
+                if r["id"] == run["id"]), None)
+            if found is None:
+                raise ServiceError("Run %s is no longer listed by any member." % run["id"])
+            return found
+        cancel = None
+    else:
+        run = tasks.invoke(task["name"], inputs=inputs, payload=payload, node=args.node)
+
+        def current():
+            found = next((r for r in tasks.runs(task=task["name"], detail=True)["runs"]
+                          if r["id"] == run["id"]), None)
+            if found is None:
+                raise ServiceError("Run %s is no longer listed." % run["id"])
+            return found
+        cancel = (lambda: tasks.cancel_run(run["id"])) if run["node"] == \
+            tasks.cluster.local_name() else None
+    if not args.json:
+        print(DIM("task %s run %s on %s, instance %s" % (task["name"], run["id"], run["node"],
+                                                          run["instance"])), flush=True)
+    if args.no_wait:
+        emit(args, run, lambda r: render_task_run(r, full=False))
+        return 0
+    stage = None
+    try:
+        while run["status"] == "running":
+            if not args.json and run.get("stage") != stage:
+                stage = run.get("stage")
+                print(DIM("  %s" % stage), flush=True)
+            time.sleep(2)
+            run = current()
+    except KeyboardInterrupt:
+        if cancel is None:
+            print(DIM("\nstopped following; the run carries on (lemondx task-runs %s)"
+                      % task["name"]))
+            return 130
+        print(DIM("\ncancelling the run"))
+        cancel()
+        return 130
+    emit(args, run, render_task_run)
+    return 0 if run["status"] == "ok" else 1
+
+
+def cmd_task_runs(args, service):
+    found = task_service(service).runs(task=args.name, local=args.local_only)
+    for problem in found["errors"]:
+        print(YELLOW("! %s did not answer: %s" % (problem["node"], problem["error"])),
+              file=sys.stderr)
+    runs = found["runs"][:args.limit]
+    emit(args, found, lambda _: table(
+        [[TASK_MARK.get(r["status"], "") + " " + r["status"].replace("_", " "), r["task"],
+          r["id"], r["node"], r["trigger"], _when(r["started_at"]),
+          "%ds" % ((r["finished_at"] or time.time()) - r["started_at"]),
+          "-" if r.get("exit_code") is None else str(r["exit_code"]),
+          short_value(next((m.get("summary") for m in reversed(
+              (r.get("job") or {}).get("modules") or []) if m.get("summary")), "")
+              .splitlines()[-1:][0] if (r.get("job") or {}).get("modules") else
+              (r.get("error") or ""))]
+         for r in runs],
+        ["status", "task", "run", "node", "trigger", "started", "took", "exit", "said"]))
+    return 0
+
+
+def cmd_task_run_show(args, service):
+    found = task_service(service).runs(detail=True)["runs"]
+    run = next((r for r in found if r["id"] == args.id), None)
+    if run is None:
+        raise ServiceError("No run '%s' on any member that answered." % args.id, 404)
+    emit(args, run, render_task_run)
+    return 0
+
+
+def cmd_task_cancel(args, service):
+    tasks = task_service(service)
+    found = tasks.runs(live=True)["runs"]
+    run = next((r for r in found if r["id"] == args.id), None)
+    if run is None:
+        raise ServiceError("No run '%s' going on any member that answered." % args.id, 404)
+    if run["node"] == tasks.cluster.local_name():
+        api = serve_for_run(tasks.cluster, args)
+        result = api.request("POST", "/api/task-runs/%s/cancel" % args.id) if api \
+            else tasks.cancel_run(args.id)
+    else:
+        result = tasks.cluster.proxy("POST", run["node"], "/api/task-runs/%s/cancel" % args.id)
+    emit(args, result, lambda r: "%s cancelling run %s of task %s on %s" % (
+        GREEN("+"), r["id"], r["task"], r["node"]))
+    return 0
+
+
+def cmd_task_secrets(args, service):
+    tasks = task_service(service)
+    task = tasks.get_task(args.name)
+    rows = {name: dict(spec, held=task["secret_status"].get(name))
+            for name, spec in task["secrets"].items()}
+    emit(args, rows, lambda r: table(
+        [[name, "set" if s["held"] else YELLOW("not set"),
+          _when(s["held"]["updated_at"]) if s["held"] else "-", s["description"] or "-"]
+         for name, s in sorted(r.items())],
+        ["secret", "value", "updated", "description"]) if r
+        else DIM("Task %s declares no secrets." % args.name))
+    return 0
+
+
+def cmd_task_secret_set(args, service):
+    # Never from argv, as for a stack's.
+    value = os.environ.get(args.secret)
+    if not value and sys.stdin.isatty():
+        value = getpass.getpass("%s: " % args.secret)
+    if not value and not sys.stdin.isatty():
+        value = sys.stdin.readline().rstrip("\n")
+    result = task_service(service).set_secret(args.name, args.secret, value)
+    emit(args, result, lambda r: "%s set secret %s of task %s%s" % (
+        GREEN("+"), BOLD(args.secret), args.name, sync_note(r)))
+    return 0
+
+
+def cmd_task_secret_clear(args, service):
+    result = task_service(service).clear_secret(args.name, args.secret)
+    emit(args, result, lambda r: "%s cleared secret %s of task %s%s" % (
+        GREEN("+"), BOLD(args.secret), args.name, sync_note(r)))
+    return 0
+
+
+def cmd_cron(args, _service):
+    preview = TaskService.preview_schedule(args.expression, args.tz, args.count)
+    emit(args, preview, lambda p: "%s  %s\n%s" % (
+        BOLD(p["cron"]), DIM("%s, %s" % (p["text"], p["timezone"])),
+        "\n".join("  " + _when(at) for at in p["next"])))
+    return 0
+
+
+
+def cmd_stack_report(args, service):
+    stacks = stack_service(service)
+    name = stacks.get_stack(args.name)["name"]
+    # The run lives in serve when one is running here, like every run the UI shows.
+    api = serve_for_run(stacks.cluster, args)
+    report = stacks.run_report(name) if api is None else api.request(
+        "GET", "/api/stack-runs/%s/report" % urllib.parse.quote(name, safe=""))
+    if args.json:
+        emit(args, report, None)
+        return 0
+    if not args.report:
+        args.report = "-"
+    save_report(args, report)
+    return 0
+
+
+def _swarm_counts(designs, given):
+    """``--count`` as ``{swarm: {step: n}}``: ``SWARM/STEP=N``, or plain
+    ``STEP=N`` where only one swarm of the run has that launch step."""
+    counts = {}
+    for key, value in given.items():
+        swarm, _, step = key.rpartition("/")
+        if swarm:
+            owners = [d["name"] for d in designs if d["name"] == swarm]
+            if not owners:
+                raise ServiceError("--count %s: swarm '%s' is not part of this run."
+                                   % (key, swarm))
+        else:
+            owners = [d["name"] for d in designs
+                      if any(s["id"] == step and s["type"] == "launch"
+                             for stage in d["stages"] for s in stage["steps"])]
+            if len(owners) > 1:
+                raise ServiceError("--count %s: swarms %s both have step '%s'; say which "
+                                   "with SWARM/%s=N." % (key, " and ".join(owners), step,
+                                                         step))
+            if not owners:
+                # Left to the service to refuse, naming the swarm it lacks.
+                owners = [designs[0]["name"]]
+        counts.setdefault(owners[0], {})[step] = value
+    return counts
+
+
+def cmd_stack_swarm_sequence(args, service):
+    stacks = stack_service(service)
+    saved = stacks.set_swarm_sequence(stacks.get_stack(args.name)["name"], args.swarm,
+                                      args.state == "on")
+    order = [w["name"] for w in saved["swarms"] if w["sequence"]]
+    emit(args, saved, lambda r: "%s swarm %s is %s the sequence: %s" % (
+        GREEN("+"), args.swarm, "in" if args.state == "on" else "out of",
+        " -> ".join(order) or DIM("empty")))
+    return 0
+
+
+def cmd_stack_swarm_stop(args, service):
+    stacks = stack_service(service)
+    name = stacks.get_stack(args.name)["name"]
+    # A swarm runs in `serve` when one answers here, and only it knows: asked
+    # in this process, a running swarm's instances would look like leftovers.
+    api = serve_for_run(stacks.cluster, args)
+    path = "/api/stacks/%s/swarms/%s/stop" % (urllib.parse.quote(name, safe=""),
+                                               urllib.parse.quote(args.swarm, safe=""))
+    # Running anywhere: a swarm started on another member is stopped there
+    # (serve forwards it), and its instances are not leftovers to confirm.
+    running = next((r for r in live_runs(stacks) if r["stack"] == name), None)
+    doomed = None
+    if not (running and running.get("action") == "swarm"
+            and args.swarm in (running.get("swarms") or [running.get("swarm")])):
+        doomed = [m for m in stack_members(stacks, name) if m.get("swarm") == args.swarm]
+        if not doomed:
+            raise ServiceError("Swarm '%s' is not running and has no instances." % args.swarm)
+        if not args.json:
+            print("Instances of swarm %s: %s" % (BOLD(args.swarm), describe_members(doomed)))
+        if not confirm("Destroy all %d?" % len(doomed), args.yes):
+            print(DIM("nothing destroyed"))
+            return 1
+        doomed = [{"node": m["node"], "name": m["name"]} for m in doomed]
+    if api is not None:
+        result = api.request("POST", path, {"instances": doomed} if doomed else {})
+        if result.get("node"):
+            # Running on another member, and stopped there.
+            emit(args, result, lambda r: "%s stopping swarm %s on %s; it tears itself down "
+                 "there" % (GREEN("+"), args.swarm, r["node"]))
+            return 0
+        # Followed to the end, so "done" means the instances are gone.
+        started_at = result["started_at"]
+
+        def current():
+            return next((r for r in api.request("GET", "/api/stack-runs") or []
+                         if r["stack"] == name and r["started_at"] == started_at), result)
+        if not args.json:
+            print("%s %s swarm %s" % (GREEN("+"), "stopping" if doomed is None
+                                       else "destroying", args.swarm), flush=True)
+        result = follow_stack_run(args, result, current, lambda: None, outlives=True)
+        if result is None:
+            return 130
+    else:
+        # Waited for here: a run on a thread would die with this command.
+        result = stacks.stop_swarm(name, args.swarm, doomed, background=False)
+        if result.get("node"):
+            emit(args, result, lambda r: "%s stopping swarm %s on %s; it tears itself down "
+                 "there" % (GREEN("+"), args.swarm, r["node"]))
+            return 0
+    emit(args, result, render_stack_run)
+    return 0 if result.get("ok") else 1
 
 
 # A step whose detail keeps changing (a health gate naming what it waits on)
@@ -1629,37 +2606,57 @@ def follow_stack_run(args, run, current, cancel, outlives=False):
     this process, on serve (``outlives``) they carry on there, and None is
     returned.
     """
-    seen = {}       # step id -> (state, detail, when printed)
+    seen = {}       # (stage, step id) -> (state, detail, when printed)
+    swarm = run.get("swarm") if run.get("action") == "swarm" else None
+
+    def refresh():
+        try:
+            return current()
+        except NodeError as exc:
+            # serve went away mid-run (restarted, say): the run was there,
+            # and so was a swarm's teardown.
+            raise ServiceError(
+                "serve here stopped answering (%s), and the run was on it. %s" % (
+                    exc.message, "If it stopped mid-swarm, the swarm's instances may be "
+                    "left: `lemondx stack-swarm-stop %s %s` destroys them."
+                    % (shlex.quote(run["stack"]), swarm) if swarm else
+                    "See `lemondx stacks` for what it left."), 502) from None
 
     def report():
         if args.json:
             return
-        for stage in run["stages"]:
+        # By stage as well as id: a swarm sequence has a teardown per swarm,
+        # and two swarms may each have a step of one name.
+        for index, stage in enumerate(run["stages"]):
             for step in stage["steps"]:
                 if step["state"] == "pending":
                     continue
-                last = seen.get(step["id"])
+                last = seen.get((index, step["id"]))
                 if last and last[0] == step["state"] and (
                         last[1] == step["detail"] or time.time() - last[2] < DETAIL_EVERY):
                     continue
-                seen[step["id"]] = (step["state"], step["detail"], time.time())
+                seen[(index, step["id"])] = (step["state"], step["detail"], time.time())
                 print(render_step(step), flush=True)
 
     try:
         while run["finished_at"] is None:
             report()
             time.sleep(1)
-            run = current()
+            run = refresh()
     except KeyboardInterrupt:
-        print(YELLOW("cancelling: nothing new starts; launches under way finish "
-                     "(Ctrl-C again to %s)" % ("stop waiting -- they finish on serve"
-                                               if outlives else "leave them")),
-              file=sys.stderr)
+        if swarm:
+            print(YELLOW("stopping the swarm: its instances are destroyed now "
+                         "(Ctrl-C again to stop waiting)"), file=sys.stderr)
+        else:
+            print(YELLOW("cancelling: nothing new starts; launches under way finish "
+                         "(Ctrl-C again to %s)" % ("stop waiting -- they finish on serve"
+                                                   if outlives else "leave them")),
+                  file=sys.stderr)
         cancel()
         try:
             while run["finished_at"] is None:
                 time.sleep(1)
-                run = current()
+                run = refresh()
         except KeyboardInterrupt:
             if outlives:
                 return None
@@ -1719,7 +2716,7 @@ def serve_mismatch(status, lxd):
     return None if same else "the daemon at %s, not %s" % (theirs or "?", lxd.socket_path)
 
 
-def fill_secrets(modules, params, service):
+def fill_secrets(modules, params, service, only=None):
     """Supply secret parameters without putting them on the command line.
 
     A value in --param works but lands in shell history and `ps`. So for each
@@ -1734,6 +2731,8 @@ def fill_secrets(modules, params, service):
         for param in module["params"]:
             name = param["name"]
             if not param.get("secret") or params.get(name):
+                continue
+            if only is not None and name not in only:
                 continue
             if os.environ.get(name):
                 params[name] = os.environ[name]
@@ -3817,12 +4816,21 @@ def build_parser():
 
     p = add("stack-delete", parents=[common, only_here], help="delete a stack")
     p.add_argument("name")
+    p.add_argument("--destroy", action="store_true",
+                   help="also stop and delete every instance it launched (asks unless -y); "
+                        "by default they are kept")
     p.set_defaults(func=cmd_stack_delete)
 
     p = add("stack-launch", help="run a stack, stage by stage, and wait for it")
     p.add_argument("name")
     p.add_argument("--param", action="append", metavar="KEY=VALUE",
                    help="supply a secret, or a value every launch gets (repeatable)")
+    p.add_argument("--var", action="append", metavar="NAME=VALUE",
+                   help="override one of the stack's variables, for this launch only "
+                        "(repeatable)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="show what the launch would do -- where each step lands, each "
+                        "parameter's value -- and change nothing")
     p.add_argument("--relaunch", action="store_true",
                    help="destroy the stack's current instances first (asks unless -y)")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
@@ -3836,12 +4844,202 @@ def build_parser():
                          ("restart", "restart every instance a stack launched")):
         p = add("stack-%s" % action, help=text)
         p.add_argument("name")
+        # Never asks -- nothing is deleted -- but taken like every other stack
+        # command's, so a script need not know which ones confirm.
+        p.add_argument("-y", "--yes", action="store_true",
+                       help="accepted for scripts; this command does not ask")
         p.set_defaults(func=cmd_stack_state, action=action)
+
+    p = add("stack-swarm", help="run one or more of a stack's swarms against it, in "
+                                "order, and wait; each swarm's instances are destroyed "
+                                "before the next starts, and a failure ends the run")
+    p.add_argument("name", help="the stack")
+    p.add_argument("swarm", nargs="*",
+                   help="the swarm, or several to run one after another -- a functional "
+                        "test, say, then a load test once it has passed")
+    p.add_argument("--sequence", action="store_true",
+                   help="run the stack's own sequence: its swarms that are in it, in the "
+                        "order the designer shows")
+    p.add_argument("--count", action="append", metavar="[SWARM/]STEP=N",
+                   help="instances for one of a swarm's launch steps, this run only "
+                        "(up to 200; repeatable); SWARM/ where two swarms share the step")
+    p.add_argument("--var", action="append", metavar="NAME=VALUE",
+                   help="override one of the stack's variables, this run only (repeatable)")
+    p.add_argument("--param", action="append", metavar="KEY=VALUE",
+                   help="a value the swarm's steps ask for as {{params.NAME}}")
+    p.add_argument("--dry-run", action="store_true",
+                   help="show what the swarm would do against the running stack -- its "
+                        "real addresses filled in -- and change nothing")
+    p.add_argument("--report", metavar="FILE",
+                   help="when it ends, write its results as Markdown: a file, a directory "
+                        "(named for the run), or - for stdout")
+    p.add_argument("--no-serve", action="store_true",
+                   help="run it in this command even when serve is running here")
+    p.set_defaults(func=cmd_stack_swarm)
+
+    p = add("stack-report", help="the stack's last finished run -- a swarm's or a sequence's "
+                                 "results -- as Markdown")
+    p.add_argument("name", help="the stack")
+    p.add_argument("-o", "--report", metavar="FILE",
+                   help="write it to a file, or a directory (named for the run); "
+                        "default stdout")
+    p.set_defaults(func=cmd_stack_report)
+
+    p = add("stack-swarm-sequence", help="put a swarm in or out of the stack's sequence "
+                                         "(out, it still runs on its own)")
+    p.add_argument("name", help="the stack")
+    p.add_argument("swarm")
+    p.add_argument("state", choices=("on", "off"))
+    p.set_defaults(func=cmd_stack_swarm_sequence)
+
+    p = add("stack-swarm-stop", help="stop a running swarm, or destroy what one left behind")
+    p.add_argument("name", help="the stack")
+    p.add_argument("swarm")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+    p.add_argument("--no-serve", action="store_true",
+                   help="act in this command even when serve is running here")
+    p.set_defaults(func=cmd_stack_swarm_stop)
+
+    p = add("stack-secrets", help="list a stack's secrets and whether each holds a value")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_stack_secrets)
+
+    p = add("stack-secret-set",
+            help="set one of a stack's secrets (from $NAME, a prompt, or stdin; never argv)")
+    p.add_argument("name", help="the stack")
+    p.add_argument("secret")
+    p.set_defaults(func=cmd_stack_secret_set)
+
+    p = add("stack-secret-clear", help="forget the value of one of a stack's secrets")
+    p.add_argument("name", help="the stack")
+    p.add_argument("secret")
+    p.set_defaults(func=cmd_stack_secret_clear)
+
+    p = add("stack-secret-reveal", help="print the value of one of a stack's secrets")
+    p.add_argument("name", help="the stack")
+    p.add_argument("secret")
+    p.set_defaults(func=cmd_stack_secret_reveal)
 
     p = add("stack-destroy", help="stop and delete every instance a stack launched")
     p.add_argument("name")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     p.set_defaults(func=cmd_stack_destroy)
+
+    # -- tasks -------------------------------------------------------------
+    p = add("tasks", help="list tasks: job modules run in a throwaway instance, on a "
+                          "schedule or when invoked")
+    p.set_defaults(func=cmd_tasks)
+
+    p = add("task-show", help="one task, with its latest runs on every member")
+    p.add_argument("name")
+    p.add_argument("--runs", type=int, default=10, help="how many runs to show (default 10)")
+    p.add_argument("--lines", type=int, default=20,
+                   help="how much of a job script to show (default 20 lines)")
+    p.set_defaults(func=cmd_task_show)
+
+    p = add("task-save", help="create or change a task (flags change only what they name)")
+    p.add_argument("name")
+    p.add_argument("--file", metavar="FILE",
+                   help="the whole definition as JSON (a file, or - for stdin) instead of "
+                        "flags; see docs/tasks.md")
+    p.add_argument("-t", "--template", help="the template its instance is launched from")
+    p.add_argument("-b", "--bootstrap", action="append", metavar="MODULE[,MODULE]",
+                   help="the job: modules run after the template's own (repeatable)")
+    p.add_argument("--script", metavar="FILE",
+                   help="the job as a script instead of modules (a file, or - for stdin); "
+                        "POSIX sh with the module helpers, or any #! interpreter")
+    p.add_argument("--param", action="append", metavar="KEY=VALUE",
+                   help="a job module parameter; may say {{inputs.NAME}} or "
+                        "{{secrets.NAME}} (repeatable)")
+    p.add_argument("--cron", metavar="EXPR",
+                   help="run on this schedule: five cron fields, or @hourly/@daily/...")
+    p.add_argument("--tz", help="the schedule's time zone (default UTC)")
+    p.add_argument("--no-schedule", action="store_true",
+                   help="remove the schedule: run only when invoked")
+    p.add_argument("--input", action="append", metavar="NAME[=DEFAULT]",
+                   help="declare an input a run is given, with its default (repeatable)")
+    p.add_argument("--require", action="append", metavar="NAME",
+                   help="make an input required (repeatable)")
+    p.add_argument("--secret-input", action="append", metavar="NAME",
+                   help="make an input secret: masked, never kept, no default (repeatable)")
+    p.add_argument("--drop-input", action="append", metavar="NAME",
+                   help="remove an input (repeatable)")
+    p.add_argument("--secret", action="append", metavar="NAME",
+                   help="declare a task secret; set its value with task-secret-set")
+    p.add_argument("--group", dest="groups", action="append", metavar="GROUP[,GROUP]",
+                   help="the node group(s) it runs on -- required; the cluster picks a "
+                        "member of them for each run (repeatable)")
+    p.add_argument("--node", dest="nodes", action="append", metavar="NODE[,NODE]",
+                   help="also these members, beside its groups (repeatable)")
+    p.add_argument("--timeout", type=int, metavar="SECONDS",
+                   help="the whole run, create to destroy (default 900)")
+    p.add_argument("--overlap", choices=("skip", "allow"),
+                   help="skip a run while one is still going (default), or allow it")
+    p.add_argument("--description")
+    p.add_argument("--disable", action="store_true", help="pause its schedule")
+    p.add_argument("--enable", action="store_true", help="resume its schedule")
+    p.set_defaults(func=cmd_task_save)
+
+    p = add("task-delete", parents=[common, only_here], help="delete a task")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_task_delete)
+
+    for verb, enabled, text in (("task-enable", True, "resume a task's schedule"),
+                                ("task-disable", False, "pause a task's schedule")):
+        p = add(verb, help=text)
+        p.add_argument("name")
+        p.set_defaults(func=cmd_task_enable, enabled=enabled)
+
+    p = add("task-run", help="run a task now, on whichever member takes it, and wait")
+    p.add_argument("name")
+    p.add_argument("--input", action="append", metavar="NAME=VALUE",
+                   help="a value for one of its inputs (repeatable); a secret one is read "
+                        "from $NAME or a prompt instead")
+    p.add_argument("--payload", metavar="FILE",
+                   help="a message for the run (a file, or - for stdin), handed to the job "
+                        "as the file $LEMONDX_TASK_PAYLOAD")
+    p.add_argument("--node", help="run it on this member of its groups rather than letting "
+                                  "the cluster choose")
+    p.add_argument("--no-wait", action="store_true", help="start it and return")
+    p.add_argument("--no-serve", action="store_true",
+                   help="run it in this command even when serve is running here")
+    p.set_defaults(func=cmd_task_run)
+
+    p = add("task-runs", help="runs of one task, or of all, on every member, newest first")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--limit", type=int, default=30)
+    p.add_argument("--local-only", action="store_true", help="this node's runs only")
+    p.set_defaults(func=cmd_task_runs)
+
+    p = add("task-run-show", help="one run, with its full output")
+    p.add_argument("id")
+    p.set_defaults(func=cmd_task_run_show)
+
+    p = add("task-cancel", help="stop a run and destroy its instance")
+    p.add_argument("id")
+    p.add_argument("--no-serve", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_task_cancel)
+
+    p = add("task-secrets", help="list a task's secrets and whether each holds a value")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_task_secrets)
+
+    p = add("task-secret-set",
+            help="set one of a task's secrets (from $NAME, a prompt, or stdin; never argv)")
+    p.add_argument("name", help="the task")
+    p.add_argument("secret")
+    p.set_defaults(func=cmd_task_secret_set)
+
+    p = add("task-secret-clear", help="forget the value of one of a task's secrets")
+    p.add_argument("name", help="the task")
+    p.add_argument("secret")
+    p.set_defaults(func=cmd_task_secret_clear)
+
+    p = add("cron", help="check a schedule: what it means and when it next fires")
+    p.add_argument("expression", help="five cron fields (quote them), or @daily etc.")
+    p.add_argument("--tz", default="UTC", help="time zone (default UTC)")
+    p.add_argument("--count", type=int, default=5)
+    p.set_defaults(func=cmd_cron)
 
     # -- cluster -----------------------------------------------------------
     cluster_p = add("cluster", help="federate with other lemondx nodes")
@@ -4101,6 +5299,8 @@ def build_parser():
 READ_ONLY = {
     "tokens", "users", "pam_test", "status", "list", "info", "snapshots", "image_search",
     "image_pins", "modules", "ssh_keys", "profiles", "templates", "stacks", "stack_show",
+    "stack_secrets", "tasks", "task_show", "task_runs", "task_run_show", "task_secrets",
+    "cron",
     "health", "resources", "top", "storage_pools", "storage_pool_show", "storage_volumes",
     "storage_volume_show", "networks", "network_show", "network_subnets", "network_lan",
     "cluster_nodes", "cluster_status", "cluster_show", "cluster_invites", "fabric_list",
@@ -4114,7 +5314,7 @@ NOT_LOGGED = {"serve", "fabric_helper"}
 # Positional arguments that name things, which the log may carry. Anything
 # else -- a join code, a command to run, a search, a file -- stays out.
 LOGGED_ARGS = ("name", "template", "snapshot", "pool", "image", "alias", "pin", "user",
-               "section", "nic", "bridge", "state", "id")
+               "section", "nic", "bridge", "state", "id", "secret", "swarm")
 
 
 def _cli_targets(args):

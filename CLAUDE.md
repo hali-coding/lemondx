@@ -57,7 +57,7 @@ Four layers, one direction of dependency:
 
 ```
 lxd.py          transport: HTTP over the daemon's AF_UNIX socket, no shelling out
-hostnet.py      transport: the host's routing table, the one place that shells out
+hostnet.py      transport: the host's routing table, the one privileged shell-out
   ↓
 service.py      domain: ContainerService turns raw daemon records into lemondx shapes
   ↓
@@ -456,11 +456,36 @@ secrets, since nothing says which of its params are secret.
 The designer's parameter panel (`LaunchParams` in `StackEditor.tsx`) lists every
 param the step's template *declares*, not just the overrides the stack stores,
 with the inherited value as the box's placeholder -- the panel answers "what
-will this launch use?", while the record stays a diff. `ReferenceInput` completes
-`{{...}}` at the caret from `suggestionsFor()`, which is the one place the
-designer's idea of a valid reference lives; it must stay in step with `FIELDS`
-and `REFERENCE`/`INPUT_REFERENCE` in `stacks.py`, since the server is what
-actually refuses a bad one.
+will this launch use?", while the record stays a diff. What a launch hands on
+-- its `FIELDS` and, as `{{step.param.NAME}}`, every non-secret parameter it
+runs with -- is `stepOutputs()`, the one place the designer's idea of a valid
+reference lives: the card chips, the inspector's list, `ReferenceInput`'s
+completion and drop target, and `problems()` all read it. It must stay in step
+with `FIELDS`, `REFERENCE`/`PARAM_REFERENCE`/`INPUT_REFERENCE` and
+`handed_names()` in `stacks.py`, since the server is what actually refuses a
+bad one. A step's parameter values are kept per run in `handed`, beside
+`context` rather than in it, because `context` lands in the run record that
+every poll re-sends. A secret is never handed on: the receiving module may not
+declare it secret, and so would not redact it.
+A stack's own values are `{{vars.NAME}}` and `{{secrets.NAME}}` (so `params`,
+`vars` and `secrets` are reserved step ids). Variables live in the stack record
+in the clear. A secret is only *declared* there; its value is in
+`auth/stack-secrets.json`, sealed by `secretbox.py` under `auth/secrets.key`,
+a key per node -- not one derived from the cluster credential, which would
+have to re-seal everything on every join, leave and rotation. Members swap the
+values in the clear over the members-only `PUT /api/stack-secrets/{stack}`
+(sync kind `stack-secrets`, the whole set per stack), and each seals them under
+its own key. Unlike `users`, it *is* in `RECONCILE_KINDS`: a node that missed a
+generated password would generate a different one. A value leaves the server to
+a person only through `reveal_secret()`, which needs admin plus
+`AuthService.confirm()` (a session re-enters its password; a token or the CLI
+needs none) and refuses a call relayed through `_forward()`, which would arrive
+as the cluster credential and pass for a token. `launch_stack()` resolves
+everything before the first launch, storing and propagating a value given at
+launch or generated, and hands variables and secrets down the run as `_Given`,
+never in the run record. `_input_only()` lets a module's secret param hold
+`{{secrets.NAME}}` as well as `{{params.NAME}}`; one in a param its module does
+not declare secret is allowed but warned about, since nothing redacts it.
 What a stack is running is the `user.lemondx.stack` tag (`STACK_CONFIG_KEY`)
 threaded through every launch path -- `launch_instances()`, the peer launch API,
 and recreate, which carries it over -- and read back with
@@ -472,6 +497,118 @@ server.py, and again in `_forward()`, where a relayed call would otherwise reach
 the target wearing the cluster credential): a stack's local share never goes
 through the API at all, and a person naming a stack on an ordinary launch would
 be giving it instances to destroy later.
+
+A `script` step (`StackService._script()`) is the one place lemondx runs
+code on a host on purpose: `/bin/sh` on a file in a fresh directory under the
+data dir (never `sh -c`, since a rendered secret would show in `/proc`), as the
+service account, in its own session so a timeout or a cancel `killpg`s
+everything it started. It takes a launch's references in its text and in
+`params`, which become environment variables, plus every launch input and
+`_exports()`; output is `redact()`ed of the run's secrets and inputs before it
+reaches the run record. `_check_references()` is the one check a launch's
+params and a script's text and params all go through.
+
+**Swarms** are load tests in the stack record (`swarms: [{name, description,
+stages}]`), never run by its launch. `_check_flow()` validates one as the
+stack's next stage -- every stack launch is an earlier launch, its ids taken --
+with launch counts to `SWARM_LAUNCH_COUNT` (200). Because the launch that made
+a stack's instances is long gone when a swarm starts, every stack launch tags
+each instance with its step (`STACK_STEP_CONFIG_KEY`) and, in a swarm, the
+swarm (`SWARM_CONFIG_KEY`): `stack=` along the whole launch path (service,
+cluster share, peer body, recreate) is `{stack, step, swarm}` now, normalised
+by `ContainerService.stack_tag()` and accepted only from a member like the
+stack tag. `_live_context()` rebuilds context and `handed` from those tags. A
+swarm is a stack run (action `swarm`) whose last stage is a `_teardown` marked
+`always`, which `_execute()` runs even after a failure or cancel. Each run has
+an `id`, carried as `run` in that dict and tagged `SWARM_RUN_CONFIG_KEY`, and
+`_swarm_teardown()` destroys only instances with *its* run id -- by tag at that
+moment, sweeping again until every template run the swarm started
+(`_launched`) has finished, since Stop no longer waits for a launch:
+`_await_template_run()` raises `_Cancelled` for a swarm. Runs live per
+process, so `_busy()` also asks every peer's `/api/stack-runs`
+(`peer_runs()`, best effort, short timeout) before any start, and
+`stop_swarm()` forwards to the member running it. `serve` turns SIGTERM into
+`_Terminated` and `_stop_swarms()` before exiting. `_run_record()` keeps a
+successful module's last lines (`_summary()`), which `_instance_output()` puts
+on the step's instance rows -- a load generator's result. A launch step's
+`min_percent` lets some instances fail (`_finish_launch()`).
+`stack_revision()` leaves `swarms` out so a load-test edit never makes the
+stack's instances stale. The stack's own sequence is its swarms in their stored
+order with `sequence` true (`sequence_of()`; missing means true, so older records
+run everything). A **sequence** run (`launch_swarms()`, `/swarm-sequence`) is
+one swarm run whose plan is each swarm's stages then its own teardown, every
+stage and step tagged with its swarm: one run so the stack's lock holds
+between swarms and Stop ends all of it, and `_execute()` skips a later
+swarm's teardown when that swarm never began. `run["swarm"]` is the one
+running now and `run["swarms"]` the whole sequence (`_sequence()` reads an older peer's
+record). Step ids may repeat across a sequence, so `earlier` stays within one
+swarm and an earlier swarm's outputs leave `context` when the next begins.
+Anything keying a run's steps must use stage index plus id. At a swarm
+boundary `_execute()` joins every follower before checking for failure, since a
+non-waiting launch's result lands a moment after its teardown; and within a
+swarm run `_halted()` stops in-flight steps (`_Halted`, marked cancelled with
+the reason) once any step has failed -- `_check_running()` is the one check for
+both that and a cancel, which every wait in a swarm goes through. A swarm run also carries
+`against` and `variables` for its report: `stackreport.py` renders any finished
+run record as Markdown (`run_report()`, `GET /api/stack-runs/{name}/report`,
+`stack-report`), from the record alone, so the UI's download and the CLI's file
+are the same document and say nothing the record does not.
+
+### Tasks
+
+`tasks.py` (`TaskService`) sits above `ClusterService` like stacks, for the
+member list. A task is a template plus a *job* -- modules, or a script pasted
+into the record (`_run_script()`: the prelude in front unless it has a `#!`,
+every input and secret as an env var, never rendered into the text) -- run as
+a second `service.bootstrap()` pass after the template's own -- one call would sort
+them together by `order` -- in an instance made for that one run
+(`ContainerService.create_from_template()`, forced ephemeral, tagged
+`TASK_CONFIG_KEY`/`TASK_RUN_CONFIG_KEY` and deliberately *not* the template
+tag, or the template's recreate/destroy/app check would take it in) and
+destroyed in `finally`. A deadline timer deletes the instance, which is how a
+timeout or cancel ends whatever runs in it. Runs live in `_live` on the
+process, and every stage change is written through `store.save_task_run()`
+(`task-runs/`, node-local, last 50), so history survives a restart;
+`sweep()` (at start and every `SWEEP_SECONDS`) destroys task instances no
+live run owns and marks their record `lost` -- unless the record names
+another live PID, a CLI run without serve.
+
+**Placement is node groups, required** -- never a lone node, never "any
+member": a task tied to one node dies with it, which is the single owner
+tasks exist to avoid. Nodes may be named only *beside* groups, and
+`eligible()` never falls back to every member for a record that names
+nothing; it runs nowhere and `_public()` says why (`placement_problem`).
+The UI's `TargetPicker` offers groups first for the same reason.
+
+**Inputs** are declared on the task and given per invocation (SNS-style);
+every one reaches the job as `LEMONDX_INPUT_<NAME>` and a param may say
+`{{inputs.NAME}}`. A module's secret param may only hold a reference
+(`_placeholder_only()`), and a secret input has no default. The payload is
+pushed as a file, never env, log or record. A task's secrets reuse the stack
+secrets store with `kind=store.TASK_SECRETS_KIND` -- every `*_stack_secret*`
+function takes `kind` -- and sync as `task-secrets`, members-only.
+
+**Who runs an occurrence is a vote, and the guarantee is at most once.** The
+occurrence is `(task, slot)`, slot being the UTC second cron fires at
+(`cron.py`, stdlib, zoneinfo), so every node names it alike. Every node ranks
+the eligible nodes by `rank()` (rendezvous hash over the slot), waits
+`HANDOFF_SECONDS` per node ranked above it, then -- unless it `declines()`,
+its own word like maintenance -- asks *every member* for a grant
+(`/api/task-grants`, members-only). `store.claim_task_grant()` grants each
+key once, first come, under a file lock and fsynced *before* answering, so
+a restarted voter cannot grant twice; a strict majority wins, and a loser
+gives its grants back so the next rank can still gather one. Short of a
+majority the last rank records `missed`. A voter **vetoes** on timing
+(`_veto()`): the candidate's `sent_at` more than `MAX_CLOCK_SKEW` from its
+clock, a slot its own copy of the schedule does not fire at, or one not due /
+past `late_limit()`. A veto is a vote withheld with a reason, logged
+`task.veto` on both sides, so a wrong clock is outvoted when it is a voter's
+and vetoed when it is the candidate's. Grants expire well after
+`late_limit()`, so an occurrence can never be granted afresh. Invoking needs
+no vote: the receiving node picks the first non-declining eligible node in a
+random rank and forwards with `here: true`, which a route believes only from
+a member. Don't add anything that runs an occurrence without a majority --
+that is the one property the whole design exists for.
 
 ### Fabrics
 
@@ -705,6 +842,8 @@ local disk).
 `LEMONDX_CONFIG_DIR` is still honoured as the name it had before the move):
 `settings.json` for default modules and remembered params, `profiles/` for one
 JSON file per bootstrap profile, `templates/` for one per instance template,
+`tasks/` for one per task (with `task-runs/` and `task-grants.json` node-local
+beside it),
 `nodes/` and `node-groups/` for federation, `pins/` for pinned images,
 `cluster-settings/` for settings the cluster shares (`logging`), `events.sock` (the
 running `serve`'s socket for CLI events, 0600), `modules/` for uploads, `auth/`

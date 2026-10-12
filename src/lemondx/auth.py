@@ -571,6 +571,56 @@ class AuthService:
                        user_role=principal.role, method=method, client=client, result="ok")
         return principal, session_id
 
+    def confirm(self, principal, password):
+        """Check that the person behind a request is still there; raise if not.
+
+        For the few things worth more than a session: reading a stored secret
+        back. A cookie is ambient -- a browser left unlocked carries it -- so a
+        session must re-enter its password, through the same backends and the
+        same throttle as a login. An API token is presented deliberately on
+        every call and has no password behind it, so it is its own proof; so is
+        the CLI, which runs as the account that owns the data anyway. With auth
+        off there is nobody to confirm. A proxy's user has no password lemondx
+        knows, so they are sent to a token.
+        """
+        if principal is None:
+            raise AuthError("Sign in first.", 401)
+        via = principal.via or ""
+        if via.startswith("token:") or via in ("static-token", "cli"):
+            return True
+        if not self.config.enabled:
+            return True
+        if via == "proxy":
+            raise AuthError("Signed in through a proxy, there is no password to confirm. "
+                            "Use an admin API token for this.", 403)
+        if via != "session":
+            raise AuthError("This needs the password confirmed.", 403)
+        if not isinstance(password, str) or not password or len(password) > 4096:
+            # 403 like a wrong one: 401 would have the UI sign the person out.
+            raise AuthError("Enter your password to confirm.", 403)
+        keys = ("user:%s" % principal.name.lower(),)
+        self._check_throttle(keys)
+        confirmed = None
+        for candidate in self.password_methods():
+            if candidate == "local":
+                confirmed = self._login_local(principal.name, password)
+            elif candidate == "pam":
+                confirmed = self._login_pam(principal.name, password)
+            if confirmed:
+                break
+        if not confirmed:
+            self._record_failure(keys)
+            eventlog.event("auth", "confirm", level=logging.WARNING, user=principal.name,
+                           result="refused")
+            # 403, not 401: the session is still good, and a 401 would have
+            # the UI throw the person back to the login screen.
+            raise AuthError("That password is not right.", 403)
+        with self._lock:
+            self._failures.pop(keys[0], None)
+        eventlog.event("auth", "confirm", level=eventlog.NOTICE, user=principal.name,
+                       result="ok")
+        return True
+
     def _login_local(self, username, password):
         record = self._records("users").get(username)
         if not verify_password(password, record["hash"] if record else _dummy_hash()) or not record:

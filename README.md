@@ -32,6 +32,7 @@ Each layer is built from the one before it, and a stack is what you deploy:
 | **Module** | A POSIX shell script that configures an instance: packages, users, services. Parameters, and secrets that are never stored. | [modules](docs/modules.md) |
 | **Template** | A whole instance: image, container or VM, limits, network, the modules to run and an app health check. | [templates](docs/templates.md) |
 | **Stack** | Templates launched in stages, each handed the names and addresses of earlier ones, with health gates between. **The unit you deploy and operate.** | [stacks](docs/stacks.md) |
+| **Task** | Modules run in a throwaway instance of a template, on a cron schedule or when invoked with inputs. The cluster votes on which node runs each occurrence. | [tasks](docs/tasks.md) |
 | **Nodes** | Several hosts, each with its own daemon and its own lemondx, joined with one code. A stack step lands on named nodes or a node group. | [nodes](docs/cluster.md) |
 | **Fabric** | A routed network across every node, so a stack's tiers reach each other by their own addresses, whichever host they are on. | [networking](docs/networking.md) |
 
@@ -132,9 +133,11 @@ as a service on each host and join them — see
 
 ```
 # stacks: the deployment
-lemondx stacks                   # every stack, and how many instances it runs
-lemondx stack-save NAME FILE     # from a JSON definition; stack-show prints one back
-lemondx stack-launch NAME        # run it step by step; --relaunch replaces what runs
+lemondx stacks                   # every stack, its swarms, and how many instances it runs
+lemondx stack-show NAME          # what each step and swarm does; --json is the definition
+lemondx stack-save NAME FILE     # from a JSON definition (stack-show --json prints one)
+lemondx stack-launch NAME        # run it step by step; --dry-run previews, --relaunch replaces
+lemondx stack-swarm NAME SWARM...  # swarms against the running stack, in order; each torn down
 lemondx stack-stop|stack-start|stack-restart NAME
 lemondx stack-destroy NAME
 
@@ -200,6 +203,7 @@ CPU is a core count; memory and disk take a unit like `4GiB` or `512MiB` — see
 | Doc | Covers |
 | --- | --- |
 | [Stacks](docs/stacks.md) | designing a deployment: stages, launch steps, handing addresses along, health gates, secrets, operating it |
+| [Tasks](docs/tasks.md) | scheduled and invoked jobs in throwaway instances: inputs, payloads, who runs each occurrence, the clock veto |
 | [Instance templates](docs/templates.md) | a full instance setup, launched by a stack or on its own; app health checks |
 | [Bootstrap modules](docs/modules.md) | writing and uploading modules, parameters, secrets, profiles, the shipped modules |
 | [Nodes and federation](docs/cluster.md) | joining nodes, node groups, maintenance, sync and reconciliation, `lemondx top` |

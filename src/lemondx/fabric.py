@@ -729,8 +729,13 @@ class FabricService:
         The bridges go through the daemon, which lemondx can already talk to.
         The routes are kernel state, so unless this process is already root
         they go to the helper -- which is handed the wanted state, not commands.
+
+        Allowed in maintenance, unlike every other fabric change: it programs
+        only what this node already claims, and a person asked for it -- after
+        a reboot the routes maintenance was keeping "as they were" are simply
+        gone, and nothing else brings them back until it ends. The automatic
+        pass (`_reapply()`) still leaves them alone.
         """
-        self.refuse_here("change this node's fabric routes")
         with self._lock:
             # One bridge that cannot be ours must not keep every other
             # fabric's routes from being programmed.

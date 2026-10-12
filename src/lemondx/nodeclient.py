@@ -367,6 +367,28 @@ class NodeClient:
     def delete_stack(self, name):
         return self.request("DELETE", "/api/stacks/%s" % _seg(name))
 
+    def adopt_stack_secrets(self, name, body):
+        """Hand a peer one stack's secret values in the clear, for it to seal.
+        Only ever over this pinned connection, to the members-only route."""
+        return self.request("PUT", "/api/stack-secrets/%s" % _seg(name), body)
+
+    def save_task(self, name, body):
+        return self.request("PUT", "/api/tasks/%s" % _seg(name), body)
+
+    def delete_task(self, name):
+        return self.request("DELETE", "/api/tasks/%s" % _seg(name))
+
+    def adopt_task_secrets(self, name, body):
+        """A task's secret values in the clear, for the peer to seal; as for stacks."""
+        return self.request("PUT", "/api/task-secrets/%s" % _seg(name), body)
+
+    def grant_task(self, body):
+        """Ask a member for its vote on who runs one occurrence of a task."""
+        return self.request("POST", "/api/task-grants", body)
+
+    def release_task_grant(self, body):
+        return self.request("POST", "/api/task-grants/release", body)
+
     def delete_profile(self, name):
         return self.request("DELETE", "/api/bootstrap-profiles/%s" % _seg(name))
 

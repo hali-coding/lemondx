@@ -46,6 +46,20 @@ TEMPLATE_CONFIG_KEY = "user.lemondx.template"
 # of what a stack is running, as the template tag is for a template, so it
 # survives a restart and needs no reconciling with a file. See stacks.py.
 STACK_CONFIG_KEY = "user.lemondx.stack"
+# Which step of the stack made an instance, and which swarm, if one did: what
+# lets a swarm started long after the stack's launch rebuild `{{db.ip}}` from
+# the instances themselves, and its teardown find exactly its own.
+STACK_STEP_CONFIG_KEY = "user.lemondx.stack-step"
+SWARM_CONFIG_KEY = "user.lemondx.swarm"
+# Which run of the swarm made it: two runs of one swarm -- from two nodes, or
+# one started while another's leftovers remain -- must each tear down only
+# their own instances.
+SWARM_RUN_CONFIG_KEY = "user.lemondx.swarm-run"
+# The task and the run a task's throwaway instance belongs to (see tasks.py).
+# Deliberately *not* the template tag as well: a template's fleet actions and
+# app check would otherwise take in instances that exist for one run.
+TASK_CONFIG_KEY = "user.lemondx.task"
+TASK_RUN_CONFIG_KEY = "user.lemondx.task-run"
 # Which version of the template and stack an instance was made from, so one
 # made before an edit can be called stale. A digest rather than a time: saves
 # arrive from peers and from reconciliation, often unchanged, and a timestamp
@@ -732,7 +746,8 @@ class ContainerService:
 
         modules = (bootstrap or {}).get("modules") or []
         record = self._begin_create(name, source_snapshot or image, instance_type,
-                                    instance_config.get(TEMPLATE_CONFIG_KEY), len(modules))
+                                    instance_config.get(TEMPLATE_CONFIG_KEY), len(modules),
+                                    task=instance_config.get(TASK_CONFIG_KEY))
 
         def work():
             return self._run_create(record, payload, start, bootstrap, remember_params,
@@ -956,7 +971,7 @@ class ContainerService:
     # can still find out how it ended.
     CREATE_RETENTION = 600
 
-    def _begin_create(self, name, image, instance_type, template, module_count):
+    def _begin_create(self, name, image, instance_type, template, module_count, task=None):
         """Record a create before it starts, so every client can follow it.
 
         Only one create per name runs at a time; a second is refused here,
@@ -972,7 +987,7 @@ class ContainerService:
                 raise ServiceError("'%s' is already being created." % name, 409)
             record = {
                 "name": name, "image": image, "type": instance_type,
-                "template": template, "modules": module_count,
+                "template": template, "task": task, "modules": module_count,
                 "stage": "creating", "started_at": now, "finished_at": None,
                 "ok": None, "error": None, "failed_module": None, "error_detail": None,
             }
@@ -1018,7 +1033,8 @@ class ContainerService:
         with self._creates_lock:
             creates = ["create of '%s' (%s)" % (r["name"], r["stage"])
                        for r in self._creates.values()
-                       if r["finished_at"] is None and not r["template"]]
+                       if r["finished_at"] is None and not r["template"]
+                       and not r.get("task")]
         return runs + creates
 
     # -- health ------------------------------------------------------------
@@ -2648,29 +2664,19 @@ class ContainerService:
         """
         config = {TEMPLATE_CONFIG_KEY: template["name"],
                   TEMPLATE_REVISION_KEY: self._revision_of("template", template["name"])}
-        if stack:
-            config[STACK_CONFIG_KEY] = stack
+        member = self.stack_tag(stack)
+        if member:
+            config[STACK_CONFIG_KEY] = member["stack"]
             config[STACK_REVISION_KEY] = stack_rev if stack_rev is not None \
-                else self._revision_of("stack", stack)
+                else self._revision_of("stack", member["stack"])
+            if member["step"]:
+                config[STACK_STEP_CONFIG_KEY] = member["step"]
+            if member["swarm"]:
+                config[SWARM_CONFIG_KEY] = member["swarm"]
+                if member["run"]:
+                    config[SWARM_RUN_CONFIG_KEY] = member["run"]
         try:
-            source = template.get("snapshot")
-            container = self.create_container(
-                name=instance_name, image=template["image"],
-                source_snapshot="%s/%s" % (source["instance"], source["name"])
-                if source else None,
-                instance_type=template["type"],
-                profiles=template["profiles"] or None,
-                cpu=template["cpu"] or None, memory=template["memory"] or None,
-                disk=template["disk"] or None, pool=template["pool"] or None,
-                network=template["network"] or None,
-                fabric=template.get("fabric") or None,
-                ephemeral=template["ephemeral"], start=template["start"],
-                secureboot=template["secureboot"],
-                config=config, bootstrap=bootstrap,
-                # A template launches its own values; it should not quietly
-                # rewrite the module settings the create form starts from.
-                remember_params=False,
-            )
+            container = self.create_from_template(template, instance_name, config, bootstrap)
         except (ServiceError, LXDError, BootstrapError) as exc:
             return {"name": instance_name, "ok": False, "error": str(exc),
                     "container": None}
@@ -2681,6 +2687,32 @@ class ContainerService:
         result = container.get("bootstrap")
         return {"name": instance_name, "ok": result is None or result["ok"],
                 "error": None, "container": container}
+
+    def create_from_template(self, template, instance_name, config, bootstrap=None):
+        """Create one instance as a (placed) template describes it; raises on failure.
+
+        ``config`` is every lemondx key the instance carries -- which tags it
+        gets is the caller's business, since a task's instance must not wear
+        its template's.
+        """
+        source = template.get("snapshot")
+        return self.create_container(
+            name=instance_name, image=template["image"],
+            source_snapshot="%s/%s" % (source["instance"], source["name"])
+            if source else None,
+            instance_type=template["type"],
+            profiles=template["profiles"] or None,
+            cpu=template["cpu"] or None, memory=template["memory"] or None,
+            disk=template["disk"] or None, pool=template["pool"] or None,
+            network=template["network"] or None,
+            fabric=template.get("fabric") or None,
+            ephemeral=template["ephemeral"], start=template["start"],
+            secureboot=template["secureboot"],
+            config=config, bootstrap=bootstrap,
+            # A template launches its own values; it should not quietly
+            # rewrite the module settings the create form starts from.
+            remember_params=False,
+        )
 
     def _remove_instance(self, instance_name):
         """Stop and delete one instance; reported rather than raised."""
@@ -2794,10 +2826,31 @@ class ContainerService:
                               notes=notes)
 
     def stack_tag(self, stack):
-        """The stack a launch belongs to, as it will be tagged, or None."""
+        """The stack a launch belongs to, as it will be tagged, or None.
+
+        ``{"stack", "step", "swarm", "run"}``: a bare name is taken as a stack
+        with no step, which is what a launch from before steps were tagged sends.
+        """
         if stack in (None, ""):
             return None
-        return self._record_name(str(stack), "stack")
+        if isinstance(stack, dict):
+            name, step, swarm = stack.get("stack"), stack.get("step"), stack.get("swarm")
+            run = stack.get("run")
+        else:
+            name, step, swarm, run = stack, None, None, None
+        if not name:
+            return None
+        step = str(step or "").strip() or None
+        swarm = str(swarm or "").strip() or None
+        run = str(run or "").strip() or None
+        if run and not re.match(r"^[0-9a-f]{8,32}$", run):
+            raise ServiceError("Invalid swarm run '%s'." % run)
+        if step and not re.match(r"^[a-z][a-z0-9_]{0,31}$", step):
+            raise ServiceError("Invalid stack step '%s'." % step)
+        if swarm and not re.match(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$", swarm):
+            raise ServiceError("Invalid swarm '%s'." % swarm)
+        return {"stack": self._record_name(str(name), "stack"), "step": step, "swarm": swarm,
+                "run": run if swarm else None}
 
     def template_instances(self, name, stale=False):
         """Names of the instances launched from template ``name``, sorted.
@@ -2874,7 +2927,12 @@ class ContainerService:
         notes = source_notes + notes
         # A recreated instance stays in the stack it was launched by, at the
         # stack revision it had: recreating applies the template, not the stack.
-        stacks = {c["name"]: (c["stack"], c["revisions"]["stack"])
+        # Its step and swarm too: they are how a swarm finds the stack's
+        # addresses later, and how a swarm's teardown finds its own.
+        stacks = {c["name"]: ({"stack": c["stack"], "step": c.get("stack_step"),
+                               "swarm": c.get("swarm"), "run": c.get("swarm_run")}
+                              if c["stack"] else None,
+                              c["revisions"]["stack"])
                   for c in self.list_containers()}
 
         def replace(instance_name):
@@ -4301,6 +4359,11 @@ def _log(message, level=None):
 
 # A failed module keeps this much of its output in a run record, for the UI.
 RUN_OUTPUT_TAIL = 4 * 1024
+# What a module that succeeded keeps: its last few lines, which is where a
+# module reports what it did -- and where a swarm's load generator reports its
+# result, which would otherwise be gone with the instance.
+RUN_SUMMARY_LINES = 3
+RUN_SUMMARY_BYTES = 300
 
 
 def _run_record(result):
@@ -4309,7 +4372,8 @@ def _run_record(result):
     Every open page re-fetches run records every few seconds for as long as
     the server runs, and a full launch result carries each instance's detail
     and every module's output -- megabytes for twenty instances installing
-    packages. The caller that waited for the run still gets all of it.
+    packages. So a failed module keeps a tail and one that succeeded only its
+    last lines. The caller that waited for the run still gets all of it.
     """
     if not result:
         return result
@@ -4327,13 +4391,20 @@ def _run_record(result):
                     "ok": bootstrap["ok"],
                     "modules": [dict(
                         {k: m.get(k) for k in ("id", "name", "exit_code", "duration")},
-                        stdout=(m.get("stdout") or "")[-RUN_OUTPUT_TAIL:] if m["exit_code"] else "",
+                        stdout=(m.get("stdout") or "")[-RUN_OUTPUT_TAIL:] if m["exit_code"]
+                        else _summary(m.get("stdout")),
                         stderr=(m.get("stderr") or "")[-RUN_OUTPUT_TAIL:] if m["exit_code"] else "",
                     ) for m in bootstrap["modules"]],
                 },
             }
         instances.append(dict(entry, container=container))
     return dict(result, instances=instances)
+
+
+def _summary(output):
+    """The last few lines of a successful module's output, kept small."""
+    lines = [line for line in (output or "").splitlines() if line.strip()]
+    return "\n".join(lines[-RUN_SUMMARY_LINES:])[-RUN_SUMMARY_BYTES:]
 
 
 def _network_read_only_reason(network, clustered):
@@ -4637,6 +4708,11 @@ def _summarize(instance):
         "snapshot_count": len(instance.get("snapshots") or []),
         "template": config.get(TEMPLATE_CONFIG_KEY) or None,
         "stack": config.get(STACK_CONFIG_KEY) or None,
+        "stack_step": config.get(STACK_CONFIG_KEY) and config.get(STACK_STEP_CONFIG_KEY) or None,
+        "swarm": config.get(STACK_CONFIG_KEY) and config.get(SWARM_CONFIG_KEY) or None,
+        "swarm_run": config.get(STACK_CONFIG_KEY) and config.get(SWARM_RUN_CONFIG_KEY) or None,
+        "task": config.get(TASK_CONFIG_KEY) or None,
+        "task_run": config.get(TASK_CONFIG_KEY) and config.get(TASK_RUN_CONFIG_KEY) or None,
         "origin": _origin(config),
         "revisions": {"template": config.get(TEMPLATE_REVISION_KEY) or "",
                       "stack": config.get(STACK_REVISION_KEY) or ""},
@@ -4655,8 +4731,12 @@ def template_revision(record):
 
 
 def stack_revision(record):
-    """A digest of a stack's stages. Any step can feed another, so it is one revision."""
-    return _revision(record, ("name", "description"))
+    """A digest of a stack's stages. Any step can feed another, so it is one revision.
+
+    Not its swarms: a load test is edited far more often than what it tests,
+    and changing one must not mark the stack's own instances stale.
+    """
+    return _revision(record, ("name", "description", "swarms"))
 
 
 def instance_prefix(name):

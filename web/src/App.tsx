@@ -9,8 +9,8 @@ import { keyOf } from './lib/instance'
 import { AuthContext } from './hooks/useAuth'
 import { useScope, scopeTargets } from './hooks/useScope'
 import { useTheme } from './hooks/useTheme'
-import { useToasts } from './hooks/useToasts'
-import type { ToastKind } from './hooks/useToasts'
+import { useNotices, useToasts } from './hooks/useToasts'
+import type { Notice, ToastKind } from './hooks/useToasts'
 import { AccessView } from './components/AccessView'
 import { AppCheckDialog } from './components/AppCheckDialog'
 import { ConfigureNodeDialog } from './components/ConfigureNodeDialog'
@@ -20,7 +20,7 @@ import { ContainerTable } from './components/ContainerTable'
 import { CreateDialog } from './components/CreateDialog'
 import {
   BoxIcon, DatabaseIcon, HelpIcon, HomeIcon, LayersIcon, MenuIcon, MoonIcon, NetworkIcon, PlusIcon, PuzzleIcon,
-  LogsIcon, PulseIcon, RefreshIcon, ServerIcon, ShieldIcon, StackIcon, SunIcon, TemplateIcon,
+  ClockIcon, LogsIcon, PulseIcon, RefreshIcon, ServerIcon, ShieldIcon, StackIcon, SunIcon, TemplateIcon,
 } from './components/Icons'
 import { ImagesView } from './components/ImagesView'
 import { ModulesView } from './components/ModulesView'
@@ -32,6 +32,7 @@ import { HomeView } from './components/HomeView'
 import { ScopePicker } from './components/ScopePicker'
 import { SetupBanner } from './components/SetupBanner'
 import { StacksView } from './components/StacksView'
+import { TasksView } from './components/TasksView'
 import { StorageView } from './components/StorageView'
 import { LoginGate } from './components/LoginGate'
 import { TemplatesView } from './components/TemplatesView'
@@ -40,7 +41,7 @@ import { Toasts } from './components/Toasts'
 
 const POLL_INTERVAL = 3000
 
-type View = 'home' | 'containers' | 'templates' | 'stacks' | 'images' | 'cluster' | 'storage'
+type View = 'home' | 'containers' | 'templates' | 'stacks' | 'tasks' | 'images' | 'cluster' | 'storage'
   | 'network' | 'modules' | 'access' | 'logs' | 'monitor'
 
 // Grouped by what a person comes to do: run things, or look after the hosts
@@ -60,7 +61,7 @@ const NAV: {
   { label: 'Workloads',
     help: {
       intro: 'Everything here ends in containers, and each part builds on the one before it.',
-      order: ['images', 'modules', 'templates', 'stacks', 'containers'],
+      order: ['images', 'modules', 'templates', 'stacks', 'tasks', 'containers'],
       chain: true,
     },
     items: [
@@ -73,6 +74,10 @@ const NAV: {
       { id: 'stacks', label: 'Stacks', icon: <StackIcon size={16} />,
         about: 'Templates run in stages, so a database is up before the app that needs it. '
           + 'Each step can hand its addresses and values to the next.' },
+      { id: 'tasks', label: 'Tasks', icon: <ClockIcon size={16} />,
+        about: 'Modules run in a throwaway container on a schedule or when invoked with '
+          + 'inputs. The cluster decides which node runs each one; the container is '
+          + 'destroyed when the run ends.' },
       { id: 'images', label: 'Images', icon: <LayersIcon size={16} />,
         about: 'What containers are made from: images on each node, and snapshots that can '
           + 'become one. Copy an image to other nodes so templates launch it there.' },
@@ -224,8 +229,8 @@ export default function App() {
         continue
       }
       if (!watchedCreates.current.delete(record.name)) continue
-      // Template runs report as a whole, below.
-      if (record.template) continue
+      // Template runs report as a whole, below; a task's create is its run's.
+      if (record.template || record.task) continue
       if (record.error) {
         notify('error', `Could not create ${record.name}`, record.error)
       } else if (record.ok === false) {
@@ -644,6 +649,21 @@ export default function App() {
   const canWrite = !principal || principal.role === 'admin'
   const running = containers?.filter((c) => c.status === 'Running').length ?? 0
 
+  // Conditions worth knowing about wherever you are, in the corner on every
+  // tab. One that Home already shows as a banner is left off there.
+  const notices: Notice[] = []
+  if (localMaintenance && view !== 'home') {
+    notices.push({
+      key: `maintenance:${localMaintenance.since}`,
+      kind: 'warn',
+      title: `${localNode || 'This node'} is in maintenance`,
+      detail: 'No new instances or fabric changes here'
+        + (localMaintenance.reason ? ` — ${localMaintenance.reason}` : '') + '.',
+      action: view === 'cluster' ? undefined : { label: 'Cluster tab', onClick: () => setView('cluster') },
+    })
+  }
+  const { visible: shownNotices, close: closeNotices } = useNotices(notices)
+
   return (
     <AuthContext.Provider value={authInfo}>
     <div className="app">
@@ -771,7 +791,7 @@ export default function App() {
           </div>
         )}
 
-        {localMaintenance && (
+        {localMaintenance && view === 'home' && (
           <div className="banner banner-warn">
             <div className="banner-body">
               <h3>{localNode || 'This node'} is in maintenance</h3>
@@ -884,6 +904,8 @@ export default function App() {
             onOpen={openInstance}
             onChanged={() => refresh()}
           />
+        ) : view === 'tasks' ? (
+          <TasksView localNode={localNode} onNotify={notify} />
         ) : view === 'storage' ? (
           <>
             <div className="section-head">
@@ -1086,7 +1108,7 @@ export default function App() {
         </Modal>
       ))}
 
-      <Toasts toasts={toasts} onDismiss={dismiss} />
+      <Toasts toasts={toasts} onDismiss={dismiss} notices={shownNotices} onCloseNotices={closeNotices} />
     </div>
     </AuthContext.Provider>
   )

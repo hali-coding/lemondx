@@ -8,6 +8,7 @@ import logging
 import mimetypes
 import os
 import re
+import signal
 import socket
 import ssl
 import sys
@@ -28,6 +29,7 @@ from .nodesetup import DEFAULT_HOST, DEFAULT_PORT, NodeSetup, SetupError
 from .nodesetup import is_loopback as _is_loopback
 from .service import ContainerService, ServiceError
 from .stacks import StackService
+from .tasks import TaskService
 
 TLS_HANDSHAKE_TIMEOUT = 10
 # Long enough for the answer to a configure request to reach the browser
@@ -111,12 +113,13 @@ class Router:
         return None, [], ADMIN, False
 
 
-def build_router(service, auth=None, cluster=None, stacks=None, setup=None):
+def build_router(service, auth=None, cluster=None, stacks=None, setup=None, tasks=None):
     r = Router()
     NAME = r"([^/]+)"
     auth = auth or AuthService()
     cluster = cluster or ClusterService(service, auth)
     stacks = stacks or StackService(cluster)
+    tasks = tasks or TaskService(cluster)
     setup = setup or NodeSetup(auth)
 
     r.add("GET", r"/api/status", lambda body, q: service.status())
@@ -412,16 +415,73 @@ def build_router(service, auth=None, cluster=None, stacks=None, setup=None):
     r.add("PUT", r"/api/stacks/%s" % NAME,
           lambda body, q, who, name: stacks.save_stack(
               name, stages=body.get("stages"), description=body.get("description", ""),
-              propagate=not from_peer(who)), principal=True)
+              variables=body.get("variables"), secrets=body.get("secrets"),
+              swarms=body.get("swarms"),
+              previous=body.get("previous"), propagate=not from_peer(who)), principal=True)
+    # A stack's secrets: status for anyone who can read the stack, values set
+    # and cleared by an admin, and read back only through `reveal`, which
+    # takes the caller to confirm their password (stacks.reveal_secret()). A
+    # POST, so the password is in a body and never in a URL or a log line.
+    r.add("GET", r"/api/stacks/%s/secrets" % NAME,
+          lambda body, q, name: stacks.secret_status(name))
+    r.add("PUT", r"/api/stacks/%s/secrets/%s" % (NAME, NAME),
+          lambda body, q, name, secret: stacks.set_secret(name, secret, body.get("value")))
+    r.add("DELETE", r"/api/stacks/%s/secrets/%s" % (NAME, NAME),
+          lambda body, q, name, secret: stacks.clear_secret(name, secret))
+    r.add("POST", r"/api/stacks/%s/secrets/%s/reveal" % (NAME, NAME),
+          lambda body, q, who, name, secret: stacks.reveal_secret(
+              name, secret, who, body.get("password")), principal=True)
+    # What a member's push of one stack's values lands on: the values whole,
+    # in the clear over the pinned connection, sealed here under this node's key.
+    r.add("PUT", r"/api/stack-secrets/%s" % NAME,
+          lambda body, q, who, name: _peers_only(who, _SYNCED % "Stack secret values")
+          or stacks.adopt_secrets(name, body), principal=True, peers=True)
     r.add("DELETE", r"/api/stacks/%s" % NAME,
           lambda body, q, who, name: stacks.delete_stack(
-              name, everywhere=_everywhere(body, q, who)), principal=True)
+              name, everywhere=_everywhere(body, q, who),
+              # A member relaying the delete destroys nothing: the person's
+              # node already has, everywhere, before it told anyone.
+              instances=None if from_peer(who) else body.get("instances")),
+          principal=True)
     # `replace` makes it a relaunch: the stack's instances as the caller
     # confirmed them are destroyed first, as part of the same run.
     r.add("POST", r"/api/stacks/%s/launch" % NAME,
           lambda body, q, name: stacks.launch_stack(
               name, params=body.get("params"), replace=body.get("replace"),
+              variables=body.get("variables"), secrets=body.get("secrets"),
               background=bool(body.get("background", False))), role=OPERATOR)
+    # A swarm: load against the running stack, started on demand, torn down
+    # however it ends. Running what exists, so an operator's -- like a launch.
+    r.add("POST", r"/api/stacks/%s/swarms/%s/start" % (NAME, NAME),
+          lambda body, q, name, swarm: stacks.launch_swarm(
+              name, swarm, counts=body.get("counts"), variables=body.get("variables"),
+              secrets=body.get("secrets"), params=body.get("params"),
+              background=bool(body.get("background", False))), role=OPERATOR)
+    # In or out of the stack's sequence: a change to the definition, so admin.
+    r.add("PUT", r"/api/stacks/%s/swarms/%s/sequence" % (NAME, NAME),
+          lambda body, q, name, swarm: stacks.set_swarm_sequence(
+              name, swarm, body.get("enabled")))
+    # Several swarms in order, as one run: each torn down before the next, and
+    # a failure ends the sequence -- a functional test gating a load test.
+    r.add("POST", r"/api/stacks/%s/swarm-sequence" % NAME,
+          lambda body, q, name: stacks.launch_swarms(
+              name, body.get("swarms"), counts=body.get("counts"),
+              variables=body.get("variables"), secrets=body.get("secrets"),
+              params=body.get("params"),
+              background=bool(body.get("background", False))), role=OPERATOR)
+    # What a launch or a swarm would do, changing nothing; problems are listed
+    # rather than refused. Asked of whoever may start one.
+    r.add("POST", r"/api/stacks/%s/preview" % NAME,
+          lambda body, q, name: stacks.preview_launch(
+              name, params=body.get("params"), variables=body.get("variables"),
+              secrets=body.get("secrets")), role=OPERATOR)
+    r.add("POST", r"/api/stacks/%s/swarms/%s/preview" % (NAME, NAME),
+          lambda body, q, name, swarm: stacks.preview_swarm(
+              name, swarm, counts=body.get("counts"), variables=body.get("variables"),
+              params=body.get("params"), secrets=body.get("secrets")), role=OPERATOR)
+    r.add("POST", r"/api/stacks/%s/swarms/%s/stop" % (NAME, NAME),
+          lambda body, q, name, swarm: stacks.stop_swarm(
+              name, swarm, body.get("instances")), role=OPERATOR)
     # What each stack is running, read from the instances' own tags on every node.
     r.add("GET", r"/api/stack-instances", lambda body, q: stacks.stack_instances())
     r.add("POST", r"/api/stacks/%s/state" % NAME,
@@ -432,10 +492,72 @@ def build_router(service, auth=None, cluster=None, stacks=None, setup=None):
               name, body.get("instances"), background=bool(body.get("background", False))),
           role=OPERATOR)
     r.add("GET", r"/api/stack-runs", lambda body, q: stacks.stack_runs())
+    # A finished run as Markdown, for keeping: a swarm's results, say.
+    r.add("GET", r"/api/stack-runs/%s/report" % NAME,
+          lambda body, q, name: stacks.run_report(name))
     r.add("POST", r"/api/stack-runs/%s/cancel" % NAME,
           lambda body, q, name: stacks.cancel_stack_run(name), role=OPERATOR)
     r.add("DELETE", r"/api/stack-runs/%s" % NAME,
           lambda body, q, name: stacks.dismiss_stack_run(name), role=OPERATOR)
+
+    # Tasks: job modules in a throwaway instance, on a schedule or invoked --
+    # see tasks.py. Definitions are kept level like stacks; a run lives on the
+    # node that won it, and the list asks every member.
+    r.add("GET", r"/api/tasks", lambda body, q: tasks.list_tasks())
+    r.add("GET", r"/api/tasks/%s" % NAME, lambda body, q, name: tasks.get_task(name))
+    r.add("PUT", r"/api/tasks/%s" % NAME,
+          lambda body, q, who, name: tasks.save_task(
+              name, template=body.get("template"), bootstrap=body.get("bootstrap"),
+              script=body.get("script"),
+              description=body.get("description", ""), schedule=body.get("schedule"),
+              nodes=body.get("nodes"), groups=body.get("groups"),
+              timeout_seconds=body.get("timeout_seconds"), overlap=body.get("overlap"),
+              inputs=body.get("inputs"), secrets=body.get("secrets"),
+              enabled=body.get("enabled", True), previous=body.get("previous"),
+              propagate=not from_peer(who)), principal=True)
+    r.add("DELETE", r"/api/tasks/%s" % NAME,
+          lambda body, q, who, name: tasks.delete_task(
+              name, everywhere=_everywhere(body, q, who), relayed=from_peer(who)),
+          principal=True)
+    # Pausing a schedule edits the definition, so an admin's.
+    r.add("PUT", r"/api/tasks/%s/enabled" % NAME,
+          lambda body, q, name: tasks.set_enabled(name, body.get("enabled")))
+    # Running what exists, so an operator's. `inputs` are the run's values,
+    # `payload` a message handed to it as a file. `here` is a member's
+    # forward of a node already chosen, believed only from a member.
+    r.add("POST", r"/api/tasks/%s/invoke" % NAME,
+          lambda body, q, who, name: tasks.invoke(
+              name, inputs=body.get("inputs"), payload=body.get("payload"),
+              node=body.get("node"), wait=bool(body.get("wait")),
+              here=bool(body.get("here")) and from_peer(who)),
+          role=OPERATOR, principal=True)
+    r.add("GET", r"/api/tasks/%s/secrets" % NAME,
+          lambda body, q, name: tasks.secret_status(name))
+    r.add("PUT", r"/api/tasks/%s/secrets/%s" % (NAME, NAME),
+          lambda body, q, name, secret: tasks.set_secret(name, secret, body.get("value")))
+    r.add("DELETE", r"/api/tasks/%s/secrets/%s" % (NAME, NAME),
+          lambda body, q, name, secret: tasks.clear_secret(name, secret))
+    r.add("PUT", r"/api/task-secrets/%s" % NAME,
+          lambda body, q, who, name: _peers_only(who, _SYNCED % "Task secret values")
+          or tasks.adopt_secrets(name, body), principal=True, peers=True)
+    # A member's vote on who runs one scheduled occurrence, and handing one
+    # back. Members only: a person granting occurrences would be choosing
+    # where -- and whether -- a task runs behind the cluster's back.
+    r.add("POST", r"/api/task-grants",
+          lambda body, q, who: _peers_only(who, _VOTED) or tasks.grant(body),
+          principal=True, peers=True)
+    r.add("POST", r"/api/task-grants/release",
+          lambda body, q, who: _peers_only(who, _VOTED) or tasks.release_grant(body),
+          principal=True, peers=True)
+    r.add("GET", r"/api/task-runs",
+          lambda body, q: tasks.runs(task=q.get("task") or None, local=_flag(q.get("local")),
+                                     live=_flag(q.get("live")), detail=_flag(q.get("detail"))))
+    r.add("GET", r"/api/task-runs/%s" % NAME, lambda body, q, run: tasks.run(run))
+    r.add("POST", r"/api/task-runs/%s/cancel" % NAME,
+          lambda body, q, run: tasks.cancel_run(run), role=OPERATOR)
+    r.add("GET", r"/api/cron",
+          lambda body, q: tasks.preview_schedule(q.get("expr", ""), q.get("tz") or "UTC",
+                                                 q.get("count") or 5))
 
     r.add("GET", r"/api/ssh-keys", lambda body, q: service.list_ssh_keys())
     # Parses a key the caller pasted; changes nothing.
@@ -1305,6 +1427,9 @@ _COMPARED = ("Only a cluster member compares what this node holds. Run `lemondx 
              "rest; what the last pass found is on the Cluster tab and at "
              "GET /api/cluster/drift.")
 
+_VOTED = ("Only a cluster member votes on who runs a task's occurrence. Invoke the "
+          "task (POST /api/tasks/{name}/invoke) to run it now.")
+
 _FABRIC_CLAIM = ("Only a cluster member hands out or takes back a fabric subnet. "
                  "Create or delete the fabric with /api/fabrics, which does it "
                  "for every node.")
@@ -1483,10 +1608,12 @@ def make_server(host=DEFAULT_HOST, port=DEFAULT_PORT, service=None, token=None,
     auth = auth or AuthService(AuthConfig(static_token=token))
     cluster = cluster or ClusterService(service, auth)
     stacks = StackService(cluster)
+    tasks = TaskService(cluster)
     handler = type("BoundHandler", (LemondxHandler,), {
-        "router": build_router(service, auth, cluster, stacks, setup),
+        "router": build_router(service, auth, cluster, stacks, setup, tasks),
         "service": service,
         "stacks": stacks,
+        "tasks": tasks,
         "auth": auth,
         "cluster": cluster,
         "web_root": os.path.realpath(web_root) if web_root else None,
@@ -1628,6 +1755,15 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
 
     service.start_metrics()
 
+    tasks = getattr(httpd.RequestHandlerClass, "tasks", None)
+    if tasks is not None:
+        # Every node schedules every task it may run; the vote decides which
+        # one does (tasks.py). Also sweeps task instances a crash left behind.
+        tasks.start()
+        scheduled = [t for t in tasks.list_tasks() if t["enabled"] and t["schedule"]]
+        if scheduled:
+            print("Tasks: %d scheduled" % len(scheduled))
+
     if open_browser:
         threading.Timer(0.5, _open, args=(url,)).start()
 
@@ -1641,15 +1777,36 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
         threading.Timer(RESTART_DELAY, httpd.shutdown).start()
     setup.restart = request_restart
     setup.busy = lambda: service.pending_work() + \
-        (stacks.pending_work() if stacks else []) + cluster.pending_work()
+        (stacks.pending_work() if stacks else []) + cluster.pending_work() + \
+        (tasks.pending_work() if tasks else [])
 
     with eventlog.system("serve"):
         eventlog.event("system", "serve.start", level=eventlog.NOTICE, url=url,
                        tls=tls is not None, auth=auth.config.enabled)
+
+    def terminated(signum, frame):
+        raise _Terminated()
+    # SIGTERM is how a service manager stops serve, and by default it ends
+    # the process on the spot -- nothing in `finally` runs.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, terminated)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        _wait_for_background_work(service, stacks, cluster)
+        _wait_for_background_work(service, stacks, cluster, tasks)
+        print("Shutting down.")
+    except _Terminated:
+        # Not waited out like Ctrl-C -- a service manager kills what overstays
+        # -- but a swarm is ended properly: its teardown is quick, and skipped
+        # it leaves load generators running against a stack with nobody to stop
+        # them. A task run likewise: its instance exists for the run alone.
+        # Anything else still running is left, and said.
+        _stop_swarms(stacks)
+        _stop_tasks(tasks)
+        left = service.pending_work() + (stacks.pending_work() if stacks else []) + \
+            cluster.pending_work()
+        if left:
+            print("Stopping with work unfinished: %s." % "; ".join(left))
         print("Shutting down.")
     finally:
         with eventlog.system("serve"):
@@ -1660,7 +1817,50 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT, token=None, dev=False, quiet=Fal
         store.clear_runtime()
         httpd.server_close()
     if restart.is_set():
+        _stop_swarms(stacks)
+        _stop_tasks(tasks)
         _reexec()
+
+
+class _Terminated(Exception):
+    """SIGTERM, raised in the main thread so `serve` stops through its `finally`."""
+
+
+# How long a stopping serve gives a swarm's teardown: inside a service
+# manager's usual stop timeout (systemd's is 90s).
+SWARM_STOP_GRACE = 60
+
+
+def _stop_swarms(stacks):
+    """Stop every swarm running here and wait, a while, for each to tear down."""
+    if stacks is None:
+        return
+    stopping = stacks.stop_swarms()
+    if not stopping:
+        return
+    print("Stopping swarm(s) %s and destroying their instances." % ", ".join(stopping),
+          flush=True)
+    deadline = time.monotonic() + SWARM_STOP_GRACE
+    while time.monotonic() < deadline and any(
+            r["action"] == "swarm" and r["finished_at"] is None for r in stacks.stack_runs()):
+        time.sleep(1)
+
+
+# A task run's teardown is one instance delete; this is plenty.
+TASK_STOP_GRACE = 20
+
+
+def _stop_tasks(tasks):
+    """Cancel every task run in this process and wait, briefly, for their teardown."""
+    if tasks is None:
+        return
+    stopping = tasks.cancel_all()
+    if not stopping:
+        return
+    print("Stopping %d task run(s) and destroying their instances." % len(stopping), flush=True)
+    deadline = time.monotonic() + TASK_STOP_GRACE
+    while time.monotonic() < deadline and tasks.pending_work():
+        time.sleep(0.5)
 
 
 def _reexec():
@@ -1681,7 +1881,7 @@ def _reexec():
                          "`lemondx serve` again to apply it." % exc)
 
 
-def _wait_for_background_work(service, stacks=None, cluster=None):
+def _wait_for_background_work(service, stacks=None, cluster=None, tasks=None):
     """Give creates, template runs, stacks and image copies the chance to finish.
 
     They run on threads the process takes down with it, and stopping one
@@ -1694,7 +1894,8 @@ def _wait_for_background_work(service, stacks=None, cluster=None):
     def pending():
         return (service.pending_work() if service else []) + \
             (stacks.pending_work() if stacks else []) + \
-            (cluster.pending_work() if cluster else [])
+            (cluster.pending_work() if cluster else []) + \
+            (tasks.pending_work() if tasks else [])
     if not pending():
         return
     print("\nStill running: %s." % "; ".join(pending()))

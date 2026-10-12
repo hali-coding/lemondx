@@ -207,6 +207,8 @@ class Collector:
             "processes": (c.get("processes") or 0) if running else 0,
             "cpu": cpu, "rx_rate": rx_rate, "tx_rate": tx_rate,
             "template": c.get("template"), "stack": c.get("stack"),
+            # Which step of it, or which swarm: what the instance is for.
+            "stack_step": c.get("stack_step"), "swarm": c.get("swarm"),
             "stale": c.get("stale") or [],
             "health": (health or {}).get("status") if running else None,
             "app": app.get("status") if running else None,
@@ -270,6 +272,7 @@ def _run_summary(run, node, now):
     finished = run.get("finished_at")
     return {
         "stack": run.get("stack") or "", "node": node, "action": run.get("action") or "launch",
+        "swarm": run.get("swarm"), "swarms": list(run.get("swarms") or []),
         "started_at": started, "finished_at": finished, "ok": run.get("ok"),
         "cancelling": bool(run.get("cancelling")), "cancelled": bool(run.get("cancelled")),
         "error": run.get("error"), "stages": stages, "active": "; ".join(active),
@@ -291,7 +294,14 @@ def _stacks(instances, runs, now, defined=()):
             entry["run"] = run
     stacks = []
     for name in sorted(found, key=_natural):
-        members, run = found[name]["members"], found[name]["run"]
+        everything, run = found[name]["members"], found[name]["run"]
+        # The stack's own, apart from its swarms' load generators: "3/3 up"
+        # is about the deployment, and the load is counted beside it.
+        members = [m for m in everything if not m.get("swarm")]
+        swarms = {}
+        for m in everything:
+            if m.get("swarm"):
+                swarms[m["swarm"]] = swarms.get(m["swarm"], 0) + 1
         up = [m for m in members if m["status"] == "Running"]
         stacks.append({
             "name": name, "defined": name in defined,
@@ -300,8 +310,9 @@ def _stacks(instances, runs, now, defined=()):
             # What a stop, destroy or relaunch confirms: the service refuses
             # if the tagged set has moved on from this.
             "members": [{"node": m["node"], "name": m["name"], "status": m["status"]}
-                        for m in sorted(members, key=lambda m: (_natural(m["name"]),
-                                                                 m["node"]))],
+                        for m in sorted(everything, key=lambda m: (_natural(m["name"]),
+                                                                    m["node"]))],
+            "swarms": swarms,
             "healthy": sum(1 for m in up if m["health"] == "healthy"
                            and m["app"] in (None, "ok")),
             "unhealthy": sum(1 for m in up if m["health"] in ("unhealthy", "degraded")
@@ -763,7 +774,12 @@ def _stacks_box(snap, view, width, height):
                      and stack["instances"] else ORANGE if stack["running"] else DIM),
                     (" ", "")]
         if run is not None:
-            segments.append((run["action"] + " ", DIM))
+            sequence = run.get("swarms") or []
+            # Which swarm of a sequence it is on: the one tab shows the rest.
+            at = (" %d/%d" % (sequence.index(run["swarm"]) + 1, len(sequence))
+                  if len(sequence) > 1 and run.get("swarm") in sequence else "")
+            segments.append(("swarm %s%s " % (run["swarm"], at), ORANGE) if run.get("swarm")
+                            and run["action"] == "swarm" else (run["action"] + " ", DIM))
             for state in run["stages"]:
                 segments.append(("◐", YELLOW) if state == "running" else STAGE[state])
             if active:
@@ -784,6 +800,12 @@ def _stacks_box(snap, view, width, height):
                 segments.append(("  on %s" % ", ".join(stack["nodes"]), DIM))
             if not stack["instances"] and not stack["run"]:
                 segments.append(("not running", FAINT))
+        # Load generators on the stack: a swarm's, live or left behind by one
+        # that never got to tear down.
+        for swarm, count in sorted(stack.get("swarms", {}).items()):
+            live = active and run.get("swarm") == swarm
+            segments.append(("  ⚡%s ×%d%s" % (swarm, count, "" if live else " left"),
+                             ORANGE if live else RED))
         lines.append((segments, SELECTED if focused and stack["name"] == view.picked["stacks"]
                        else None))
     return _box(title, lines, inner + 2, height, _panel_footer(stacks, shown))
@@ -833,9 +855,12 @@ def _templates_box(snap, view, width, height):
                     (_cut(count, 9), GREEN if t["running"] == t["instances"] and t["instances"]
                      else ORANGE if t["running"] else DIM), (" ", "")]
         if active:
+            # Where the instances are going -- the node holding the run is only
+            # the one that coordinated a launch spread over others.
+            where = ", ".join(run["nodes"]) or run["node"]
             segments += [("%s " % run["action"], DIM),
-                         ("%d on %s" % (run["count"], run["node"]) if run["count"]
-                          else "on %s" % run["node"], CYAN),
+                         ("%d on %s" % (run["count"], where) if run["count"]
+                          else "on %s" % where, CYAN),
                          (" %s" % _duration(run["elapsed"]), DIM)]
         elif run is not None and run["ok"]:
             segments += [("%s " % run["action"], DIM), ("done", GREEN),
@@ -861,7 +886,7 @@ COLUMNS = (
     ("app", "APP", "<", 5, 4), ("cpu", "CPU%", ">", 1, 6), ("mem", "MEM", ">", 2, 6),
     ("rx", "NET↓", ">", 6, 8), ("tx", "NET↑", ">", 6, 8), ("proc", "PROC", ">", 7, 5),
     ("ipv4", "IPV4", "<", 3, 18), ("template", "TEMPLATE", "<", 4, 16),
-    ("stack", "STACK", "<", 4, 14),
+    ("stack", "STACK", "<", 4, 22),
 )
 
 
@@ -885,7 +910,11 @@ def _cells(row):
         "ipv4": (ipv4, CYAN if row["ipv4"] else FAINT),
         "template": (row["template"] or "-", ORANGE if row["stale"] else
                      "" if row["template"] else FAINT),
-        "stack": (row["stack"] or "-", LEMON if row["stack"] else FAINT),
+        # stack·step for what the stack launched, stack ⚡swarm for load.
+        "stack": ((row["stack"] + (" ⚡%s" % row["swarm"] if row.get("swarm")
+                                   else "·%s" % row["stack_step"] if row.get("stack_step")
+                                   else "")) if row["stack"] else "-",
+                  ORANGE if row.get("swarm") else LEMON if row["stack"] else FAINT),
     }
 
 

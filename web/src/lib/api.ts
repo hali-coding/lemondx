@@ -11,7 +11,8 @@ import type {
   InstanceTemplate, NetworkRequest, NetworkSummary, SubnetInUse, Resources, SetupResult, Snapshot, SshKey,
   StateAction, Status, StorageOverview, StoragePoolDetail, StoragePoolRequest,
   StorageVolume, StorageVolumeRequest, TemplateRequest, TemplateRun,
-  SavedStack, Stack, StackInstances, StackRun, StackStage, BulkStateResult as StackStateResult,
+  SavedStack, Stack, StackInstances, StackRun, StackSecret, StackSecretDeclaration, StackStage,
+  StackRunReport, StackSwarm, StackVariable, BulkStateResult as StackStateResult,
   FabricStatus,
   FabricPlan,
   FabricApplyResult,
@@ -26,6 +27,7 @@ import type {
   NodeSetupState,
   ConfigureNodeRequest,
   ConfigureNodeResult,
+  CronPreview, SavedTask, Task, TaskRequest, TaskRun, TaskRuns,
 } from './types'
 
 /** Error carrying the HTTP status so callers can react to 401/409 specifically. */
@@ -146,6 +148,20 @@ function on(node: string | undefined, path: string) {
 }
 
 /** The requests behind the create and edit dialogs; see `ApiCall`. */
+/** What starting a swarm takes; all optional. Counts are per launch step, up to 200. */
+export interface SwarmStart {
+  counts?: Record<string, number>
+  variables?: Record<string, string>
+  secrets?: Record<string, string>
+  params?: Record<string, string>
+}
+
+/** Several swarms in order, as one run; `counts` is per swarm, then per step. */
+export interface SwarmSequenceStart extends Omit<SwarmStart, 'counts'> {
+  swarms: string[]
+  counts?: Record<string, Record<string, number>>
+}
+
 export const calls = {
   /**
    * The UI asks for `background` so the create outlives the page that started
@@ -231,10 +247,24 @@ export const calls = {
     ({ method: 'POST', path: `/templates/${seg(name)}/recreate`,
        body: { instances, params, background: true, ...(stale ? { stale: true } : {}) } }),
 
+  /**
+   * `variables` overrides the stack's for this launch only; `secrets` gives
+   * values for stack secrets that hold none yet, which are then kept.
+   */
+  startSwarm: (stack: string, swarm: string, body: SwarmStart): ApiCall =>
+    ({ method: 'POST', path: `/stacks/${seg(stack)}/swarms/${seg(swarm)}/start`,
+       body: { ...body, background: true } }),
+  startSwarmSequence: (stack: string, body: SwarmSequenceStart): ApiCall =>
+    ({ method: 'POST', path: `/stacks/${seg(stack)}/swarm-sequence`,
+       body: { ...body, background: true } }),
+
   launchStack: (name: string, params: Record<string, string>,
-                replace?: InstanceRef[]): ApiCall =>
+                replace?: InstanceRef[], variables?: Record<string, string>,
+                secrets?: Record<string, string>): ApiCall =>
     ({ method: 'POST', path: `/stacks/${seg(name)}/launch`,
-       body: { params, replace, background: true } }),
+       body: { params, replace, background: true,
+         ...(variables && Object.keys(variables).length ? { variables } : {}),
+         ...(secrets && Object.keys(secrets).length ? { secrets } : {}) } }),
 
   createApiToken: (body: { name: string; role: Role; expires_days: number | null }): ApiCall =>
     ({ method: 'POST', path: '/auth/tokens', body }),
@@ -272,6 +302,13 @@ export const calls = {
   }): ApiCall => ({ method: 'POST', path: '/cluster/sync', body }),
 
   /** Asked of the node itself: only its own word counts for its record. */
+  saveTask: (name: string, body: TaskRequest): ApiCall =>
+    ({ method: 'PUT', path: `/tasks/${seg(name)}`, body }),
+  invokeTask: (name: string, inputs: Record<string, string>, payload?: unknown,
+    node?: string): ApiCall =>
+    ({ method: 'POST', path: `/tasks/${seg(name)}/invoke`,
+      body: { inputs, ...(payload === undefined ? {} : { payload }), ...(node ? { node } : {}) },
+      secrets: [] }),
   setMaintenance: (node: string | undefined, body: { enabled: boolean; reason?: string }):
     ApiCall => ({ method: 'PUT', path: on(node, '/cluster/maintenance'), body }),
 }
@@ -620,21 +657,68 @@ export const api = {
     request<Stack[]>('/stacks', { signal }),
 
   /** Kept level across a cluster like templates, with the templates it uses. */
-  saveStack: (name: string, body: { description: string; stages: StackStage[] }) =>
+  /** `previous`: the name this stack had, for a rename -- its secrets move with it. */
+  saveStack: (name: string, body: {
+    description: string; stages: StackStage[]
+    variables: Record<string, StackVariable>
+    secrets: Record<string, StackSecretDeclaration>
+    swarms: StackSwarm[]
+    previous?: string
+  }) =>
     request<SavedStack>(`/stacks/${encodeURIComponent(name)}`, { method: 'PUT', body }),
 
-  deleteStack: (name: string, everywhere = true) =>
-    request<Synced<{ deleted: string }>>(
-      `/stacks/${encodeURIComponent(name)}?everywhere=${everywhere}`,
+  /** Put one swarm in or out of the stack's sequence; a save of the stack (admin). */
+  setSwarmSequence: (stack: string, swarm: string, enabled: boolean) =>
+    request<SavedStack>(
+      `/stacks/${encodeURIComponent(stack)}/swarms/${encodeURIComponent(swarm)}/sequence`,
+      { method: 'PUT', body: { enabled } }),
+
+  setStackSecret: (stack: string, secret: string, value: string) =>
+    request<StackSecret & { name: string }>(
+      `/stacks/${encodeURIComponent(stack)}/secrets/${encodeURIComponent(secret)}`,
+      { method: 'PUT', body: { value } }),
+
+  clearStackSecret: (stack: string, secret: string) =>
+    request<StackSecret & { name: string }>(
+      `/stacks/${encodeURIComponent(stack)}/secrets/${encodeURIComponent(secret)}`,
       { method: 'DELETE' }),
+
+  /**
+   * A stored secret's value. Admin only; a password session must send its
+   * password again (a token is enough on its own), and every read is logged.
+   */
+  revealStackSecret: (stack: string, secret: string, password?: string) =>
+    request<{ name: string; value: string; generated: boolean; updated_at: number }>(
+      `/stacks/${encodeURIComponent(stack)}/secrets/${encodeURIComponent(secret)}/reveal`,
+      { method: 'POST', body: password ? { password } : {} }),
+
+  /**
+   * `instances`, as the person confirmed them, are destroyed first; left out,
+   * they stay, still tagged with the stack's name.
+   */
+  deleteStack: (name: string, everywhere = true, instances?: InstanceRef[]) =>
+    request<Synced<{ deleted: string; destroyed: InstanceRef[] }>>(
+      `/stacks/${encodeURIComponent(name)}?everywhere=${everywhere}`,
+      { method: 'DELETE', ...(instances ? { body: { instances } } : {}) }),
 
   /**
    * Starts a stack and returns its run record at once; follow it with
    * stackRuns(). `replace` makes it a relaunch: exactly those instances, as the
    * user confirmed them, are destroyed first.
    */
-  launchStack: (name: string, params: Record<string, string>, replace?: InstanceRef[]) =>
-    send<StackRun>(calls.launchStack(name, params, replace)),
+  launchStack: (name: string, params: Record<string, string>, replace?: InstanceRef[],
+                variables?: Record<string, string>, secrets?: Record<string, string>) =>
+    send<StackRun>(calls.launchStack(name, params, replace, variables, secrets)),
+
+  startSwarm: (stack: string, swarm: string, body: SwarmStart) =>
+    send<StackRun>(calls.startSwarm(stack, swarm, body)),
+  startSwarmSequence: (stack: string, body: SwarmSequenceStart) =>
+    send<StackRun>(calls.startSwarmSequence(stack, body)),
+
+  /** A running swarm is stopped (and torn down); otherwise `instances` it left are destroyed. */
+  stopSwarm: (stack: string, swarm: string, instances?: InstanceRef[]) =>
+    request<StackRun>(`/stacks/${encodeURIComponent(stack)}/swarms/${encodeURIComponent(swarm)}/stop`,
+      { method: 'POST', body: instances ? { instances } : {} }),
 
   /** What every stack is running, by the tags on the instances, across the cluster. */
   stackInstances: (signal?: AbortSignal) =>
@@ -653,6 +737,52 @@ export const api = {
 
   cancelStackRun: (name: string) =>
     request<StackRun>(`/stack-runs/${encodeURIComponent(name)}/cancel`, { method: 'POST' }),
+
+  /** The stack's last run, finished, as a Markdown report to save. */
+  stackRunReport: (name: string) =>
+    request<StackRunReport>(`/stack-runs/${encodeURIComponent(name)}/report`),
+
+  tasks: (signal?: AbortSignal) => request<Task[]>('/tasks', { signal }),
+
+  saveTask: (name: string, body: TaskRequest) => send<SavedTask>(calls.saveTask(name, body)),
+
+  deleteTask: (name: string, everywhere = true) =>
+    request<Synced<{ deleted: string }>>(
+      `/tasks/${encodeURIComponent(name)}?everywhere=${everywhere}`, { method: 'DELETE' }),
+
+  setTaskEnabled: (name: string, enabled: boolean) =>
+    request<SavedTask>(`/tasks/${encodeURIComponent(name)}/enabled`,
+      { method: 'PUT', body: { enabled } }),
+
+  /** Starts a run on whichever member takes it and returns its record at once. */
+  invokeTask: (name: string, inputs: Record<string, string>, payload?: unknown, node?: string) =>
+    send<TaskRun>(calls.invokeTask(name, inputs, payload, node)),
+
+  /** Every member's runs, newest first; outputs as last lines only. */
+  taskRuns: (task?: string, signal?: AbortSignal) =>
+    request<TaskRuns>(`/task-runs${task ? `?task=${encodeURIComponent(task)}` : ''}`,
+      { signal }),
+
+  /** One run with its output, from the node that ran it. */
+  taskRun: (id: string, node?: string) =>
+    request<TaskRun>(on(node, `/task-runs/${encodeURIComponent(id)}`)),
+
+  cancelTaskRun: (id: string, node?: string) =>
+    request<TaskRun>(on(node, `/task-runs/${encodeURIComponent(id)}/cancel`),
+      { method: 'POST' }),
+
+  setTaskSecret: (task: string, secret: string, value: string) =>
+    request<{ name: string }>(
+      `/tasks/${encodeURIComponent(task)}/secrets/${encodeURIComponent(secret)}`,
+      { method: 'PUT', body: { value } }),
+
+  clearTaskSecret: (task: string, secret: string) =>
+    request<{ name: string }>(
+      `/tasks/${encodeURIComponent(task)}/secrets/${encodeURIComponent(secret)}`,
+      { method: 'DELETE' }),
+
+  cronPreview: (expr: string, tz: string, signal?: AbortSignal) =>
+    request<CronPreview>(`/cron?${logQuery({ expr, tz })}`, { signal }),
 
   dismissStackRun: (name: string) =>
     request<{ dismissed: string }>(`/stack-runs/${encodeURIComponent(name)}`,

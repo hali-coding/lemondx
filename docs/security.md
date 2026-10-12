@@ -279,6 +279,67 @@ portably -- Ubuntu 25.10's sudo-rs matches arguments literally and supports
 neither wildcards nor regular expressions, while classic sudo supports both.
 See [networking.md](networking.md).
 
+## Stack script steps
+
+A stack's **Run a script** step runs a shell script on the node driving the
+stack, as the account lemondx runs as -- the only thing in lemondx that runs
+code on a host on purpose (modules run inside instances). Only an admin can
+write one, since a stack is saved by an admin; an operator can launch a stack,
+and so runs its scripts exactly as written. Stacks are synced, so a script an
+admin saves on one node can be launched from any member -- which is no more
+than federation already means (any member is an admin of every other).
+
+What keeps it contained is the account and the service unit, not lemondx: under
+the shipped systemd units the filesystem is read-only outside the data
+directory (`ProtectSystem=strict`, `ProtectHome=read-only`). The script is a
+file in a fresh directory, never an argument, and its output is kept masked of
+the stack's secrets and of every value entered at launch. Each run is logged
+with its stack, step, exit code and duration, never its text. A timeout or a
+cancel stops the script's whole process group.
+
+## Stack secrets
+
+A stack's secrets (see [Stacks](stacks.md#variables-and-secrets)) are the one
+kind of secret lemondx keeps in a form it can give back, because a launch has
+to hand the value to a module. So they get more than the `0600` the rest of
+`auth/` has:
+
+- **Encrypted at rest.** `auth/stack-secrets.json` holds each value sealed
+  under `auth/secrets.key`, a random 256-bit key made on first use, `0600`,
+  that never leaves the node. The backend is stdlib-only, which has no block
+  cipher, so this is encrypt-then-MAC built from what it does have: SHA-256 in
+  counter mode with a fresh random nonce per value, and HMAC-SHA256 over the
+  nonce and ciphertext, with separate derived keys for each. A box that fails
+  its MAC is never decrypted. What this protects is a copy of the file on its
+  own -- a backup, a data directory moved to another machine, a file attached
+  to a bug report. It does not protect against an account that can read both
+  files: the service account and root can decrypt, as they can use every other
+  credential under `auth/`.
+- **A key per node, not per cluster.** Members exchange the values in the
+  clear over the pinned TLS of a members-only route (`PUT /api/stack-secrets/…`,
+  refused to people and never relayed), exactly as the cluster credential
+  itself travels, and each seals what it receives under its own key. A key
+  derived from the cluster credential would have to re-seal every value on
+  every join, leave and rotation, and a failure half-way would lose them.
+- **Never in the open.** Not in the stack file, a listing, a run record, a
+  sync of `stacks`, the API explorer (shown as `<NAME>`), or the event log
+  (names only, and request bodies are logged through an allowlist that has
+  neither `value` nor `password`).
+- **Read back by an admin who confirms it.** Revealing one takes the `admin`
+  role *and* proof that a person is there: a password session must send its
+  password again, through the same backends and lockout as a login, because a
+  session cookie is ambient -- an unlocked browser carries it. An API token is
+  presented deliberately on every call and is enough on its own; a
+  trusted-proxy user has no password lemondx knows, and is sent to a token.
+  With auth off there is nobody to confirm, and the UI says so. A reveal
+  relayed through another node is refused, since there it would arrive under
+  the cluster credential. Every reveal is logged at warning level with who
+  and which secret.
+
+A secret handed to a module parameter its module does not declare secret is
+not redacted from that module's output; the designer and the save warn about
+it.
+
 ## Federation
 
 Federating nodes is opt-in and hand-carried: nothing is trusted for being on the

@@ -34,6 +34,12 @@ session open, `sudo loginctl enable-linger $USER` (the installer prints this
 when it applies). The unit files are in `systemd/` if you want to edit them
 before installing.
 
+Stopping or restarting the unit sends `serve` SIGTERM. A [swarm](stacks.md#swarms-load-tests-against-a-running-stack)
+it is running is stopped and its instances destroyed first (up to a minute,
+inside systemd's default 90 s stop timeout). Other work still running -- a
+template launch, a stack between stages -- is cut off, and the journal lists
+it. Ctrl-C in a terminal waits for all of it instead.
+
 ## Configuring the node
 
 Press **Configure node** in the UI: it saves an admin login, a certificate and

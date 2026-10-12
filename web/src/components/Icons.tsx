@@ -104,6 +104,25 @@ export const ChevronLeftIcon = ({ size = 15 }: Props) => (
   <svg {...base(size)}><path d="M15 6l-6 6 6 6" /></svg>
 )
 
+export const DownloadIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}><path d="M12 4v11M7 10.5l5 5 5-5M5 19.5h14" /></svg>
+)
+
+export const ChevronUpIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}><path d="M6 15l6-6 6 6" /></svg>
+)
+
+export const ChevronDownIcon = ({ size = 15 }: Props) => (
+  <svg {...base(size)}><path d="M6 9l6 6 6-6" /></svg>
+)
+
+/** Numbered rows: an order of things run one after another. */
+export const ListOrderIcon = ({ size = 13 }: Props) => (
+  <svg {...base(size)}>
+    <path d="M10 6h10M10 12h10M10 18h10M4 5h1.5v4M4 9h3M4 14.5c.5-.8 2.8-.9 2.8.6 0 1.1-2.8 2-2.8 3.4h3" />
+  </svg>
+)
+
 export const TerminalIcon = ({ size = 15 }: Props) => (
   <svg {...base(size)}>
     <path d="M5 8l4 4-4 4M12 17h7" />

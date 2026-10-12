@@ -7,6 +7,9 @@ Everything lemondx keeps between runs lives under one data directory,
     profiles/         one JSON file per bootstrap profile
     templates/        one JSON file per instance template
     stacks/           one JSON file per stack (templates launched in sequence)
+    tasks/            one JSON file per task (modules run on a schedule or when invoked)
+    task-runs/        this node's history of the task runs it ran (never synced)
+    task-grants.json  which candidate this node granted each task occurrence to
     nodes/            one JSON file per federated lemondx node
     node-groups/      one JSON file per node group
     modules/          uploaded modules
@@ -35,7 +38,7 @@ import tempfile
 import threading
 import time
 
-from . import eventlog
+from . import eventlog, secretbox
 
 # 1 kept profiles inside settings.json; 2 moved them to profiles/.
 SETTINGS_VERSION = 2
@@ -91,6 +94,18 @@ def templates_dir():
 
 def stacks_dir():
     return os.path.join(data_dir(), "stacks")
+
+
+def tasks_dir():
+    return os.path.join(data_dir(), "tasks")
+
+
+def task_runs_dir():
+    return os.path.join(data_dir(), "task-runs")
+
+
+def task_grants_path():
+    return os.path.join(data_dir(), "task-grants.json")
 
 
 def nodes_dir():
@@ -402,10 +417,20 @@ def _clean_template(stored, name):
 # shapes it -- a step it cannot make sense of is dropped, numbers are clamped --
 # and the service holds a save to the stricter rules (see stacks.py).
 
-STACK_STEP_TYPES = ("launch", "sleep", "wait_healthy")
+STACK_STEP_TYPES = ("launch", "sleep", "wait_healthy", "script")
+STACK_SCRIPT_TIMEOUT = (1, 86400, 300)
+STACK_SCRIPT_BYTES = 64 * 1024
+STACK_SCRIPT_DEFAULT = "exit 0"
 STACK_SLEEP = (1, 86400, 30)              # lowest, highest, default seconds
 STACK_WAIT = (10, 86400, 900)
 STACK_LAUNCH_COUNT = (1, 20, 1)
+# A swarm's launch is load generators, which come in larger numbers.
+SWARM_LAUNCH_COUNT = (1, 200, 1)
+# How many of a launch's instances must come up for the step to count as done,
+# as a share: a swarm of 200 load generators is not a failed test because one
+# node could not create two of them. 100 means every one, as before.
+STACK_LAUNCH_MIN_PERCENT = (1, 100, 100)
+SWARMS_MAX = 20
 
 
 def _bounded(value, bounds):
@@ -419,7 +444,7 @@ def _bounded(value, bounds):
     return min(high, max(low, value))
 
 
-def _clean_stack_step(stored):
+def _clean_stack_step(stored, swarm=False):
     if not isinstance(stored, dict) or stored.get("type") not in STACK_STEP_TYPES:
         return None
     kind = stored["type"]
@@ -428,8 +453,10 @@ def _clean_stack_step(stored):
         params = stored.get("params")
         step.update({
             "template": _text(stored.get("template"), 200),
-            "count": _bounded(stored.get("count"), STACK_LAUNCH_COUNT),
+            "count": _bounded(stored.get("count"),
+                              SWARM_LAUNCH_COUNT if swarm else STACK_LAUNCH_COUNT),
             "prefix": _text(stored.get("prefix"), 50),
+            "min_percent": _bounded(stored.get("min_percent"), STACK_LAUNCH_MIN_PERCENT),
             # Absent means wait: the next stage usually needs what this one built.
             "wait_bootstrap": stored.get("wait_bootstrap") is not False,
             "params": {str(k): str(v) for k, v in
@@ -439,23 +466,150 @@ def _clean_stack_step(stored):
         })
     elif kind == "sleep":
         step["seconds"] = _bounded(stored.get("seconds"), STACK_SLEEP)
+    elif kind == "script":
+        # Kept as written -- not stripped, a heredoc can end in blank lines --
+        # only cut to size. An empty one is the default, which does nothing.
+        script = stored.get("script")
+        step["script"] = (script if isinstance(script, str) and script.strip()
+                          else STACK_SCRIPT_DEFAULT)[:STACK_SCRIPT_BYTES]
+        step["timeout_seconds"] = _bounded(stored.get("timeout_seconds"), STACK_SCRIPT_TIMEOUT)
+        params = stored.get("params")
+        step["params"] = {str(k): str(v) for k, v in
+                          (params.items() if isinstance(params, dict) else ())}
     else:
         step["timeout_seconds"] = _bounded(stored.get("timeout_seconds"), STACK_WAIT)
     return step
 
 
-def _clean_stack(stored, name):
+# A stack variable or secret: the same names a launch input may have, since
+# all three end up as the value of some step's parameter.
+STACK_VALUE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+STACK_VALUES_MAX = 50
+STACK_VARIABLE_BYTES = 4096
+
+
+def _clean_stack_values(stored, keep):
+    """``{NAME: keep(entry)}`` for a stack's variables or secret declarations."""
+    found = {}
+    for name, entry in (stored.items() if isinstance(stored, dict) else ()):
+        if len(found) >= STACK_VALUES_MAX:
+            break
+        if isinstance(name, str) and STACK_VALUE_NAME.match(name):
+            found[name] = keep(entry if isinstance(entry, dict) else {})
+    return found
+
+
+def _clean_stages(stored, swarm=False):
     stages = []
-    for stage in stored.get("stages") if isinstance(stored.get("stages"), list) else []:
+    for stage in stored if isinstance(stored, list) else []:
         raw = stage.get("steps") if isinstance(stage, dict) else None
-        steps = [s for s in (_clean_stack_step(r) for r in
+        steps = [s for s in (_clean_stack_step(r, swarm) for r in
                              (raw if isinstance(raw, list) else [])) if s]
         if steps:
             stages.append({"steps": steps})
+    return stages
+
+
+def _clean_swarms(stored):
+    """A stack's swarms: named sequences of stages, run against it on demand."""
+    found, seen = [], set()
+    for entry in stored if isinstance(stored, list) else []:
+        if not isinstance(entry, dict) or len(found) >= SWARMS_MAX:
+            continue
+        name = _text(entry.get("name"), 64)
+        if not STACK_VALUE_NAME.match(name) or name in seen:
+            continue
+        seen.add(name)
+        found.append({"name": name, "description": _text(entry.get("description"), 200),
+                      "stages": _clean_stages(entry.get("stages"), swarm=True),
+                      # Whether the stack's sequence runs it; on unless turned
+                      # off, so a stack saved before sequences runs them all.
+                      "sequence": entry.get("sequence") is not False})
+    return found
+
+
+def _clean_stack(stored, name):
+    stages = _clean_stages(stored.get("stages"))
     return {
         "name": name,
         "description": _text(stored.get("description"), 200),
         "stages": stages,
+        # Values in the clear: anything that may not be read by whoever can
+        # read the stack is a secret, which is declared here and kept in auth/.
+        "variables": _clean_stack_values(stored.get("variables"), lambda e: {
+            "value": str(e.get("value") if e.get("value") is not None else "")
+            [:STACK_VARIABLE_BYTES],
+            "description": _text(e.get("description"), 200)}),
+        # Declarations only. A value found here -- a hand-edited file -- is
+        # dropped by not being copied: the record is synced and listed, and a
+        # secret must be neither.
+        "secrets": _clean_stack_values(stored.get("secrets"), lambda e: {
+            "description": _text(e.get("description"), 200),
+            "generate": e.get("generate") is True}),
+        # Run against the stack on demand, never by its launch.
+        "swarms": _clean_swarms(stored.get("swarms")),
+    }
+
+
+# -- tasks -----------------------------------------------------------------
+#
+# A task is job modules run in a throwaway instance of a template, on a
+# schedule or when invoked. The record is as copyable and untrusted as a
+# stack's, so this only shapes it; the service holds a save to the stricter
+# rules (tasks.py), including whether the schedule parses at all.
+
+TASK_TIMEOUT = (60, 86400, 900)           # the whole run, create to destroy
+TASK_OVERLAP = ("skip", "allow")
+TASK_INPUT_BYTES = 4096
+# A pasted job script, instead of modules: as large as a stack's script step.
+TASK_SCRIPT_BYTES = 64 * 1024
+
+
+def _clean_task_schedule(stored):
+    if not isinstance(stored, dict):
+        return None
+    cron = _text(stored.get("cron"), 100)
+    if not cron:
+        return None
+    return {"cron": cron, "timezone": _text(stored.get("timezone"), 64) or "UTC"}
+
+
+def _clean_task_input(entry):
+    secret = entry.get("secret") is True
+    default = entry.get("default")
+    return {"description": _text(entry.get("description"), 200),
+            # A secret input has no default: one would sit in this file, in
+            # the clear, synced to every member. A task secret is for that.
+            "default": "" if secret or default is None else str(default)[:TASK_INPUT_BYTES],
+            "required": entry.get("required") is True,
+            "secret": secret}
+
+
+def _clean_task(stored, name):
+    bootstrap = stored.get("bootstrap")
+    overlap = stored.get("overlap")
+    return {
+        "name": name,
+        "description": _text(stored.get("description"), 200),
+        # Absent means on: a task copied in by hand is meant to run.
+        "enabled": stored.get("enabled") is not False,
+        "template": _text(stored.get("template"), 200),
+        # The job: run after the template's own modules, as a second pass --
+        # either modules, or a script pasted into the task. Kept as written,
+        # since a heredoc can end in blank lines, and only cut to size.
+        "bootstrap": _clean_selection(bootstrap if isinstance(bootstrap, dict) else {}),
+        "script": stored["script"][:TASK_SCRIPT_BYTES]
+        if isinstance(stored.get("script"), str) and stored["script"].strip() else "",
+        "schedule": _clean_task_schedule(stored.get("schedule")),
+        "nodes": _strings(stored.get("nodes")),
+        "groups": _strings(stored.get("groups")),
+        "timeout_seconds": _bounded(stored.get("timeout_seconds"), TASK_TIMEOUT),
+        "overlap": overlap if overlap in TASK_OVERLAP else "skip",
+        # What an invocation may hand the run, read when it starts.
+        "inputs": _clean_stack_values(stored.get("inputs"), _clean_task_input),
+        # Declarations only, like a stack's: the values are in auth/.
+        "secrets": _clean_stack_values(stored.get("secrets"), lambda e: {
+            "description": _text(e.get("description"), 200)}),
     }
 
 
@@ -826,6 +980,7 @@ def drop_tombstones():
 _profiles = _Records(profiles_dir, _clean_profile)
 _templates = _Records(templates_dir, _clean_template)
 _stacks = _Records(stacks_dir, _clean_stack)
+_tasks = _Records(tasks_dir, _clean_task)
 _nodes = _Records(nodes_dir, _clean_node)
 _node_groups = _Records(node_groups_dir, _clean_node_group)
 _pins = _Records(pins_dir, clean_pin)
@@ -842,6 +997,7 @@ load_node_groups = _node_groups.load
 load_profiles = _profiles.load
 load_templates = _templates.load
 load_stacks = _stacks.load
+load_tasks = _tasks.load
 
 
 def load_pins():
@@ -876,6 +1032,7 @@ def _tracked(records, kind):
 save_profile, delete_profile = _tracked(_profiles, "profiles")
 save_template, delete_template = _tracked(_templates, "templates")
 save_stack, delete_stack = _tracked(_stacks, "stacks")
+save_task, delete_task = _tracked(_tasks, "tasks")
 save_node_group, delete_node_group = _tracked(_node_groups, "groups")
 save_pin, delete_pin = _tracked(_pins, "pins")
 save_setting, delete_setting = _tracked(_settings, "settings")
@@ -932,19 +1089,26 @@ def dependents(kind, name):
     def label(what, names):
         return ["%s '%s'" % (what, n) for n in sorted(set(names))]
 
+    def launches(stack):
+        """Every launch step of a stack, its swarms' included."""
+        return (step for stages in [stack["stages"]] + [w["stages"] for w in stack["swarms"]]
+                for stage in stages for step in stage["steps"] if step["type"] == "launch")
+
     if kind == "templates":
-        return label("stack", (stack_name for _, stack_name, stack in _stacks.scan()
-                               for stage in stack["stages"] for step in stage["steps"]
-                               if step["type"] == "launch" and step["template"] == name))
+        return (label("stack", (stack_name for _, stack_name, stack in _stacks.scan()
+                                for step in launches(stack) if step["template"] == name))
+                + label("task", (t for _, t, task in _tasks.scan() if task["template"] == name)))
     if kind == "groups":
-        return label("stack", (stack_name for _, stack_name, stack in _stacks.scan()
-                               for stage in stack["stages"] for step in stage["steps"]
-                               if step["type"] == "launch" and name in step["groups"]))
+        return (label("stack", (stack_name for _, stack_name, stack in _stacks.scan()
+                                for step in launches(stack) if name in step["groups"]))
+                + label("task", (t for _, t, task in _tasks.scan() if name in task["groups"])))
     if kind == "modules":
         return (label("template", (t for _, t, record in _templates.scan()
                                    if name in record["bootstrap"]["modules"]))
                 + label("profile", (p for _, p, record in _profiles.scan()
-                                    if name in record["modules"])))
+                                    if name in record["modules"]))
+                + label("task", (t for _, t, task in _tasks.scan()
+                                 if name in task["bootstrap"]["modules"])))
     if kind == "pins":
         # ``name`` is one name a pin answers to -- its id or a nickname -- since
         # either can be taken away while a template still launches by it.
@@ -970,7 +1134,7 @@ def dependents(kind, name):
 # "invites" the hashed one-time codes it will accept for enrolment. Both are
 # secrets, and both have to be on disk rather than in one process: `lemondx
 # cluster invite` runs in the CLI and the code is redeemed against `serve`.
-AUTH_KINDS = ("users", "tokens", "cluster", "invites")
+AUTH_KINDS = ("users", "tokens", "cluster", "invites", "stack-secrets", "task-secrets")
 
 
 def _auth_path(kind):
@@ -1021,6 +1185,293 @@ def update_auth(kind, mutate):
             pass
         _write_json(_auth_path(kind), {"version": 1, kind: records})
     return result
+
+
+# -- stack secrets ---------------------------------------------------------
+#
+# The one kind of secret lemondx keeps in a form it can give back: a launch
+# hands the value to a module, and an admin may ask to see it. So it is sealed
+# (secretbox.py) under a key that never leaves this node -- a value crosses to
+# a member in the clear over the pinned TLS of the members-only sync route, as
+# the cluster credential itself does, and is sealed there under that node's
+# own key. A key shared through the cluster credential would have had to
+# re-seal everything on every join, leave and rotation, and losing any of
+# those half-way would lose the secrets.
+#
+# Kept per stack, keyed by the stack's name; the ledger kind is
+# ``stack-secrets`` with the stack as the name, so reconciliation settles a
+# stack's secrets as one artifact.
+
+STACK_SECRETS_KIND = "stack-secrets"
+# A task's secrets are kept the same way, under a kind of their own: every
+# function below takes ``kind``, and the owner is the task's name instead.
+TASK_SECRETS_KIND = "task-secrets"
+SECRETS_KINDS = (STACK_SECRETS_KIND, TASK_SECRETS_KIND)
+
+
+def secrets_key_path():
+    return os.path.join(auth_dir(), "secrets.key")
+
+
+def _secrets_key():
+    """This node's key, made on first use. Call with ``_lock`` held."""
+    path = secrets_key_path()
+    try:
+        with open(path, "rb") as handle:
+            key = handle.read()
+        if len(key) == secretbox.KEY_BYTES:
+            return key
+    except FileNotFoundError:
+        pass
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    key = secretbox.new_key()
+    # Exclusive, so a second process racing to make one loses rather than
+    # overwrites the key the first one has already sealed something under.
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        with open(path, "rb") as handle:
+            return handle.read()
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(key)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return key
+
+
+def stack_secret_status(stack, kind=STACK_SECRETS_KIND):
+    """``{NAME: {generated, updated_at}}`` of the values held for one stack -- no values."""
+    held = load_auth(kind).get(stack) or {}
+    return {name: {"generated": entry.get("generated") is True,
+                   "updated_at": int(entry.get("updated_at") or 0)}
+            for name, entry in held.items()
+            if isinstance(entry, dict) and isinstance(entry.get("box"), str)}
+
+
+def stacks_with_secrets(kind=STACK_SECRETS_KIND):
+    return sorted(name for name, held in load_auth(kind).items() if held)
+
+
+def load_stack_secrets(stack, kind=STACK_SECRETS_KIND):
+    """``{NAME: {value, generated, updated_at}}``, decrypted. One that does not
+    open -- sealed under another key, or tampered with -- is left out, so it
+    reads as not set rather than as a wrong value."""
+    held = load_auth(kind).get(stack) or {}
+    with _lock:
+        key = _secrets_key()
+    found = {}
+    for name, entry in held.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            value = secretbox.open_(key, entry.get("box"))
+        except secretbox.SecretBoxError:
+            continue
+        found[name] = {"value": value, "generated": entry.get("generated") is True,
+                       "updated_at": int(entry.get("updated_at") or 0)}
+    return found
+
+
+def _change_stack_secrets(stack, mutate, action, note=True, kind=STACK_SECRETS_KIND,
+                          **fields):
+    # update_auth() holds the store lock while this runs, so nothing in here
+    # may take it -- which is why every caller seals before coming in.
+    def apply(records):
+        held = dict(records.get(stack) or {})
+        result = mutate(held)
+        if held:
+            records[stack] = held
+        else:
+            records.pop(stack, None)
+        return result
+    result = update_auth(kind, apply)
+    if note:
+        note_change(kind, stack)
+    # Names only, never a value: the stack (or task) and which of its secrets.
+    owner = "stack" if kind == STACK_SECRETS_KIND else "task"
+    eventlog.event("change", action, kind=kind, **{owner: stack}, **fields)
+    return result
+
+
+def set_stack_secret(stack, name, value, generated=False, note=True,
+                     kind=STACK_SECRETS_KIND):
+    with _lock:
+        key = _secrets_key()
+    box = secretbox.seal(key, value)
+
+    def mutate(held):
+        held[name] = {"box": box, "generated": bool(generated),
+                      "updated_at": int(time.time())}
+    return _change_stack_secrets(stack, mutate, "secret.set", note, kind, secret=name,
+                                 generated=bool(generated) or None)
+
+
+def clear_stack_secret(stack, name, note=True, kind=STACK_SECRETS_KIND):
+    def mutate(held):
+        return held.pop(name, None) is not None
+    return _change_stack_secrets(stack, mutate, "secret.clear", note, kind, secret=name)
+
+
+def replace_stack_secrets(stack, values, note=True, kind=STACK_SECRETS_KIND):
+    """Hold exactly ``values`` (``{NAME: {value, generated}}``) for one stack.
+
+    What a member's push and reconciliation do: the set crosses whole, so a
+    secret cleared on the far side is cleared here too.
+    """
+    with _lock:
+        key = _secrets_key()
+    now = int(time.time())
+    boxes = {name: {"box": secretbox.seal(key, entry["value"]),
+                    "generated": entry.get("generated") is True,
+                    "updated_at": int(entry.get("updated_at") or now)}
+             for name, entry in values.items()}
+
+    def mutate(held):
+        held.clear()
+        held.update(boxes)
+    return _change_stack_secrets(stack, mutate, "secret.replace", note, kind,
+                                 secrets=sorted(values) or None)
+
+
+def drop_stack_secrets(stack, note=True, kind=STACK_SECRETS_KIND):
+    """Forget every value held for a stack: it was deleted."""
+    if not load_auth(kind).get(stack):
+        return False
+    return _change_stack_secrets(stack, lambda held: held.clear() or True,
+                                 "secret.drop", note, kind)
+
+
+def rename_stack_secrets(old, new, kind=STACK_SECRETS_KIND):
+    """Move a stack's values to its new name, for a rename -- which is a save
+    under the new name and a delete of the old, and the delete would drop them."""
+    values = load_stack_secrets(old, kind)
+    if not values or old == new:
+        return False
+    replace_stack_secrets(new, values, kind=kind)
+    drop_stack_secrets(old, kind=kind)
+    return True
+
+
+# -- task grants and run history -------------------------------------------
+#
+# Both node-local, never synced. A grant is this node's one vote on who runs
+# one occurrence of a task, and it must outlive a restart: a voter that forgot
+# what it granted could grant the same occurrence again, and two runs is the
+# one outcome the vote exists to prevent. So a grant is on disk before the
+# answer leaves (see TaskService.grant()). The history is what this node ran,
+# so "did last night's backup run?" has an answer after a restart; the
+# cluster's view is every node's, asked for.
+
+TASK_RUNS_KEPT = 50
+
+
+def _read_json_file(path, default):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError):
+        return default
+    return stored if isinstance(stored, type(default)) else default
+
+
+def claim_task_grant(key, candidate, expires, now=None):
+    """Grant occurrence ``key`` to ``candidate`` unless it is already granted.
+
+    Returns ``(holder, granted_now)``: who holds the grant after this call.
+    One read-check-write under a file lock, so two candidates asking at the
+    same moment -- on two request threads -- cannot both be told yes.
+    """
+    path = task_grants_path()
+    now = int(now if now is not None else time.time())
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    descriptor = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        grants = {k: v for k, v in _read_json_file(path, {}).items()
+                  if isinstance(v, dict) and _epoch(v.get("expires")) > now}
+        held = grants.get(key)
+        if held and held.get("to"):
+            return str(held["to"]), False
+        grants[key] = {"to": candidate, "at": now, "expires": int(expires)}
+        _write_json(path, grants)
+        return candidate, True
+    finally:
+        os.close(descriptor)
+
+
+def release_task_grant(key, candidate):
+    """Drop this node's grant of ``key``, if ``candidate`` holds it.
+
+    For a candidate that did not win: what it collected is given back, so a
+    lower-ranked node can still gather a majority for the same occurrence.
+    """
+    path = task_grants_path()
+    descriptor = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        grants = _read_json_file(path, {})
+        held = grants.get(key)
+        if not isinstance(held, dict) or held.get("to") != candidate:
+            return False
+        del grants[key]
+        _write_json(path, grants)
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def load_task_grants(now=None):
+    now = int(now if now is not None else time.time())
+    return {k: v for k, v in _read_json_file(task_grants_path(), {}).items()
+            if isinstance(v, dict) and _epoch(v.get("expires")) > now}
+
+
+def _task_runs_path(task):
+    return os.path.join(task_runs_dir(), profile_slug(task) + ".json")
+
+
+def load_task_runs(task=None):
+    """This node's runs of one task, or of every task, newest first."""
+    directory = task_runs_dir()
+    if task is not None:
+        paths = [_task_runs_path(task)]
+    else:
+        try:
+            paths = [os.path.join(directory, f) for f in sorted(os.listdir(directory))
+                     if f.endswith(".json") and not f.startswith(".")]
+        except OSError:
+            return []
+    runs = []
+    for path in paths:
+        stored = _read_json_file(path, {})
+        for run in stored.get("runs") if isinstance(stored.get("runs"), list) else []:
+            # The slug is shared by names that slug alike; the record says whose.
+            if isinstance(run, dict) and (task is None or run.get("task") == task):
+                runs.append(run)
+    return sorted(runs, key=lambda r: r.get("started_at") or 0, reverse=True)
+
+
+def save_task_run(record):
+    """Add or replace (by id) one run in its task's history, keeping the newest."""
+    path = _task_runs_path(record["task"])
+    with _lock:
+        stored = _read_json_file(path, {})
+        runs = [r for r in (stored.get("runs") if isinstance(stored.get("runs"), list) else [])
+                if isinstance(r, dict) and r.get("id") != record["id"]]
+        runs.append(record)
+        runs.sort(key=lambda r: r.get("started_at") or 0, reverse=True)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _write_json(path, {"runs": runs[:TASK_RUNS_KEPT]})
+    return record
+
+
+def drop_task_runs(task):
+    try:
+        os.unlink(_task_runs_path(task))
+        return True
+    except OSError:
+        return False
 
 
 # -- what `serve` is doing right now ---------------------------------------
