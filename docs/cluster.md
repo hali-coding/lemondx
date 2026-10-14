@@ -2,8 +2,8 @@
 
 [← back to README](../README.md)
 
-A lemondx deployment is meant to be several nodes: hosts that each run their
-own LXD or Incus and their own lemondx, federated so that any one of them can
+A waterpump deployment is meant to be several nodes: hosts that each run their
+own LXD or Incus and their own waterpump, federated so that any one of them can
 launch a [stack](stacks.md) across all of them, and list, operate and sync
 everything on every host. A single node works on its own, and is where a
 cluster starts; see
@@ -21,7 +21,7 @@ bridge NATs its traffic. [Fabrics](networking.md) add routed networks shared by
 every node; they are opt-in and need the nodes on one L2 network.
 
 There is no leader, no quorum and no shared database. Every node is a complete
-lemondx that works on its own; a cluster only means each one knows how to call
+waterpump that works on its own; a cluster only means each one knows how to call
 the others. A node that is down costs you that node and nothing else.
 
 Joining is **one way, and once**. A node redeems a code against any one member
@@ -33,27 +33,27 @@ the other direction.
 **Each node needs one step of setup**: leaving
 [unconfigured mode](security.md#unconfigured-mode), in which it listens on
 loopback only and no peer could reach it. **Configure node** in the UI (or
-`lemondx configure node` and a restart) adds an admin login and a certificate
+`waterpump configure node` and a restart) adds an admin login and a certificate
 and listens on every interface; inviting and joining are refused until then.
-Beyond that, `lemondx cluster invite` is the setup. A node's name and the
+Beyond that, `waterpump cluster invite` is the setup. A node's name and the
 address peers reach it on are worked out the first time it federates — its
 hostname and the address on its default route — and a certificate is
-generated if it has none. `lemondx configure cluster` exists to *override*
+generated if it has none. `waterpump configure cluster` exists to *override*
 those, not to make federation work. The one thing it is needed for is a **name clash**: a name is how calls
 are routed to a node, so two hosts that share a hostname cannot both be members
 — a join under a name the cluster already uses is refused, and renaming either
-side with `lemondx configure cluster` and issuing a fresh code settles it.
+side with `waterpump configure cluster` and issuing a fresh code settles it.
 
-The local host is the default everywhere. A lemondx joined to nothing behaves
+The local host is the default everywhere. A waterpump joined to nothing behaves
 exactly as it did before this existed, and a launch that names no node still
 runs here.
 
 ## What it is not
 
 - **Not LXD clustering.** LXD and Incus have their own clustering, where several
-  daemons share one database and one API. lemondx federation sits a layer above
+  daemons share one database and one API. waterpump federation sits a layer above
   that and knows nothing about it: each node talks to its own local daemon,
-  clustered or not. If you already run an LXD cluster, point one lemondx at it
+  clustered or not. If you already run an LXD cluster, point one waterpump at it
   and use that — you do not need this.
 - **Not a replicated store.** A template synced to four nodes is four
   independent copies. Sync is a push: the node you pushed from wins, wholesale.
@@ -64,7 +64,7 @@ runs here.
 Configure each node first (above). Then, on the node you want to start from:
 
 ```bash
-lemondx cluster invite
+waterpump cluster invite
 ```
 
 That one command works out this node's name, address and certificate,
@@ -74,20 +74,20 @@ and prints a code:
 ```
 + join code for the cluster around nodeA (1 member(s)), valid for 30 minutes:
 
-    lemondx-join.eyJjb2RlIjoibG1keGpvaW5fMDQ4ZDc3NTg4N2M5X19…
+    waterpump-join.eyJjb2RlIjoibG1keGpvaW5fMDQ4ZDc3NTg4N2M5X19…
 
-Run `lemondx cluster join '<code>'` on the node that should join, once it is
-out of unconfigured mode (Configure node, or `lemondx configure node`).
+Run `waterpump cluster join '<code>'` on the node that should join, once it is
+out of unconfigured mode (Configure node, or `waterpump configure node`).
 ```
 
 A configured node already serves its certificate on every interface, so a peer
 can reach it at once. One configured to stay on loopback, or started with
 `--host 127.0.0.1`, is one no peer can reach: the invite says so, as does
 `cluster status`, and if it has to generate a certificate it tells you to
-restart `lemondx serve` to pick it up. The code stays valid across that
+restart `waterpump serve` to pick it up. The code stays valid across that
 restart.
 
-`lemondx cluster status` says where a node stands, and names anything that would
+`waterpump cluster status` says where a node stands, and names anything that would
 stop a peer reaching it:
 
 ```
@@ -102,15 +102,15 @@ This node
 
 ### Overriding what it worked out
 
-`lemondx configure cluster` sets the node's name, the address peers use and the
+`waterpump configure cluster` sets the node's name, the address peers use and the
 certificate. You need it when the guess is wrong — a DNS name rather than an IP,
 an address behind NAT, a port other than the one being served, or a certificate
-from your own CA. Saved values win over anything worked out, and `lemondx serve`
+from your own CA. Saved values win over anything worked out, and `waterpump serve`
 uses the saved certificate unless `--tls-cert` or `--no-tls` says otherwise.
-`lemondx configure tls` edits that same certificate on its own, for HTTPS
+`waterpump configure tls` edits that same certificate on its own, for HTTPS
 without federating.
 
-`lemondx cluster cert` writes a fresh self-signed certificate on demand. Any
+`waterpump cluster cert` writes a fresh self-signed certificate on demand. Any
 certificate works: federation pins the key rather than trusting an issuer, so
 being self-signed costs nothing.
 
@@ -120,7 +120,7 @@ On the joining node — configured, and nothing else: no certificate to make and
 no cluster settings:
 
 ```bash
-lemondx cluster join 'lemondx-join.eyJjb2RlIjoibG1keGpvaW5f…'
+waterpump cluster join 'waterpump-join.eyJjb2RlIjoibG1keGpvaW5f…'
 ```
 
 In the web UI the same pair is **Invite new node** and **Join cluster** on the
@@ -129,7 +129,7 @@ Cluster tab.
 **A member must run LXD 5.21 or later, or Incus 6.0 or later** -- each
 project's current long-term release. The joining node checks its own daemon
 before it redeems the code, and the member admitting it checks again from what
-the joiner reports, so a node on an older daemon -- or an older lemondx that
+the joiner reports, so a node on an older daemon -- or an older waterpump that
 does not report one -- is refused either way. Both refusals happen before the
 code is spent: upgrade, then join again with the same code. The table is
 `MIN_CLUSTER_VERSION` in `lxd.py`. Nodes that are members already are not
@@ -156,8 +156,8 @@ What happens:
    had. With authentication off it will not let callers from other hosts in
    without a credential once it is a member (loopback is exempt), and the
    accounts are how you log in to it from your own machine without first
-   running `lemondx token-create` there. An account added later reaches it
-   with `lemondx cluster sync --kind users`.
+   running `waterpump token-create` there. An account added later reaches it
+   with `waterpump cluster sync --kind users`.
 5. The joiner announces itself to every member it just learned about.
 6. It runs one [reconciliation](#a-node-that-was-switched-off-catches-itself-up)
    pass straight away, rather than waiting for the hourly one: having no
@@ -172,21 +172,21 @@ What happens:
 The join's answer (and `--json`) says what was taken, shared and made.
 
 So joining *any* member joins the cluster. A member that was down when you
-joined finds out later, from `lemondx cluster refresh` on either side.
+joined finds out later, from `waterpump cluster refresh` on either side.
 
 Codes last 30 minutes by default (`--expires`), are consumed on first use, and
 can be listed and withdrawn:
 
 ```bash
-lemondx cluster invites
-lemondx cluster revoke-invite <id>
+waterpump cluster invites
+waterpump cluster revoke-invite <id>
 ```
 
 ## Membership
 
 ```bash
-lemondx cluster refresh      # pull every peer's member list, push ours
-lemondx cluster leave        # step out; every member is told to forget this node
+waterpump cluster refresh  # pull every peer's member list, push ours
+waterpump cluster leave    # step out; every member is told to forget this node
 ```
 
 Membership converges by `refresh`: it announces this node to every peer and
@@ -198,7 +198,7 @@ member is told to forget this node while the credential is still here to tell
 them with; only then does this node drop the credential, its record of the
 other nodes, and its node groups. Instances, templates and modules stay. A
 member that could not be reached still lists this node — the command names it,
-and the fix is `lemondx cluster evict <name>` there.
+and the fix is `waterpump cluster evict <name>` there.
 
 The Cluster tab has the same thing: **Leave cluster**, next to this node's name.
 
@@ -213,10 +213,10 @@ because none of them is the problem.
 so and simply drops the peer records and node groups:
 
 ```
-$ lemondx cluster leave
+$ waterpump cluster leave
 + left the cluster (forgot prdev1, prdev2)
 ! This node had no cluster credential, so no member could be told it has gone.
-  Any that still list 'orange' need `lemondx cluster evict orange` run there.
+  Any that still list 'orange' need `waterpump cluster evict orange` run there.
 ```
 
 The Cluster tab shows the same state as a banner, with the button reading **Clear
@@ -226,19 +226,19 @@ way — only the federation records go.
 ## Nodes and groups
 
 ```bash
-lemondx cluster nodes                # who this node knows, and how they are
-lemondx cluster show nodeB           # one node, with the instances on it
-lemondx cluster containers           # every instance, across nodes
-lemondx cluster evict nodeB          # put a node out of the cluster
+waterpump cluster nodes            # who this node knows, and how they are
+waterpump cluster show nodeB       # one node, with the instances on it
+waterpump cluster containers       # every instance, across nodes
+waterpump cluster evict nodeB      # put a node out of the cluster
 ```
 
 A group is a name for a set of nodes, so a launch or a sync can say "everywhere"
 once:
 
 ```bash
-lemondx cluster group set edge --node nodeA --node nodeB
-lemondx cluster groups
-lemondx cluster group delete edge -y
+waterpump cluster group set edge --node nodeA --node nodeB
+waterpump cluster groups
+waterpump cluster group delete edge -y
 ```
 
 Deleting a group is refused (`409`) while a stack's launch step targets it.
@@ -250,10 +250,10 @@ asked.
 
 ### large and small, sized by the cluster
 
-Two groups are kept by lemondx rather than by you:
+Two groups are kept by waterpump rather than by you:
 
 ```bash
-lemondx cluster group auto   # rebuild large and small from what each node has
+waterpump cluster group auto  # rebuild large and small from what each node has
 ```
 
 Every node is asked for its CPU threads and total memory — its capacity, not
@@ -300,15 +300,15 @@ Delete, and **Size nodes** in that card's header runs the same thing.
 Evicting a node leaves nothing of it anywhere, and the order is the point:
 
 ```bash
-lemondx cluster evict nodeC              # stand it down, then forget it everywhere
-lemondx cluster evict nodeC --rotate     # replace the credential as well
-lemondx cluster evict nodeC --no-rotate  # never replace it, reachable or not
+waterpump cluster evict nodeC          # stand it down, then forget it everywhere
+waterpump cluster evict nodeC --rotate  # replace the credential as well
+waterpump cluster evict nodeC --no-rotate  # never replace it, reachable or not
 ```
 
 1. **nodeC is told first**, while its record is still here to call it with. It
    stands down: it drops the cluster credential, its record of every other
    node, and its node groups. It keeps its instances, templates and modules and
-   carries on as an ordinary unfederated lemondx.
+   carries on as an ordinary unfederated waterpump.
 2. **Then it goes** from this node's registry and from every group here, and
    every remaining member is told to do the same.
 3. **Then the credential is rotated, if it has to be.** A node that stood down
@@ -319,7 +319,7 @@ lemondx cluster evict nodeC --no-rotate  # never replace it, reachable or not
    unconditionally. `--rotate` and `--no-rotate` decide it by hand.
 
 The command says which of those happened, including any member that could not
-be told and still lists the evicted node. `lemondx cluster rotate` can always
+be told and still lists the evicted node. `waterpump cluster rotate` can always
 be run on its own afterwards.
 
 Under the UI's **Evict** and **Leave cluster** buttons is exactly this, and both
@@ -330,9 +330,9 @@ ask you to type the node's name first.
 A node can be put into maintenance before you work on the host:
 
 ```bash
-lemondx cluster maintenance on --reason "kernel upgrade"        # this node
-lemondx cluster maintenance on --node prdev2 --reason "disk swap"
-lemondx cluster maintenance off --node prdev2
+waterpump cluster maintenance on --reason "kernel upgrade"    # this node
+waterpump cluster maintenance on --node prdev2 --reason "disk swap"
+waterpump cluster maintenance off --node prdev2
 ```
 
 or with **Maintenance** / **End maintenance** on its card in the Cluster tab.
@@ -346,14 +346,16 @@ While it lasts:
   refused before anything is torn down.
 - **No fabric changes.** Creating, extending or deleting a fabric that would
   touch it waits until it is back, and on the node itself fabric claims,
-  `fabric apply`, attaching and detaching are refused. Its own routes are left
-  exactly as they were, and brought up to date when maintenance ends.
+  attaching and detaching are refused. Its own routes are left exactly as they
+  were, and brought up to date when maintenance ends. `waterpump fabric apply` on
+  the node still works: it only programs what the node already claims, which is
+  how routes come back after a reboot during maintenance.
 - **Definitions still sync.** Templates, stacks, modules, profiles and groups
   are pushed to it as usual, so it comes back level with everyone.
 - Its running instances can still be started, stopped and destroyed.
 
 **A node whose launches keep failing puts itself into maintenance.** After 5
-instance launches in a row fail on it, it marks itself (`by: lemondx`, the
+instance launches in a row fail on it, it marks itself (`by: waterpump`, the
 last error in the reason) and tells the cluster, so launches to a group go
 elsewhere until someone looks. Only failures that point at the node count: the
 daemon failing to create or start an instance (storage, its network, an image
@@ -363,7 +365,7 @@ fails the same on every node and would otherwise take the whole cluster out
 with one launch; nor does a failing bootstrap module, which runs after the
 launch worked. A launch that works ends the streak, and so does ending
 maintenance. `cluster nodes` and `cluster show` give the reason and who set it
-(`by lemondx` for this), and the Cluster tab shows it on the node's card. The count is kept in `launch-failures.json` in the data
+(`by waterpump` for this), and the Cluster tab shows it on the node's card. The count is kept in `launch-failures.json` in the data
 directory, so CLI launches and `serve`'s add up.
 
 The mark belongs to the node, like its fabric claims: it is kept in the node's
@@ -397,27 +399,27 @@ offering this node's would be offering the wrong thing.
 Health dots — the instance's and its app check's — show on every row. Each
 node's own monitor still judges its instances on its own schedule; the listing
 only carries what the owning node last concluded, so a node with health checks
-off (or running a lemondx too old to report app checks) shows no dot, or no
+off (or running a waterpump too old to report app checks) shows no dot, or no
 diamond, for its rows. The external
 link on a remote row opens that node's own UI, for the things that are still
 about the host rather than the instance: its storage, networks and nodes.
 
 ### Watching it from a terminal
 
-`lemondx top` is the same picture, live, in the style of btop: every node with
+`waterpump top` is the same picture, live, in the style of btop: every node with
 a CPU and memory meter and a CPU history, every instance on every node with
 its health, CPU, memory and network rates, and a stacks panel while any stack
 has instances or a run in progress (stage by stage, with the step that is
 running). It needs no `serve` of its own to work.
 
 ```
-lemondx top                  # q quits; ↑↓ select, tab to stacks and templates,
+waterpump top              # q quits; ↑↓ select, tab to stacks and templates,
                              # space mark, c console, b bootstrap, s sort
                              # (node/cpu/mem/name), r running only, n one node
                              # at a time, +/- interval
-lemondx top -i 5             # a reading every 5 seconds (default 2)
-lemondx top --once           # one frame, e.g. into a file
-lemondx top --json           # one snapshot, two readings a second apart
+waterpump top -i 5         # a reading every 5 seconds (default 2)
+waterpump top --once       # one frame, e.g. into a file
+waterpump top --json       # one snapshot, two readings a second apart
 ```
 
 Health records and stack runs are kept in memory by the `serve` that made
@@ -479,7 +481,7 @@ the instances against, so one launched meanwhile makes it refuse rather than
 act on something unseen. Recreating or destroying a template's instances that
 belong to a stack says so first. A stack relaunch asks for the stack's launch
 inputs (`{{params.NAME}}`) and any module secret no step sets, the same values
-`lemondx stack-launch` prompts for; a template launch or recreate asks for its
+`waterpump stack-launch` prompts for; a template launch or recreate asks for its
 modules' secrets. Either way they are masked and never kept.
 
 The actions go to this node's `serve`, so a launch, recreate, destroy or
@@ -488,7 +490,7 @@ relaunch is an ordinary stack or template run there: it carries on after
 whichever node holds the run. Without a `serve` here, start, stop and restart
 still work (they finish in seconds), but the actions that start a run are
 refused, since the run would die with `top`. When authentication is on, `top` calls its own `serve` with
-`LEMONDX_TOKEN` if set, else the cluster credential.
+`WATERPUMP_TOKEN` if set, else the cluster credential.
 
 ### Reaching one node's own API
 
@@ -506,20 +508,23 @@ to special-case it. Two limits are deliberate: a proxied call cannot itself be
 proxied, and the access required is the *target* endpoint's, resolved against
 the same route table — so forwarding can never let someone do more than calling
 that endpoint directly would. A path this node does not recognise is treated as
-admin-only rather than waved through.
+admin-only rather than waved through. The member answers the call as the person
+who made it, with their role -- not as one of its peers, though it arrives under
+the cluster credential -- so a delete through it is still refused while
+something uses the thing, and a save there still pushes to everyone else.
 
 The choice is remembered per browser, not on the server: it is how one person
 is looking at their cluster right now, not a property of the cluster. A
 remembered scope naming a node that has since gone falls back to this node.
 
 The picker only appears when there is more than one node, so an unfederated
-lemondx looks exactly as it did.
+waterpump looks exactly as it did.
 
 ## Launching across nodes
 
 ```bash
-lemondx launch web -n 6 --group edge
-lemondx launch web -n 2 --node nodeB
+waterpump launch web -n 6 --group edge
+waterpump launch web -n 2 --node nodeB
 ```
 
 In the UI, Launch opens a dialog with a node picker whenever more than one node
@@ -565,7 +570,7 @@ launch started from another node's UI is only visible there.
 ```
 ! nodeA: No storage pool 'fast-nvme' on this node; used the default profile's pool (default) instead.
 ! nodeB: No network 'dmz-br' on this node; used the default profile's network (lxdbr0) instead.
-! nodeC: This node is not on the fabric lemonfab1; launched without its NIC, so these instances can only be reached from this host.
+! nodeC: This node is not on the fabric pumpfab1; launched without its NIC, so these instances can only be reached from this host.
 ```
 
 What a node cannot substitute — an image it cannot pull, no space, a module that
@@ -588,7 +593,7 @@ and then** — no sync step to remember. The same goes for deleting one, since a
 copy left behind on one node is drift that a push-only sync can never clear.
 
 ```
-$ lemondx template-save web --image images:alpine/3.24
+$ waterpump template-save web --image images:alpine/3.24
 + saved template web: images:alpine/3.24
   + synced to 2 node(s): prdev1, prdev2
 ```
@@ -601,10 +606,10 @@ not undone because another host is switched off. What each node made of it comes
 back with the record, and a node that missed out is named:
 
 ```
-$ lemondx template-save web --image images:alpine/3.24
+$ waterpump template-save web --image images:alpine/3.24
 + saved template web: images:alpine/3.24
   ! not synced to prdev2 (Cannot reach https://…:8099: Connection refused)
-    -- run `lemondx cluster sync` when they are back
+    -- run `waterpump cluster sync` when they are back
 ```
 
 Deleting removes it from every member. Pass `--local-only` (or untick the box in
@@ -618,8 +623,8 @@ to find out on its own. **Reconciling is that missing half.** It runs shortly
 after `serve` starts, hourly after that, and whenever you ask:
 
 ```bash
-lemondx cluster reconcile              # settle this node against every member
-lemondx cluster reconcile --dry-run    # report what differs, change nothing
+waterpump cluster reconcile          # settle this node against every member
+waterpump cluster reconcile --dry-run  # report what differs, change nothing
 ```
 
 The Cluster tab has the same thing behind **Reconcile**, and a **Shared
@@ -630,7 +635,7 @@ template, module, profile, stack and node group, taken over the very body a push
 would send. Only what actually differs is then fetched, so an hourly pass over a
 whole cluster costs one small request per node.
 
-What it does with a difference depends on which side moved, and lemondx knows
+What it does with a difference depends on which side moved, and waterpump knows
 that because each node keeps a **change ledger**: when it last saved or deleted
 each shared artifact. The ledger is local, never synced, and never inside the
 record files — those are copyable and hand-editable, so a timestamp in one would
@@ -650,12 +655,12 @@ records carry no version — so both are left exactly as they are and the confli
 is reported:
 
 ```
-$ lemondx cluster reconcile
-? templates/web differs on prdev2 -- push the copy that is right with `lemondx cluster sync`
+$ waterpump cluster reconcile
+? templates/web differs on prdev2 -- push the copy that is right with `waterpump cluster sync`
 0 change(s), 1 conflict(s), against prdev1, prdev2
 ```
 
-You resolve it by pushing whichever copy is right, with `lemondx cluster sync
+You resolve it by pushing whichever copy is right, with `waterpump cluster sync
 --name web --node prdev2` or **Sync** in the UI. A copy that is merely out of
 date is not an emergency; being unable to see that it is would be.
 
@@ -673,10 +678,10 @@ Two things it deliberately does not do:
 Sync is the manual counterpart, and the way to settle a conflict:
 
 ```bash
-lemondx cluster sync --group edge                        # every template
-lemondx cluster sync --kind modules --kind templates --node nodeB
-lemondx cluster sync --name web --node nodeB             # just this one
-lemondx cluster sync --kind users --kind groups --group edge
+waterpump cluster sync --group edge                    # every template
+waterpump cluster sync --kind modules --kind templates --node nodeB
+waterpump cluster sync --name web --node nodeB         # just this one
+waterpump cluster sync --kind users --kind groups --group edge
 ```
 
 `--kind` takes any of `templates`, `modules`, `profiles`, `groups`, `stacks`,
@@ -695,14 +700,14 @@ Notes:
   only between members — `PUT /api/auth/users/{name}/record` refuses anyone who
   is not one. An account of the same name on the target is replaced; accounts
   that exist only there are left alone, because sync never deletes. PAM and
-  proxy logins are not affected: they are not lemondx accounts.
+  proxy logins are not affected: they are not waterpump accounts.
 
 - It is one direction, and it overwrites. There is no merge and no
   last-writer-wins clock, because there is no shared clock — the node you pushed
   from is the answer to "which copy is right?", and the only answer that needs
   no coordination between hosts.
 - Syncing a template also pushes the uploaded modules it uses, so it is not
-  broken on arrival. Built-in modules ship with lemondx and are skipped.
+  broken on arrival. Built-in modules ship with waterpump and are skipped.
 - Only uploaded modules are pushed. A built-in exists on every node already.
 - Templates carry no secrets — a template never stores one — so syncing one
   moves no credential. Public SSH keys in a template do travel. `--kind users`
@@ -727,19 +732,19 @@ short:
   with the wrong certificate never sees the credential.
 - **The join code is the only thing sent over an unauthenticated call**, and it
   is a 32-byte single-use secret that expires.
-- **One credential, shared by the cluster.** It is an ordinary lemondx API
-  token — it shows up in `lemondx tokens` as `cluster`, and every member holds
+- **One credential, shared by the cluster.** It is an ordinary waterpump API
+  token — it shows up in `waterpump tokens` as `cluster`, and every member holds
   the same one. That is what lets joining be one-way: a new node can call
   everybody immediately, and everybody can call it, without a per-pair exchange
   that would need every node up at the same moment. The cost is that removing a
-  node means rotating it (`lemondx cluster rotate`), and that any member is an
+  node means rotating it (`waterpump cluster rotate`), and that any member is an
   admin of every other — so federate hosts you administer, not someone else's.
 - **A member demands a credential from other hosts even with authentication
   off.** Joining a cluster means accepting API calls from elsewhere, which a
   node cannot do while treating whoever reaches its port as an admin. Loopback
   is untouched, so nobody is locked out of the UI on their own host, and no
   auth setup is needed to join. Configure real authentication
-  (`lemondx configure auth`) if people other than you use that node.
+  (`waterpump configure auth`) if people other than you use that node.
 - **Node records are safe to copy; the credential is not in them.**
   `nodes/*.json` holds a name, URL and fingerprint. The credential lives in
   `auth/cluster.json` in the `0700` auth directory.
@@ -750,7 +755,7 @@ refuse it — with a message saying exactly that. Re-join it with a fresh code.
 ## Where it is kept
 
 ```
-~/.local/share/lemondx/
+~/.local/share/waterpump/
   nodes/<name>.json        name, URL, certificate fingerprint  (safe to copy)
   node-groups/<name>.json  a group's members
   auth/cluster.json        the cluster credential this node calls peers with (0700)
@@ -773,7 +778,7 @@ that can be copied between machines or checked into a repo, and is treated as
 untrusted input on read. Adding a node by hand takes a token it will accept:
 
 ```bash
-lemondx cluster fingerprint https://10.0.0.5:8099    # what it presents right now
+waterpump cluster fingerprint https://10.0.0.5:8099  # what it presents right now
 ```
 
 That only shows what answers at an address — whoever that is chooses what to
@@ -788,7 +793,7 @@ for obtaining one.
 | `POST` | `/api/cluster/groups/auto` | rebuild `large` and `small` from each node's CPU and memory |
 | `GET` | `/api/cluster/nodes` | every node with its state (`?probe=false` to skip contacting them) |
 | `GET` | `/api/cluster/nodes/{name}` | one node, with the instances on it |
-| `POST` | `/api/cluster/nodes` | `{"code":"lemondx-join.…"}` → join that node's cluster |
+| `POST` | `/api/cluster/nodes` | `{"code":"waterpump-join.…"}` → join that node's cluster |
 | `DELETE` | `/api/cluster/nodes/{name}` | evict a node: stand it down, forget it everywhere (`?rotate=true`/`false` overrides the credential rotation) |
 | `POST` | `/api/cluster/leave` | give up membership, or clear the records left behind when the credential is already gone |
 | `GET`/`POST` | `/api/cluster/members` | the member list / announce a member |

@@ -66,7 +66,7 @@ export function AccessView({ onNotify }: Props) {
             <h3>Authentication is off</h3>
             <p>
               Anyone who can reach this server has full access. Tokens and users made here are
-              stored now and take effect once lemondx is started with <code>--auth</code> — see
+              stored now and take effect once waterpump is started with <code>--auth</code> — see
               docs/security.md.
             </p>
           </div>
@@ -77,7 +77,7 @@ export function AccessView({ onNotify }: Props) {
         <div className="card"><div className="empty">
           <h3>Signed in with an API token</h3>
           <p>A token cannot create or revoke tokens. Log in with a password, or use
-            <code> lemondx tokens</code> on the host.</p>
+            <code> waterpump tokens</code> on the host.</p>
         </div></div>
       ) : (
         <TokensCard onNotify={onNotify} grantable={principal?.role ?? 'admin'} showOwner={isAdmin} />
@@ -299,8 +299,8 @@ function UsersCard({ onNotify, localEnabled }: Props & { localEnabled: boolean }
         <h3>Local users</h3>
         <span className="faint">
           {localEnabled
-            ? 'Accounts kept by lemondx itself, separate from the host’s.'
-            : 'Not used until lemondx is started with --auth local.'}
+            ? 'Accounts kept by waterpump itself, separate from the host’s.'
+            : 'Not used until waterpump is started with --auth local.'}
         </span>
         <button className="btn btn-sm btn-primary access-head-end" onClick={() => setEditing('new')}>
           <PlusIcon /> Add user

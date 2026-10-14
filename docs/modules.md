@@ -7,11 +7,11 @@ starts. Pick the ones you want when creating a container, or run them later
 against an existing one.
 
 ```bash
-./lemondx modules                       # what is available
-./lemondx create dev -i images:debian/12 \
+./waterpump modules                   # what is available
+./waterpump create dev -i images:debian/12 \
     -b base -b ssh-access \
     --param USERNAME=hampus --all-ssh-keys
-./lemondx bootstrap dev -b docker       # add more later; modules are re-runnable
+./waterpump bootstrap dev -b docker   # add more later; modules are re-runnable
 ```
 
 In the web UI the create dialog has a **Bootstrap** section, and each container
@@ -67,12 +67,12 @@ added once always has:
 ```
 
 ```bash
-lemondx create box -i images:debian/12 -b nfs-mount -b nfs-mount \
+waterpump create box -i images:debian/12 -b nfs-mount -b nfs-mount \
     --param NFS_SOURCE=192.168.1.10:/media --param NFS_MOUNTPOINT=/mnt/media \
     --param NFS_SOURCE@2=192.168.1.11:/shared --param NFS_MOUNTPOINT@2=/mnt/shared
 ```
 
-The module itself sees plain `NAME` every time; `LEMONDX_OCCURRENCE` says
+The module itself sees plain `NAME` every time; `WATERPUMP_OCCURRENCE` says
 which run it is. Each repeat starts from the module's own defaults (and your
 saved settings for it), never from the first copy's values, so give every
 `NAME@n` that differs. Secrets are the exception: a repeat with no secret of its
@@ -86,7 +86,7 @@ each repeat's parameters separately.
 ## SSH keys
 
 A module declares `uses: ssh-keys` in its header (only `ssh-access` does, but a
-module you write can too) to receive the keys you select as `LEMONDX_SSH_KEYS`;
+module you write can too) to receive the keys you select as `WATERPUMP_SSH_KEYS`;
 the prelude's `install_ssh_keys USER` writes them to that user's
 `authorized_keys` with the right ownership and permissions. Selecting such a
 module makes the runner refuse to start without at least one key.
@@ -117,9 +117,9 @@ its script, and the facts from its header. Profiles have their own sub-tab.
 you create a container.
 
 ```bash
-./lemondx module-set docker --default
-./lemondx create dev -i images:debian/12      # runs your defaults
-./lemondx create bare --no-default-modules    # opt out
+./waterpump module-set docker --default
+./waterpump create dev -i images:debian/12  # runs your defaults
+./waterpump create bare --no-default-modules  # opt out
 ```
 
 **Saved settings.** A module's parameters are remembered. Edit them in the
@@ -129,17 +129,17 @@ worked last time. The UI marks these *saved* and shows the module's original
 value beside them, with *Reset* to go back to it.
 
 ```bash
-./lemondx module-set ssh-access --param USERNAME=hampus --param SHELL_PATH=/bin/sh
+./waterpump module-set ssh-access --param USERNAME=hampus --param SHELL_PATH=/bin/sh
 ```
 
 **Bootstrap profiles** are named module selections with their parameters and
 SSH public keys — "Save as profile" in the create dialog, or:
 
 ```bash
-./lemondx profile-save "Web server" -b base -b ssh-access -b docker \
+./waterpump profile-save "Web server" -b base -b ssh-access -b docker \
     --param USERNAME=hampus --all-ssh-keys --description "my usual dev box"
-./lemondx profiles
-./lemondx create web -P "Web server"
+./waterpump profiles
+./waterpump create web -P "Web server"
 ```
 
 A profile stores every non-secret parameter of its modules, not only the ones
@@ -156,17 +156,17 @@ from another cluster member instead, it was checked there, and the module is
 dropped from every profile and template here that used it; a profile left
 with nothing to run is removed rather than kept as an empty shell.
 
-These are lemondx's own; they have nothing to do with LXD/Incus profiles, which
+These are waterpump's own; they have nothing to do with LXD/Incus profiles, which
 configure devices and limits. The CLI flag is `-P/--bootstrap-profile`, because
 `--profile` already means the daemon's kind.
 
 ## Where all this is kept
 
-Everything lemondx remembers lives under `~/.local/share/lemondx`, and is meant
+Everything waterpump remembers lives under `~/.local/share/waterpump`, and is meant
 to be readable and editable by hand:
 
 ```
-~/.local/share/lemondx/
+~/.local/share/waterpump/
   settings.json         default modules and remembered parameter values
   profiles/
     web-server.json     one file per bootstrap profile
@@ -176,7 +176,7 @@ to be readable and editable by hand:
     redis.sh            uploaded modules
 ```
 
-`LEMONDX_DATA_DIR` points the whole thing elsewhere; `XDG_DATA_HOME` is
+`WATERPUMP_DATA_DIR` points the whole thing elsewhere; `XDG_DATA_HOME` is
 honoured if you set it.
 
 A profile is one JSON file, named after a slug of the profile name, with the
@@ -196,14 +196,9 @@ So a profile can be copied between machines, or checked into a project and
 dropped in — anything in `profiles/` is picked up, and a file mangled into
 invalid JSON costs that one profile rather than all of them.
 
-Earlier versions kept all of this in `~/.config/lemondx`. That directory is
-moved here the first time you run a newer lemondx, profiles included, so there
-is nothing to do by hand. `LEMONDX_CONFIG_DIR` still works and still names the
-whole directory; a directory you name explicitly is never migrated away from.
-
 ## Uploading modules
 
-Drop a `.sh` file into `~/.local/share/lemondx/modules`, or upload it through
+Drop a `.sh` file into `~/.local/share/waterpump/modules`, or upload it through
 the Modules tab (choose a file or paste the script). An uploaded module's
 script can be edited on its page, and a built-in one can be *customised*:
 saving writes your copy under the same name, which shadows the built-in until
@@ -212,8 +207,8 @@ templates that name the module, since the built-in is still there to run.
 From the CLI:
 
 ```bash
-./lemondx module-add ./redis.sh --default
-./lemondx module-remove redis -y
+./waterpump module-add ./redis.sh --default
+./waterpump module-remove redis -y
 ```
 
 Uploads are validated before they are stored: the name is reduced to a safe id
@@ -227,9 +222,9 @@ and only when you select it.
 
 ## Writing your own
 
-Drop a `.sh` file in `modules/`, or in `~/.local/share/lemondx/modules` to keep
+Drop a `.sh` file in `modules/`, or in `~/.local/share/waterpump/modules` to keep
 it outside the repo (a file there shadows a shipped module of the same name).
-`LEMONDX_MODULES` adds more directories. Those win over uploads, so lemondx
+`WATERPUMP_MODULES` adds more directories. Those win over uploads, so waterpump
 refuses to upload over, or delete, a module one of them supplies.
 
 ```sh
@@ -246,9 +241,9 @@ log "redis on port ${REDIS_PORT}"
 
 Every module is prepended with `modules/_prelude.sh`, which provides
 `log` / `warn` / `die`, `have`, `pkg_refresh`, `pkg_install`, `svc_enable` and
-`install_ssh_keys`, and sets `LEMONDX_OS_ID` and `LEMONDX_PKG`. The package
+`install_ssh_keys`, and sets `WATERPUMP_OS_ID` and `WATERPUMP_PKG`. The package
 helpers cover apt, dnf/yum/microdnf, apk, pacman and zypper; `svc_enable`
-handles systemd and OpenRC. The runner also sets `LEMONDX_INSTANCE`, the instance's name on
+handles systemd and OpenRC. The runner also sets `WATERPUMP_INSTANCE`, the instance's name on
 the daemon. Use that, not `hostname`, in anything telling someone what to run
 on the host, since the guest may call itself something else.
 
@@ -281,7 +276,7 @@ newlines intact. Write it out with `printf '%s\n' "$VAR" > file` rather than
 value from a file:
 
 ```bash
-./lemondx bootstrap web -b apache2 --param "VHOST_CONFIG=$(cat site.conf)"
+./waterpump bootstrap web -b apache2 --param "VHOST_CONFIG=$(cat site.conf)"
 ```
 
 ## Secret parameters
@@ -301,12 +296,12 @@ with `********` in the output shown in the UI, the terminal and `--json`. The
 UI renders it as a password field and clears it once used.
 
 From the CLI, avoid `--param` for secrets — it lands in shell history and
-`ps`. Instead set an environment variable of the same name, or let lemondx
+`ps`. Instead set an environment variable of the same name, or let waterpump
 prompt without echo:
 
 ```bash
-./lemondx create db -i images:debian/12 -b postgresql      # prompts
-POSTGRES_PASSWORD="$(pass show db)" ./lemondx bootstrap db -b postgresql
+./waterpump create db -i images:debian/12 -b postgresql  # prompts
+POSTGRES_PASSWORD="$(pass show db)" ./waterpump bootstrap db -b postgresql
 ```
 
 Redaction is a safety net, not a licence: a module should still never print a
@@ -320,7 +315,7 @@ needed), optionally creates a database it owns, and controls where it accepts
 TCP connections. Verified on Debian 12, Alpine 3.21, Rocky Linux 9 and Arch.
 
 ```bash
-./lemondx create db -i images:debian/12 -b postgresql \
+./waterpump create db -i images:debian/12 -b postgresql \
     --param POSTGRES_USER=app --param POSTGRES_DB=appdb --param 'LISTEN_ADDRESSES=*'
 psql -h <container-ip> -U app -d appdb
 ```
@@ -350,7 +345,7 @@ cat > site.conf <<'CONF'
     </Directory>
 </VirtualHost>
 CONF
-./lemondx create web -i images:debian/12 -b apache2 \
+./waterpump create web -i images:debian/12 -b apache2 \
     --param "VHOST_CONFIG=$(cat site.conf)" --param VHOST_NAME=demo --param ENABLE_MODULES=rewrite
 curl -H 'Host: demo.test' http://<container-ip>/
 ```
@@ -359,7 +354,7 @@ The config is written verbatim as `VHOST_NAME.conf` in the distro's own
 drop-in directory (`sites-available` plus `a2ensite` on Debian/Ubuntu,
 `conf.d` on Fedora/RHEL and Alpine, `vhosts.d` on openSUSE). Arch's
 `httpd.conf` includes no such directory, so the module adds an
-`IncludeOptional` for `/etc/httpd/conf/lemondx.d`. A `DocumentRoot` that does
+`IncludeOptional` for `/etc/httpd/conf/waterpump.d`. A `DocumentRoot` that does
 not exist yet is created with a placeholder `index.html`.
 
 Apache 2.4 serves no directory it is not told to. Debian's main config allows
@@ -368,7 +363,7 @@ root, so a vhost without a `<Directory>` block answers **403** to everything
 there while passing the config test. So for each `DocumentRoot` that nothing
 but the default `<Directory />` covers, the module appends a
 `<Directory ...> Require all granted` block to the same file (marked `Added by
-lemondx`; a rerun rewrites the file, so it never piles up). A root that a
+waterpump`; a rerun rewrites the file, so it never piles up). A root that a
 `<Directory>` or `<DirectoryMatch>` block covers -- one for the root itself or
 any directory above it, in the vhost or anywhere in the server's config -- is
 left to that block: a `Require` in a deeper block replaces its parent's rather
@@ -406,7 +401,7 @@ export. Verified with Debian 12 and Alpine 3.23 containers and a Debian 12 VM,
 across reboots.
 
 ```bash
-lemondx create files -i images:debian/12 -b nfs-mount \
+waterpump create files -i images:debian/12 -b nfs-mount \
     --param NFS_SOURCE=192.168.1.10:/srv/share --param NFS_MOUNTPOINT=/srv/share
 ```
 
@@ -419,7 +414,7 @@ template uses — and restart it:
 lxc profile create nfs-client      # incus on Incus
 lxc profile set nfs-client security.syscalls.intercept.mount=true \
     security.syscalls.intercept.mount.allowed=nfs,nfs4
-lemondx template-save files -i images:debian/12 --profile default --profile nfs-client -b nfs-mount ...
+waterpump template-save files -i images:debian/12 --profile default --profile nfs-client -b nfs-mount ...
 ```
 
 Without them, the module fails with those commands in its error. The profile
@@ -432,7 +427,7 @@ fall back to an older NFS version when the server refuses the newest, so when
 a mount fails the module tries 4.1, 4.0 and 3 in turn and writes the one that
 worked into fstab as `vers=`. Naming `vers=` in `NFS_OPTIONS` skips that. On
 Alpine, OpenRC's `netmount` does not run in a container, so the module adds
-`/etc/local.d/lemondx-nfs.start` to mount NFS at boot instead.
+`/etc/local.d/waterpump-nfs.start` to mount NFS at boot instead.
 
 ## The mDNS module
 
@@ -442,7 +437,7 @@ Verified with Debian 12, Ubuntu 24.04, Fedora 44, Arch, openSUSE Tumbleweed
 and Alpine 3.22 containers, Alpine across a reboot.
 
 ```bash
-lemondx create web-1 -i images:debian/12 -b mdns --param MDNS_SERVICES="http:80 ssh:22"
+waterpump create web-1 -i images:debian/12 -b mdns --param MDNS_SERVICES="http:80 ssh:22"
 ping web-1.local                    # from the host, or another instance on the bridge
 avahi-browse -rt _http._tcp         # the advertised services
 ```
@@ -452,7 +447,7 @@ avahi-browse -rt _http._tcp         # the advertised services
   would claim the same name. If another host already answers for a name,
   Avahi takes `name-2` and the module warns with the name it got.
 - **`MDNS_SERVICES`** advertises DNS-SD services as `type:port` (`/udp` for
-  UDP), named after the host, in `/etc/avahi/services/lemondx.service`.
+  UDP), named after the host, in `/etc/avahi/services/waterpump.service`.
   Running the module again replaces the list; blank removes it.
 - **`MDNS_RESOLVE=yes`** also installs nss-mdns, so the instance resolves
   other `.local` names (instances of a stack finding each other, say). On
@@ -472,7 +467,7 @@ multicast is not routed -- so across nodes use the addresses
 installed on most desktops).
 
 Where systemd-resolved runs, the module turns its own mDNS off
-(`/etc/systemd/resolved.conf.d/lemondx-mdns.conf`), so only Avahi answers on
+(`/etc/systemd/resolved.conf.d/waterpump-mdns.conf`), so only Avahi answers on
 port 5353. It also comments out Avahi's `rlimit-nproc`: on host kernels
 before 5.14 that limit was counted across every container sharing the
 daemon's ID map, so a second instance running Avahi could not start it.

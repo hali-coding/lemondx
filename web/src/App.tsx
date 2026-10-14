@@ -9,8 +9,8 @@ import { keyOf } from './lib/instance'
 import { AuthContext } from './hooks/useAuth'
 import { useScope, scopeTargets } from './hooks/useScope'
 import { useTheme } from './hooks/useTheme'
-import { useToasts } from './hooks/useToasts'
-import type { ToastKind } from './hooks/useToasts'
+import { useNotices, useToasts } from './hooks/useToasts'
+import type { Notice, ToastKind } from './hooks/useToasts'
 import { AccessView } from './components/AccessView'
 import { AppCheckDialog } from './components/AppCheckDialog'
 import { ConfigureNodeDialog } from './components/ConfigureNodeDialog'
@@ -20,7 +20,7 @@ import { ContainerTable } from './components/ContainerTable'
 import { CreateDialog } from './components/CreateDialog'
 import {
   BoxIcon, DatabaseIcon, HelpIcon, HomeIcon, LayersIcon, MenuIcon, MoonIcon, NetworkIcon, PlusIcon, PuzzleIcon,
-  LogsIcon, PulseIcon, RefreshIcon, ServerIcon, ShieldIcon, StackIcon, SunIcon, TemplateIcon,
+  ClockIcon, LogsIcon, PulseIcon, RefreshIcon, ServerIcon, ShieldIcon, StackIcon, SunIcon, TemplateIcon,
 } from './components/Icons'
 import { ImagesView } from './components/ImagesView'
 import { ModulesView } from './components/ModulesView'
@@ -32,6 +32,7 @@ import { HomeView } from './components/HomeView'
 import { ScopePicker } from './components/ScopePicker'
 import { SetupBanner } from './components/SetupBanner'
 import { StacksView } from './components/StacksView'
+import { TasksView } from './components/TasksView'
 import { StorageView } from './components/StorageView'
 import { LoginGate } from './components/LoginGate'
 import { TemplatesView } from './components/TemplatesView'
@@ -40,7 +41,7 @@ import { Toasts } from './components/Toasts'
 
 const POLL_INTERVAL = 3000
 
-type View = 'home' | 'containers' | 'templates' | 'stacks' | 'images' | 'cluster' | 'storage'
+type View = 'home' | 'containers' | 'templates' | 'stacks' | 'tasks' | 'images' | 'cluster' | 'storage'
   | 'network' | 'modules' | 'access' | 'logs' | 'monitor'
 
 // Grouped by what a person comes to do: run things, or look after the hosts
@@ -60,7 +61,7 @@ const NAV: {
   { label: 'Workloads',
     help: {
       intro: 'Everything here ends in containers, and each part builds on the one before it.',
-      order: ['images', 'modules', 'templates', 'stacks', 'containers'],
+      order: ['images', 'modules', 'templates', 'stacks', 'tasks', 'containers'],
       chain: true,
     },
     items: [
@@ -73,6 +74,10 @@ const NAV: {
       { id: 'stacks', label: 'Stacks', icon: <StackIcon size={16} />,
         about: 'Templates run in stages, so a database is up before the app that needs it. '
           + 'Each step can hand its addresses and values to the next.' },
+      { id: 'tasks', label: 'Tasks', icon: <ClockIcon size={16} />,
+        about: 'Modules run in a throwaway container on a schedule or when invoked with '
+          + 'inputs. The cluster decides which node runs each one; the container is '
+          + 'destroyed when the run ends.' },
       { id: 'images', label: 'Images', icon: <LayersIcon size={16} />,
         about: 'What containers are made from: images on each node, and snapshots that can '
           + 'become one. Copy an image to other nodes so templates launch it there.' },
@@ -88,7 +93,7 @@ const NAV: {
     },
     items: [
       { id: 'cluster', label: 'Cluster', icon: <ServerIcon size={16} />,
-        about: 'The hosts running lemondx, each with its own LXD or Incus. Joined into a '
+        about: 'The hosts running waterpump, each with its own LXD or Incus. Joined into a '
           + 'cluster they share templates, stacks and modules, and launches can spread '
           + 'across them. Settings for the whole cluster, such as logging, are here too.' },
       { id: 'monitor', label: 'Monitor', icon: <PulseIcon size={16} />,
@@ -103,7 +108,7 @@ const NAV: {
         about: 'Users and API tokens, and whether each may only look, operate what exists, '
           + 'or change everything.' },
       { id: 'logs', label: 'Logs', icon: <LogsIcon size={16} />,
-        about: 'Everything lemondx does and who asked for it, live from every node: '
+        about: 'Everything waterpump does and who asked for it, live from every node: '
           + 'follow one request across the cluster, or one instance’s history.' },
     ] },
 ]
@@ -116,13 +121,13 @@ const STATE_VERB: Record<StateAction, string> = {
 export default function App() {
   const { theme, toggle } = useTheme()
   const { scope, choose: chooseScope, nodes, groups, federated, reload: reloadCluster } = useScope()
-  // Where this lemondx sits, so a row here can be told apart from one elsewhere.
+  // Where this waterpump sits, so a row here can be told apart from one elsewhere.
   const localNode = nodes.find((n) => n.self)?.name ?? ''
 
   // Which node a tab is on, in the tab itself: with several nodes' UIs open
-  // side by side, "lemondx" six times tells them apart by nothing.
+  // side by side, "waterpump" six times tells them apart by nothing.
   useEffect(() => {
-    document.title = localNode ? `${localNode} (lemondx)` : 'lemondx'
+    document.title = localNode ? `${localNode} (waterpump)` : 'waterpump'
   }, [localNode])
   // Refused by the server anyway; said up front so nobody fills in a create first.
   const localMaintenance = nodes.find((n) => n.self)?.maintenance ?? null
@@ -224,8 +229,8 @@ export default function App() {
         continue
       }
       if (!watchedCreates.current.delete(record.name)) continue
-      // Template runs report as a whole, below.
-      if (record.template) continue
+      // Template runs report as a whole, below; a task's create is its run's.
+      if (record.template || record.task) continue
       if (record.error) {
         notify('error', `Could not create ${record.name}`, record.error)
       } else if (record.ok === false) {
@@ -644,13 +649,28 @@ export default function App() {
   const canWrite = !principal || principal.role === 'admin'
   const running = containers?.filter((c) => c.status === 'Running').length ?? 0
 
+  // Conditions worth knowing about wherever you are, in the corner on every
+  // tab. One that Home already shows as a banner is left off there.
+  const notices: Notice[] = []
+  if (localMaintenance && view !== 'home') {
+    notices.push({
+      key: `maintenance:${localMaintenance.since}`,
+      kind: 'warn',
+      title: `${localNode || 'This node'} is in maintenance`,
+      detail: 'No new instances or fabric changes here'
+        + (localMaintenance.reason ? ` — ${localMaintenance.reason}` : '') + '.',
+      action: view === 'cluster' ? undefined : { label: 'Cluster tab', onClick: () => setView('cluster') },
+    })
+  }
+  const { visible: shownNotices, close: closeNotices } = useNotices(notices)
+
   return (
     <AuthContext.Provider value={authInfo}>
     <div className="app">
       <aside className={`sidebar${navOpen ? ' sidebar-open' : ''}`} aria-label="Main menu">
         <div className="brand">
-          <img src="/lemon.svg" alt="" />
-          <span>lemondx</span>
+          <img src="/waterpump.svg" alt="" />
+          <span>waterpump</span>
         </div>
         <nav className="sidebar-nav" aria-label="Views">
           <button className="sidebar-item"
@@ -765,13 +785,13 @@ export default function App() {
         {connectionError && (
           <div className="banner banner-error">
             <div className="banner-body">
-              <h3>Lost contact with the lemondx server</h3>
+              <h3>Lost contact with the waterpump server</h3>
               <p style={{ margin: 0 }}>{connectionError}</p>
             </div>
           </div>
         )}
 
-        {localMaintenance && (
+        {localMaintenance && view === 'home' && (
           <div className="banner banner-warn">
             <div className="banner-body">
               <h3>{localNode || 'This node'} is in maintenance</h3>
@@ -813,7 +833,7 @@ export default function App() {
               <h3>This node is unconfigured</h3>
               <p>
                 It listens on this host only, with no login and no HTTPS — fine for trying
-                lemondx here, but no other host can reach it, so it cannot join a cluster
+                waterpump here, but no other host can reach it, so it cannot join a cluster
                 either. Configuring it adds an admin login and a certificate, and can open
                 it to other hosts.
               </p>
@@ -884,6 +904,8 @@ export default function App() {
             onOpen={openInstance}
             onChanged={() => refresh()}
           />
+        ) : view === 'tasks' ? (
+          <TasksView localNode={localNode} onNotify={notify} />
         ) : view === 'storage' ? (
           <>
             <div className="section-head">
@@ -948,7 +970,7 @@ export default function App() {
         )}
 
         {(() => {
-          // The prompt to review instances made outside lemondx; each row
+          // The prompt to review instances made outside waterpump; each row
           // carries a badge too. Null, not undefined: a peer too old to mark
           // its instances says nothing, rather than calling them all foreign.
           const foreign = (containers ?? []).filter((c) => c.origin === null).length
@@ -957,8 +979,8 @@ export default function App() {
               <div className="banner-body">
                 <p style={{ margin: 0 }}>
                   {foreign === 1 ? '1 instance here was' : `${foreign} instances here were`} made
-                  outside lemondx (with <span className="mono">lxc</span>, a script, or an older
-                  lemondx). Import {foreign === 1 ? 'it' : 'them'} to stop the warning, and
+                  outside waterpump (with <span className="mono">lxc</span>, a script, or an older
+                  waterpump). Import {foreign === 1 ? 'it' : 'them'} to stop the warning, and
                   optionally attach {foreign === 1 ? 'it' : 'them'} to a template.
                 </p>
               </div>
@@ -1086,7 +1108,7 @@ export default function App() {
         </Modal>
       ))}
 
-      <Toasts toasts={toasts} onDismiss={dismiss} />
+      <Toasts toasts={toasts} onDismiss={dismiss} notices={shownNotices} onCloseNotices={closeNotices} />
     </div>
     </AuthContext.Provider>
   )

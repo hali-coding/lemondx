@@ -18,7 +18,7 @@ import { SshKeyPicker } from './SshKeyPicker'
 // cannot contain a colon.
 const FABRIC_CHOICE = 'fabric:'
 // A NAT'd fabric stored as a second NIC, which the picker never makes but
-// `lemondx template --fabric` does: shown as its own choice, or it reads as
+// `waterpump template --fabric` does: shown as its own choice, or it reads as
 // the fabric alone and picking that changes nothing.
 const SECOND_NIC_CHOICE = 'second-nic:'
 

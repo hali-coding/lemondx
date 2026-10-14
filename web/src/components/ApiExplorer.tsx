@@ -5,7 +5,7 @@ import type { Language } from '../lib/snippets'
 import { useAuthInfo } from '../hooks/useAuth'
 import { CopyButton } from './CopyButton'
 
-const LANGUAGE_KEY = 'lemondx-api-language'
+const LANGUAGE_KEY = 'waterpump-api-language'
 
 function storedLanguage(): Language {
   try {

@@ -45,14 +45,14 @@ reported and the rest go ahead.
 From the CLI:
 
 ```bash
-lemondx network lan                               # the NICs, and what each can do
-lemondx network lan-create lan0 eno1                 # macvlan, the default
-lemondx network lan-create lan1 enp2s0 --mode bridge   # a spare NIC
-lemondx network lan-create lan --default          # this node's default-route NIC
-lemondx network lan-create lan --all-nodes        # every node, on its default-route NIC
-lemondx network convert eno1 --dry-run            # the commands, without running them
-lemondx network convert eno1 --bridge br0         # asks first
-lemondx network revert br0
+waterpump network lan                           # the NICs, and what each can do
+waterpump network lan-create lan0 eno1             # macvlan, the default
+waterpump network lan-create lan1 enp2s0 --mode bridge  # a spare NIC
+waterpump network lan-create lan --default      # this node's default-route NIC
+waterpump network lan-create lan --all-nodes    # every node, on its default-route NIC
+waterpump network convert eno1 --dry-run        # the commands, without running them
+waterpump network convert eno1 --bridge br0     # asks first
+waterpump network revert br0
 ```
 
 ## What each NIC allows
@@ -71,25 +71,25 @@ lemondx network revert br0
 An instance on a macvlan network reaches every [fabric](networking.md)
 instance in the cluster, on any node, by its fabric address:
 
-- **Routes in the instance.** At launch lemondx gives it a static route to each
+- **Routes in the instance.** At launch waterpump gives it a static route to each
   node's fabric subnet, via that node's LAN address -- and to its own host's
   via the host's fabric gateway (below). They are kept where the guest's
   network manager keeps them: a drop-in for the interface's own
   systemd-networkd file (so networkd does not clear them as foreign), or an
   ifupdown `if-up.d` hook elsewhere (Alpine, Debian without networkd). When
-  fabrics or members change, lemondx writes them again into every running
+  fabrics or members change, waterpump writes them again into every running
   macvlan instance on that node, on the same clock as fabric routes.
 - **The fabrics let the LAN in.** Every member publishes which LAN subnets its
   macvlan networks are on, and every fabric firewall admits them. That is the
-  whole subnet, not just lemondx's instances: any device on that LAN that adds
+  whole subnet, not just waterpump's instances: any device on that LAN that adds
   a route can reach fabric instances.
 - **The host shim.** macvlan never passes frames between a NIC and its own
   macvlan instances, so on its own the host could not reach them, nor they its
-  fabric. lemondx adds a small macvlan interface to the host (`lmdx-<nic>`, no
+  fabric. waterpump adds a small macvlan interface to the host (`wpmp-<nic>`, no
   address) that its instances *can* reach, plus a `/32` route per instance
   through it (route protocol 134, apart from the fabric's 133), sending from the
   host's own address on that LAN. What a fabric instance opens towards one is
-  SNAT'd to that address too (`ip lemondx_shim`). The shim is removed with the
+  SNAT'd to that address too (`ip waterpump_shim`). The shim is removed with the
   last macvlan instance on that host. As a side effect the host now reaches
   its own macvlan instances.
 
@@ -101,13 +101,13 @@ fabric.
 ## Converting the host's own NIC
 
 This is the one that changes the host, so it is worth knowing what it does.
-lemondx asks NetworkManager to:
+waterpump asks NetworkManager to:
 
-1. make a bridge connection `lemondx-br0` with the NIC's **MAC, addresses,
+1. make a bridge connection `waterpump-br0` with the NIC's **MAC, addresses,
    gateway, DNS and routes** copied from the NIC's own connection -- the same
    MAC means the router hands back the same address, and static extra
    addresses carry over;
-2. make a port connection `lemondx-br0-port` putting the NIC in the bridge;
+2. make a port connection `waterpump-br0-port` putting the NIC in the bridge;
 3. keep the NIC's own connection from coming back up on its own (it is not
    deleted: reverting goes back to it);
 4. bring the port and bridge up, and wait.
@@ -115,12 +115,12 @@ lemondx asks NetworkManager to:
 The network drops for a few seconds while the address moves; an open page may
 lose the server briefly. If the bridge does not come up with an address -- and,
 when the NIC was the host's way out, with the default route -- **everything is
-undone** before lemondx answers, and the NIC's own connection brought back.
+undone** before waterpump answers, and the NIC's own connection brought back.
 STP is off and the forwarding delay zero, or the port would spend 30 seconds
 learning before passing DHCP.
 
 **Revert** (on the bridge, in *Other host interfaces*) deletes the two
-`lemondx-` connections and brings the NIC's own connection back. It is refused
+`waterpump-` connections and brings the NIC's own connection back. It is refused
 while an instance or profile still has a NIC on the bridge.
 
 It needs NetworkManager to be running the NIC (the default on Ubuntu desktop and
@@ -144,12 +144,12 @@ network:
 
 ### Privilege
 
-Converting runs as root through the same helper as fabrics (`lemondx
+Converting runs as root through the same helper as fabrics (`waterpump
 fabric-helper`, see [networking](networking.md#privilege)), which reads a
 wanted state -- `{"lan": {"action": "convert", "nic": "eno1", "bridge": "br0"}}`
 -- rather than a command, and holds it to what it can check itself: the NIC is
 a physical, wired NIC that is no bridge's port yet, the bridge a free name, and
-only connections named `lemondx-<bridge>` are ever removed. Without the helper,
+only connections named `waterpump-<bridge>` are ever removed. Without the helper,
 the dialog and `network convert --dry-run` show the exact commands to run
 yourself.
 
@@ -157,8 +157,8 @@ yourself.
 
 Docker loads `br_netfilter`, which sends bridged frames through iptables, and
 sets `FORWARD` to `DROP`: a LAN bridge on a Docker host carries nothing until
-it is let through. lemondx adds an accept in `DOCKER-USER` for each LAN bridge
-(tagged `lemondx-lan`, apart from the fabric's rules), removes it when the
+it is let through. waterpump adds an accept in `DOCKER-USER` for each LAN bridge
+(tagged `waterpump-lan`, apart from the fabric's rules), removes it when the
 bridge goes, and puts it back after Docker restarts on the same clock as fabric
 routes. Without the helper, it says which rules to add. macvlan never passes a
 bridge and needs none.

@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lemondx"
+name = "waterpump"
 version = "0.9.1"
 description = "Application orchestration on LXD and Incus: staged, multi-node stacks of instance templates"
 readme = "README.md"
@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 dependencies = []          # stdlib only, by design
 
 [project.scripts]
-lemondx = "lemondx.cli:main"
+waterpump = "waterpump.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -2,7 +2,7 @@ import type { AutoSync } from './types'
 
 /**
  * How a save or delete that the cluster keeps level went, as a line to show
- * the user. Empty on a lemondx that is not federated, so nothing in the UI has
+ * the user. Empty on a waterpump that is not federated, so nothing in the UI has
  * to know whether there is a cluster before reporting an ordinary save.
  */
 export function syncDetail(synced: AutoSync | null | undefined) {

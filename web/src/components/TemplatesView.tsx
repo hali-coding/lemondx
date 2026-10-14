@@ -18,7 +18,7 @@ import { StaleBadge } from './StaleBadge'
 
 interface Props {
   containers: ScopedContainer[] | null
-  /** Which node this lemondx is, for telling local instances from the rest. */
+  /** Which node this waterpump is, for telling local instances from the rest. */
   localNode: string
   /** How wide the view is; a template's members follow the same scope. */
   scope: Scope
@@ -99,7 +99,7 @@ export function TemplatesView({
       .catch((cause) => {
         if ((cause as Error).name !== 'AbortError') setError((cause as Error).message)
       })
-    // A lemondx federated with nobody answers with one node, and the launch
+    // A waterpump federated with nobody answers with one node, and the launch
     // dialog leaves the picker out -- so a failure here is not worth showing.
     Promise.all([api.nodes(signal, false), api.nodeGroups(signal)])
       .then(([loadedNodes, loadedGroups]) => {

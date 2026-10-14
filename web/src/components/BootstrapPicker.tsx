@@ -8,6 +8,11 @@ interface Props {
   disabled?: boolean
   /** Show secrets as asked for on launch instead of as inputs (templates). */
   secretsAtLaunch?: boolean
+  /**
+   * A secret holds a reference instead -- `{{secrets.NAME}}`, or a secret
+   * input's `{{inputs.NAME}}` -- which is what a task saves (see tasks.py).
+   */
+  secretReferences?: boolean
 }
 
 /**
@@ -18,7 +23,9 @@ interface Props {
  * its own parameters: the first under NAME, the nth under NAME@n, which is how
  * the server tells them apart (`bootstrap.param_key()`).
  */
-export function BootstrapPicker({ modules, value, onChange, disabled, secretsAtLaunch }: Props) {
+export function BootstrapPicker({
+  modules, value, onChange, disabled, secretsAtLaunch, secretReferences,
+}: Props) {
   const countOf = (id: string) => value.modules.filter((m) => m === id).length
 
   function toggleModule(id: string) {
@@ -63,7 +70,7 @@ export function BootstrapPicker({ modules, value, onChange, disabled, secretsAtL
       <p className="hint">
         No bootstrap modules found. Drop <span className="mono">.sh</span> files into{' '}
         <span className="mono">modules/</span> or{' '}
-        <span className="mono">~/.local/share/lemondx/modules</span>.
+        <span className="mono">~/.local/share/waterpump/modules</span>.
       </p>
     )
   }
@@ -109,6 +116,7 @@ export function BootstrapPicker({ modules, value, onChange, disabled, secretsAtL
                   {module.params.map((param) => (
                     <ParamField key={param.name} param={param} n={n} value={value}
                       disabled={disabled} secretsAtLaunch={secretsAtLaunch}
+                      secretReferences={secretReferences}
                       onChange={setParam} />
                   ))}
                 </div>
@@ -131,16 +139,37 @@ export function BootstrapPicker({ modules, value, onChange, disabled, secretsAtL
 }
 
 /** One parameter of one occurrence of a module. */
-function ParamField({ param, n, value, disabled, secretsAtLaunch, onChange }: {
+function ParamField({ param, n, value, disabled, secretsAtLaunch, secretReferences, onChange }: {
   param: BootstrapModule['params'][number]
   n: number
   value: BootstrapSelection
   disabled?: boolean
   secretsAtLaunch?: boolean
+  secretReferences?: boolean
   onChange: (key: string, next: string) => void
 }) {
   const key = occurrenceKey(param.name, n)
   const id = `p-${key}`
+  if (param.secret && secretReferences) {
+    return (
+      <div className="field">
+        <label htmlFor={id}>
+          {param.name}
+          <span className="badge badge-warn">secret</span>
+        </label>
+        <input id={id} className="input mono" autoComplete="off" disabled={disabled}
+          value={value.params[key] ?? ''} placeholder="{{secrets.NAME}}"
+          onChange={(event) => onChange(key, event.target.value)} />
+        <span className="hint">
+          {param.description}
+          <span className="faint">
+            {' '}· a reference only: a task secret, or a secret input&rsquo;s
+            {' '}<span className="mono">{'{{inputs.NAME}}'}</span>
+          </span>
+        </span>
+      </div>
+    )
+  }
   if (param.secret && secretsAtLaunch) {
     return (
       <div className="field">

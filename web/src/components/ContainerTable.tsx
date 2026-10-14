@@ -36,7 +36,7 @@ interface Props {
   onDelete: (container: ScopedContainer) => void
   onCreate: () => void
   canCreate: boolean
-  /** Which node this lemondx is; rows on any other are read-only here. */
+  /** Which node this waterpump is; rows on any other are read-only here. */
   localNode: string
   /** Node name -> its own UI address, for opening a remote instance where it lives. */
   nodeUrls: Record<string, string>
@@ -271,8 +271,8 @@ export function ContainerTable({
                     {/* Undefined, from a peer too old to mark, is not flagged: it cannot tell. */}
                     {container.origin === null && (
                       <span className="badge badge-warn"
-                        title="Made outside lemondx (lxc, a script, or an older lemondx). Import it from the Cluster tab's Inventory.">
-                        not from lemondx
+                        title="Made outside waterpump (lxc, a script, or an older waterpump). Import it from the Cluster tab's Inventory.">
+                        not from waterpump
                       </span>
                     )}
                   </div>

@@ -8,25 +8,25 @@ Sockets are searched in this order, first match wins:
 
 | Order | Path | Daemon |
 | --- | --- | --- |
-| 1 | `--socket` / `LEMONDX_SOCKET` / `INCUS_SOCKET` | inferred from the path |
+| 1 | `--socket` / `WATERPUMP_SOCKET` / `INCUS_SOCKET` | inferred from the path |
 | 2 | `$INCUS_DIR/unix.socket`, `$LXD_DIR/unix.socket` | Incus / LXD |
 | 3 | `/var/snap/lxd/common/lxd/unix.socket` | LXD (snap) |
 | 4 | `/var/lib/lxd/unix.socket` | LXD (deb) |
 | 5 | `/var/lib/incus/unix.socket`, `/run/incus/unix.socket` | Incus |
 
-Force one with `LEMONDX_FLAVOR=lxd` or `LEMONDX_FLAVOR=incus`. `lemondx status`
+Force one with `WATERPUMP_FLAVOR=lxd` or `WATERPUMP_FLAVOR=incus`. `waterpump status`
 prints which socket and daemon it settled on.
 
-The daemons know different image servers, and lemondx adapts: on LXD you get
+The daemons know different image servers, and waterpump adapts: on LXD you get
 `ubuntu:`, `ubuntu-daily`, `ubuntu-minimal` and `images:`
 (images.lxd.canonical.com); on Incus just `images:`
 (images.linuxcontainers.org), so Ubuntu is `images:ubuntu/24.04` there rather
-than `ubuntu:24.04`. The image picker and the default for `lemondx create` both
+than `ubuntu:24.04`. The image picker and the default for `waterpump create` both
 follow whichever daemon is in use.
 
 ## Image aliases
 
-Images are given as `remote:alias`; `lemondx images` lists what the current
+Images are given as `remote:alias`; `waterpump images` lists what the current
 daemon knows. A bare alias assumes `ubuntu:` on LXD and `images:` on Incus,
 and `local:FINGERPRINT` uses an already-cached image. See also the
 [image browser](web-ui.md#browsing-images) for searching a daemon's full
@@ -53,14 +53,14 @@ the cluster, and one that a template launches by cannot be taken off, just as
 a pin a template launches cannot be unpinned.
 
 ```bash
-lemondx image-search debian 12 --versions   # every build the remotes still serve
-lemondx image-pin images:debian/12 --nickname debian-golden   # today's build, fetched on every node
-lemondx image-pin images:debian/12 --serial 20261001_0350 --note "March base"
-lemondx image-pins                          # every pin, its names, what launches it, whether this node has it
-lemondx image-pin-edit debian-golden --add debian-stable --remove debian-old
-lemondx template-save web --image pin:debian-golden
-lemondx image-fetch debian-golden --node new-node   # a node that missed it
-lemondx image-unpin images-debian-12-20261001-0350  # refused while a template launches it
+waterpump image-search debian 12 --versions  # every build the remotes still serve
+waterpump image-pin images:debian/12 --nickname debian-golden  # today's build, fetched on every node
+waterpump image-pin images:debian/12 --serial 20261001_0350 --note "March base"
+waterpump image-pins                      # every pin, its names, what launches it, whether this node has it
+waterpump image-pin-edit debian-golden --add debian-stable --remove debian-old
+waterpump template-save web --image pin:debian-golden
+waterpump image-fetch debian-golden --node new-node  # a node that missed it
+waterpump image-unpin images-debian-12-20261001-0350  # refused while a template launches it
 ```
 
 Remotes keep only their last few builds — `images:` about a day's — so pinning
@@ -85,14 +85,14 @@ launch it rather than quietly taking something else.
 ## Pruning images
 
 Every launch from a remote leaves the image it downloaded behind, and the
-daemon keeps refreshing those copies. `lemondx image-prune` (or **Prune
+daemon keeps refreshing those copies. `waterpump image-prune` (or **Prune
 images…** on the Images tab) deletes the downloaded ones nothing needs, on
 every node:
 
 ```bash
-lemondx image-prune --dry-run      # what each node would delete, and what it keeps and why
-lemondx image-prune                # the same, then asks before deleting
-lemondx image-prune --node prdev2 -y
+waterpump image-prune --dry-run  # what each node would delete, and what it keeps and why
+waterpump image-prune            # the same, then asks before deleting
+waterpump image-prune --node prdev2 -y
 ```
 
 Downloaded means pulled from a remote: the daemon's cache, an image with a
@@ -107,7 +107,7 @@ launch picked up in between is kept.
 
 ## Storage, and disk sizes
 
-`lemondx init` gets a fresh host ready for instances — a pool, a bridge and a
+`waterpump init` gets a fresh host ready for instances — a pool, a bridge and a
 default profile that uses them. It is a convenience for a new node, not a
 substitute for setting up the daemon deliberately: a host whose daemon is
 already configured needs none of it. It creates the pool with the `dir` driver
@@ -116,17 +116,17 @@ backing file.
 
 The trade-off is that **`dir` cannot enforce a per-container disk size** unless
 the backing filesystem has project quotas enabled. The daemon accepts the size,
-logs `skipping set quota`, and ignores it. lemondx does not hide this:
+logs `skipping set quota`, and ignores it. waterpump does not hide this:
 
-- `lemondx status` marks such a pool `no disk quotas`
-- `lemondx init` prints a note when it creates one
-- `lemondx create -d ...` warns before creating
+- `waterpump status` marks such a pool `no disk quotas`
+- `waterpump init` prints a note when it creates one
+- `waterpump create -d ...` warns before creating
 - the web UI warns under the Disk field, naming the pool and driver
 
 If you want enforced disk quotas, initialize with a driver that supports them:
 
 ```bash
-./lemondx init --storage btrfs --size 50GiB    # or zfs, lvm
+./waterpump init --storage btrfs --size 50GiB  # or zfs, lvm
 ```
 
 CPU and memory limits are enforced on every driver; only disk size depends on
@@ -134,7 +134,7 @@ the pool.
 
 ## Managing pools and volumes
 
-The **Storage** tab and `lemondx storage` commands manage local storage through
+The **Storage** tab and `waterpump storage` commands manage local storage through
 the daemon API. The supported management drivers are deliberately limited to:
 
 - `dir` — an existing directory or daemon-managed directory storage
@@ -144,7 +144,7 @@ the daemon API. The supported management drivers are deliberately limited to:
 
 A driver appears in the create form only when the connected daemon reports it
 as available. Distributed, clustered, shared, object and enterprise drivers
-are outside lemondx's management scope. Existing pools using one of those
+are outside waterpump's management scope. Existing pools using one of those
 drivers are still listed, but are read-only, as are their volumes. Storage is
 also read-only when the connected daemon is clustered because pool creation
 then requires per-member configuration.
@@ -169,32 +169,32 @@ image listed in the plan is removed from every pool where it is cached. The
 cascade is ordered but not transactional: if the daemon rejects a later step,
 resources removed by earlier steps cannot be restored automatically.
 
-ZFS pool deletion is a detach operation. lemondx first deletes the confirmed
+ZFS pool deletion is a detach operation. waterpump first deletes the confirmed
 LXD-managed resources, but it never asks LXD to delete an imported backing
 zpool because LXD couples unregistering a ZFS pool with `zpool destroy`.
-Instead, lemondx asks you to run `sudo zpool export ZPOOL` on the host and
+Instead, waterpump asks you to run `sudo zpool export ZPOOL` on the host and
 retry. Once the zpool is no longer imported, LXD removes its storage-pool
 registration without destroying the zpool or its remaining datasets. The
-zpool can be imported again after the LXD registration is gone. lemondx does
+zpool can be imported again after the LXD registration is gone. waterpump does
 not run privileged ZFS commands or modify LXD's database directly.
 
 ```bash
-./lemondx storage pools
-./lemondx storage pool create fast --driver zfs --size 30GiB
-./lemondx storage volumes --pool fast
-./lemondx storage volume create fast data --size 10GiB
-./lemondx storage volume set fast data --size 20GiB
-./lemondx storage volume delete fast data
-./lemondx storage pool delete fast --force
-./lemondx storage pool delete fast --force --confirm-name fast  # automation
+./waterpump storage pools
+./waterpump storage pool create fast --driver zfs --size 30GiB
+./waterpump storage volumes --pool fast
+./waterpump storage volume create fast data --size 10GiB
+./waterpump storage volume set fast data --size 20GiB
+./waterpump storage volume delete fast data
+./waterpump storage pool delete fast --force
+./waterpump storage pool delete fast --force --confirm-name fast  # automation
 ```
 
-Use `./lemondx create NAME --pool fast` to place a new instance's root disk on
+Use `./waterpump create NAME --pool fast` to place a new instance's root disk on
 a specific existing pool without changing the default profile.
 
 Pool and volume configuration can be supplied with repeated
 `--config KEY=VALUE`, but only documented local-driver keys are accepted.
-lemondx does not accept remote-backend credentials through this interface.
+waterpump does not accept remote-backend credentials through this interface.
 
 ## Units
 

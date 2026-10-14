@@ -4,7 +4,7 @@ import type {
 } from './types'
 
 // What a blank CPU or memory field means in the UI. Only the forms apply
-// these: the API and `lemondx create` still treat an omitted limit as none, so
+// these: the API and `waterpump create` still treat an omitted limit as none, so
 // scripts keep the daemon's behaviour. Shown as the placeholders, so the value
 // a blank field sends is the value it appears to hold.
 export const DEFAULT_CPU = '4'

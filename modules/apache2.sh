@@ -3,11 +3,11 @@
 # description: Install the Apache web server, start it, and optionally install a virtual host you supply.
 # order: 55
 # text: VHOST_CONFIG=  Virtual host configuration, e.g. a <VirtualHost *:80> block; blank installs Apache only
-# param: VHOST_NAME=lemondx  File name for the virtual host, without .conf
+# param: VHOST_NAME=waterpump  File name for the virtual host, without .conf
 # param: ENABLE_MODULES=  Extra Apache modules to enable, space-separated (e.g. rewrite headers proxy proxy_http)
 # param: DISABLE_DEFAULT_SITE=yes  On Debian/Ubuntu, disable 000-default when a vhost is given (yes or no)
 
-vhost_name="${VHOST_NAME:-lemondx}"
+vhost_name="${VHOST_NAME:-waterpump}"
 modules="$(printf '%s' "${ENABLE_MODULES:-}" | tr ',' ' ')"
 # A config pasted from elsewhere may carry CRLF line endings, which Apache
 # reads as part of each directive's last argument.
@@ -28,22 +28,22 @@ esac
 # Every family names the package, the service and the drop-in directory
 # differently. Arch's httpd.conf includes no directory of its own, so the
 # module adds one (below).
-case "$LEMONDX_PKG" in
+case "$WATERPUMP_PKG" in
     apt)              pkg_install apache2;  svc=apache2; confdir=/etc/apache2/sites-available ;;
     dnf|yum|microdnf) pkg_install httpd;    svc=httpd;   confdir=/etc/httpd/conf.d ;;
     apk)              pkg_install apache2;  svc=apache2; confdir=/etc/apache2/conf.d ;;
-    pacman)           pkg_install apache;   svc=httpd;   confdir=/etc/httpd/conf/lemondx.d ;;
+    pacman)           pkg_install apache;   svc=httpd;   confdir=/etc/httpd/conf/waterpump.d ;;
     zypper)           pkg_install apache2;  svc=apache2; confdir=/etc/apache2/vhosts.d ;;
-    *)                die "no Apache recipe for package manager '$LEMONDX_PKG'" ;;
+    *)                die "no Apache recipe for package manager '$WATERPUMP_PKG'" ;;
 esac
 
 mkdir -p "$confdir"
 
-if [ "$LEMONDX_PKG" = pacman ]; then
+if [ "$WATERPUMP_PKG" = pacman ]; then
     main=/etc/httpd/conf/httpd.conf
     include="IncludeOptional $confdir/*.conf"
     if ! grep -qxF "$include" "$main"; then
-        printf '\n# Added by lemondx: virtual hosts from the apache2 module.\n%s\n' "$include" >> "$main"
+        printf '\n# Added by waterpump: virtual hosts from the apache2 module.\n%s\n' "$include" >> "$main"
     fi
 fi
 
@@ -114,7 +114,7 @@ EOF
 
 # Some modules are separate packages outside Debian and SUSE.
 for m in $modules; do
-    case "$LEMONDX_PKG:$m" in
+    case "$WATERPUMP_PKG:$m" in
         apk:ssl)              pkg_install apache2-ssl ;;
         apk:proxy*)           pkg_install apache2-proxy ;;
         dnf:ssl|yum:ssl|microdnf:ssl) pkg_install mod_ssl ;;
@@ -149,12 +149,12 @@ if [ -n "$vhost" ]; then
     target="$confdir/$vhost_name.conf"
     backup=""
     if [ -f "$target" ]; then
-        backup="$target.lemondx-previous"
+        backup="$target.waterpump-previous"
         cp -p "$target" "$backup"
     fi
 
     printf '%s\n' "$vhost" > "$target"
-    if [ "$LEMONDX_PKG" = apt ]; then
+    if [ "$WATERPUMP_PKG" = apt ]; then
         a2ensite "$vhost_name" >/dev/null
     fi
 
@@ -167,7 +167,7 @@ if [ -n "$vhost" ]; then
         case "$root" in /*) ;; *) continue ;; esac
         [ -e "$root" ] && continue
         mkdir -p "$root"
-        printf '<!doctype html>\n<title>%s</title>\n<p>%s is served by Apache, installed by lemondx.</p>\n' \
+        printf '<!doctype html>\n<title>%s</title>\n<p>%s is served by Apache, installed by waterpump.</p>\n' \
             "$vhost_name" "$vhost_name" > "$root/index.html"
         log "created $root"
     done
@@ -194,7 +194,7 @@ if [ -n "$vhost" ]; then
                 log "left access to $root to the <Directory> block that covers it"
                 continue
             fi
-            printf '\n# Added by lemondx (apache2): Apache serves no directory it is not\n# told to, and no <Directory> block covers this one.\n<Directory "%s">\n    Require all granted\n</Directory>\n' \
+            printf '\n# Added by waterpump (apache2): Apache serves no directory it is not\n# told to, and no <Directory> block covers this one.\n<Directory "%s">\n    Require all granted\n</Directory>\n' \
                 "$root" >> "$target"
             log "granted access to $root (no <Directory> block covers it)"
         done
@@ -208,7 +208,7 @@ if [ -n "$vhost" ]; then
         if [ -n "$backup" ]; then
             mv "$backup" "$target"
         else
-            [ "$LEMONDX_PKG" = apt ] && a2dissite "$vhost_name" >/dev/null 2>&1
+            [ "$WATERPUMP_PKG" = apt ] && a2dissite "$vhost_name" >/dev/null 2>&1
             rm -f "$target"
         fi
         printf '%s\n' "$output" >&2
@@ -219,7 +219,7 @@ if [ -n "$vhost" ]; then
 
     # Debian's default site is a catch-all on *:80 that sorts first, so a vhost
     # without a matching ServerName would never be reached.
-    if [ "$LEMONDX_PKG" = apt ] && [ "${DISABLE_DEFAULT_SITE:-yes}" = yes ] \
+    if [ "$WATERPUMP_PKG" = apt ] && [ "${DISABLE_DEFAULT_SITE:-yes}" = yes ] \
         && [ -e /etc/apache2/sites-enabled/000-default.conf ]; then
         a2dissite 000-default >/dev/null
         log "disabled the default site"

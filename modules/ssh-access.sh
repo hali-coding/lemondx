@@ -15,7 +15,7 @@
 # above makes the runner refuse to start without one) and there is no way to
 # ask for only part of this.
 
-[ -n "${LEMONDX_SSH_KEYS:-}" ] || die "no SSH key was selected for this run"
+[ -n "${WATERPUMP_SSH_KEYS:-}" ] || die "no SSH key was selected for this run"
 
 user="${USERNAME:-dev}"
 shell="${SHELL_PATH:-/bin/bash}"
@@ -24,7 +24,7 @@ have "$shell" || shell=/bin/sh
 
 # --- sshd --------------------------------------------------------------
 
-case "$LEMONDX_PKG" in
+case "$WATERPUMP_PKG" in
     apk) pkg_install openssh; svc="sshd" ;;
     apt) pkg_install openssh-server; svc="ssh" ;;
     *)   pkg_install openssh-server || pkg_install openssh; svc="sshd" ;;

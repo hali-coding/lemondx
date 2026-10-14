@@ -261,7 +261,7 @@ export function TemplateDialog({ template, onCancel, onSaved }: Props) {
           <span className="hint">
             Also applies {spec.profiles.length === 1 ? 'daemon profile' : 'daemon profiles'}{' '}
             <span className="mono">{spec.profiles.join(', ')}</span> (set with{' '}
-            <span className="mono">lemondx template-save --profile</span>).
+            <span className="mono">waterpump template-save --profile</span>).
           </span>
         )}
 

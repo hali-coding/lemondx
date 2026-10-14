@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 
 export type Theme = 'light' | 'dark'
 
-const STORAGE_KEY = 'lemondx-theme'
+const STORAGE_KEY = 'waterpump-theme'
 
 function initialTheme(): Theme {
   // index.html already resolved this before paint; trust the DOM, then storage.

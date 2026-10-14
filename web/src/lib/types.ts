@@ -33,9 +33,12 @@ export interface Container {
   template: string | null
   /** The stack that launched it, if any; kept on the instance itself. */
   stack: string | null
-  /** Who made it: lemondx, a person importing it, or null when it was made some
+  /** The task and run it exists for: a throwaway instance, gone when the run ends. */
+  task?: string | null
+  task_run?: string | null
+  /** Who made it: waterpump, a person importing it, or null when it was made some
    *  other way (`lxc launch`, a script) and the inventory flags it. */
-  origin: 'lemondx' | 'imported' | null
+  origin: 'waterpump' | 'imported' | null
   /** Which version of each it was made from; blank when made before this was kept. */
   revisions: { template: string; stack: string }
   /** Which of its template and stack have changed since it was made. */
@@ -150,6 +153,8 @@ export interface CreateProgress {
   type: string
   /** Set when a template launch or recreate started it. */
   template: string | null
+  /** Set when a task run made it; reported as the run, not as a create. */
+  task?: string | null
   /** How many bootstrap modules it runs. */
   modules: number
   stage: 'creating' | 'starting' | 'bootstrapping' | 'done'
@@ -229,7 +234,7 @@ export interface ModuleParam {
 
 export interface BootstrapModule {
   id: string
-  /** Shipped with lemondx; cannot be deleted, only shadowed. */
+  /** Shipped with waterpump; cannot be deleted, only shadowed. */
   builtin: boolean
   /** An upload: its script can be rewritten and the module deleted. */
   editable: boolean
@@ -408,7 +413,7 @@ export interface NetworkSummary {
   default: boolean
   /** Managed networks and host bridges; what an instance can be put on. */
   attachable: boolean
-  /** A managed bridge lemondx can edit and delete. */
+  /** A managed bridge waterpump can edit and delete. */
   manageable: boolean
   read_only_reason: string
   /** How it puts instances on a host NIC's LAN, or null when it does not. */
@@ -419,7 +424,7 @@ export interface NetworkSummary {
  * A network whose instances are addressed by the LAN's own DHCP (the
  * router), not by the daemon. `bridge`: a daemon bridge over a spare NIC.
  * `macvlan`: beside a NIC, so the host cannot reach them over it.
- * `converted`: the NIC the host uses, made a port of a bridge by lemondx.
+ * `converted`: the NIC the host uses, made a port of a bridge by waterpump.
  * `host`: a bridge with a NIC in it that was made some other way.
  */
 export interface LanInfo {
@@ -457,13 +462,13 @@ export interface LanInterface {
   master: string
   /** The NetworkManager connection running it, blank when NM does not. */
   network_manager: string
-  /** `manual`: possible, but lemondx cannot run it as root, so it shows the commands. */
+  /** `manual`: possible, but waterpump cannot run it as root, so it shows the commands. */
   modes: Record<LanMode, { available: boolean; reason: string; manual: boolean }>
 }
 
 export interface LanInterfaces {
   interfaces: LanInterface[]
-  /** lemondx can run its helper as root. */
+  /** waterpump can run its helper as root. */
   helper: boolean
   /** Docker is here, so LAN bridges need an exception in its firewall. */
   docker: boolean
@@ -668,7 +673,7 @@ export interface NodeImage {
   /** Pulled from a remote to launch something, not made or copied here. */
   cached: boolean
   created_at: string | null
-  /** `instance/snapshot` when lemondx published it from one. */
+  /** `instance/snapshot` when waterpump published it from one. */
   source: string | null
 }
 
@@ -779,7 +784,16 @@ export interface StackLaunchStep {
   prefix: string
   /** False: the next stage starts once the instances run, bootstrap or not. */
   wait_bootstrap: boolean
-  /** Parameter overrides; values may hold `{{step.field}}` placeholders. */
+  /**
+   * The share of its instances that must come up for the step to succeed,
+   * 1-100. Below 100 a few failures are noted rather than failing the step.
+   */
+  min_percent: number
+  /**
+   * Parameter overrides. Values may hold `{{step.field}}` (what an earlier
+   * launch made), `{{step.param.NAME}}` (what it ran with) and `{{params.NAME}}`
+   * (entered at launch) placeholders.
+   */
   params: Record<string, string>
   /** Both empty: this node. */
   nodes: string[]
@@ -799,12 +813,49 @@ export interface StackWaitStep {
   timeout_seconds: number
 }
 
-export type StackStep = StackLaunchStep | StackSleepStep | StackWaitStep
+/**
+ * A shell script, run on the node driving the stack as the account waterpump
+ * runs as. Fails the stack on a non-zero exit or the timeout.
+ */
+export interface StackScriptStep {
+  id: string
+  type: 'script'
+  script: string
+  timeout_seconds: number
+  /** Environment variables for the script; values may hold any `{{…}}` placeholder. */
+  params: Record<string, string>
+}
+
+export type StackStep = StackLaunchStep | StackSleepStep | StackWaitStep | StackScriptStep
 export type StackStepType = StackStep['type']
 
 /** Stages run in order; the steps inside one run side by side. */
 export interface StackStage {
   steps: StackStep[]
+}
+
+/** A value the stack carries in the clear, as `{{vars.NAME}}`. */
+export interface StackVariable {
+  value: string
+  description: string
+}
+
+/**
+ * One of the stack's secrets, as `{{secrets.NAME}}`: a declaration and whether
+ * this node holds a value. Never the value -- that is only ever read back
+ * through `revealStackSecret`.
+ */
+export interface StackSecretDeclaration {
+  description: string
+  /** Made at random the first time a launch needs it, then kept. */
+  generate: boolean
+}
+
+export interface StackSecret extends StackSecretDeclaration {
+  set: boolean
+  /** The value held was generated rather than typed in. */
+  generated: boolean
+  updated_at: number | null
 }
 
 export interface Stack {
@@ -813,6 +864,25 @@ export interface Stack {
   stages: StackStage[]
   /** Values a launch must be given, because a step says `{{params.NAME}}`. */
   inputs: string[]
+  variables: Record<string, StackVariable>
+  secrets: Record<string, StackSecret>
+  /** Load tests against the running stack, started on demand; never by its launch. */
+  swarms: StackSwarm[]
+}
+
+/**
+ * A swarm: stages like a stack's, run against the stack while it runs. Every
+ * launch of the stack is an earlier launch to it, and its own instances are
+ * destroyed however it ends. A launch step's count may go to 200.
+ */
+export interface StackSwarm {
+  name: string
+  description: string
+  stages: StackStage[]
+  /** Whether the stack's sequence runs it; the sequence is its swarms in order. */
+  sequence: boolean
+  /** Values its steps ask for as `{{params.NAME}}`, entered when it is started. */
+  inputs?: string[]
 }
 
 /** A save's answer: the stack, how sync went, and what it names that this node
@@ -827,6 +897,11 @@ export interface StackInstance {
   template: string | null
   ipv4: string[]
   stale: StaleKind[]
+  /** The stack step that launched it, and the swarm, if one did. */
+  step?: string | null
+  swarm?: string | null
+  /** Which run of the swarm made it: each run tears down only its own. */
+  swarm_run?: string | null
 }
 
 export interface StackInstances {
@@ -867,21 +942,49 @@ export interface StackStepRun {
   instances?: {
     name: string; node: string; ok: boolean | null; error: string | null
     ipv4?: string | null
+    /** What its modules said last when they succeeded: a load generator's result. */
+    output?: string | null
   }[]
   outputs?: StackOutputs | null
+  // Script steps only. `output` is stdout and stderr together, its tail, with
+  // the stack's secrets and values entered at launch masked.
+  timeout_seconds?: number
+  exit_code?: number | null
+  output?: string | null
+  /** A destroy that is a swarm's teardown. */
+  swarm?: string | null
 }
 
 /** A stack the server is running or last ran. Held by the server process. */
 export interface StackRun {
+  /** Tags a swarm's instances, so its teardown takes only its own. */
+  id: string
   stack: string
-  action: 'launch' | 'relaunch' | 'destroy'
+  action: 'launch' | 'relaunch' | 'destroy' | 'swarm' | 'swarm-stop'
+  /** For a swarm's run, and the destroy of what one left behind. In a
+      sequence, the swarm running now. */
+  swarm?: string | null
+  /** Every swarm a swarm run is for, in the order they run. */
+  swarms?: string[]
   started_at: number
   finished_at: number | null
   ok: boolean | null
   error: string | null
   cancelling: boolean
   cancelled: boolean
-  stages: { steps: StackStepRun[] }[]
+  /** `swarm` names which swarm of a sequence the stage belongs to. */
+  stages: { swarm?: string; steps: StackStepRun[] }[]
+  /** A swarm run's: the stack's instances it was pointed at, by step. */
+  against?: Record<string, { names: string[]; ips: string[]; nodes: string[] }>
+  /** A swarm run's: the stack variables it ran with. */
+  variables?: Record<string, string>
+}
+
+/** A finished run as Markdown, and the name to save it under. */
+export interface StackRunReport {
+  stack: string
+  filename: string
+  markdown: string
 }
 
 export interface ModuleSource {
@@ -1141,7 +1244,7 @@ export interface HealthRecord {
   cpu: { percent: number; cores_used: number; cores: number } | null
   memory: { usage: number; limit: number | null; percent: number | null }
   /**
-   * `source: cgroup` is counted by lemondx from the container's cgroup: 1, 5 and
+   * `source: cgroup` is counted by waterpump from the container's cgroup: 1, 5 and
    * 15 minute averages from `serve` (`warming` for its first minute), or one
    * average over `window` seconds from a one-off check. `guest` is a VM's own;
    * `proc` is what a container reports, usually the host's (`scope: host`).
@@ -1623,7 +1726,7 @@ export interface SyncOutcome {
 
 /**
  * What the rest of the cluster made of a save or a delete that was propagated
- * automatically. Null on a lemondx that is not federated, which is most.
+ * automatically. Null on a waterpump that is not federated, which is most.
  */
 export interface AutoSync {
   ok: boolean
@@ -1659,7 +1762,7 @@ export interface ClusterContainers {
 
 /**
  * Where the Containers and Templates tabs are looking. `local` is this node
- * alone, which is what an unfederated lemondx always shows; the others widen
+ * alone, which is what an unfederated waterpump always shows; the others widen
  * it, and both tabs read the same value so a template's instances and the
  * container list never disagree about which hosts are in view.
  */
@@ -1812,7 +1915,7 @@ export interface ClusterMetrics {
   nodes: NodeMetrics[]
 }
 
-/** An instance lemondx did not make or import, as the inventory found it. */
+/** An instance waterpump did not make or import, as the inventory found it. */
 export interface ForeignInstance {
   node: string
   name: string
@@ -1823,13 +1926,13 @@ export interface ForeignInstance {
   ipv4: string[]
 }
 
-/** Every node listed just now, and what on them lemondx did not make. */
+/** Every node listed just now, and what on them waterpump did not make. */
 export interface Inventory {
   /** Unix seconds. */
   checked_at: number
   nodes: string[]
   foreign: ForeignInstance[]
-  /** Nodes that could not be listed, or run a lemondx too old to tell. */
+  /** Nodes that could not be listed, or run a waterpump too old to tell. */
   errors: { node: string; error: string }[]
 }
 
@@ -1837,4 +1940,119 @@ export interface ImportResult {
   ok: boolean
   template: string | null
   instances: { node: string; name: string; ok: boolean; error: string | null }[]
+}
+
+
+// -- tasks -------------------------------------------------------------------
+
+/** What an invocation may hand a run; a job sees it as `WATERPUMP_INPUT_<NAME>`. */
+export interface TaskInput {
+  description: string
+  /** Used when a run is not given one, and by every scheduled run. Never set on a secret. */
+  default: string
+  required: boolean
+  /** Masked in output and never kept on the run record. */
+  secret: boolean
+}
+
+export interface TaskSchedule {
+  cron: string
+  timezone: string
+}
+
+export interface Task {
+  name: string
+  description: string
+  /** Off pauses the schedule; invoking still works. */
+  enabled: boolean
+  template: string
+  /** The job: modules run after the template's own... */
+  bootstrap: BootstrapSelection
+  /** ...or a script pasted in instead; '' when the job is modules. */
+  script: string
+  schedule: TaskSchedule | null
+  nodes: string[]
+  groups: string[]
+  timeout_seconds: number
+  overlap: 'skip' | 'allow'
+  inputs: Record<string, TaskInput>
+  secrets: Record<string, { description: string }>
+  next_run: number | null
+  schedule_text: string | null
+  schedule_problem: string | null
+  /** The members it may run on now: its groups' members, and nodes named beside them. */
+  eligible: string[]
+  /** Why it runs nowhere -- no group, or groups with no members -- or null. */
+  placement_problem: string | null
+  /** The secrets holding a value on this node; never the values. */
+  secret_status: Record<string, { generated: boolean; updated_at: number }>
+}
+
+export type SavedTask = Synced<Task & { warnings: string[] }>
+
+export interface TaskRequest {
+  template: string
+  bootstrap: BootstrapSelection
+  script: string
+  description: string
+  schedule: TaskSchedule | null
+  nodes: string[]
+  groups: string[]
+  timeout_seconds: number
+  overlap: 'skip' | 'allow'
+  inputs: Record<string, TaskInput>
+  secrets: Record<string, { description: string }>
+  enabled: boolean
+  previous?: string
+}
+
+export type TaskRunStatus =
+  | 'running' | 'ok' | 'failed' | 'timed_out' | 'cancelled' | 'missed' | 'vetoed' | 'lost'
+
+export interface TaskRunModule {
+  id: string
+  name: string
+  occurrence: number
+  exit_code: number
+  duration: number
+  /** In the polled list: the last lines. */
+  summary?: string
+  /** In a run fetched alone: the output (the tail of it). */
+  stdout?: string
+  stderr?: string
+}
+
+export interface TaskRun {
+  id: string
+  task: string
+  node: string
+  trigger: 'schedule' | 'invoke'
+  /** The occurrence a scheduled run is for (epoch seconds). */
+  slot: number | null
+  status: TaskRunStatus
+  stage: 'creating' | 'running' | 'destroying' | 'done'
+  error: string | null
+  started_at: number
+  finished_at: number | null
+  instance: string | null
+  exit_code: number | null
+  /** The non-secret inputs it ran with. */
+  inputs: Record<string, string>
+  notes: string[]
+  setup: { ok: boolean; modules: TaskRunModule[] } | null
+  job: { ok: boolean; modules: TaskRunModule[] } | null
+  payload_bytes: number
+}
+
+export interface TaskRuns {
+  runs: TaskRun[]
+  /** Members that did not answer: their runs are missing. */
+  errors: { node: string; error: string }[]
+}
+
+export interface CronPreview {
+  cron: string
+  timezone: string
+  text: string
+  next: number[]
 }

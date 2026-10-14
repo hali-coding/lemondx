@@ -15,7 +15,7 @@ mise --version
 # What this module always sets goes in conf.d, which mise merges with
 # config.toml, so a config.toml supplied below replaces none of it.
 mkdir -p /etc/mise/conf.d
-cat > /etc/mise/conf.d/lemondx.toml <<'EOF'
+cat > /etc/mise/conf.d/waterpump.toml <<'EOF'
 [tools]
 btop = "latest"
 
@@ -27,7 +27,7 @@ if [ -n "${MISE_CONFIG:-}" ]; then
     log "writing /etc/mise/config.toml"
     printf '%s\n' "$MISE_CONFIG" > /etc/mise/config.toml
 fi
-chmod 644 /etc/mise/conf.d/lemondx.toml /etc/mise/config.toml 2>/dev/null || true
+chmod 644 /etc/mise/conf.d/waterpump.toml /etc/mise/config.toml 2>/dev/null || true
 
 # mise only applies [env] in a shell it has been activated in.
 cat > /etc/profile.d/mise.sh <<'EOF'

@@ -96,7 +96,7 @@ function evictDetail(result: EvictResult) {
       ? 'The cluster credential was replaced on every member.'
       : `The credential was replaced, but ${result.rotated.stranded.join(', ')} missed it and must rejoin.`)
   } else if (result.still_holds_credential) {
-    parts.push('It still holds the cluster credential — run `lemondx cluster rotate` to cut it off.')
+    parts.push('It still holds the cluster credential — run `waterpump cluster rotate` to cut it off.')
   }
   const behind = stragglers(result.told)
   if (behind.length > 0) parts.push(`${behind.join(', ')} still lists it.`)
@@ -137,7 +137,7 @@ function actionLine(row: ReconcileRow, local: string) {
     : `Deleted ${what} on ${row.node}.`
 }
 
-/** Nodes this lemondx federates with, the groups they form, and what spans them. */
+/** Nodes this waterpump federates with, the groups they form, and what spans them. */
 export function ClusterView({ onNotify, onMembershipChanged, setup, onConfigure }: Props) {
   const canWrite = useCanWrite()
   const unconfigured = !!setup?.unconfigured
@@ -295,7 +295,7 @@ export function ClusterView({ onNotify, onMembershipChanged, setup, onConfigure 
       <div className="section-head">
         <h2>Cluster</h2>
         <span className="faint" style={{ fontSize: 12.5 }}>
-          this host, the lemondx nodes it federates with, and settings they share
+          this host, the waterpump nodes it federates with, and settings they share
         </span>
       </div>
 
@@ -318,7 +318,7 @@ export function ClusterView({ onNotify, onMembershipChanged, setup, onConfigure 
         <header className="access-head">
           <h3>Nodes</h3>
           <span className="faint">
-            Every node runs its own lemondx; this one only knows how to call them.
+            Every node runs its own waterpump; this one only knows how to call them.
           </span>
           <div className="row-actions access-head-end">
             <button className="btn btn-sm btn-icon" onClick={() => load()} title="Refresh"
@@ -383,7 +383,7 @@ export function ClusterView({ onNotify, onMembershipChanged, setup, onConfigure 
           <div className="empty">
             <h3>No other nodes yet</h3>
             <p>
-              Press <strong>Invite new node</strong> here (or run <code>lemondx cluster
+              Press <strong>Invite new node</strong> here (or run <code>waterpump cluster
               invite</code>) and redeem the code it prints with <strong>Join
               cluster</strong> on the other host. Everything already works on this host
               alone.
@@ -424,7 +424,7 @@ export function ClusterView({ onNotify, onMembershipChanged, setup, onConfigure 
                     <strong>{group.name}</strong>
                     {group.managed && (
                       <span className="badge badge-dim" style={{ marginLeft: 6 }}
-                        title="Sized by lemondx from each node's CPU and memory">
+                        title="Sized by waterpump from each node's CPU and memory">
                         auto
                       </span>
                     )}
@@ -543,7 +543,7 @@ export function ClusterView({ onNotify, onMembershipChanged, setup, onConfigure 
             : `Clear ${info.node.name}'s leftover cluster state?`}
           message={info.in_cluster
             ? `Every other member is told to forget this node, and this node gives up the cluster credential, its record of the ${peers.length} other node${peers.length === 1 ? '' : 's'} and its node groups. Instances, templates and modules stay exactly as they are; only federation stops. Rejoining needs a fresh join code.`
-            : `This node holds no cluster credential, so nothing can be told it is going — its record of the ${peers.length} other node${peers.length === 1 ? '' : 's'} and its node groups are simply dropped. Instances, templates and modules stay exactly as they are. Any node that still lists this one needs \`lemondx cluster evict ${info.node.name}\` run there.`}
+            : `This node holds no cluster credential, so nothing can be told it is going — its record of the ${peers.length} other node${peers.length === 1 ? '' : 's'} and its node groups are simply dropped. Instances, templates and modules stay exactly as they are. Any node that still lists this one needs \`waterpump cluster evict ${info.node.name}\` run there.`}
           confirmLabel={info.in_cluster ? 'Leave cluster' : 'Clear cluster state'}
           confirmText={info.node.name}
           danger
@@ -696,7 +696,7 @@ function ThisNode({ info, peers, setup, onConfigure }: {
               cluster credential, so every call it makes to them fails. Press
               {' '}<strong>Clear cluster state</strong> to forget them. Any node that
               still lists this one has to be told separately — run
-              {' '}<code>lemondx cluster evict {info.node.name}</code> there.
+              {' '}<code>waterpump cluster evict {info.node.name}</code> there.
             </p>
           </div>
         </div>
@@ -717,7 +717,7 @@ function ThisNode({ info, peers, setup, onConfigure }: {
               Authentication is off here, and a cluster member cannot treat whoever reaches
               its port as an admin. Peers use the cluster credential; anyone else logs in
               with one of the cluster's accounts (taken when this node joined, or sent
-              with <code>lemondx cluster sync users</code>) or an API token. Browsing from
+              with <code>waterpump cluster sync users</code>) or an API token. Browsing from
               this host is unaffected.
             </p>
           </div>
@@ -961,10 +961,10 @@ function JoinDialog({ onCancel, onDone }: {
           <label htmlFor="join-code">Join code</label>
           <textarea id="join-code" className="input" rows={4} value={code}
             spellCheck={false} autoCapitalize="off"
-            placeholder="lemondx-join.eyJ…"
+            placeholder="waterpump-join.eyJ…"
             onChange={(event) => setCode(event.target.value)} />
           <span className="hint">
-            From <code>lemondx cluster invite</code> on any node already in the cluster,
+            From <code>waterpump cluster invite</code> on any node already in the cluster,
             or its <strong>Invite new node</strong> button. A code works once and expires.
             Joining one node makes this host a member of the whole cluster.
           </span>
@@ -992,7 +992,7 @@ function InviteDialog({ info, onClose }: { info: ClusterInfo | null; onClose: ()
   // node's identity and forms a cluster if there is none. Only an operator
   // switching enrolment off stands in the way.
   const blocked = info && !info.allow_enrollment
-    ? 'Joining through this node is switched off (`lemondx configure cluster`).'
+    ? 'Joining through this node is switched off (`waterpump configure cluster`).'
     : ''
 
   async function create(event: React.FormEvent) {
@@ -1039,7 +1039,7 @@ function InviteDialog({ info, onClose }: { info: ClusterInfo | null; onClose: ()
 
   return (
     <Modal title="Invite a new node"
-      subtitle="Makes a one-time code another lemondx redeems to federate with this one."
+      subtitle="Makes a one-time code another waterpump redeems to federate with this one."
       onClose={busy ? () => {} : onClose}
       api={blocked ? undefined
         : calls.createInvite({ expires_minutes: minutes, note: note.trim() })}

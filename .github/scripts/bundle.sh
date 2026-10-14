@@ -26,7 +26,7 @@ if [ ! -f web/dist/index.html ]; then
     exit 1
 fi
 
-name="lemondx-$version"
+name="waterpump-$version"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 stage="$work/$name"
@@ -35,8 +35,8 @@ mkdir -p "$stage/web"
 # Everything the runtime reaches for: the launcher, the package, the built UI,
 # the bootstrap modules, the systemd templates, and the docs that error
 # messages point at ("see docs/security.md"). Not web/src, not .github --
-# those are for changing lemondx, not running it.
-for item in lemondx pyproject.toml README.md CHANGELOG.md src modules systemd docs; do
+# those are for changing waterpump, not running it.
+for item in waterpump pyproject.toml README.md CHANGELOG.md src modules systemd docs; do
     [ -e "$item" ] || continue
     cp -R "$item" "$stage/"
 done

@@ -12,7 +12,7 @@ auth table below says otherwise and these, which need `operator`: container
 `state` (single and bulk, and `/api/cluster/containers/state` and `/delete`),
 `DELETE /api/containers/{name}`, container `exec` and `bootstrap`, template
 `launch`, `exec`, `recreate` and `destroy`, stack `launch`, `state` and
-`destroy`, and cancelling or dismissing a template or stack run. Missing or bad
+`destroy`, task `invoke`, and cancelling or dismissing a template, stack or task run. Missing or bad
 credentials get `401`, too little access `403`, too many failed logins `429`.
 
 | Method | Path | Purpose |
@@ -83,7 +83,7 @@ credentials get `401`, too little access `403`, too many failed logins `429`.
 | `GET` | `/api/cluster` | this node's name, address and certificate fingerprint |
 | `GET` | `/api/cluster/nodes` | federated nodes and their state (`?probe=false` skips contacting them) |
 | `GET` | `/api/cluster/nodes/{name}` | one node, with the instances on it |
-| `POST` | `/api/cluster/nodes` | `{"code":"lemondx-join.…"}` → join that node's cluster |
+| `POST` | `/api/cluster/nodes` | `{"code":"waterpump-join.…"}` → join that node's cluster |
 | `DELETE` | `/api/cluster/nodes/{name}` | evict a node: stand it down, forget it everywhere (`?rotate=` overrides) |
 | `POST` | `/api/cluster/groups/auto` | rebuild the `large` and `small` groups from each node's CPU and memory |
 | `PUT` | `/api/auth/users/{name}/record` | take a synced account as stored, hash included — cluster members only |
@@ -134,15 +134,29 @@ credentials get `401`, too little access `403`, too many failed logins `429`.
 | `GET` | `/api/template-runs` | launches/recreates/destroys in progress, or last finished, per template |
 | `DELETE` | `/api/template-runs/{name}` | dismiss a finished run |
 | `GET` | `/api/stacks` | saved stacks; see [Stacks](stacks.md#api) for the rest |
-| `PUT` | `/api/stacks/{name}` | `{"description","stages"}` → create or replace one |
+| `PUT` | `/api/stacks/{name}` | `{"description","stages","variables","secrets"}` → create or replace one |
 | `DELETE` | `/api/stacks/{name}` | delete one |
-| `POST` | `/api/stacks/{name}/launch` | `{"params":{},"background":true}` → run it stage by stage |
-| `GET` | `/api/stack-runs` | stacks running, or last finished |
+| `POST` | `/api/stacks/{name}/launch` | `{"params":{},"background":true}` → run it stage by stage; `variables`/`secrets` as in [Stacks](stacks.md#api) |
+| `POST` | `/api/stacks/{name}/swarms/{swarm}/start` | `{"counts":{step:n},"variables","params","background":true}` → run one of its swarms against it; see [Stacks](stacks.md#swarms-load-tests-against-a-running-stack) |
+| `POST` | `/api/stacks/{name}/swarm-sequence` | `{"swarms":[...],"counts":{swarm:{step:n}},"variables","params","background":true}` → run several swarms in order (no `swarms`: the stack's own sequence), each torn down before the next, a failure skipping the rest; see [Stacks](stacks.md#swarms-load-tests-against-a-running-stack) |
+| `POST` | `/api/stacks/{name}/swarms/{swarm}/stop` | stop a running swarm, or the whole sequence it is part of (one running on another member is stopped there; the answer then carries `node`), or `{"instances":[...]}` to destroy what one left behind |
+| `GET` | `/api/stacks/{name}/secrets` | which of its secrets hold a value -- never the value |
+| `PUT`/`DELETE` | `/api/stacks/{name}/secrets/{secret}` | `{"value"}` → set one / forget its value |
+| `POST` | `/api/stacks/{name}/secrets/{secret}/reveal` | `{"password"}` → the value, to an admin who confirms it; see [Security](security.md#stack-secrets) |
+| `GET` | `/api/stack-runs` | stacks running, or last finished, on this node. A run's `id` tags a swarm's instances (`swarm_run` in listings); a launch step's `instances[]` carry `output`, what each one's modules said last. Starting any run of a stack is refused (`409`) while another member is running it |
+| `GET` | `/api/stack-runs/{name}/report` | the stack's last finished run as Markdown: `{"stack","filename","markdown"}`; 409 while it runs |
 | `GET` | `/api/stack-instances` | each stack's instances, by their tags, on every node |
 | `POST` | `/api/stacks/{name}/state` | `{"action":"stop","instances":[...]}` → start/stop/restart them all |
 | `POST` | `/api/stacks/{name}/destroy` | `{"instances":[...]}` → stop and delete them all |
 | `POST` | `/api/stack-runs/{name}/cancel` | start nothing new in a running stack |
 | `DELETE` | `/api/stack-runs/{name}` | dismiss a finished run |
+| `GET` | `/api/tasks` | saved tasks; see [Tasks](tasks.md#api) for the rest |
+| `PUT` | `/api/tasks/{name}` | `{"template","bootstrap","schedule","inputs","secrets",...}` → create or replace one |
+| `DELETE` | `/api/tasks/{name}` | delete one |
+| `POST` | `/api/tasks/{name}/invoke` | `{"inputs":{},"payload":...,"node"}` → start a run now on whichever member takes it (`operator`) |
+| `GET` | `/api/task-runs` | every member's task runs, newest first; `?task=&detail=1` |
+| `POST` | `/api/task-runs/{id}/cancel` | stop a run of this node's and destroy its instance (`operator`) |
+| `GET` | `/api/cron` | `?expr=&tz=` → what a schedule means and when it next fires |
 | `GET` | `/api/profiles` | available profiles |
 
 Authentication:
@@ -164,7 +178,7 @@ proxy-authenticated requests other than `GET` must not carry a foreign `Origin`.
 
 ```bash
 curl -s localhost:8099/api/containers | jq
-curl -s -H "Authorization: Bearer $LEMONDX_API_TOKEN" localhost:8099/api/containers   # with --auth
+curl -s -H "Authorization: Bearer $WATERPUMP_API_TOKEN" localhost:8099/api/containers  # with --auth
 curl -s -X POST localhost:8099/api/containers \
   -H 'content-type: application/json' \
   -d '{"name":"demo","image":"images:alpine/3.21","memory":"512MiB"}'
@@ -208,8 +222,11 @@ normal destructive pool-delete behavior.
 `/api/nodes/prdev2/containers/web-1/exec` runs a command on `web-1` over there.
 The access checked is the target endpoint's, resolved against the same route
 table, so forwarding grants nothing extra; an unrecognised path is treated as
-admin-only, and a proxied call cannot be proxied again. Naming this node runs
-the call locally.
+admin-only, and a proxied call cannot be proxied again. The member answers it
+as the person who asked, with their role, not as a peer: it travels under the
+cluster credential but marked `X-Waterpump-Relayed`, so nothing reserved for
+members' own calls (pushes, placement, member-only routes, managed groups)
+applies to it. Naming this node runs the call locally.
 
 In a cluster, `PUT /api/templates/{name}`, `POST /api/modules`,
 `PUT /api/bootstrap-profiles/{name}` and `PUT /api/cluster/groups/{name}` push

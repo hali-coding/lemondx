@@ -6,7 +6,7 @@
 # param: MDNS_SERVICES=  Services to advertise as name:port, space-separated (e.g. http:80 ssh:22 postgresql:5432; add /udp for UDP)
 # param: MDNS_RESOLVE=yes  Resolve other .local names from inside the instance too (yes or no)
 
-name="${MDNS_HOSTNAME:-${LEMONDX_INSTANCE:-}}"
+name="${MDNS_HOSTNAME:-${WATERPUMP_INSTANCE:-}}"
 [ -n "$name" ] || name="$(hostname)"
 services="$(printf '%s' "${MDNS_SERVICES:-}" | tr ',' ' ')"
 resolve="${MDNS_RESOLVE:-yes}"
@@ -55,13 +55,13 @@ done
 # has no Name Service Switch at all (its "nss" package is Mozilla's crypto
 # library, unrelated), so see the resolving section below.
 nss=""
-case "$LEMONDX_PKG" in
+case "$WATERPUMP_PKG" in
     apt)              pkg_install avahi-daemon dbus; nss=libnss-mdns ;;
     dnf|yum|microdnf) pkg_install avahi dbus dbus-tools; nss=nss-mdns ;;
     apk)              pkg_install avahi dbus ;;
     pacman)           pkg_install avahi dbus; nss=nss-mdns ;;
     zypper)           pkg_install avahi dbus-1; nss=nss-mdns ;;
-    *)                die "no Avahi recipe for package manager '$LEMONDX_PKG'" ;;
+    *)                die "no Avahi recipe for package manager '$WATERPUMP_PKG'" ;;
 esac
 
 conf=/etc/avahi/avahi-daemon.conf
@@ -94,13 +94,13 @@ log "announcing as $name.local"
 
 # --- services --------------------------------------------------------------
 
-svcfile=/etc/avahi/services/lemondx.service
+svcfile=/etc/avahi/services/waterpump.service
 if [ -n "$services" ]; then
     mkdir -p /etc/avahi/services
     {
         printf '<?xml version="1.0" standalone="no"?>\n'
         printf '<!DOCTYPE service-group SYSTEM "avahi-service.dtd">\n'
-        printf '<!-- Written by lemondx (mdns); re-running the module replaces it. -->\n'
+        printf '<!-- Written by waterpump (mdns); re-running the module replaces it. -->\n'
         printf '<service-group>\n  <name replace-wildcards="yes">%%h</name>\n'
         for entry in $services; do
             type="${entry%%:*}"
@@ -128,8 +128,8 @@ systemd_running() { have systemctl && [ -d /run/systemd/system ]; }
 # module configures, so resolved stands aside.
 if systemd_running && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
     mkdir -p /etc/systemd/resolved.conf.d
-    printf '# Written by lemondx (mdns): Avahi answers mDNS here.\n[Resolve]\nMulticastDNS=no\n' \
-        > /etc/systemd/resolved.conf.d/lemondx-mdns.conf
+    printf '# Written by waterpump (mdns): Avahi answers mDNS here.\n[Resolve]\nMulticastDNS=no\n' \
+        > /etc/systemd/resolved.conf.d/waterpump-mdns.conf
     systemctl restart systemd-resolved
 fi
 
@@ -150,7 +150,7 @@ elif [ "$resolve" = yes ]; then
     # nothing on Alpine adds mDNS to that (gcompat loads no NSS modules), so
     # programs cannot look up .local names. avahi-resolve asks Avahi itself,
     # which is what a script or health check here can use instead.
-    [ "$LEMONDX_PKG" != apk ] || pkg_install avahi-tools
+    [ "$WATERPUMP_PKG" != apk ] || pkg_install avahi-tools
     warn "this instance is announced, but its programs cannot resolve other .local names (musl has no mDNS support); scripts can use: avahi-resolve -n4 <name>.local"
 fi
 

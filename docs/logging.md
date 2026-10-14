@@ -2,17 +2,17 @@
 
 [← back to README](../README.md)
 
-lemondx logs every change it makes and who asked for it: instance state and
+waterpump logs every change it makes and who asked for it: instance state and
 configuration, daemon resources (networks, storage, images, profiles), host
-networking, lemondx's own definitions and settings, logins and cluster
+networking, waterpump's own definitions and settings, logins and cluster
 membership. Each line also says *how* the change was made: the web UI, the API,
 the CLI, another node relaying it, or `serve` itself.
 
 Lines always go to the local syslog. Under systemd that is the journal:
 
 ```bash
-journalctl -t lemondx -f                 # everything lemondx logs on this host
-journalctl -t lemondx | grep req=3cbcc6f8   # one request, end to end
+journalctl -t waterpump -f             # everything waterpump logs on this host
+journalctl -t waterpump | grep req=3cbcc6f8  # one request, end to end
 ```
 
 Optionally they also go to a remote syslog host. Both the level and the remote
@@ -20,11 +20,11 @@ host are one setting for the whole cluster: set them in the **Cluster** tab
 under **Configuration → Logging**, or from the CLI:
 
 ```bash
-lemondx logging                                     # the settings, and how each destination is doing here
-lemondx logging-set --level info --remote logs.example.net:514 --protocol tcp
-lemondx logging-set --no-remote
-lemondx logging-test                                # send a test line everywhere, now
-lemondx configure logging                           # the same, asked interactively
+waterpump logging                                 # the settings, and how each destination is doing here
+waterpump logging-set --level info --remote logs.example.net:514 --protocol tcp
+waterpump logging-set --no-remote
+waterpump logging-test                            # send a test line everywhere, now
+waterpump configure logging                       # the same, asked interactively
 ```
 
 ## Watching it live
@@ -42,11 +42,11 @@ can follow what is happening without a shell on each host:
 - **The CLI:**
 
   ```bash
-  lemondx logs                       # the last 50 events, from every node
-  lemondx logs -f                    # ...and keep following
-  lemondx logs -f -n 0 --node prdev2 --kind change
-  lemondx logs --req 3cbcc6f8        # one request, everywhere
-  lemondx logs -f --json | jq .      # one JSON event per line
+  waterpump logs                   # the last 50 events, from every node
+  waterpump logs -f                # ...and keep following
+  waterpump logs -f -n 0 --node prdev2 --kind change
+  waterpump logs --req 3cbcc6f8    # one request, everywhere
+  waterpump logs -f --json | jq .  # one JSON event per line
   ```
 
   It asks the `serve` running on this host, so it needs one running.
@@ -143,7 +143,7 @@ started it.
 
 | Level | Adds |
 | --- | --- |
-| `error` | lemondx's own faults (an API call that ended in a 500) |
+| `error` | waterpump's own faults (an API call that ended in a 500) |
 | `warning` | anything refused or failed: denied requests, failed changes, sync failures, unhealthy instances |
 | `notice` | logins and logouts, users and tokens, cluster membership, settings, terminals, `serve` starting and stopping |
 | `info` (default) | every change and every API call or CLI command that changes something |
@@ -155,11 +155,11 @@ per instance per round would drown everything else.
 ## Format and transport
 
 - **Local:** sent to `/dev/log` in the form journald and rsyslog parse,
-  `lemondx[PID]: <kind> key=value…`, so `journalctl -t lemondx` works. A host
+  `waterpump[PID]: <kind> key=value…`, so `journalctl -t waterpump` works. A host
   with no syslog socket logs to stderr instead, and says so in
-  `lemondx logging` and in the Cluster tab. `serve` started in a terminal also
+  `waterpump logging` and in the Cluster tab. `serve` started in a terminal also
   echoes lines there.
-- **Remote:** RFC 5424 (`<PRI>1 TIMESTAMP HOST lemondx PID KIND - key=value…`)
+- **Remote:** RFC 5424 (`<PRI>1 TIMESTAMP HOST waterpump PID KIND - key=value…`)
   over UDP, or over TCP with RFC 6587 octet-counted framing.
   - **Facility:** `local0` by default.
   - **Delivery:** lines are queued and sent from a thread of their own, so a
@@ -173,7 +173,7 @@ An rsyslog collector, for example:
 ```
 module(load="imudp")  input(type="imudp" port="514")
 module(load="imtcp")  input(type="imtcp" port="514")
-if $programname == "lemondx" then /var/log/lemondx.log
+if $programname == "waterpump" then /var/log/waterpump.log
 ```
 
 Under the hood, a destination is a type, and `syslog` is the only one so far.
@@ -200,7 +200,7 @@ addresses and what was done. Keep the collector on a network you trust.
 
 ## How the setting is shared
 
-The setting is one record, `logging`, in `~/.local/share/lemondx/cluster-settings/`.
+The setting is one record, `logging`, in `~/.local/share/waterpump/cluster-settings/`.
 It is a [shared definition](cluster.md#shared-definitions-stay-level-by-themselves) like a
 template: saving it pushes it to every member, and a running `serve` applies it
 at once. A CLI change reaches `serve` within a few seconds.

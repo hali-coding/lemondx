@@ -318,7 +318,7 @@ export function LanDialog({ onCancel, onBack, onSubmit }: Props) {
 
         {found?.docker && mode && mode !== 'macvlan' && (
           <p className="hint">
-            Docker is installed here, and its firewall drops bridged traffic. lemondx
+            Docker is installed here, and its firewall drops bridged traffic. waterpump
             {found.helper ? ' adds an exception for the bridge'
               : ' cannot run its helper as root, so it will show the exception to add yourself'}.
           </p>

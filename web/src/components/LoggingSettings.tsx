@@ -17,7 +17,7 @@ const LEVELS: { value: LogLevel; label: string }[] = [
   { value: 'info', label: 'Info — every change, and who made it (recommended)' },
   { value: 'notice', label: 'Notice — logins, users, tokens, membership and settings' },
   { value: 'warning', label: 'Warning — only what was refused or failed' },
-  { value: 'error', label: 'Error — only lemondx’s own faults' },
+  { value: 'error', label: 'Error — only waterpump’s own faults' },
 ]
 
 const FACILITIES = ['daemon', 'user', 'auth', 'local0', 'local1', 'local2', 'local3',
@@ -244,7 +244,7 @@ export function LoggingSettings({ nodes, canWrite, onNotify }: Props) {
             </select>
           </div>
           <span className="hint">
-            Always on. Under systemd it is the journal: <span className="mono">journalctl -t lemondx</span>.
+            Always on. Under systemd it is the journal: <span className="mono">journalctl -t waterpump</span>.
             {status.local_fallback && (
               <span style={{ color: 'var(--warn)' }}> This node has no syslog socket, so lines go to stderr.</span>
             )}

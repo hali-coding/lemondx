@@ -4,7 +4,7 @@
 # scripts/create-vm.sh; Proxmox's own meta-data sets no hostname when
 # cicustom supplies user-data, so it has to be here.
 hostname: @HOSTNAME@
-fqdn: @HOSTNAME@.lemondx.test
+fqdn: @HOSTNAME@.waterpump.test
 users:
   - name: ci
     shell: /bin/bash

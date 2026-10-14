@@ -24,7 +24,7 @@ interface Props {
   onNotify: (kind: ToastKind, title: string, detail?: string) => void
 }
 
-/** How the daemon's networking is wired up, and the bridges lemondx manages. */
+/** How the daemon's networking is wired up, and the bridges waterpump manages. */
 export function NetworkView({ onNotify }: Props) {
   const canWrite = useCanWrite()
   const [summaries, setSummaries] = useState<NetworkSummary[] | null>(null)
@@ -438,7 +438,7 @@ function FabricsSection({ onNotify, onChanged, creating, onCreateClosed, onBack 
           </span>
           {!local.privileged && overview.fabrics.length > 0 && (
             <span className="badge badge-dim"
-              title="lemondx cannot program routes here; the plan shows what to run">
+              title="waterpump cannot program routes here; the plan shows what to run">
               no privilege here
             </span>
           )}
@@ -724,7 +724,7 @@ function FabricDialog({ busy, onCancel, onBack, onSubmit }: {
         <div className="grid-2">
           <Field label="Name">
             <input className="input mono" value={name} disabled={busy || !started}
-              maxLength={15} autoComplete="off" placeholder="lemonfab1"
+              maxLength={15} autoComplete="off" placeholder="pumpfab1"
               onChange={(event) => setName(event.target.value)} />
             <span className="hint">Also the bridge&apos;s name on every node.</span>
             {current && check.name_error && <span className="field-error">{check.name_error}</span>}
@@ -838,7 +838,7 @@ function FabricDeleteDialog({ fabric, busy, onCancel, onConfirm }: {
       {inUse.length > 0 ? (
         <div className="pool-delete-dialog">
           <p style={{ margin: 0 }}>
-            Detach or delete these instances first. lemondx does not do it for you:
+            Detach or delete these instances first. waterpump does not do it for you:
             an instance whose NIC is removed keeps running cut off, which is easy to miss.
           </p>
           {inUse.map((member) => (
@@ -1078,7 +1078,7 @@ function NetworkDialog({ network, busy, onCancel, onBack, onSubmit }: {
         config: Object.fromEntries(Object.entries(config).filter(([, value]) => value !== '')),
       }
     }
-    // Only what changed: re-sending keys the daemon has but lemondx does not
+    // Only what changed: re-sending keys the daemon has but waterpump does not
     // allow (set with the daemon's own CLI, say) would be refused.
     const changes = Object.fromEntries(Object.entries(config).filter(([key, value]) =>
       value !== (current[key] ?? IMPLICIT[key] ?? '')))
@@ -1107,7 +1107,7 @@ function NetworkDialog({ network, busy, onCancel, onBack, onSubmit }: {
     <Modal
       title={network ? `Edit ${network.name}` : 'Private network on this node'}
       subtitle={network ? undefined
-        : 'A managed bridge: lemondx runs DHCP and DNS on it and can NAT it behind the host.'}
+        : 'A managed bridge: waterpump runs DHCP and DNS on it and can NAT it behind the host.'}
       onClose={busy ? () => {} : onCancel}
       api={call}
       footer={
@@ -1275,7 +1275,7 @@ function NetworkDeleteDialog({ network, busy, onCancel, onConfirm }: {
         <div className="pool-delete-dialog">
           <p style={{ margin: 0 }}>
             Detach everything from <strong className="mono">{network.name}</strong> first.
-            lemondx does not do it for you: an instance whose NIC is removed keeps
+            waterpump does not do it for you: an instance whose NIC is removed keeps
             running with no network, which is easy to miss.
           </p>
           {network.profiles.length > 0 && (

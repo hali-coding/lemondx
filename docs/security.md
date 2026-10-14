@@ -2,7 +2,7 @@
 
 [← back to README](../README.md)
 
-Anyone who can drive lemondx controls your containers, and creating a
+Anyone who can drive waterpump controls your containers, and creating a
 container is enough to become root on the host — which is why the daemon's own
 `lxd`/`incus-admin` group is treated as root-equivalent.
 
@@ -18,15 +18,15 @@ another node nor join a cluster (both are refused until it is configured).
 Configuring is one step that settles all three, in the order that never leaves
 the port open without a login: an admin account, a certificate (generated
 self-signed, uploaded, or the one already saved), the `local` login method, and
-then the address. lemondx then restarts itself in place — the same process, so
+then the address. waterpump then restarts itself in place — the same process, so
 a systemd unit keeps tracking it — and the browser carries on at `https://`,
 where it asks for the login just made. From a shell, the same thing:
 
 ```bash
-lemondx configure node          # admin, certificate, listen on 0.0.0.0? -- then restart serve
-lemondx configure node --show   # what is saved
-lemondx configure node --reset  # back to unconfigured mode at the next start (accounts kept)
-lemondx configure listen        # just the address and port
+waterpump configure node      # admin, certificate, listen on 0.0.0.0? -- then restart serve
+waterpump configure node --show  # what is saved
+waterpump configure node --reset  # back to unconfigured mode at the next start (accounts kept)
+waterpump configure listen    # just the address and port
 ```
 
 Each part is saved where it already lives — the account in `auth/users.json`,
@@ -47,10 +47,10 @@ Authentication is opt-in. There are four methods, usable together:
 
 | Method | Who logs in | Good for |
 | --- | --- | --- |
-| `local` | users lemondx keeps itself (`lemondx user-add`) | a shared box, containers, macOS — anywhere PAM is awkward |
+| `local` | users waterpump keeps itself (`waterpump user-add`) | a shared box, containers, macOS — anywhere PAM is awkward |
 | `pam` | accounts on the host, by password | a personal workstation; see the caveats below |
 | `proxy` | whoever a trusted reverse proxy says | SSO, OIDC, 2FA via Authelia, oauth2-proxy, Tailscale and friends |
-| `token` | API tokens only (`lemondx token-create`) | scripts and CI, no browser logins |
+| `token` | API tokens only (`waterpump token-create`) | scripts and CI, no browser logins |
 
 API tokens are accepted whenever any method is on, and `--token` still works as
 a single static admin token.
@@ -58,13 +58,13 @@ a single static admin token.
 The easiest way to set this up is to answer a few questions once:
 
 ```bash
-lemondx configure auth          # pick methods, PAM groups, proxy, token file; offers a first user
-lemondx configure auth --show   # what is saved (add --json for the raw settings)
-lemondx configure auth --reset  # forget them: authentication off again
-./lemondx serve                 # uses the saved settings from now on
+waterpump configure auth      # pick methods, PAM groups, proxy, token file; offers a first user
+waterpump configure auth --show  # what is saved (add --json for the raw settings)
+waterpump configure auth --reset  # forget them: authentication off again
+./waterpump serve             # uses the saved settings from now on
 ```
 
-Settings go to `~/.local/share/lemondx/config/auth.json` (0600) and every later
+Settings go to `~/.local/share/waterpump/config/auth.json` (0600) and every later
 `serve` loads them. Any flag given to `serve` overrides just that setting —
 `--auth` replaces the saved method list, `--session-hours 1` changes only that —
 and `--ignore-config` skips the file altogether. If the file exists but does not
@@ -75,8 +75,8 @@ off. The file only ever references a static token by path, never contains one.
 The same can be done with flags alone:
 
 ```bash
-lemondx user-add alice --role admin          # asks for a password
-./lemondx serve --auth local                 # the UI now shows a login form
+waterpump user-add alice --role admin      # asks for a password
+./waterpump serve --auth local             # the UI now shows a login form
 ```
 
 ## Roles
@@ -101,7 +101,7 @@ with `403`.
 
 ## Without auth
 
-Even with auth off, lemondx refuses two kinds of request a browser can be
+Even with auth off, waterpump refuses two kinds of request a browser can be
 tricked into sending:
 
 - a non-`GET` request (or WebSocket upgrade) whose `Origin` is another site, so
@@ -115,7 +115,7 @@ Scripts that send no `Origin` are unaffected.
 
 A password login sets an `HttpOnly`, `SameSite=Strict` cookie (`Secure` over
 TLS), valid for `--session-hours` (default 12). Sessions live in memory:
-restarting lemondx logs everyone out. A session ends early when its user is
+restarting waterpump logs everyone out. A session ends early when its user is
 removed or has their password changed — from the UI or the CLI, which edits
 the data directory the server re-reads — and a PAM user's role is re-checked
 every five minutes, so leaving the admin group takes effect without a restart.
@@ -130,35 +130,35 @@ loopback, arrives over TLS, or comes through a `--trust-proxy` address.
 ## API tokens
 
 ```bash
-lemondx token-create ci --role read --expires 30d   # prints the token once
-lemondx tokens
-lemondx token-revoke 3f9c0a1b2d4e
+waterpump token-create ci --role read --expires 30d  # prints the token once
+waterpump tokens
+waterpump token-revoke 3f9c0a1b2d4e
 ```
 
-Clients send `Authorization: Bearer lmdx_…` (or `X-Lemondx-Token`). A browser
+Clients send `Authorization: Bearer wpmp_…` (or `X-Waterpump-Token`). A browser
 WebSocket cannot set headers, so terminals also take `?token=`; that value is
 masked in the request log. Tokens can also be made and revoked from the
 **Access** tab, by anyone logged in, for themselves — admins see everyone's.
 
-Only a SHA-256 of each token is stored, in `~/.local/share/lemondx/auth/`
+Only a SHA-256 of each token is stored, in `~/.local/share/waterpump/auth/`
 (`0700`, files `0600`). Revocation applies on the next request, no restart. A
 token cannot create more tokens (that would let it outlive its own expiry),
 and nobody can mint a token with more access than they have.
 
-For the static token, prefer `--token-file PATH` or the `LEMONDX_TOKEN`
+For the static token, prefer `--token-file PATH` or the `WATERPUMP_TOKEN`
 environment variable over `--token`, which any local user can read in `ps`.
 
 ## Local users
 
 ```bash
-lemondx user-add bob                   # read-only unless --role operator/admin
-lemondx user-set bob --role operator
-lemondx user-set bob --password
-lemondx user-remove bob
+waterpump user-add bob               # read-only unless --role operator/admin
+waterpump user-set bob --role operator
+waterpump user-set bob --password
+waterpump user-remove bob
 ```
 
 Passwords are hashed with scrypt (PBKDF2-SHA256 where Python's OpenSSL lacks
-it). `LEMONDX_PASSWORD` supplies one non-interactively. Admins can also manage
+it). `WATERPUMP_PASSWORD` supplies one non-interactively. Admins can also manage
 users from the **Access** tab.
 
 ## PAM
@@ -169,20 +169,20 @@ admin, `--pam-operator-group` gives operator, `--pam-read-group` gives read, and
 anyone else is refused even with the right password. The first match in that
 order wins.
 
-lemondx uses the PAM service named by `--pam-service` (default `lemondx`).
+waterpump uses the PAM service named by `--pam-service` (default `waterpump`).
 Create it, or PAM falls back to `other`, which denies everything on some
-distributions. `systemd/lemondx.pam` is a ready one -- it delegates to the
+distributions. `systemd/waterpump.pam` is a ready one -- it delegates to the
 host's own stack, and carries the one-line swap for distributions with a
 single `system-auth` instead of Debian's `common-auth`:
 
 ```bash
-sudo install -m 644 systemd/lemondx.pam /etc/pam.d/lemondx
+sudo install -m 644 systemd/waterpump.pam /etc/pam.d/waterpump
 ```
 
 Two properties of `pam_unix` decide who can actually log in, and `serve` warns
 about both at startup:
 
-- **Not running as root, PAM can only verify the account lemondx runs as.** Its
+- **Not running as root, PAM can only verify the account waterpump runs as.** Its
   `unix_chkpwd` helper refuses to check anyone else's password. As a user
   service that means you, which is usually exactly right.
 - **`NoNewPrivileges=yes` breaks it entirely.** The helper reads `/etc/shadow`
@@ -192,13 +192,13 @@ about both at startup:
 To check a stack without starting the server:
 
 ```bash
-lemondx pam-test "$USER"                  # asks for the password
+waterpump pam-test "$USER"              # asks for the password
 ```
 
 ## Trusted proxy
 
 ```bash
-./lemondx serve --auth proxy --trust-proxy 127.0.0.1 \
+./waterpump serve --auth proxy --trust-proxy 127.0.0.1 \
   --proxy-user-header X-Forwarded-User \
   --proxy-groups-header X-Forwarded-Groups --proxy-admin-group ops \
   --proxy-operator-group oncall --proxy-read-group dev
@@ -206,7 +206,7 @@ lemondx pam-test "$USER"                  # asks for the password
 
 The user header is believed only from `--trust-proxy` addresses (IPs or CIDRs);
 from anywhere else it is ignored. Without the group flags every proxied user is
-an admin. Keep lemondx bound to loopback or firewalled so the proxy is the only
+an admin. Keep waterpump bound to loopback or firewalled so the proxy is the only
 way in, and make sure the proxy strips these headers from incoming requests.
 Behind a trusted proxy, `X-Forwarded-For` keys the login throttle,
 `X-Forwarded-Host` the Origin check, and `X-Forwarded-Proto: https` marks
@@ -215,9 +215,9 @@ cookies `Secure`.
 ## TLS
 
 ```bash
-lemondx configure tls           # generate a self-signed certificate, or name your own
-lemondx configure tls --show    # which one, and its fingerprint
-lemondx configure tls --reset   # back to plain HTTP (refused on a cluster member)
+waterpump configure tls       # generate a self-signed certificate, or name your own
+waterpump configure tls --show  # which one, and its fingerprint
+waterpump configure tls --reset  # back to plain HTTP (refused on a cluster member)
 ```
 
 Once one is saved, `serve` uses HTTPS by default; until then it serves plain
@@ -225,8 +225,8 @@ HTTP and says so at startup, suggesting the command above. For one run,
 certificate files can also be given directly:
 
 ```bash
-./lemondx serve --host 0.0.0.0 --auth local \
-  --tls-cert /etc/lemondx/cert.pem --tls-key /etc/lemondx/key.pem
+./waterpump serve --host 0.0.0.0 --auth local \
+  --tls-cert /etc/waterpump/cert.pem --tls-key /etc/waterpump/key.pem
 ```
 
 TLS 1.2 or newer, with the handshake done per connection so a client that
@@ -247,15 +247,15 @@ Only `/api/*` is gated.
 
 ## The fabric holds privilege, opt in
 
-Everything else in lemondx is a front end to a socket. The fabric is the one
+Everything else in waterpump is a front end to a socket. The fabric is the one
 feature that writes host state: a route between two nodes is kernel state no
 container API can set. It is off until you install its sudo rules, and without
-them `lemondx fabric plan` prints the commands for you to run instead.
+them `waterpump fabric plan` prints the commands for you to run instead.
 
 The rules grant one command, to the daemon's own admin group:
 
 ```
-%lxd ALL=(root) NOPASSWD: /path/to/lemondx fabric-helper
+%lxd ALL=(root) NOPASSWD: /path/to/waterpump fabric-helper
 ```
 
 Two things bound what that means:
@@ -265,7 +265,7 @@ Two things bound what that means:
   not a /24 inside one of this node's fabric prefixes, reached through a
   directly-connected network -- so the default route and the host's own LAN
   cannot be expressed through it at all. The firewall it installs (its own
-  `ip lemondx` nftables table, plus accept rules in Docker's `DOCKER-USER`
+  `ip waterpump` nftables table, plus accept rules in Docker's `DOCKER-USER`
   where that exists) is built from the saved fabric settings, never from
   stdin.
 - **The group is already root-equivalent.** As above, creating a container is
@@ -278,6 +278,67 @@ Two things bound what that means:
 portably -- Ubuntu 25.10's sudo-rs matches arguments literally and supports
 neither wildcards nor regular expressions, while classic sudo supports both.
 See [networking.md](networking.md).
+
+## Stack script steps
+
+A stack's **Run a script** step runs a shell script on the node driving the
+stack, as the account waterpump runs as -- the only thing in waterpump that runs
+code on a host on purpose (modules run inside instances). Only an admin can
+write one, since a stack is saved by an admin; an operator can launch a stack,
+and so runs its scripts exactly as written. Stacks are synced, so a script an
+admin saves on one node can be launched from any member -- which is no more
+than federation already means (any member is an admin of every other).
+
+What keeps it contained is the account and the service unit, not waterpump: under
+the shipped systemd units the filesystem is read-only outside the data
+directory (`ProtectSystem=strict`, `ProtectHome=read-only`). The script is a
+file in a fresh directory, never an argument, and its output is kept masked of
+the stack's secrets and of every value entered at launch. Each run is logged
+with its stack, step, exit code and duration, never its text. A timeout or a
+cancel stops the script's whole process group.
+
+## Stack secrets
+
+A stack's secrets (see [Stacks](stacks.md#variables-and-secrets)) are the one
+kind of secret waterpump keeps in a form it can give back, because a launch has
+to hand the value to a module. So they get more than the `0600` the rest of
+`auth/` has:
+
+- **Encrypted at rest.** `auth/stack-secrets.json` holds each value sealed
+  under `auth/secrets.key`, a random 256-bit key made on first use, `0600`,
+  that never leaves the node. The backend is stdlib-only, which has no block
+  cipher, so this is encrypt-then-MAC built from what it does have: SHA-256 in
+  counter mode with a fresh random nonce per value, and HMAC-SHA256 over the
+  nonce and ciphertext, with separate derived keys for each. A box that fails
+  its MAC is never decrypted. What this protects is a copy of the file on its
+  own -- a backup, a data directory moved to another machine, a file attached
+  to a bug report. It does not protect against an account that can read both
+  files: the service account and root can decrypt, as they can use every other
+  credential under `auth/`.
+- **A key per node, not per cluster.** Members exchange the values in the
+  clear over the pinned TLS of a members-only route (`PUT /api/stack-secrets/…`,
+  refused to people and never relayed), exactly as the cluster credential
+  itself travels, and each seals what it receives under its own key. A key
+  derived from the cluster credential would have to re-seal every value on
+  every join, leave and rotation, and a failure half-way would lose them.
+- **Never in the open.** Not in the stack file, a listing, a run record, a
+  sync of `stacks`, the API explorer (shown as `<NAME>`), or the event log
+  (names only, and request bodies are logged through an allowlist that has
+  neither `value` nor `password`).
+- **Read back by an admin who confirms it.** Revealing one takes the `admin`
+  role *and* proof that a person is there: a password session must send its
+  password again, through the same backends and lockout as a login, because a
+  session cookie is ambient -- an unlocked browser carries it. An API token is
+  presented deliberately on every call and is enough on its own; a
+  trusted-proxy user has no password waterpump knows, and is sent to a token.
+  With auth off there is nobody to confirm, and the UI says so. A reveal
+  relayed through another node is refused, since there it would arrive under
+  the cluster credential. Every reveal is logged at warning level with who
+  and which secret.
+
+A secret handed to a module parameter its module does not declare secret is
+not redacted from that module's output; the designer and the save warn about
+it.
 
 ## Federation
 
@@ -299,7 +360,7 @@ re-joins.
 network.
 
 **Joining is the only unauthenticated call**, and only because it is how a node
-gets its first credential. `lemondx cluster invite` mints a 32-byte single-use
+gets its first credential. `waterpump cluster invite` mints a 32-byte single-use
 code that expires (30 minutes by default) and stores only its hash, in the `0700`
 auth directory — so a code issued from the CLI is honoured by an already-running
 `serve`, and redeeming it consumes it. The code carries the issuing node's
@@ -307,8 +368,8 @@ fingerprint, so the joiner pins the connection before sending the secret: the
 secret proves the joiner was given permission, the fingerprint proves it reached
 the right node.
 
-**The cluster shares one credential.** It is an ordinary lemondx API token,
-stored like any other and listed by `lemondx tokens` as `cluster`, and every
+**The cluster shares one credential.** It is an ordinary waterpump API token,
+stored like any other and listed by `waterpump tokens` as `cluster`, and every
 member holds the same one. That is what makes joining one-way: a node that has
 redeemed a code can immediately call every member and be called by them, with no
 per-pair exchange needing every host up at once. Two consequences worth being
@@ -317,15 +378,15 @@ clear about:
 - **Any member is an admin of every other.** Federate hosts you administer.
   Anyone who can create a container on a node can become root on it.
 - **An evicted node is cut off by giving up its own copy of the credential.**
-  `lemondx cluster evict` tells it to stand down before forgetting it, and
+  `waterpump cluster evict` tells it to stand down before forgetting it, and
   standing down deletes the credential there. A node that could not be told
   still holds a working one, so eviction then replaces the credential on every
-  remaining member instead — which is also what `lemondx cluster rotate` does on
+  remaining member instead — which is also what `waterpump cluster rotate` does on
   its own. A member that is down during a rotation is left behind and has to
   re-join, which is why the rotation is not unconditional; `--rotate` and
   `--no-rotate` decide it by hand. Either way the command says what happened.
 
-- **Syncing users copies password hashes between members.** `lemondx cluster
+- **Syncing users copies password hashes between members.** `waterpump cluster
   sync --kind users` exists so one set of logins works on every node, and an
   account is only usable on another host if its hash goes with it — there is no
   plaintext kept anywhere to re-hash there. The hash travels over the same
