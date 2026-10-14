@@ -28,7 +28,7 @@ create or bootstrap does not stop the rest, and the ones that exist are kept.
 A failed instance in the result has a **Diagnose** button, which opens a new
 browser tab searching Google for the error in double quotes -- for a failed
 module, the last line the module printed. Only the error's first line is
-sent, without lemondx's own `error:` prefix or any double quotes inside it;
+sent, without waterpump's own `error:` prefix or any double quotes inside it;
 it can still name hosts, paths or addresses, so mind what you search for.
 
 Once a template has instances, its card also offers **Run command**,
@@ -55,14 +55,14 @@ fills the form from a template, for a one-off variation.
 `template-save` takes the same instance and bootstrap flags as `create`:
 
 ```bash
-./lemondx template-save "Web server" -i images:debian/12 -c 2 -m 2GiB \
+./waterpump template-save "Web server" -i images:debian/12 -c 2 -m 2GiB \
     -b base -b ssh-access --param USERNAME=hampus --all-ssh-keys \
     --prefix web --description "nginx boxes"
-./lemondx template-save "Pg" -i ubuntu:24.04 -P "Web server" -b postgresql
-./lemondx templates
-./lemondx launch "Web server" -n 3            # web-1, web-2, web-3
-./lemondx launch "Web server" --prefix canary # canary-1
-./lemondx template-delete "Pg" -y
+./waterpump template-save "Pg" -i ubuntu:24.04 -P "Web server" -b postgresql
+./waterpump templates
+./waterpump launch "Web server" -n 3        # web-1, web-2, web-3
+./waterpump launch "Web server" --prefix canary # canary-1
+./waterpump template-delete "Pg" -y
 ```
 
 `launch` exits 1 if any instance failed. When `serve` runs on the node, the
@@ -80,9 +80,9 @@ skips the question, and without a terminal it is required. A delete is refused
 stacks.
 
 ```bash
-./lemondx template-exec "Web server" -- apt-get -y upgrade
-./lemondx template-recreate "Web server"      # lists them, then asks
-./lemondx template-destroy "Web server" -y
+./waterpump template-exec "Web server" -- apt-get -y upgrade
+./waterpump template-recreate "Web server"  # lists them, then asks
+./waterpump template-destroy "Web server" -y
 ```
 
 ## Running a command on every instance
@@ -146,7 +146,7 @@ Each instance records which version of its template it was made from. Edit
 the template afterwards and every instance made before the edit is marked
 **stale**: a badge on its row in the Containers tab and on the template's
 card, a note in its drawer, a count on Home, and `stale: template` in
-`lemondx list`. **Replace N stale** on the card (or `lemondx template-recreate
+`waterpump list`. **Replace N stale** on the card (or `waterpump template-recreate
 --stale`) recreates just those, leaving current instances alone; **Recreate
 all** does every one. Either uses the template as it is now.
 
@@ -163,7 +163,7 @@ description, the instance-name prefix or the app check does not make anything
 stale: none of those is baked into an instance.
 
 Each node judges its own instances against its own copy of the template,
-which sync keeps level with everyone's. Instances made before lemondx kept
+which sync keeps level with everyone's. Instances made before waterpump kept
 revisions carry none and are never marked, since there is nothing to compare;
 recreating them starts tracking. The API reports it as `stale` (a list of
 `template` and/or `stack`) and `revisions` on every container.
@@ -219,10 +219,10 @@ every run rather than copied onto instances, so editing it reaches instances
 already launched — and a template that is deleted takes its check with it.
 
 ```bash
-./lemondx template-save "Web server" -i images:debian/12 -b base \
+./waterpump template-save "Web server" -i images:debian/12 -b base \
     --app-check checks/web.sh --app-check-interval 30 --app-check-timeout 5
-./lemondx template-save "Web server" -i images:debian/12 -b base -m 4GiB  # keeps the check
-./lemondx template-save "Web server" -i images:debian/12 -b base --no-app-check
+./waterpump template-save "Web server" -i images:debian/12 -b base -m 4GiB  # keeps the check
+./waterpump template-save "Web server" -i images:debian/12 -b base --no-app-check
 ```
 
 `--app-check -` reads the script from stdin.
@@ -238,18 +238,18 @@ diamond in the web UI shows.
 Instances are named `<prefix>-<n>` with the lowest numbers no instance is
 using, so deleting `web-2` means the next launch creates `web-2` again. The
 prefix defaults to a slug of the template name and can be overridden per
-launch. Every launched instance carries `user.lemondx.template` in its config,
+launch. Every launched instance carries `user.waterpump.template` in its config,
 which is how the UI groups them; renaming a template does not relabel
 instances launched before the rename.
 
 ## Launching across nodes
 
-A launch stays on this host unless it is told otherwise. If this lemondx is
+A launch stays on this host unless it is told otherwise. If this waterpump is
 federated with others (see [Nodes and federation](cluster.md)), `launch` takes
 `--node` and `--group`, and the UI's Launch button opens a node picker:
 
 ```bash
-lemondx launch web -n 6 --group edge
+waterpump launch web -n 6 --group edge
 ```
 
 Instances go round robin, and the `<prefix>-<n>` numbering is allocated across
@@ -272,14 +272,14 @@ editor pick **Made from → A snapshot**, then the instance and snapshot; from
 the CLI:
 
 ```bash
-lemondx snapshot golden base
-lemondx template-save "Golden" --snapshot golden/base --prefix app
-lemondx launch "Golden" -n 3                      # app-1..3, clones of golden/base
+waterpump snapshot golden base
+waterpump template-save "Golden" --snapshot golden/base --prefix app
+waterpump launch "Golden" -n 3                  # app-1..3, clones of golden/base
 ```
 
 Each instance is a copy-on-write clone where the storage driver supports it
 (zfs, btrfs, lvm), so a launch is quick. The clone is container or VM as its
-source was, and it is made its own instance on the way: lemondx tags from the
+source was, and it is made its own instance on the way: waterpump tags from the
 source (its template, its stack) are removed, and a container's
 `/etc/machine-id` is emptied so systemd makes a new one at first boot --
 otherwise every clone would ask DHCP for the source's address. A VM's files
@@ -302,9 +302,9 @@ To make and copy the image: **Make image** on the snapshot in the container
 drawer or the Images tab, or
 
 ```bash
-lemondx snapshot-publish golden base golden-base --to node2 --to node3
-lemondx image-copy golden-base --to node4          # later, to one that was missed
-lemondx launch "Golden" --group edge              # from the image on those nodes
+waterpump snapshot-publish golden base golden-base --to node2 --to node3
+waterpump image-copy golden-base --to node4      # later, to one that was missed
+waterpump launch "Golden" --group edge          # from the image on those nodes
 ```
 
 A template of `local:golden-base` works too, if you would rather the image
@@ -406,7 +406,7 @@ is blocked by them.
 
 ## On disk
 
-One JSON file per template in `~/.local/share/lemondx/templates/`, named after
+One JSON file per template in `~/.local/share/waterpump/templates/`, named after
 a slug of the template name, just like profiles — copy them between machines
 or check them into a project:
 

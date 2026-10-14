@@ -9,11 +9,11 @@ on :5173 and proxies `/api` to the Python backend, so run both:
 
 ```bash
 ./build.sh                     # once: checks Node, installs, builds
-./lemondx serve --dev          # terminal 1
+./waterpump serve --dev      # terminal 1
 npm --prefix web run dev       # terminal 2 → http://localhost:5173
 ```
 
-Point the proxy somewhere else with `LEMONDX_API=http://host:port npm run dev`.
+Point the proxy somewhere else with `WATERPUMP_API=http://host:port npm run dev`.
 
 `web/dist` is a build output and is **not** in git — it is rebuilt by the
 release workflow and shipped inside the release archive. Build it once in a
@@ -32,8 +32,8 @@ that directly. There is nothing to commit afterwards: `.gitignore` covers
 ## The live-daemon CI job
 
 GitHub's hosted runners have no LXD or Incus, so `pr.yml`'s `daemon` job runs on
-a self-hosted runner labelled `lemondx-daemon`. The runner is a small Debian 13
-VM (1 vCPU, 1 GB) with Incus. The job runs `.github/scripts/daemon_smoke.sh`,
+a self-hosted runner labelled `waterpump-daemon`. The runner is a small Debian
+13 VM (1 vCPU, 1 GB) with Incus. The job runs `.github/scripts/daemon_smoke.sh`,
 which you can also run by hand on any host with a daemon. It covers:
 
 - `status`
@@ -77,11 +77,11 @@ The flow, all in `.github/workflows/release.yml`:
 
 1. A merge to `main` makes release-please open (or update) a release PR titled
    `chore(main): release <version>`. It holds the `CHANGELOG.md` entry and the
-   bumped version in `pyproject.toml` and `src/lemondx/__init__.py`.
+   bumped version in `pyproject.toml` and `src/waterpump/__init__.py`.
 2. Merging that PR is the decision to release. release-please tags
    `v<version>` and creates the GitHub release.
 3. The same run then does `npm ci && npm run build` and attaches
-   `lemondx-<version>.tar.gz`, `.zip` and `SHA256SUMS`.
+   `waterpump-<version>.tar.gz`, `.zip` and `SHA256SUMS`.
 
 The archive is the runnable tree — launcher, `src/`, the built `web/dist`,
 `modules/`, `systemd/` and the docs — so a user needs only Python 3.10+. Build
@@ -89,7 +89,7 @@ the same thing locally to see what a release will contain:
 
 ```bash
 ./build.sh
-.github/scripts/bundle.sh 1.2.3     # -> dist/lemondx-1.2.3.{tar.gz,zip}
+.github/scripts/bundle.sh 1.2.3     # -> dist/waterpump-1.2.3.{tar.gz,zip}
 ```
 
 To force a version — the first `1.0.0`, say — put `Release-As: 1.0.0` in a

@@ -1,4 +1,4 @@
-# Releases lemondx. Two stages, both driven by a merge to main:
+# Releases waterpump. Two stages, both driven by a merge to main:
 #
 #   1. release-please reads the conventional-commit subjects since the last tag
 #      and keeps a release PR open with the next semantic version, the bumped
@@ -90,7 +90,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ needs.release-please.outputs.tag }}" \
-            dist/lemondx-*.tar.gz dist/lemondx-*.zip dist/SHA256SUMS \
+            dist/waterpump-*.tar.gz dist/waterpump-*.zip dist/SHA256SUMS \
             --clobber
 
       - name: Note how to use the archive in the release body
@@ -110,9 +110,9 @@ jobs:
           ### Install
 
           \`\`\`bash
-          curl -LO https://github.com/${{ github.repository }}/releases/download/$TAG/lemondx-$VERSION.tar.gz
-          tar xzf lemondx-$VERSION.tar.gz && cd lemondx-$VERSION
-          ./lemondx serve --open
+          curl -LO https://github.com/${{ github.repository }}/releases/download/$TAG/waterpump-$VERSION.tar.gz
+          tar xzf waterpump-$VERSION.tar.gz && cd waterpump-$VERSION
+          ./waterpump serve --open
           \`\`\`
 
           Python 3.10+ and a running LXD or Incus daemon are the only

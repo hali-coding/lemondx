@@ -3,7 +3,7 @@
 # Ubuntu 24.04 with LXD from snap (5.21/stable, the LTS track Ubuntu ships).
 # @HOSTNAME@ and @SSH_KEYS@ are filled in by scripts/create-vm.sh.
 hostname: @HOSTNAME@
-fqdn: @HOSTNAME@.lemondx.test
+fqdn: @HOSTNAME@.waterpump.test
 users:
   - name: ci
     shell: /bin/bash

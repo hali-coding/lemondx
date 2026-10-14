@@ -20,7 +20,7 @@ interface Props {
 
 // Open or closed follows the person from dialog to dialog: someone reading
 // the API wants it on every form, and nobody else wants it on any.
-const EXPLORER_KEY = 'lemondx-api-explorer'
+const EXPLORER_KEY = 'waterpump-api-explorer'
 
 function storedExplorer() {
   try {

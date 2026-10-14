@@ -9,7 +9,7 @@ fixed was verified live on the cluster afterwards.
 - [x] Two nodes could run one swarm at once, and one's teardown destroyed the
   other's generators. Starts are now refused while any member runs the stack
   (`_busy()` / `peer_runs()`); each swarm run tags its instances
-  (`user.lemondx.swarm-run`) and tears down only its own; Stop forwards to the
+  (`user.waterpump.swarm-run`) and tears down only its own; Stop forwards to the
   member running it.
 - [x] A swarm against a stopped stack wasn't refused: `_live_context()` counts
   running instances only, and refuses a referenced address that is missing.
@@ -20,7 +20,7 @@ fixed was verified live on the cluster afterwards.
   in the UI and under the step in the CLI.
 - [x] One failed generator failed the whole swarm: launch steps take
   `min_percent` (**Must start** in the designer); failures within it are noted.
-- [x] Leftover swarm instances were invisible in the CLI: `lemondx stacks`
+- [x] Leftover swarm instances were invisible in the CLI: `waterpump stacks`
   shows `heavy (6 left)` plus the command to clear them; `stack-show` notes them.
 - [x] `serve` stopped by systemd mid-swarm left instances behind: SIGTERM now
   stops swarms and waits up to 60 s for their teardown. The CLI follower says
@@ -50,15 +50,15 @@ fixed was verified live on the cluster afterwards.
     Added `root:1000000:1000000000` (backups are `*.bak-20261011`), restarted
     Incus, and ended the auto-maintenance.
   - **No DHCP or DNS for containers:** firewalld put the unzoned `lxdbr0` and
-    `lemonfab1` in `FedoraServer`, which only admits ssh, cockpit and 8099.
+    the fabric bridge in `FedoraServer`, which only admits ssh, cockpit and 8099.
     firewalld is now **disabled** on prdev5 (by hand). If it comes back, give
     both bridges a zone that allows DHCP, DNS and forwarding first.
-  - **No fabric routes:** restarting Incus re-created `lemonfab1`, and the
+  - **No fabric routes:** restarting Incus re-created the fabric bridge, and the
     routes that use its address as `src` went with it (0/5).
-    `lemondx fabric apply` on prdev5 restored them.
+    `waterpump fabric apply` on prdev5 restored them.
 - [ ] **prdev3** gained an empty LXD snap during the drill: Ubuntu's
-  `lxd-installer` installed it when `lxc list` was run there. lemondx prefers an
-  LXD socket over Incus, so its serve is now started with `LEMONDX_FLAVOR=incus`.
+  `lxd-installer` installed it when `lxc list` was run there. waterpump prefers an
+  LXD socket over Incus, so its serve is now started with `WATERPUMP_FLAVOR=incus`.
   A plain `restart-all.sh` will flip it back to the empty LXD until the snap is
   removed: `sudo snap remove --purge lxd` (it holds no instances, storage,
   networks or images).
@@ -66,17 +66,17 @@ fixed was verified live on the cluster afterwards.
 
 ## Ideas, not done
 
-- lemondx picks the first daemon socket that exists. A host with both (prdev1,
+- waterpump picks the first daemon socket that exists. A host with both (prdev1,
   and now prdev3) silently switches daemon when one appears. Worth a saved
   per-node daemon choice, or at least a warning in `status` when both exist.
 - `serve` could check the idmap at startup rather than learning from five
   failed launches.
-- **firewalld hosts:** lemondx neither documents nor handles firewalld. On
+- **firewalld hosts:** waterpump neither documents nor handles firewalld. On
   Fedora, its bridges fall into the default zone and containers get no DHCP or
   DNS. `docs/networking.md` should say which zone settings a bridge needs.
   The fabric helper could put its own bridges (and say which other bridge to
   add) in a zone, the way it already keeps `DOCKER-USER` rules for Docker
-  hosts. `status` could warn when firewalld is active and a lemondx bridge has
+  hosts. `status` could warn when firewalld is active and a waterpump bridge has
   no zone.
 - **Fabric routes after a daemon restart:** when Incus or LXD restarts and
   re-creates a fabric bridge, the routes stay missing until the periodic

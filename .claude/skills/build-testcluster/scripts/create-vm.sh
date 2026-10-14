@@ -1,7 +1,7 @@
 #!/bin/sh
 # Create one cloud-image VM on the Proxmox host and wait for cloud-init.
 #
-#   create-vm.sh <vmid> <name> <ip-last-octet> [lxd|basic|lemondx-ci] [cores] [memory-MB] [disk-GB]
+#   create-vm.sh <vmid> <name> <ip-last-octet> [lxd|basic|waterpump-ci] [cores] [memory-MB] [disk-GB]
 #
 # Runs from this machine: renders a per-VM user-data snippet (so the guest
 # gets its hostname -- a shared snippet cannot carry one), copies it to the

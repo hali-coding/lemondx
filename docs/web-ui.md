@@ -18,7 +18,7 @@ One request carries the whole list (`POST /api/containers/state`) and the server
 applies the action to each in parallel, reporting every outcome separately: a
 container the daemon refuses — one already stopped, say — is that container's
 result, not a failure for the rest. The notification afterwards says so,
-naming only the ones that did not do as asked. `lemondx start`/`stop` take
+naming only the ones that did not do as asked. `waterpump start`/`stop` take
 several names for the same reason and go through the same code.
 
 ## Configuring a new node
@@ -74,7 +74,7 @@ abandons it, which can leave an instance created but not bootstrapped. Stopping
 the systemd unit, or killing the process, abandons it straight away.
 
 Only the `serve` process's own creates are tracked: one started with
-`lemondx create` in a terminal appears in the list once the daemon has it,
+`waterpump create` in a terminal appears in the list once the daemon has it,
 without a stage.
 
 ## API explorer
@@ -89,18 +89,21 @@ code that sends the real request, so the two cannot differ.
 
 Secrets typed into the form (bootstrap secrets, passwords, a join code) are
 shown as `<name>` placeholders rather than their values. With authentication
-on, the examples read a token from `LEMONDX_API_TOKEN`; make one on the Access
+on, the examples read a token from `WATERPUMP_API_TOKEN`; make one on the Access
 tab. Requests the UI sends with `background: true` answer at once with a run
 record; leave it out in a script and the call waits until the work is done.
 Whether the panel is open, and which language, is remembered in the browser.
 
 ## Showing one node or the whole cluster
 
-A lemondx joined to a cluster puts a **Showing** picker on the Containers tab:
-this node, the whole cluster, a single node, or a node group. The Templates tab
-follows the same setting, so the instances a template lists and the containers
-in the table always cover the same hosts, and Launch opens on the nodes you are
-already looking at.
+A waterpump joined to a cluster puts a **Showing** picker on the Containers tab:
+the whole cluster, a node group, or a single node (this one is marked
+*this node*). It opens on the whole cluster. A narrower choice is marked, says
+how many of the nodes it covers, and has **Show all** beside it; it lasts for
+the browser tab, so a new visit starts at the whole cluster again. The
+Templates tab follows the same setting, so the instances a template lists and
+the containers in the table always cover the same hosts, and Launch opens on
+the nodes you are already looking at.
 
 Widened, the table gains a Node column, and start/stop/restart/delete are routed
 to whichever node owns each row — a selection may span hosts. Clicking any row
@@ -134,7 +137,7 @@ it comes back: see [Cluster view](#cluster-view) and
 
 ## Logs view
 
-A live tail of what lemondx does on every node, merged by time: each change,
+A live tail of what waterpump does on every node, merged by time: each change,
 who made it and how, and the requests behind it. Filter by node or group,
 level, kind, who, instance or text; **Pause** stops it moving, and **Follow**
 keeps the newest event, at the top, in view unless you have scrolled down to read.
@@ -168,7 +171,7 @@ opened, and a reload loses nothing.
   still lists every one). **← All nodes** goes back. A single node always
   shows its instances this way.
 - **Instances**, sorted by CPU, with a sparkline of the last five minutes.
-  An instance's CPU is a share of one core, as in `lemondx top`, so a busy
+  An instance's CPU is a share of one core, as in `waterpump top`, so a busy
   one can pass 100%. Click a row for its own CPU, memory and network charts.
 
 Pick the nodes or a group, 5, 15 or 30 minutes, and how often the page
@@ -177,13 +180,13 @@ slower refresh loses no detail, it only arrives in bigger steps). The range and
 refresh rate are remembered in this browser. **Pause** holds the
 charts still; resuming catches up on what was sampled meanwhile. A restarted
 `serve` starts its history again, and the page stops polling while the
-browser tab is hidden. [`lemondx top`](cluster.md#watching-it-from-a-terminal) is the terminal's
+browser tab is hidden. [`waterpump top`](cluster.md#watching-it-from-a-terminal) is the terminal's
 equivalent, without the history.
 
 ## Cluster view
 
 The nodes, and the settings they share. The node parts are only interesting
-once this lemondx is federated with another; on its own it shows this host and
+once this waterpump is federated with another; on its own it shows this host and
 its settings. It has five parts:
 
 - **This node** — the name, address and certificate fingerprint peers know it
@@ -228,7 +231,7 @@ on.
 
 ## Health checks
 
-While `lemondx serve` runs, it checks every running instance once a minute.
+While `waterpump serve` runs, it checks every running instance once a minute.
 Each check reads the instance's `/proc/loadavg` through the daemon's file API,
 which proves it responds, and compares its CPU and memory with its limits:
 
@@ -268,7 +271,7 @@ host's CPUs for a container without one. Memory is only judged against a
 `limits.memory`.
 
 **Load average.** A container's own `/proc/loadavg` is the host's (unless
-LXCFS virtualises it, which is off by default), so lemondx counts each
+LXCFS virtualises it, which is off by default), so waterpump counts each
 container's load itself, the way the kernel does for the host: every five
 seconds it counts the container's threads that are running, waiting for a CPU
 or in uninterruptible sleep — read from the container's cgroup on the host —
@@ -279,10 +282,10 @@ judged once it has a minute of samples. It is an absolute count of tasks, not
 divided by CPUs.
 
 A VM reports its own load average through its agent. If a container's cgroup
-cannot be found or read, lemondx falls back to the container's `/proc/loadavg`;
+cannot be found or read, waterpump falls back to the container's `/proc/loadavg`;
 when that is the host's, it shows "host-wide" and does not judge it.
 
-Tune any of it with `lemondx configure health` (interval of 15 seconds or more,
+Tune any of it with `waterpump configure health` (interval of 15 seconds or more,
 each threshold including `load_average`, probe timeout, missed probes before unhealthy, start grace);
 `serve --no-health` turns checks off for one run. A saved file that does not
 validate is ignored with a warning. The same checks run on demand from the
@@ -290,8 +293,8 @@ CLI, which measures CPU and load over a short window since it has no previous
 check (its load is that window's average, shown as e.g. `4.00 (5s)`):
 
 ```bash
-lemondx health                  # every running instance
-lemondx health web-1 --window 10 --json
+waterpump health              # every running instance
+waterpump health web-1 --window 10 --json
 ```
 
 The CLI also runs each instance's app check once, and shows its status in the
@@ -357,7 +360,7 @@ A few things the numbers deliberately do not hide:
 Allocations cover the current project; host figures cover the whole host.
 
 ```bash
-./lemondx resources
+./waterpump resources
 curl -s localhost:8099/api/resources | jq '.memory, .instances[].memory'
 ```
 
@@ -403,7 +406,7 @@ under one node: enough to get it ready for instances and to see what they are
 using. They are not meant to replace the host's own tooling.
 
 The **Storage** tab has separate Pools and Volumes views. Pools show their
-driver, source, capacity, resident instances, volume count and whether lemondx
+driver, source, capacity, resident instances, volume count and whether waterpump
 can manage them. Instances whose root disk is on the pool are listed directly;
 instances that only attach a custom volume from it are labeled separately.
 The create form offers only local `dir`, `btrfs`, `lvm` and `zfs` drivers that
@@ -422,7 +425,7 @@ request if that list changes before deletion begins.
 
 For ZFS, the action removes the pool from LXD but preserves its backing zpool.
 After the confirmed LXD resources are removed, the dialog asks the operator to
-export the zpool on the host and retry. lemondx verifies the export before it
+export the zpool on the host and retry. waterpump verifies the export before it
 lets LXD remove the registration, preventing LXD's normal `zpool destroy`.
 
 Pool sizes apply only to loop-backed Btrfs, LVM and ZFS pools; `dir` has no
@@ -511,16 +514,16 @@ left for instances and the usable range, plus every subnet already on the
 host. A block that overlaps one of them — another bridge, `docker0`, your LAN —
 is refused before you can submit, and again by the server, because the daemon
 itself accepts it and routing to both then quietly breaks. Public IPv4 ranges
-and IPv6 prefixes other than /64 are allowed but get a warning. The defaults are what `lemondx init`
+and IPv6 prefixes other than /64 are allowed but get a warning. The defaults are what `waterpump init`
 creates: a free IPv4 subnet behind NAT and no IPv6. DNS domain, MTU and a
 short allowlist of other bridge keys (`ipv4.dhcp.ranges`, `ipv4.routing`,
 `dns.mode`, …) are available too; `raw.dnsmasq`, tunnels and uplinks are left
 to the daemon's own CLI. Names are limited to 15 characters, the kernel's
 limit for an interface.
 
-**Edit** sends only the keys that changed, so a network with options lemondx
+**Edit** sends only the keys that changed, so a network with options waterpump
 does not allow can still be edited. **Delete** is refused while any profile
-or instance uses the network, and the dialog lists them. lemondx will not
+or instance uses the network, and the dialog lists them. waterpump will not
 detach them for you, because an instance whose NIC is removed keeps running
 with no network. Only managed bridges on non-clustered servers can be edited
 or deleted.
@@ -537,14 +540,14 @@ with the same CIDR block picker, and selects it.
 From the CLI:
 
 ```bash
-./lemondx network ls
-./lemondx network show lxdbr0
-./lemondx network subnets                             # what a new block must avoid
-./lemondx network create labbr0 --ipv4 10.20.0.0/24 --dns-domain lab
-./lemondx network set labbr0 --no-nat --mtu 1400
-./lemondx network set labbr0 --config dns.domain=   # an empty value unsets a key
-./lemondx create lab1 --network labbr0
-./lemondx network delete labbr0
+./waterpump network ls
+./waterpump network show lxdbr0
+./waterpump network subnets                         # what a new block must avoid
+./waterpump network create labbr0 --ipv4 10.20.0.0/24 --dns-domain lab
+./waterpump network set labbr0 --no-nat --mtu 1400
+./waterpump network set labbr0 --config dns.domain=  # an empty value unsets a key
+./waterpump create lab1 --network labbr0
+./waterpump network delete labbr0
 curl -s localhost:8099/api/networks/lxdbr0 | jq '.ipv4, .leases'
 ```
 

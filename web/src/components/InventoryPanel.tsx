@@ -12,11 +12,11 @@ interface Props {
 const keyOf = (c: { node: string; name: string }) => `${c.node}/${c.name}`
 
 /**
- * Instances on any node that lemondx did not make: someone's `lxc launch`, a
- * script, a lemondx from before instances were marked. Listed when the tab
+ * Instances on any node that waterpump did not make: someone's `lxc launch`, a
+ * script, a waterpump from before instances were marked. Listed when the tab
  * opens and again on Force inventory -- every node is asked there and then,
- * since lemondx keeps no list of its own and the daemons' listings are the
- * inventory. Importing marks them as lemondx's, and can make them one
+ * since waterpump keeps no list of its own and the daemons' listings are the
+ * inventory. Importing marks them as waterpump's, and can make them one
  * template's, which is the step with a cost: that template's Recreate
  * deletes and remakes them.
  */
@@ -98,12 +98,12 @@ export function InventoryPanel({ onNotify }: Props) {
       <header className="access-head">
         <h3>Inventory</h3>
         <span className="faint">
-          Instances on any node that lemondx did not make
+          Instances on any node that waterpump did not make
           {inventory && <> · checked {new Date(inventory.checked_at * 1000).toLocaleTimeString()}</>}
         </span>
         <div className="row-actions access-head-end">
           <button className="btn btn-sm" disabled={loading} onClick={() => take()}
-            title="List every node now for instances made outside lemondx">
+            title="List every node now for instances made outside waterpump">
             {loading ? <span className="spinner" /> : <RefreshIcon size={13} />} Force inventory
           </button>
         </div>
@@ -118,7 +118,7 @@ export function InventoryPanel({ onNotify }: Props) {
 
       {inventory && foreign.length === 0 && (
         <div className="inventory-note faint">
-          Every instance on {inventory.nodes.join(', ')} was made or imported by lemondx.
+          Every instance on {inventory.nodes.join(', ')} was made or imported by waterpump.
         </div>
       )}
 
@@ -128,12 +128,12 @@ export function InventoryPanel({ onNotify }: Props) {
             <div className="banner-body">
               <h3>
                 {foreign.length === 1 ? '1 instance was' : `${foreign.length} instances were`} made
-                outside lemondx
+                outside waterpump
               </h3>
               <p>
-                Created with <span className="mono">lxc</span>, a script, or an older lemondx.
+                Created with <span className="mono">lxc</span>, a script, or an older waterpump.
                 They are already listed and monitored like any other; importing marks them as
-                lemondx’s so they are no longer flagged, and can make them one template’s.
+                waterpump’s so they are no longer flagged, and can make them one template’s.
               </p>
             </div>
           </div>
@@ -183,7 +183,7 @@ export function InventoryPanel({ onNotify }: Props) {
           <div className="inventory-actions">
             <select className="select" value={template} aria-label="Import into a template"
               onChange={(e) => setTemplate(e.target.value)} disabled={!canWrite || importing}>
-              <option value="">Just mark them as lemondx’s</option>
+              <option value="">Just mark them as waterpump’s</option>
               {templates.map((t) => (
                 <option key={t.name} value={t.name}>Also make them “{t.name}” instances</option>
               ))}

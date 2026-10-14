@@ -31,7 +31,7 @@ export function SetupBanner({ status, onSetup }: Props) {
       <div className="banner-body">
         <h3>{status.product} needs to be set up before you can create containers</h3>
         <p>
-          lemondx can do it for you: create a storage pool, add a NAT bridge, and
+          waterpump can do it for you: create a storage pool, add a NAT bridge, and
           attach both to the default profile.
         </p>
         <ul>

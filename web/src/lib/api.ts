@@ -45,7 +45,7 @@ export class ApiError extends Error {
 // sessionStorage so a reload does not re-prompt, but never in localStorage: it
 // is a credential. A password login uses an HttpOnly cookie instead, which
 // this code never sees.
-const TOKEN_KEY = 'lemondx-token'
+const TOKEN_KEY = 'waterpump-token'
 
 let authToken: string | null = readStoredToken()
 
@@ -75,7 +75,7 @@ async function request<T>(
 ): Promise<T> {
   // Lets the server log this as the web UI rather than a script: attribution
   // only, never trusted for anything.
-  const headers: Record<string, string> = { 'X-Lemondx-Client': 'web' }
+  const headers: Record<string, string> = { 'X-Waterpump-Client': 'web' }
   if (options.body !== undefined) headers['Content-Type'] = 'application/json'
   if (authToken) headers['Authorization'] = `Bearer ${authToken}`
 
@@ -89,7 +89,7 @@ async function request<T>(
     })
   } catch (cause) {
     if ((cause as Error).name === 'AbortError') throw cause
-    throw new ApiError('Cannot reach the lemondx server. Is it still running?', 0)
+    throw new ApiError('Cannot reach the waterpump server. Is it still running?', 0)
   }
 
   const text = await response.text()
@@ -875,7 +875,7 @@ export const api = {
   drift: (signal?: AbortSignal) =>
     request<DriftReport | null>('/cluster/drift', { signal }),
 
-  /** List every node now for instances lemondx did not make or import. */
+  /** List every node now for instances waterpump did not make or import. */
   inventory: (signal?: AbortSignal) => request<Inventory>('/cluster/inventory', { signal }),
 
   /** Adopt them, wherever each is; optionally as one template's. */

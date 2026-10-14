@@ -20,7 +20,7 @@ const WINDOWS = [
 ]
 const RATES = [2, 5, 10, 30]
 const SERIES_SLOTS = 8
-const SETTINGS_KEY = 'lemondx-monitor'
+const SETTINGS_KEY = 'waterpump-monitor'
 const SPARK_SECONDS = 300
 
 type SortKey = 'name' | 'node' | 'cpu' | 'memory' | 'rx' | 'tx'

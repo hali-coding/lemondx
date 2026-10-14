@@ -1773,6 +1773,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 .scope-picker { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; }
 .scope-picker .select { width: auto; }
+/* Narrower than the whole cluster: said, so a filtered table is not taken for all of it. */
+.scope-picker-narrowed .select { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.scope-picker-note { color: var(--accent); white-space: nowrap; }
 
 /* A row on another node: the drawer is this node's, so it does not open. */
 .ctable tr.row-elsewhere { cursor: default; }

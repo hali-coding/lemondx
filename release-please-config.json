@@ -6,10 +6,10 @@
   "include-component-in-tag": false,
   "packages": {
     ".": {
-      "package-name": "lemondx",
+      "package-name": "waterpump",
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
-        "src/lemondx/__init__.py"
+        "src/waterpump/__init__.py"
       ]
     }
   },

@@ -29,7 +29,7 @@ for value in "$source" "$target" "$options"; do
 done
 target="${target%/}"
 
-case "$LEMONDX_PKG" in
+case "$WATERPUMP_PKG" in
     apt)    pkg_install nfs-common ;;
     zypper) pkg_install nfs-client ;;
     *)      pkg_install nfs-utils ;;
@@ -67,9 +67,9 @@ elif have rc-update; then
         # OpenRC's netmount is keyworded -lxc, so it never runs in a
         # container; the local service does, and mounts them instead.
         mkdir -p /etc/local.d
-        printf '#!/bin/sh\n# Written by lemondx (nfs-mount): netmount does not run in a container.\nmount -a -t nfs,nfs4\n' \
-            > /etc/local.d/lemondx-nfs.start
-        chmod 0755 /etc/local.d/lemondx-nfs.start
+        printf '#!/bin/sh\n# Written by waterpump (nfs-mount): netmount does not run in a container.\nmount -a -t nfs,nfs4\n' \
+            > /etc/local.d/waterpump-nfs.start
+        chmod 0755 /etc/local.d/waterpump-nfs.start
         rc-update add local default >/dev/null 2>&1 || true
     else
         rc-update add netmount default >/dev/null 2>&1 || true
@@ -118,8 +118,8 @@ if in_container; then
         *"not permitted"*)
             printf '%s\n' "$error" >&2
             die "an unprivileged container may not mount NFS unless the daemon mounts it on its behalf. On the host, run:
-  lxc config set ${LEMONDX_INSTANCE:-<instance>} security.syscalls.intercept.mount=true security.syscalls.intercept.mount.allowed=nfs,nfs4
-  lxc restart ${LEMONDX_INSTANCE:-<instance>}
+  lxc config set ${WATERPUMP_INSTANCE:-<instance>} security.syscalls.intercept.mount=true security.syscalls.intercept.mount.allowed=nfs,nfs4
+  lxc restart ${WATERPUMP_INSTANCE:-<instance>}
 (incus for lxc on Incus; or put both keys in a profile the template uses), then run this module again. If they are set already, check that the server exports $source to this host. A virtual machine needs neither." ;;
     esac
 fi

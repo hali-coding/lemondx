@@ -42,7 +42,7 @@ function visible(signal: AbortSignal) {
 }
 
 /**
- * A live tail of lemondx's events: the backlog first, then each new event as
+ * A live tail of waterpump's events: the backlog first, then each new event as
  * it happens, by long-polling `/api/logs` or `/api/cluster/logs` with the
  * cursor the last answer gave. Pausing keeps the cursor, so resuming catches
  * up on what happened meanwhile (as far as each node's buffer reaches); a

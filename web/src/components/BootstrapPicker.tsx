@@ -70,7 +70,7 @@ export function BootstrapPicker({
       <p className="hint">
         No bootstrap modules found. Drop <span className="mono">.sh</span> files into{' '}
         <span className="mono">modules/</span> or{' '}
-        <span className="mono">~/.local/share/lemondx/modules</span>.
+        <span className="mono">~/.local/share/waterpump/modules</span>.
       </p>
     )
   }

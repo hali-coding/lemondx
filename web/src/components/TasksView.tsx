@@ -511,7 +511,7 @@ function InvokeDialog({ task, onCancel, onStarted }: {
           value={payload} spellCheck={false} onChange={(e) => setPayload(e.target.value)}
           placeholder='{"message": "…"}  — optional, JSON or text' />
         <span className="hint">
-          Handed to the job as a file named by <span className="mono">$LEMONDX_TASK_PAYLOAD</span>;
+          Handed to the job as a file named by <span className="mono">$WATERPUMP_TASK_PAYLOAD</span>;
           never logged or kept.
         </span>
       </div>
@@ -545,7 +545,7 @@ function InvokeHelp({ task, values, hasPayload, node, onClose }: {
   const flags = entries.filter(([n, s]) => !s.secret && values[n])
     .map(([n]) => ` --input ${n}=${JSON.stringify(values[n])}`).join('')
   const env = entries.filter(([, s]) => s.secret).map(([n]) => `${n}=… `).join('')
-  const command = `${env}lemondx task-run ${task.name}${flags}`
+  const command = `${env}waterpump task-run ${task.name}${flags}`
     + `${hasPayload ? ' --payload message.json' : ''}${node ? ` --node ${node}` : ''}`
   return (
     <HelpPanel title="How these reach the job" onClose={onClose}>
@@ -569,7 +569,7 @@ function InvokeHelp({ task, values, hasPayload, node, onClose }: {
           })}
           <tr>
             <td>payload</td>
-            <td className="mono">the file at $LEMONDX_TASK_PAYLOAD</td>
+            <td className="mono">the file at $WATERPUMP_TASK_PAYLOAD</td>
             <td>no file, and no variable</td>
           </tr>
         </tbody>

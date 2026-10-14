@@ -1,6 +1,6 @@
 ---
 name: build-testcluster
-description: The clean Proxmox test environment on 164.132.166.12 — building LXD (or Incus) VMs there with cloud-init, installing lemondx on them as a service, forming a cluster, a fabric and stacks, reaching everything through SSH tunnels, and the host/systemd quirks learned doing it. Use when asked for test VMs or nodes, a fresh cluster, a firedrill, a CI/daemon host, or anything on the Proxmox test host.
+description: The clean Proxmox test environment on 164.132.166.12 — building LXD (or Incus) VMs there with cloud-init, installing waterpump on them as a service, forming a cluster, a fabric and stacks, reaching everything through SSH tunnels, and the host/systemd quirks learned doing it. Use when asked for test VMs or nodes, a fresh cluster, a firedrill, a CI/daemon host, or anything on the Proxmox test host.
 ---
 
 # The Proxmox test environment
@@ -26,14 +26,14 @@ with fabric prefixes (10.100/16 and up).
 
 | VMID | Name | IP | Spec | Contents |
 |---|---|---|---|---|
-| 101 | `lxd1` | 172.30.0.11 | 3c / 6 GB (balloon 3G) / 40G | Ubuntu 24.04, LXD 5.21.8 (snap), lemondx user service |
+| 101 | `lxd1` | 172.30.0.11 | 3c / 6 GB (balloon 3G) / 40G | Ubuntu 24.04, LXD 5.21.8 (snap), waterpump user service |
 | 102 | `lxd2` | 172.30.0.12 | same | same |
 | 103 | `lxd3` | 172.30.0.13 | same | same |
 | 104 | `lxd4` | 172.30.0.14 | same | same |
 
 - **Cluster:** 4 members, re-formed on lxd1 on 2026-10-04. Auth is off, so loopback callers are admin and peers use the cluster credential.
 - **Groups:** `large` and `small` (auto-sized; identical hosts, so both hold all four) and `frontends` = lxd2, lxd3, lxd4.
-- **Fabric:** `lemonfab0`, `10.100.0.0/16` with NAT. Each lxdN has `10.100.N.0/24`, and all 3/3 routes are ok.
+- **Fabric:** `pumpfab0`, `10.100.0.0/16` with NAT. Each lxdN has `10.100.N.0/24`, and all 3/3 routes are ok.
 - **Stack:** `fd-3tier`. Every template puts its instance on the fabric:
   - `db` (`fd-db`: Debian 12 + base, postgresql, mdns; app check `pg_isready`) on lxd1
   - `web` ×3 (`fd-web`: Alpine + apache2 with its own vhost, mdns; app check wget) on group `frontends`
@@ -42,8 +42,8 @@ with fabric prefixes (10.100/16 and up).
 
   The probe fails the stack unless all three web servers and a Postgres login
   (role `app`, db `appdb`) answer across the fabric. The password is in
-  `~ci/fd/db-password` on lxd1 (0600) and is never stored by lemondx; launch with
-  `DB_PASSWORD=$(cat ~/fd/db-password) ./lemondx stack-launch fd-3tier`.
+  `~ci/fd/db-password` on lxd1 (0600) and is never stored by waterpump; launch with
+  `DB_PASSWORD=$(cat ~/fd/db-password) ./waterpump stack-launch fd-3tier`.
 - **Also:** template `fd-dev` (Ubuntu + base, ssh-access, nodejs, mise; user
   `dev`) with one instance per node. Its key is `~ci/.ssh/firedrill_ed25519` on
   lxd1: `ssh -i ~/.ssh/firedrill_ed25519 dev@<fabric ip>`. Definitions and app
@@ -61,7 +61,7 @@ Keep this table current when adding or removing VMs.
 
 ```sh
 ssh -J root@164.132.166.12 ci@172.30.0.11          # a node (user ci, passwordless sudo, in lxd)
-ssh -J root@164.132.166.12 -L 8099:127.0.0.1:8099 ci@172.30.0.11   # lemondx UI -> https://localhost:8099
+ssh -J root@164.132.166.12 -L 8099:127.0.0.1:8099 ci@172.30.0.11   # waterpump UI -> https://localhost:8099
 ssh -L 8006:127.0.0.1:8006 root@164.132.166.12     # Proxmox UI, if 8006 is ever firewalled
 ```
 
@@ -76,14 +76,14 @@ To close a tunnel, kill it by PID (`pgrep -af 'L 8099'`, then `kill`). A
 ## Building VMs
 
 ```sh
-.claude/skills/build-testcluster/scripts/create-vm.sh <vmid> <name> <octet> [lxd|basic|lemondx-ci] [cores] [memMB] [diskGB]
+.claude/skills/build-testcluster/scripts/create-vm.sh <vmid> <name> <octet> [lxd|basic|waterpump-ci] [cores] [memMB] [diskGB]
 # e.g. .claude/skills/build-testcluster/scripts/create-vm.sh 105 lxd5 15 lxd 3 6144 40
 ```
 
 - **Profiles** are in `cloud-init/`. Each one's `# image:` line picks the cloud image:
   - `lxd`: Ubuntu 24.04, LXD `5.21/stable` snap, `lxd init --auto`. About 4 minutes.
   - `basic`: Debian 13 + Incus.
-  - `lemondx-ci`: Debian 13, Incus + LXD, node/npm. Slow: Debian's npm pulls in 600+ packages.
+  - `waterpump-ci`: Debian 13, Incus + LXD, node/npm. Slow: Debian's npm pulls in 600+ packages.
 - **Per-VM snippet:** the script renders `/var/lib/vz/snippets/testcluster-<vmid>.yaml`,
   filling in the hostname and ssh keys (this machine's and the host root's).
   With a shared snippet, Proxmox sets no hostname and the guest comes up as `localhost`.
@@ -101,22 +101,22 @@ To close a tunnel, kill it by PID (`pgrep -af 'L 8099'`, then `kill`). A
 Snapshots: `qm snapshot <id> <name>`, `qm rollback <id> <name>`.
 Removal is destructive, so confirm first: `qm stop <id> && qm destroy <id> --purge && rm /var/lib/vz/snippets/testcluster-<id>.yaml`.
 
-## Installing lemondx on the nodes
+## Installing waterpump on the nodes
 
 1. Pack the working tree without `.git`, `node_modules`, `.claude` or
-   `__pycache__`, and unpack it to `~ci/lemondx`. Check `web/dist` is newer
+   `__pycache__`, and unpack it to `~ci/waterpump`. Check `web/dist` is newer
    than `web/src`.
 2. As ci:
    - `sudo loginctl enable-linger ci`
    - `export XDG_RUNTIME_DIR=/run/user/$(id -u)` (needed for `systemctl --user` over ssh)
    - `./systemd/install-service.sh`
    - `sudo ./systemd/install-service.sh --fabric`. This installs only the sudoers rule for `fabric-helper`.
-3. Add the drop-in `~/.config/systemd/user/lemondx.service.d/testcluster.conf`,
+3. Add the drop-in `~/.config/systemd/user/waterpump.service.d/testcluster.conf`,
    then `daemon-reload` and restart:
    ```ini
    [Service]
    ExecStart=
-   ExecStart=/usr/bin/python3 /home/ci/lemondx/lemondx serve --host 0.0.0.0 --port 8099
+   ExecStart=/usr/bin/python3 /home/ci/waterpump/waterpump serve --host 0.0.0.0 --port 8099
    NoNewPrivileges=no
    ProtectSystem=no
    ProtectHome=no
@@ -138,7 +138,7 @@ Removal is destructive, so confirm first: `qm stop <id> && qm destroy <id> --pur
      node stays out.
    - Restart each joiner after it joins.
    - Revoke the code left over from the first `invite`.
-5. **Fabric:** `lemondx fabric check`, then `lemondx fabric create` on any
+5. **Fabric:** `waterpump fabric check`, then `waterpump fabric create` on any
    node. `serve` programs the routes itself about 20 seconds after a restart
    (`START_DELAY`). After that it only re-applies on a membership change or
    hourly.
@@ -156,10 +156,10 @@ host's when NAT'd).
 
 The previous host (`github@sysvmbox5.trustsno1.com`, vmbr29 `192.168.29.0/24`)
 still has:
-- VM 103 `lemondx-runner` (.20), the self-hosted GitHub Actions runner for
-  `pr.yml`'s `daemon` job, label `lemondx-daemon`
+- VM 103 `waterpump-runner` (.20), the self-hosted GitHub Actions runner for
+  `pr.yml`'s `daemon` job, label `waterpump-daemon`
 - 104/105 `debian13-test1/2`, stopped
-- 106–108 `lemondx-fd1..3`, the firedrill cluster
+- 106–108 `waterpump-fd1..3`, the firedrill cluster
 
 Its API token `root@pam!github` has no ACLs. To target it, set
 `PVE_HOST=github@sysvmbox5.trustsno1.com PVE_BRIDGE=vmbr29 PVE_NET=192.168.29 PVE_STORAGE=local`.

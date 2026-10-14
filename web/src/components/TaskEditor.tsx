@@ -32,9 +32,9 @@ const SCRIPT_LIMIT = 64 * 1024
 const SCRIPT_PLACEHOLDER = `# Runs as root in a fresh instance of the template; exit 0 for success.
 # Without a #! line: POSIX sh, with the module helpers (log, die, pkg_install…).
 pkg_install curl
-curl -fsS "https://example.com/hook?from=$LEMONDX_TASK_NODE" \\
-  -H "Authorization: Bearer $LEMONDX_SECRET_API_KEY" \\
-  --data @"\${LEMONDX_TASK_PAYLOAD:-/dev/null}"`
+curl -fsS "https://example.com/hook?from=$WATERPUMP_TASK_NODE" \\
+  -H "Authorization: Bearer $WATERPUMP_SECRET_API_KEY" \\
+  --data @"\${WATERPUMP_TASK_PAYLOAD:-/dev/null}"`
 const EMPTY_JOB: BootstrapSelection = { modules: [], params: {}, ssh_keys: [] }
 // The browser's own zone first: what a person writing "02:00" usually means.
 const LOCAL_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
@@ -249,7 +249,7 @@ export function TaskEditor({ task, templates, modules, groups, nodes, onSaved, o
                 Run after the template&rsquo;s own modules. Its exit code is the run&rsquo;s.
                 A parameter can say <span className="mono">{'{{inputs.NAME}}'}</span> or{' '}
                 <span className="mono">{'{{secrets.NAME}}'}</span>; every input also reaches
-                the job as <span className="mono">$LEMONDX_INPUT_NAME</span>.
+                the job as <span className="mono">$WATERPUMP_INPUT_NAME</span>.
               </p>
               <BootstrapPicker modules={modules} value={job} onChange={setJob} disabled={busy}
                 secretReferences />
@@ -403,7 +403,7 @@ export function TaskEditor({ task, templates, modules, groups, nodes, onSaved, o
           <p className="hint" style={{ marginBottom: 10 }}>
             Declared here, set from the task&rsquo;s card once saved: sealed on every member,
             handed to the job {jobKind === 'script'
-              ? <>as <span className="mono">$LEMONDX_SECRET_NAME</span></>
+              ? <>as <span className="mono">$WATERPUMP_SECRET_NAME</span></>
               : <>by <span className="mono">{'{{secrets.NAME}}'}</span></>}, never shown
             again.
           </p>
@@ -482,7 +482,7 @@ function InputsHelp({ task, kind, inputs, params, onClose }: {
       </p>
       <ul>
         <li><strong>Run</strong> on the task&rsquo;s card asks for each one.</li>
-        <li>The CLI: <Code>{`lemondx task-run ${task} --input ${plain}=value`}</Code>
+        <li>The CLI: <Code>{`waterpump task-run ${task} --input ${plain}=value`}</Code>
           {hidden && <> — a secret one such as <Code>{hidden}</Code> is read from{' '}
             <Code>{`$${hidden}`}</Code> or a prompt, never the command line</>}.</li>
         <li>The API, for a webhook: <Code>{`POST /api/tasks/${task}/invoke`}</Code> with{' '}
@@ -555,7 +555,7 @@ function SecretsHelp({ task, kind, secrets, params, onClose }: {
       </p>
       <ul>
         <li><strong>Setting it:</strong> once the task is saved, the key button for it on the
-          task&rsquo;s card, or <Code>{`lemondx task-secret-set ${task} ${example}`}</Code>
+          task&rsquo;s card, or <Code>{`waterpump task-secret-set ${task} ${example}`}</Code>
           {' '}(from <Code>{`$${example}`}</Code>, a prompt or stdin — never the command
           line).</li>
         <li><strong>Keeping it:</strong> sealed on every member under that node&rsquo;s own
@@ -668,7 +668,7 @@ POSTGRES_PASSWORD = {{secrets.DB_PASSWORD}} a secret kept with the task`}</pre>
         </p>
       )}
       <p>
-        The payload, when a run is given one, is a file: <Code>{'cat "$LEMONDX_TASK_PAYLOAD"'}</Code>.
+        The payload, when a run is given one, is a file: <Code>{'cat "$WATERPUMP_TASK_PAYLOAD"'}</Code>.
         It is never put in the environment, the log or the run&rsquo;s record.
       </p>
     </HelpPanel>

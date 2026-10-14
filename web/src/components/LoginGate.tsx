@@ -30,7 +30,7 @@ export function LoginGate({ info, onDone }: Props) {
           Reload</button>}>
         <p style={{ margin: 0 }}>
           This server takes your identity from the reverse proxy in front of it, and the proxy
-          did not vouch for this request. Open lemondx through the proxy&apos;s address and sign
+          did not vouch for this request. Open waterpump through the proxy&apos;s address and sign
           in there.
         </p>
       </Modal>
@@ -64,7 +64,7 @@ export function LoginGate({ info, onDone }: Props) {
 
   return (
     <Modal
-      title={mode === 'password' ? 'Log in to lemondx' : 'API token required'}
+      title={mode === 'password' ? 'Log in to waterpump' : 'API token required'}
       subtitle={mode === 'password'
         ? (info.methods.includes('pam') ? 'Use your account on this host.' : undefined)
         : 'Paste an API token to continue.'}

@@ -95,7 +95,7 @@ export function PublishDialog({ instance, snapshot, node, onCancel, onStarted }:
           <label htmlFor="p-desc">Description</label>
           <input id="p-desc" className="input" value={description} disabled={busy}
             onChange={(e) => setDescription(e.target.value)} maxLength={200}
-            placeholder={`${instance}/${snapshot}, published by lemondx`} autoComplete="off" />
+            placeholder={`${instance}/${snapshot}, published by waterpump`} autoComplete="off" />
         </div>
         {others.length > 0 && (
           <div className="field">

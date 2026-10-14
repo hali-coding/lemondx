@@ -4,7 +4,7 @@
 # os: debian ubuntu fedora alpine arch
 # order: 60
 
-case "$LEMONDX_PKG" in
+case "$WATERPUMP_PKG" in
     apk)    pkg_install docker docker-cli-compose; svc=docker ;;
     pacman) pkg_install docker docker-compose; svc=docker ;;
     apt)    pkg_install docker.io docker-compose-v2 || pkg_install docker.io; svc=docker ;;

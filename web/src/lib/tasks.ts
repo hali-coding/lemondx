@@ -3,17 +3,17 @@
  * mirroring `env_name()`, `secret_env_name()` and `_job()` in tasks.py.
  */
 
-export const inputEnv = (name: string) => `LEMONDX_INPUT_${name.toUpperCase()}`
-export const secretEnv = (name: string) => `LEMONDX_SECRET_${name.toUpperCase()}`
+export const inputEnv = (name: string) => `WATERPUMP_INPUT_${name.toUpperCase()}`
+export const secretEnv = (name: string) => `WATERPUMP_SECRET_${name.toUpperCase()}`
 
 /** What every run's job gets, whatever the task declares. */
 export const TASK_ENV: [string, string][] = [
-  ['LEMONDX_TASK', 'the task’s name'],
-  ['LEMONDX_TASK_RUN', 'this run’s id'],
-  ['LEMONDX_TASK_TRIGGER', '“schedule” or “invoke”'],
-  ['LEMONDX_TASK_SLOT', 'for a scheduled run, the occurrence it is for (epoch seconds)'],
-  ['LEMONDX_TASK_NODE', 'the member running it'],
-  ['LEMONDX_TASK_PAYLOAD', 'the path of the payload file, when the run was given one'],
+  ['WATERPUMP_TASK', 'the task’s name'],
+  ['WATERPUMP_TASK_RUN', 'this run’s id'],
+  ['WATERPUMP_TASK_TRIGGER', '“schedule” or “invoke”'],
+  ['WATERPUMP_TASK_SLOT', 'for a scheduled run, the occurrence it is for (epoch seconds)'],
+  ['WATERPUMP_TASK_NODE', 'the member running it'],
+  ['WATERPUMP_TASK_PAYLOAD', 'the path of the payload file, when the run was given one'],
 ]
 
 /** The module parameters whose value names `{{kind.name}}`, e.g. every one fed by an input. */

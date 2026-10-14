@@ -685,7 +685,7 @@ export function StacksView({ localNode, ready, runs: runList, onRunStarted, onNo
       {clearing && (
         <ConfirmDialog
           title={`Destroy what swarm “${clearing.swarm}” left?`}
-          message="Its run ended without destroying these (lemondx stopped mid-swarm, say). They are stopped and deleted; the stack's own instances stay."
+          message="Its run ended without destroying these (waterpump stopped mid-swarm, say). They are stopped and deleted; the stack's own instances stay."
           confirmLabel={`Destroy ${membersOf(clearing.stack).filter((m) => m.swarm === clearing.swarm).length}`}
           danger
           onConfirm={() => {
@@ -803,7 +803,7 @@ const STANDING_BADGE: Record<SwarmStanding, string> = {
  * launches, can be started once the stack has instances, and is stopped --
  * which tears it down -- while it runs. With more than one, the stack's
  * sequence sits above them: the swarms switched into it, in order, each run
- * only once the one before it passed. What one left behind (lemondx stopped
+ * only once the one before it passed. What one left behind (waterpump stopped
  * mid-swarm) is listed with its own way out.
  */
 function SwarmList({ stack, run, members, canStart, canOperate, canEdit, toggling, onStart,
@@ -1063,7 +1063,7 @@ function SwarmDialog({ stack, swarm, templates, onCancel, onConfirm }: {
         {lasting.length > 0 && (
           <div className="banner banner-warn"><div className="banner-body"><p>
             {lasting.join(', ')} {lasting.length === 1 ? 'is' : 'are'} not ephemeral. The swarm
-            still destroys its instances when it ends, but if lemondx stops mid-swarm they stay
+            still destroys its instances when it ends, but if waterpump stops mid-swarm they stay
             until the swarm is stopped from this tab.
           </p></div></div>
         )}

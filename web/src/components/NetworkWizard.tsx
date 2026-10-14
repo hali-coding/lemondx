@@ -23,7 +23,7 @@ interface Choice {
 
 /**
  * The first step of "New network": what should instances on it reach? Every
- * kind of network lemondx makes answers one version of that question, so the
+ * kind of network waterpump makes answers one version of that question, so the
  * wizard starts there rather than with bridges, fabrics and NICs, and hands on
  * to the form for the answer picked.
  */
@@ -45,7 +45,7 @@ export function NetworkWizard({ onCancel, onPick }: Props) {
       title: 'Private to this node',
       reach: 'Each other on this host, and the internet',
       about: <>
-        lemondx hands out the addresses and NATs the instances behind the host, like the
+        waterpump hands out the addresses and NATs the instances behind the host, like the
         default <span className="mono">lxdbr0</span>. Nothing outside this host can reach
         them. The usual choice when unsure.
       </>,
@@ -71,7 +71,7 @@ export function NetworkWizard({ onCancel, onPick }: Props) {
       reach: 'Everything on your network, like any other machine',
       about: <>
         Instances get their address from your router, with no NAT and no DHCP from
-        lemondx, and are reachable from anything on that network. They still reach
+        waterpump, and are reachable from anything on that network. They still reach
         every fabric.
       </>,
       next: 'Next: which network card, and how — macvlan (nothing on the host changes), a spare NIC as a bridge, or this host’s own NIC as a bridge.',

@@ -53,7 +53,7 @@ const MAX_COUNT = 20
 /** A swarm's launch is load generators, which come in larger numbers. */
 const SWARM_MAX_COUNT = 200
 /** A reference being dragged; text/plain rides along for any other text box. */
-const REF_MIME = 'application/x-lemondx-ref'
+const REF_MIME = 'application/x-waterpump-ref'
 /** How long a dragged reference hovers over a later step before it opens. */
 const SPRING_MS = 450
 
@@ -1368,7 +1368,7 @@ export function StackEditor({ stack: opened, templates, modules, nodes, groups, 
                 <li>A launch hands on what it made and what it ran with: the chips under
                   each launch card. Drag one onto a parameter of a later step (it becomes
                   <span className="mono"> {'{{db.ip}}'}</span>), or type it there and press
-                  Tab. Modules also see <span className="mono">$LEMONDX_STACK_DB_IPS</span>.
+                  Tab. Modules also see <span className="mono">$WATERPUMP_STACK_DB_IPS</span>.
                 </li>
                 <li>If a step fails, no further stage starts. Instances already launched stay.</li>
               </ol>
@@ -1849,7 +1849,7 @@ function SwarmHeader({ swarm, issues, templates, place, many, onSequence, onChan
       {lasting.length > 0 && (
         <p className="hint stack-exposed">
           {lasting.join(', ')} {lasting.length === 1 ? 'is' : 'are'} not ephemeral: the swarm
-          still destroys those instances when it ends, but if lemondx stops mid-swarm they stay
+          still destroys those instances when it ends, but if waterpump stops mid-swarm they stay
           until the swarm is stopped.
         </p>
       )}
@@ -2007,7 +2007,7 @@ function StepCard({ step, selected, issues, templates, outputs, stageIndex, uses
             {!step.wait_bootstrap && <span className="badge badge-warn">no wait</span>}
             {inSwarm && template && !template.ephemeral && (
               <span className="badge badge-warn" title={'The template is not ephemeral. The '
-                + 'swarm still destroys its instances when it ends, but if lemondx stops '
+                + 'swarm still destroys its instances when it ends, but if waterpump stops '
                 + 'mid-swarm they stay until the swarm is stopped.'}>
                 not ephemeral
               </span>
@@ -2408,7 +2408,7 @@ function ScriptSettings({ step, stageIndex, stages, templates, modules, onChange
         <ComesFrom value={step.script} suggestions={suggestions} />
         <span className="hint">
           Runs with <span className="mono">/bin/sh</span> on the node driving the stack, as the
-          account lemondx runs as, in an empty directory of its own. Placeholders are filled in
+          account waterpump runs as, in an empty directory of its own. Placeholders are filled in
           first, as text — quote them: <span className="mono">"{'{{vars.NAME}}'}"</span>. A
           non-zero exit, or running past the timeout, fails the stack.
         </span>
@@ -2429,7 +2429,7 @@ function ScriptSettings({ step, stageIndex, stages, templates, modules, onChange
           Handed to the script as environment variables, like a template's parameters to its
           modules. A secret is best passed this way: as <span className="mono">$NAME</span> it
           never sits in the script's text. The script also gets every value entered at launch
-          under its own name, and <span className="mono">$LEMONDX_STACK_{'<ID>'}_IPS</span>,
+          under its own name, and <span className="mono">$WATERPUMP_STACK_{'<ID>'}_IPS</span>,
           _NAMES, _IPV6 and _NODES for each earlier launch.
         </span>
         <div className="stack-param-group">
@@ -2698,7 +2698,7 @@ function AvailableRefs({ earlier, suggestions, active, onInsert }: {
       </div>
       <p className="hint">
         Filled in when this step starts, from what the earlier launches actually made.
-        Modules also see each as <span className="mono">$LEMONDX_STACK_{'<ID>'}_IPS</span>,
+        Modules also see each as <span className="mono">$WATERPUMP_STACK_{'<ID>'}_IPS</span>,
         _NAMES, _IPV6 and _NODES, space-separated.
       </p>
       {own.length > 0 && (

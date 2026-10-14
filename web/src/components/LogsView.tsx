@@ -25,7 +25,7 @@ function useSettled(value: string, ms = 400) {
 }
 
 /**
- * Everything lemondx does, as it happens, on every node: the live tail of each
+ * Everything waterpump does, as it happens, on every node: the live tail of each
  * node's recent events, merged by time. Kept by each `serve` in memory, so it
  * reaches back to that node's last restart; syslog is the record.
  */
@@ -94,7 +94,7 @@ export function LogsView({ nodes, groups, federated }: Props) {
       <div className="section-head">
         <h2>Logs</h2>
         <span className="faint" style={{ fontSize: 12.5 }}>
-          what lemondx does and who asked, live{federated ? ' from every node' : ''}
+          what waterpump does and who asked, live{federated ? ' from every node' : ''}
         </span>
         <span className={`log-live${live ? ' is-live' : ''}`} style={{ marginLeft: 'auto' }}>
           {paused ? 'paused' : live ? 'live' : error ? 'reconnecting…' : 'connecting…'}
@@ -170,8 +170,8 @@ export function LogsView({ nodes, groups, federated }: Props) {
       </div>
       <p className="hint" style={{ marginTop: 8 }}>
         Each node keeps its last 5000 events in memory, from its last restart. The full record is
-        in syslog: <span className="mono">journalctl -t lemondx</span> on each host, or your remote
-        syslog host. <span className="mono">lemondx logs -f</span> is the same tail in a terminal.
+        in syslog: <span className="mono">journalctl -t waterpump</span> on each host, or your remote
+        syslog host. <span className="mono">waterpump logs -f</span> is the same tail in a terminal.
       </p>
     </>
   )

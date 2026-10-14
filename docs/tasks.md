@@ -8,7 +8,7 @@ a host that owns the job, and Lambda without the cloud. No node owns a task.
 For every run the cluster decides which member runs it, so losing a node
 loses nothing but that node.
 
-A task is made of parts lemondx already has:
+A task is made of parts waterpump already has:
 
 - **A [template](templates.md)**: image, size, network, fabric, and the
   template's own modules. Its setup is whatever the template does.
@@ -22,12 +22,12 @@ A task is made of parts lemondx already has:
 - **Secrets**: kept sealed on every member and handed to the job.
 
 ```bash
-./lemondx task-save nightly-dump -t "Debian" -b pg-dump --group workers \
+./waterpump task-save nightly-dump -t "Debian" -b pg-dump --group workers \
     --cron "0 2 * * *" --tz Europe/Stockholm \
     --secret DB_PASSWORD --param 'PGPASSWORD={{secrets.DB_PASSWORD}}'
-./lemondx task-secret-set nightly-dump DB_PASSWORD      # from $DB_PASSWORD or a prompt
-./lemondx task-run nightly-dump                          # run it now and wait
-./lemondx task-runs nightly-dump                         # every member's runs
+./waterpump task-secret-set nightly-dump DB_PASSWORD  # from $DB_PASSWORD or a prompt
+./waterpump task-run nightly-dump                      # run it now and wait
+./waterpump task-runs nightly-dump                     # every member's runs
 ```
 
 ## Where it runs
@@ -59,8 +59,8 @@ completes from the task's own members.
 
 1. A member takes the run (see [who runs it](#who-runs-a-scheduled-run)).
 2. It launches one instance of the template, named `task-<task>-<id>`. The
-   instance is always ephemeral, and is tagged `user.lemondx.task` and
-   `user.lemondx.task-run` but *not* with the template. So the template's
+   instance is always ephemeral, and is tagged `user.waterpump.task` and
+   `user.waterpump.task-run` but *not* with the template. So the template's
    Recreate, Destroy and app check never take in an instance that exists for
    one run.
 3. The template's own modules run, then the job's. Each job module gets these
@@ -68,12 +68,12 @@ completes from the task's own members.
 
    | Variable | Value |
    | --- | --- |
-   | `LEMONDX_TASK`, `LEMONDX_TASK_RUN` | the task and this run's id |
-   | `LEMONDX_TASK_TRIGGER` | `schedule` or `invoke` |
-   | `LEMONDX_TASK_SLOT` | for a scheduled run, the occurrence it is for (epoch seconds) |
-   | `LEMONDX_TASK_NODE` | the member running it |
-   | `LEMONDX_INPUT_<NAME>` | every declared input, given or defaulted |
-   | `LEMONDX_TASK_PAYLOAD` | the path of the payload file, when the run was given one |
+   | `WATERPUMP_TASK`, `WATERPUMP_TASK_RUN` | the task and this run's id |
+   | `WATERPUMP_TASK_TRIGGER` | `schedule` or `invoke` |
+   | `WATERPUMP_TASK_SLOT` | for a scheduled run, the occurrence it is for (epoch seconds) |
+   | `WATERPUMP_TASK_NODE` | the member running it |
+   | `WATERPUMP_INPUT_<NAME>` | every declared input, given or defaulted |
+   | `WATERPUMP_TASK_PAYLOAD` | the path of the payload file, when the run was given one |
 
 4. The instance is destroyed, however the run ended.
 
@@ -112,9 +112,9 @@ script, never both.
 - **With one** (`#!/usr/bin/env python3`), that interpreter runs it as
   written, without the prelude. The interpreter must exist in the image,
   either from the template's own modules or from the image itself.
-- **Its environment** carries everything a job is given: `LEMONDX_TASK_*`,
-  `LEMONDX_INPUT_<NAME>` for each input, `LEMONDX_TASK_PAYLOAD`, and
-  `LEMONDX_SECRET_<NAME>` for each task secret. Secret values are masked in
+- **Its environment** carries everything a job is given: `WATERPUMP_TASK_*`,
+  `WATERPUMP_INPUT_<NAME>` for each input, `WATERPUMP_TASK_PAYLOAD`, and
+  `WATERPUMP_SECRET_<NAME>` for each task secret. Secret values are masked in
   the output.
 - **No placeholders.** Nothing is filled into the script's text, so a secret
   never sits in a file in the instance. Every declared secret must hold a
@@ -123,15 +123,15 @@ script, never both.
   it.
 
 ```bash
-./lemondx task-save ping-hook -t Debian --group workers --secret API_KEY --script hook.sh
+./waterpump task-save ping-hook -t Debian --group workers --secret API_KEY --script hook.sh
 ```
 
 where `hook.sh` is:
 
 ```sh
 pkg_install curl
-curl -fsS -H "Authorization: Bearer $LEMONDX_SECRET_API_KEY" \
-     --data @"${LEMONDX_TASK_PAYLOAD:-/dev/null}" https://example.com/hook
+curl -fsS -H "Authorization: Bearer $WATERPUMP_SECRET_API_KEY" \
+     --data @"${WATERPUMP_TASK_PAYLOAD:-/dev/null}" https://example.com/hook
 ```
 
 ## Inputs and payloads
@@ -146,18 +146,18 @@ declares each one:
 | `secret` | masked in all output, never kept on the run record; cannot have a default |
 | `description` | shown in the run dialog and on `task-show` |
 
-A job sees every input as `LEMONDX_INPUT_<NAME>`, and a job parameter can use
+A job sees every input as `WATERPUMP_INPUT_<NAME>`, and a job parameter can use
 one by name: `--param 'TARGET={{inputs.TARGET}}'`. A module's *secret*
 parameter can only be set to a reference: `{{secrets.NAME}}` or a secret
 input's `{{inputs.NAME}}`, never a value.
 
 A **payload** is a whole message, as JSON or text, up to 256 KiB. The job
-gets it as a file whose path is in `$LEMONDX_TASK_PAYLOAD`. It is never put in
+gets it as a file whose path is in `$WATERPUMP_TASK_PAYLOAD`. It is never put in
 the environment, the event log or the run record. Only its size is kept.
 
 ```bash
 echo '{"order": 42, "status": "shipped"}' | \
-    ./lemondx task-run notify --input CHANNEL=ops --payload -
+    ./waterpump task-run notify --input CHANNEL=ops --payload -
 curl -X POST https://node:8099/api/tasks/notify/invoke \
     -H "Authorization: Bearer $TOKEN" \
     -d '{"inputs": {"CHANNEL": "ops"}, "payload": {"order": 42}}'
@@ -185,8 +185,8 @@ wall-clock times in the schedule's `timezone` (default UTC):
 - A time repeated in autumn runs once.
 
 ```bash
-./lemondx cron "*/15 9-17 * * mon-fri" --tz Europe/London   # what it means, the next five
-./lemondx task-disable nightly-dump                         # pause the schedule
+./waterpump cron "*/15 9-17 * * mon-fri" --tz Europe/London  # what it means, the next five
+./waterpump task-disable nightly-dump                     # pause the schedule
 ```
 
 Pausing (`enabled: false`) stops the schedule only. Invoking still works.
@@ -221,8 +221,8 @@ occurrence can be **missed**. When that happens it is logged and recorded as
    A candidate short of a majority gives its grants back, so the next node can
    still gather one.
 
-A one-node lemondx is its own majority, so a task runs there exactly as
-scheduled. A member running a lemondx from before tasks cannot vote. Upgrade
+A one-node waterpump is its own majority, so a task runs there exactly as
+scheduled. A member running a waterpump from before tasks cannot vote. Upgrade
 until a majority of members have tasks, or every scheduled occurrence is
 missed. That is the at-most-once rule doing its job, not a fault.
 
@@ -279,21 +279,21 @@ for the run as typed.
 ## From the CLI
 
 ```bash
-./lemondx tasks                                   # list
-./lemondx task-show NAME                          # one, with its latest runs
-./lemondx task-save NAME -t TEMPLATE (-b MOD[,MOD] [--param K=V] | --script FILE|-)
+./waterpump tasks                               # list
+./waterpump task-show NAME                      # one, with its latest runs
+./waterpump task-save NAME -t TEMPLATE (-b MOD[,MOD] [--param K=V] | --script FILE|-)
     [--cron EXPR --tz TZ]
     [--input NAME[=DEFAULT]] [--require NAME] [--secret-input NAME] [--secret NAME]
     --group G [--node N] [--timeout S] [--overlap skip|allow] [--disable|--enable]
-./lemondx task-save NAME --file task.json         # the whole definition as JSON
-./lemondx task-enable NAME / task-disable NAME
-./lemondx task-run NAME [--input K=V] [--payload FILE|-] [--node N] [--no-wait]
-./lemondx task-runs [NAME]                        # every member's runs
-./lemondx task-run-show ID                        # one run, full output
-./lemondx task-cancel ID
-./lemondx task-secrets NAME / task-secret-set NAME SECRET / task-secret-clear NAME SECRET
-./lemondx task-delete NAME [--local-only] [-y]
-./lemondx cron EXPR [--tz TZ]
+./waterpump task-save NAME --file task.json     # the whole definition as JSON
+./waterpump task-enable NAME / task-disable NAME
+./waterpump task-run NAME [--input K=V] [--payload FILE|-] [--node N] [--no-wait]
+./waterpump task-runs [NAME]                    # every member's runs
+./waterpump task-run-show ID                    # one run, full output
+./waterpump task-cancel ID
+./waterpump task-secrets NAME / task-secret-set NAME SECRET / task-secret-clear NAME SECRET
+./waterpump task-delete NAME [--local-only] [-y]
+./waterpump cron EXPR [--tz TZ]
 ```
 
 `task-save` with flags changes only what the flags name, so an existing

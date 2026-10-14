@@ -76,7 +76,7 @@ export function ConfigureNodeDialog({ state, onClose, onRestarting }: Props) {
 
   return (
     <Modal title="Configure this node"
-      subtitle="Turns on logins and HTTPS, and opens the port to other hosts if you want. lemondx restarts to apply it; you then log in at the new address."
+      subtitle="Turns on logins and HTTPS, and opens the port to other hosts if you want. waterpump restarts to apply it; you then log in at the new address."
       onClose={busy ? () => {} : onClose}
       api={{ ...calls.configureNode(body), secrets: ['password', 'tls.key'] }}
       footer={<>
@@ -240,7 +240,7 @@ function Restarting({ result, state, onClose }: {
 
   return (
     <Modal title="Restarting"
-      subtitle="The configuration is saved, and lemondx is restarting to apply it. This page stops working; carry on at the new address."
+      subtitle="The configuration is saved, and waterpump is restarting to apply it. This page stops working; carry on at the new address."
       onClose={onClose}
       footer={<button className="btn btn-primary" disabled={!ready}
         onClick={() => window.location.assign(url)}>

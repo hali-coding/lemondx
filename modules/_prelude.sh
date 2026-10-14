@@ -1,4 +1,4 @@
-# lemondx bootstrap prelude -- prepended to every module before it runs.
+# waterpump bootstrap prelude -- prepended to every module before it runs.
 #
 # Modules get a small, distro-neutral toolkit so they can stay short:
 #   log / warn / die        progress output
@@ -6,11 +6,11 @@
 #   pkg_refresh             refresh the package index (once per run)
 #   pkg_install PKG...      install packages non-interactively
 #   svc_enable NAME         enable + start a service (systemd or OpenRC)
-#   install_ssh_keys USER   write $LEMONDX_SSH_KEYS to that user's authorized_keys
+#   install_ssh_keys USER   write $WATERPUMP_SSH_KEYS to that user's authorized_keys
 #
-# Available variables: LEMONDX_OS_ID, LEMONDX_OS_LIKE, LEMONDX_PKG,
-# LEMONDX_SSH_KEYS, LEMONDX_MODULE, LEMONDX_INSTANCE (the instance's name on the
-# daemon, which its hostname need not be), LEMONDX_OCCURRENCE (1, or n for the nth time
+# Available variables: WATERPUMP_OS_ID, WATERPUMP_OS_LIKE, WATERPUMP_PKG,
+# WATERPUMP_SSH_KEYS, WATERPUMP_MODULE, WATERPUMP_INSTANCE (the instance's name on the
+# daemon, which its hostname need not be), WATERPUMP_OCCURRENCE (1, or n for the nth time
 # a module is selected in one run), plus any parameters the module declares.
 
 # Modules run under /bin/sh, which is dash on Debian/Ubuntu and busybox ash on
@@ -27,23 +27,23 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # --- distro detection ------------------------------------------------------
 
-LEMONDX_OS_ID="unknown"
-LEMONDX_OS_LIKE=""
+WATERPUMP_OS_ID="unknown"
+WATERPUMP_OS_LIKE=""
 if [ -r /etc/os-release ]; then
     # shellcheck disable=SC1091
     . /etc/os-release
-    LEMONDX_OS_ID="${ID:-unknown}"
-    LEMONDX_OS_LIKE="${ID_LIKE:-}"
+    WATERPUMP_OS_ID="${ID:-unknown}"
+    WATERPUMP_OS_LIKE="${ID_LIKE:-}"
 fi
 
-if   have apt-get; then LEMONDX_PKG=apt
-elif have dnf;     then LEMONDX_PKG=dnf
-elif have microdnf;then LEMONDX_PKG=microdnf
-elif have yum;     then LEMONDX_PKG=yum
-elif have apk;     then LEMONDX_PKG=apk
-elif have pacman;  then LEMONDX_PKG=pacman
-elif have zypper;  then LEMONDX_PKG=zypper
-else LEMONDX_PKG=none
+if   have apt-get; then WATERPUMP_PKG=apt
+elif have dnf;     then WATERPUMP_PKG=dnf
+elif have microdnf;then WATERPUMP_PKG=microdnf
+elif have yum;     then WATERPUMP_PKG=yum
+elif have apk;     then WATERPUMP_PKG=apk
+elif have pacman;  then WATERPUMP_PKG=pacman
+elif have zypper;  then WATERPUMP_PKG=zypper
+else WATERPUMP_PKG=none
 fi
 
 export DEBIAN_FRONTEND=noninteractive
@@ -52,30 +52,30 @@ export DEBIAN_FRONTEND=noninteractive
 
 # Refreshing is slow, so only do it once per bootstrap run. The marker lives
 # in the container, and each run clears it before the first module.
-_LEMONDX_REFRESH_MARKER=/tmp/.lemondx-pkg-refreshed
+_WATERPUMP_REFRESH_MARKER=/tmp/.waterpump-pkg-refreshed
 
 pkg_refresh() {
-    [ -f "$_LEMONDX_REFRESH_MARKER" ] && return 0
-    log "refreshing package index ($LEMONDX_PKG)"
-    case "$LEMONDX_PKG" in
+    [ -f "$_WATERPUMP_REFRESH_MARKER" ] && return 0
+    log "refreshing package index ($WATERPUMP_PKG)"
+    case "$WATERPUMP_PKG" in
         apt)      apt-get update -qq ;;
-        dnf|yum)  "$LEMONDX_PKG" -q makecache ;;
+        dnf|yum)  "$WATERPUMP_PKG" -q makecache ;;
         microdnf) microdnf -q makecache ;;
         apk)      apk update -q ;;
         pacman)   pacman -Sy --noconfirm >/dev/null ;;
         zypper)   zypper --non-interactive --quiet refresh ;;
         none)     die "no supported package manager found" ;;
     esac
-    : > "$_LEMONDX_REFRESH_MARKER"
+    : > "$_WATERPUMP_REFRESH_MARKER"
 }
 
 pkg_install() {
     [ "$#" -gt 0 ] || return 0
     pkg_refresh
     log "installing: $*"
-    case "$LEMONDX_PKG" in
+    case "$WATERPUMP_PKG" in
         apt)      apt-get install -y -qq --no-install-recommends "$@" ;;
-        dnf|yum)  "$LEMONDX_PKG" install -y -q "$@" ;;
+        dnf|yum)  "$WATERPUMP_PKG" install -y -q "$@" ;;
         microdnf) microdnf install -y "$@" ;;
         apk)      apk add --no-cache -q "$@" ;;
         pacman)   pacman -S --noconfirm --needed "$@" >/dev/null ;;
@@ -105,7 +105,7 @@ svc_enable() {
 # preserved and duplicates are skipped.
 install_ssh_keys() {
     local user="${1:-root}"
-    [ -n "${LEMONDX_SSH_KEYS:-}" ] || { warn "no SSH keys supplied"; return 0; }
+    [ -n "${WATERPUMP_SSH_KEYS:-}" ] || { warn "no SSH keys supplied"; return 0; }
 
     local home
     home="$(getent passwd "$user" | cut -d: -f6)"
@@ -123,7 +123,7 @@ install_ssh_keys() {
         printf '%s\n' "$key" >> "$file"
         added=$((added + 1))
     done <<EOF
-$LEMONDX_SSH_KEYS
+$WATERPUMP_SSH_KEYS
 EOF
 
     chown -R "$user:$(id -gn "$user" 2>/dev/null || echo "$user")" "$home/.ssh" 2>/dev/null || true

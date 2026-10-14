@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build the web UI into web/dist, which is not in git -- a clone has to run
-# this once before `./lemondx serve` has anything to serve. A release archive
+# this once before `./waterpump serve` has anything to serve. A release archive
 # already contains it; see docs/development.md.
 #
 #   ./build.sh            # install deps if needed, then tsc -b && vite build
@@ -34,7 +34,7 @@ die() {
 # -- check the toolchain before touching anything -------------------------
 
 command -v node >/dev/null 2>&1 || die "node is not installed.
-lemondx itself does not need Node -- only building the UI does. Install it
+waterpump itself does not need Node -- only building the UI does. Install it
 from your distro, from https://nodejs.org, or with a version manager (nvm,
 fnm, mise), then run this again. Or download a release, which ships web/dist
 already built."
@@ -98,4 +98,4 @@ echo
 echo "Built web/dist:"
 ls -l web/dist
 echo
-echo "Now run: ./lemondx serve --open"
+echo "Now run: ./waterpump serve --open"

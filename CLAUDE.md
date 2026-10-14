@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-lemondx is application orchestration on LXD/Incus: a web UI, CLI and REST API
+waterpump is application orchestration on LXD/Incus: a web UI, CLI and REST API
 whose core is the **stack** (templates launched in stages across federated
 nodes, wired together and operated as one deployment). Multi-node is the
 recommended deployment; the host-level features (init, storage, networks,
@@ -17,22 +17,22 @@ web UI, service, security, frontend dev).
 ## Commands
 
 ```bash
-./lemondx serve --open              # run API + built UI on :8099
-./lemondx serve --dev               # same, with CORS open for the Vite dev server
+./waterpump serve --open          # run API + built UI on :8099
+./waterpump serve --dev           # same, with CORS open for the Vite dev server
 ./build.sh                          # check the Node toolchain, install, build -> web/dist
 npm --prefix web run dev            # Vite on :5173, proxies /api to :8099
 npm --prefix web run build          # the build step alone (web/dist is not committed)
 .github/scripts/bundle.sh 1.2.3     # the release archive, exactly as CI builds it
 npm --prefix web run lint           # oxlint
-python3 -m compileall -q src/lemondx # syntax check; there is no Python linter configured
+python3 -m compileall -q src/waterpump # syntax check; there is no Python linter configured
 sh -n modules/foo.sh                # modules must parse as POSIX sh
-LEMONDX_FLAVOR=incus ./lemondx status  # force the other daemon
-LEMONDX_DATA_DIR=/tmp/n1 ./lemondx cluster status   # a second node's state, for testing federation
+WATERPUMP_FLAVOR=incus ./waterpump status  # force the other daemon
+WATERPUMP_DATA_DIR=/tmp/n1 ./waterpump cluster status  # a second node's state, for testing federation
 ./systemd/install-service.sh        # install as a systemd --user unit (see systemd/)
 ```
 
 There is **no test suite** and no test runner configured. Verify changes by running the CLI
-or the server against a live daemon. `./lemondx status` reports which socket and flavor it
+or the server against a live daemon. `./waterpump status` reports which socket and flavor it
 resolved; `--json` on any CLI command prints the same payload the REST API returns.
 
 ## Hard constraints
@@ -59,7 +59,7 @@ Four layers, one direction of dependency:
 lxd.py          transport: HTTP over the daemon's AF_UNIX socket, no shelling out
 hostnet.py      transport: the host's routing table, the one privileged shell-out
   ↓
-service.py      domain: ContainerService turns raw daemon records into lemondx shapes
+service.py      domain: ContainerService turns raw daemon records into waterpump shapes
   ↓
 server.py       JSON API + static hosting      cli.py   argparse front end
 ```
@@ -73,7 +73,7 @@ calls other nodes through `nodeclient.py` -- which is to a peer what `lxd.py` is
 to the daemon, transport and nothing else. The dependency only goes one way:
 `service.py` knows nothing about nodes.
 
-`ContainerService` (`src/lemondx/service.py`) is the only place domain logic lives, so the
+`ContainerService` (`src/waterpump/service.py`) is the only place domain logic lives, so the
 API and the CLI cannot drift. **Adding a feature means: a method on `ContainerService`,
 then a route in `build_router()` (`server.py:85`) and a subcommand in `build_parser()`
 (`cli.py:1653`).** A route's role defaults to `read` for `GET` and `admin` otherwise;
@@ -88,14 +88,14 @@ command.
 
 Supporting modules: `bootstrap.py` (module discovery, validation, SSH-key parsing, the
 runner), `simplestreams.py` (remote image catalogs, 15-minute in-process cache),
-`store.py` (atomic JSON state under `~/.local/share/lemondx`), `nodesetup.py`
+`store.py` (atomic JSON state under `~/.local/share/waterpump`), `nodesetup.py`
 (the bind address and leaving unconfigured mode -- see below), `eventlog.py`
 (who did what, to syslog -- see below).
 
 ### Event log
 
 `eventlog.py` is the one log: stdlib `logging` behind a queue, delivered to
-local syslog (`/dev/log`, journald's `lemondx[PID]:` form) always and to the
+local syslog (`/dev/log`, journald's `waterpump[PID]:` form) always and to the
 cluster's remote destinations (RFC 5424 over UDP/TCP). Who is acting lives in a
 ContextVar opened *once per entry point* with `eventlog.acting()`:
 `_handle_api()` (per request, with the caller's principal and channel ui/api,
@@ -110,7 +110,7 @@ Hooks that record a change never take an actor; they read the context:
 - `auth.py` logins, users and tokens
 Because the context is a ContextVar, **a thread or pool loses it**: wrap the target in
 `eventlog.carry()` (every existing `Thread(`/`pool.map` site does), or that work is
-logged as nobody. `NodeClient` sends `X-Lemondx-Request`/`X-Lemondx-Actor` from the
+logged as nobody. `NodeClient` sends `X-Waterpump-Request`/`X-Waterpump-Actor` from the
 context on every peer call, and the receiver believes them only from `from_peer()`,
 so one `req` id follows an action across nodes. A new mutating path that bypasses
 these hooks must log itself with `eventlog.event("change", ...)`. **Never pass a
@@ -144,7 +144,7 @@ right exception with the right code is all that either front end needs.
 ### Authentication
 
 Opt-in: with no `--auth` method and no static token, `AuthConfig.enabled` is false
-and every request is an anonymous admin. `LemondxHandler._principal()` resolves the
+and every request is an anonymous admin. `WaterpumpHandler._principal()` resolves the
 caller in a fixed order -- token header, `?token=` (WebSockets cannot send headers),
 session cookie, trusted-proxy header -- and reports whether the credential was
 *explicit*. Ambient credentials (cookies, proxy identity, or none at all) must pass
@@ -161,7 +161,7 @@ only in the process. Sessions are the exception (in memory; a restart logs out).
 account, and `NoNewPrivileges=yes` breaks it -- `pam.diagnose()` says so at startup.
 Never log a credential: `log_message()` masks `token=` and startup prints no token.
 
-`lemondx configure <section>` (`configure.py`) saves settings to
+`waterpump configure <section>` (`configure.py`) saves settings to
 `store.config_path(section)` for later launches. A section is a `Section` subclass
 decorated `@register`; the CLI builds its choices from `SECTIONS`, so a new section
 needs no parser change. `tls` is the exception to one-file-per-section: it
@@ -200,7 +200,7 @@ enrolled as a member is one nobody can call back.
 ### Federation
 
 Flat by design: no leader, no quorum, no shared state. A node is a complete
-lemondx; a cluster means each one knows how to call the others, so losing one
+waterpump; a cluster means each one knows how to call the others, so losing one
 costs that node alone and `cluster.py` never has to reconcile anything. Template
 sync is a one-way push -- the node pushed from wins -- because there is no
 shared clock to do better with.
@@ -216,7 +216,7 @@ miss whoever was down.
 The cluster credential is one shared secret held by every member, stored twice
 on purpose: plaintext in `auth/cluster.json` for calling out, and its hash as an
 ordinary token record for calls coming in -- so `AuthService.authenticate_token`
-authenticates a peer with no new code path, and `lemondx tokens` lists it. The
+authenticates a peer with no new code path, and `waterpump tokens` lists it. The
 consequences are in the design, not accidents: a copy of it sits on every host,
 and any member is an admin of every other.
 
@@ -285,15 +285,24 @@ and a bootstrap run are all ordinary per-container endpoints, and forwarding
 them whole is far less to get wrong than mirroring each. **The role enforced is
 the target route's**, resolved against the same router, so proxying can never
 widen what a caller may do -- an unknown path resolves to admin and fails
-closed. Naming the local node dispatches through the router here rather than
+closed. The relayed call travels under the cluster credential, so `_forward()`
+sends it with `relayed=True` (`RELAYED_HEADER`) and the member's
+`_handle_api()` swaps the peer for `auth.relayed_principal()` -- the person and
+role from the actor header, `via` `relayed:<node>` -- before dispatch: every
+`from_peer()` check (propagate, `relayed=`, `managed=`, `here`, `by`, the
+members-only routes) then sees a person, as it would calling that node
+directly. `is_relayed()` is refused wherever a credential's strength matters
+(`confirm()`, token management). `_forward()` still strips and refuses those
+itself, for members from before the header. Naming the local node dispatches through the router here rather than
 looping back over HTTP, so the front end never special-cases itself. Timeouts
 come from `PROXY_TIMEOUTS`, since a bootstrap genuinely takes minutes and
 nothing else does.
 
 The Containers tab's scope (`hooks/useScope.ts`) is the one setting both it and
 the Templates tab read, so the instances a template lists and the table's rows
-always cover the same hosts; it lives in `localStorage` because it is how one
-person is looking right now, not cluster state. Widened, an instance's identity
+always cover the same hosts. It defaults to the whole cluster and lives in
+`sessionStorage` -- how one person is looking right now, not cluster state, and
+never what a new visit opens on. Widened, an instance's identity
 becomes `keyOf()` -- node plus name -- since two nodes may each hold a `web-1`
 unless a cluster-wide launch named them, and `_share_names()` allocates against
 *every* member for that reason, not just the targets. Health is judged where the instance lives -- each node's monitor, its own
@@ -362,7 +371,7 @@ was decided and refusing it here would leave the cluster split for good.
 
 `ClusterService.change_state()` / `delete_containers()` / `template_action()`
 take `[{node, name}]`, group by node and fan out. Each takes the plain local
-path when the only node named is this one, so an unfederated lemondx never
+path when the only node named is this one, so an unfederated waterpump never
 touches cluster code. The `*_instances` methods on `ContainerService`
 (`launch_`, `destroy_`, `recreate_`, `exec_`) are the untracked halves these
 call: tracking twice under one template name would deadlock a run against
@@ -382,11 +391,11 @@ a launch naming no node there, and stacks resolve a step's targets through it
 too, or they would follow the wrong node's listing. Any other node launches
 from an image published from the snapshot: `resolve_source()` swaps the
 template to `local:<fingerprint>` on that node, matching the image's own
-`lemondx.source`/`lemondx.source-node` properties (in the image file, so
+`waterpump.source`/`waterpump.source-node` properties (in the image file, so
 copies carry them), and `template_targets()` refuses a node holding neither.
 A share arriving with `names` is a coordinator's, already placed, and skips
 the redirect. `_detach_clone()` strips the source's
-`user.lemondx.*` keys (the daemon merges ours over the copied config, so a
+`user.waterpump.*` keys (the daemon merges ours over the copied config, so a
 key we do not set would survive -- a stack tag being the dangerous one) and
 empties a container's `/etc/machine-id`, without which every clone asks DHCP
 for the source's address. Running it elsewhere is deliberately explicit:
@@ -442,7 +451,7 @@ run in order and the steps in one on threads side by side; a launch with
 `wait_bootstrap` off returns once its instances run and leaves a follower
 thread on its template run, which a health gate, a later launch of the same
 template and the end of the stack all join. Metadata crosses to later launches
-as ordinary launch params: `LEMONDX_STACK_<ID>_*` values (the runner exports
+as ordinary launch params: `WATERPUMP_STACK_<ID>_*` values (the runner exports
 every param as an env var) plus `{{step.field}}` placeholders rendered into the
 step's own params, so remote shares get it through the existing API. Stacks
 sync like templates (`SYNC_KINDS`), dragging their templates along in
@@ -486,7 +495,7 @@ launch or generated, and hands variables and secrets down the run as `_Given`,
 never in the run record. `_input_only()` lets a module's secret param hold
 `{{secrets.NAME}}` as well as `{{params.NAME}}`; one in a param its module does
 not declare secret is allowed but warned about, since nothing redacts it.
-What a stack is running is the `user.lemondx.stack` tag (`STACK_CONFIG_KEY`)
+What a stack is running is the `user.waterpump.stack` tag (`STACK_CONFIG_KEY`)
 threaded through every launch path -- `launch_instances()`, the peer launch API,
 and recreate, which carries it over -- and read back with
 `cluster.containers(everything=True)`; stop/start/destroy/relaunch confirm
@@ -498,7 +507,7 @@ the target wearing the cluster credential): a stack's local share never goes
 through the API at all, and a person naming a stack on an ordinary launch would
 be giving it instances to destroy later.
 
-A `script` step (`StackService._script()`) is the one place lemondx runs
+A `script` step (`StackService._script()`) is the one place waterpump runs
 code on a host on purpose: `/bin/sh` on a file in a fresh directory under the
 data dir (never `sh -c`, since a rendered secret would show in `/proc`), as the
 service account, in its own session so a timeout or a cancel `killpg`s
@@ -581,7 +590,7 @@ nothing; it runs nowhere and `_public()` says why (`placement_problem`).
 The UI's `TargetPicker` offers groups first for the same reason.
 
 **Inputs** are declared on the task and given per invocation (SNS-style);
-every one reaches the job as `LEMONDX_INPUT_<NAME>` and a param may say
+every one reaches the job as `WATERPUMP_INPUT_<NAME>` and a param may say
 `{{inputs.NAME}}`. A module's secret param may only hold a reference
 (`_placeholder_only()`), and a secret input has no default. The payload is
 pushed as a file, never env, log or record. A task's secrets reuse the stack
@@ -620,7 +629,7 @@ gives each node a /24 of it, with a host route to every peer's /24. Instances
 get a NIC on it beside the profile's `eth0` (`fabric_nic()`, `FABRIC_NIC`), or
 as their only NIC by picking it as the network. `hostnet.py` is to the host's
 routing table and firewall what `lxd.py` is to the daemon, and is the only
-place lemondx shells out to a privileged command.
+place waterpump shells out to a privileged command.
 
 There is no list of fabrics: a fabric is the set of members claiming a subnet
 in it, and the claims ride on each node's record (`store.clean_fabric`,
@@ -635,7 +644,7 @@ Things that are easy to get wrong here:
 
 **Routed within, NAT'd without, closed to everyone else.** The daemon's
 `ipv4.nat` stays off on fabric bridges -- it would masquerade traffic to the
-peers' /24s too. `hostnet.firewall_ruleset()` builds lemondx's own `ip lemondx`
+peers' /24s too. `hostnet.firewall_ruleset()` builds waterpump's own `ip waterpump`
 nftables table instead: masquerade except to the fabric's prefix, accept into a
 bridge only from its prefix (or replies), drop towards other fabrics. The
 table is replaced whole on every apply, and the helper builds it from saved
@@ -655,7 +664,7 @@ add a route to the whole prefix through it -- without that, traffic to a peer's
 /24 leaves by `eth0` and arrives NAT'd behind the host.
 
 **Privilege is one command, not one binary.** The sudoers rules name
-`lemondx fabric-helper` (`fabrichelper.py`), which takes the wanted state on
+`waterpump fabric-helper` (`fabrichelper.py`), which takes the wanted state on
 stdin and decides what to run itself. `ip` cannot be granted -- `ip netns exec X
 sh` is a root shell -- and argument patterns do not confine portably, because
 Ubuntu 25.10's sudo-rs matches arguments literally and supports neither
@@ -676,9 +685,9 @@ host uses -- because the safe answer depends on the NIC: a bridge port cannot
 keep an address, and Wi-Fi carries neither. Converting goes through
 NetworkManager as root, via the fabric helper's `{"lan": ...}` request:
 `hostnet.lan_convert_plan()` copies the connection's addresses and MAC onto a
-`lemondx-<bridge>` connection, and the helper undoes it all
+`waterpump-<bridge>` connection, and the helper undoes it all
 (`apply_all()`, which does not stop at a failure) if the bridge comes up
-without an address or the default route it had. The `lemondx-` prefix is the
+without an address or the default route it had. The `waterpump-` prefix is the
 ownership, as proto 133 is for routes. `create_lan_everywhere()` names no NIC
 at all -- each member resolves `hostnet.default_route_device()` itself, since
 NIC names differ between machines -- and a create that finds the same LAN
@@ -716,7 +725,7 @@ calls the daemon; `service.py` gathers them (one `list_instances()` plus a
 second `serve` thread, every 5s like the kernel's LOAD_FREQ) counts R and D threads in
 the container's cgroup on the host (`cgroup_dir()`, prefix from `CGROUP_PAYLOAD_PREFIX`
 in `lxd.py`) and keeps 1/5/15 minute averages; the CLI averages over its window with
-`measure_load()`. This and `metrics.py` are the places lemondx reads host kernel state instead of the
+`measure_load()`. This and `metrics.py` are the places waterpump reads host kernel state instead of the
 API, which relies on being on the daemon's host. VMs use the guest's load via the
 probe, and a container whose cgroup is missing falls back to the probe, judged only when
 `load_scope()` says it is the instance's own. The load threshold is absolute
@@ -777,11 +786,11 @@ files over HTTP and deletes them, which avoids a websocket client entirely. It d
 recovers output from *failed* operations, because the daemon reports some non-zero exits
 (127 among them) as operation failures even though the record holds the real exit code. A
 command that ran and failed is a result, not an API error. The consequence is that exec
-has no TTY and no streaming — the browser console is non-interactive, and `lemondx shell`
+has no TTY and no streaming — the browser console is non-interactive, and `waterpump shell`
 hands off to the real `lxc`/`incus` binary instead. Interactive terminals are a separate
 path: `ContainerService.open_terminal()` attaches to the daemon's shell or console
 WebSocket (`websocket.py`, both halves), `server.py` bridges it at
-`/api/containers/{name}/shell|console`, and `lemondx top` attaches to a local instance
+`/api/containers/{name}/shell|console`, and `waterpump top` attaches to a local instance
 directly and to a peer's through that endpoint via `NodeClient.open_websocket()`, which
 goes through the pinned `_connect()` like every other peer call.
 
@@ -812,7 +821,7 @@ it on save and on list, the runner refuses to start when one is empty and passes
 module result through `redact()`, and the CLI takes it from an env var of the same name or
 `getpass` rather than argv. A new place that persists or echoes params needs the same check.
 
-Search order is built-ins → `~/.config/lemondx/modules` → `$LEMONDX_MODULES`, later wins,
+Search order is built-ins → `~/.local/share/waterpump/modules` → `$WATERPUMP_MODULES`, later wins,
 so an uploaded module shadows a shipped one and built-ins can never be deleted. Uploads are
 validated before storage (safe id, UTF-8 under 256 KiB, `sh -n` parse) and never executed
 at upload time. Bootstrap probes outbound connectivity first so a blocked bridge fails
@@ -820,15 +829,15 @@ immediately with an explanation instead of as a package-manager timeout.
 
 SSH keys: only `*.pub` files are ever opened, keys are validated by `parse_public_key()`
 (known type, no `PRIVATE KEY`, no embedded newlines or control characters) before they go
-anywhere, and reach the container as `LEMONDX_SSH_KEYS`.
+anywhere, and reach the container as `WATERPUMP_SSH_KEYS`.
 
 ### Running as a service
 
-`systemd/` holds unit templates and `install-service.sh`. The user unit (`lemondx.service`) is the
-one to reach for -- it runs as the invoking user, which is what lemondx's own design assumes
+`systemd/` holds unit templates and `install-service.sh`. The user unit (`waterpump.service`) is the
+one to reach for -- it runs as the invoking user, which is what waterpump's own design assumes
 everywhere else: daemon-group membership, `~/.ssh/*.pub` for the bootstrap key picker, and
-`store.py`'s data directory are all *that user's*. The system unit (`lemondx-system.service`) runs
-as a dedicated account instead, which is why it needs `@LEMONDX_GROUP@` filled in by the installer
+`store.py`'s data directory are all *that user's*. The system unit (`waterpump-system.service`) runs
+as a dedicated account instead, which is why it needs `@WATERPUMP_GROUP@` filled in by the installer
 (a group that does not exist on the host would make systemd refuse the whole unit) and documents
 that the account's `~/.ssh` starts empty. Both run under `ProtectSystem=strict`/`ProtectHome=read-only`
 with only the data directory carved out via `ReadWritePaths=`, since nothing else in the codebase
@@ -837,9 +846,8 @@ local disk).
 
 ### Persistent state
 
-`store.py` owns everything lemondx keeps between runs, under
-`~/.local/share/lemondx` (`LEMONDX_DATA_DIR`, or `XDG_DATA_HOME`, moves it;
-`LEMONDX_CONFIG_DIR` is still honoured as the name it had before the move):
+`store.py` owns everything waterpump keeps between runs, under
+`~/.local/share/waterpump` (`WATERPUMP_DATA_DIR`, or `XDG_DATA_HOME`, moves it):
 `settings.json` for default modules and remembered params, `profiles/` for one
 JSON file per bootstrap profile, `templates/` for one per instance template,
 `tasks/` for one per task (with `task-runs/` and `task-grants.json` node-local
@@ -851,7 +859,7 @@ running `serve`'s socket for CLI events, 0600), `modules/` for uploads, `auth/`
 hashes, `runtime.json` for what `serve` is listening on, `changes.json` for
 when this node last saved or deleted each shared artifact (the one file here
 that is *not* meant to be copied -- see reconciliation above), `config/`
-for `lemondx configure` sections -- the one place where an unparseable file is an error,
+for `waterpump configure` sections -- the one place where an unparseable file is an error,
 not a default. Nothing else in the codebase builds those paths — go
 through `store.py` so migration and atomic writes apply.
 
@@ -873,7 +881,7 @@ too -- which is why the token for calling a peer is not in its record but in
 A template is a create request minus the name. `launch_template()` refuses
 anything that would fail for every instance before creating one, then creates
 `<prefix>-<n>` instances on a small thread pool (the LXD client opens a socket
-per request, so this is safe), tags each with `user.lemondx.template`, and
+per request, so this is safe), tags each with `user.waterpump.template`, and
 passes `remember_params=False` so launches never rewrite module settings.
 Recreate and destroy take the instance list the user confirmed and refuse with
 409 if the tagged set differs (`_confirmed_instances()`); recreate runs
@@ -892,11 +900,14 @@ without making instances stale; a field added to templates that is baked into
 an instance must not go there. Recreate keeps the old stack revision, because
 it applies the template, not the stack.
 
-`_migrate()` runs once per process, is best-effort (an `OSError` must never
-stop lemondx from starting) and handles both older layouts: adopting
-`~/.config/lemondx` wholesale, and splitting a `profiles` key out of an older
-`settings.json`. Bump `SETTINGS_VERSION` and add a step there for the next
-layout change.
+There are no layout migrations: the data directory is read as it is. When
+the layout next changes, bump `SETTINGS_VERSION` and migrate from
+`store.data_dir()`, once per process and best-effort (an `OSError` must never
+stop waterpump from starting). Some names are part of what is already made
+and cannot change without breaking it: the secretbox labels are part of the
+key (every sealed value becomes unreadable), and the `user.waterpump.*`
+instance keys, `waterpump.*` image properties, `wpmp_` token prefix,
+`BRIDGE_MARK` and `LAN_PREFIX` are how waterpump recognises its own.
 
 ### Frontend
 

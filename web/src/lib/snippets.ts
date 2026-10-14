@@ -15,7 +15,7 @@ export const LANGUAGES: { id: Language; label: string }[] = [
 ]
 
 /** The variable every snippet reads the token from, as in docs/api.md. */
-export const TOKEN_VAR = 'LEMONDX_API_TOKEN'
+export const TOKEN_VAR = 'WATERPUMP_API_TOKEN'
 
 export interface SnippetOptions {
   /** Where the API lives, e.g. `http://localhost:8099`. */

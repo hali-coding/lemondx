@@ -110,7 +110,7 @@ export function ExecConsole({ name, node, running }: {
       </form>
       <p className="hint" style={{ marginTop: 7 }}>
         Runs via <span className="mono">sh -c</span>, non-interactively. For a real shell use{' '}
-        <span className="mono">./lemondx shell {name}</span>.
+        <span className="mono">./waterpump shell {name}</span>.
       </p>
     </>
   )

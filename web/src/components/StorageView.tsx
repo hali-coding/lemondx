@@ -290,7 +290,7 @@ function PoolDeleteDialog({ pool, busy, onCancel, onConfirm }: {
         ))}
         {unsupported && (
           <div className="banner banner-error"><div className="banner-body"><p>
-            lemondx cannot safely remove: {[...plan.other_references,
+            waterpump cannot safely remove: {[...plan.other_references,
               ...plan.other_volumes].join(', ')}
           </p></div></div>
         )}
@@ -371,7 +371,7 @@ function PoolDialog({ pool, drivers, busy, onCancel, onSubmit }: {
       footer={<><button className="btn" onClick={onCancel} disabled={busy}>Cancel</button><button className="btn btn-primary" form="storage-pool-form" disabled={busy}>{busy && <span className="spinner" />}{pool ? 'Save changes' : 'Create pool'}</button></>}>
       <form id="storage-pool-form" className="storage-form" onSubmit={submit}>
         <div className="grid-2"><Field label="Name"><input className="input" required value={name} disabled={!!pool} onChange={(event) => setName(event.target.value)} /></Field><Field label="Driver"><select className="select" value={driver} disabled={!!pool} onChange={(event) => setDriver(event.target.value)}>{drivers.map((item) => <option key={item}>{item}</option>)}</select></Field></div>
-        <Field label="Source"><input className="input mono" value={source} disabled={!!pool} placeholder={driver === 'dir' ? '/srv/lemondx' : 'optional device or existing pool'} onChange={(event) => setSource(event.target.value)} /></Field>
+        <Field label="Source"><input className="input mono" value={source} disabled={!!pool} placeholder={driver === 'dir' ? '/srv/waterpump' : 'optional device or existing pool'} onChange={(event) => setSource(event.target.value)} /></Field>
         {driver !== 'dir' && (!source || !!pool?.config.size) && <Field label="Size"><input className="input" value={size} placeholder="30GiB" onChange={(event) => setSize(event.target.value)} /></Field>}
         <Field label="Description"><input className="input" value={description} onChange={(event) => setDescription(event.target.value)} /></Field>
         <Field label="Advanced local options"><textarea className="textarea mono" rows={4} value={config} placeholder="volume.size=20GiB" onChange={(event) => { setConfig(event.target.value); setConfigError('') }} />{configError && <span className="field-error">{configError}</span>}</Field>

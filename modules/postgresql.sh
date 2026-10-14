@@ -32,7 +32,7 @@ esac
 
 # Only Debian and Ubuntu create a cluster on install; everywhere else it is a
 # separate step, skipped when a cluster already exists so reruns are safe.
-case "$LEMONDX_PKG" in
+case "$WATERPUMP_PKG" in
     apt)
         pkg_install postgresql
         ;;
@@ -62,7 +62,7 @@ case "$LEMONDX_PKG" in
         pkg_install postgresql-server postgresql
         ;;
     *)
-        die "no PostgreSQL recipe for package manager '$LEMONDX_PKG'"
+        die "no PostgreSQL recipe for package manager '$WATERPUMP_PKG'"
         ;;
 esac
 
@@ -124,12 +124,12 @@ current=$(su -s /bin/sh postgres -c "psql -X -At -d postgres -c 'show listen_add
 # rules at the top: peer for the local socket (how the postgres superuser is
 # reached), a password for every TCP connection. The block is regenerated on
 # each run, so changing LISTEN_ADDRESSES back to localhost removes remote rules.
-begin="# BEGIN lemondx postgresql module"
-end="# END lemondx postgresql module"
+begin="# BEGIN waterpump postgresql module"
+end="# END waterpump postgresql module"
 
 block=$(
     printf '%s\n' "$begin"
-    printf '%s\n' "# Managed by lemondx; rerun the module rather than editing by hand."
+    printf '%s\n' "# Managed by waterpump; rerun the module rather than editing by hand."
     printf 'local  all  all                 peer\n'
     printf 'host   all  all  127.0.0.1/32   scram-sha-256\n'
     printf 'host   all  all  ::1/128        scram-sha-256\n'
@@ -149,12 +149,12 @@ block=$(
         $0 == e { skip = 0; next }
         !skip
     ' "$hba" | awk 'NF || seen { seen = 1; print }'
-} > "$hba.lemondx-new"
-if ! cmp -s "$hba.lemondx-new" "$hba"; then
+} > "$hba.waterpump-new"
+if ! cmp -s "$hba.waterpump-new" "$hba"; then
     log "password authentication enforced in $hba"
-    cat "$hba.lemondx-new" > "$hba"
+    cat "$hba.waterpump-new" > "$hba"
 fi
-rm -f "$hba.lemondx-new"
+rm -f "$hba.waterpump-new"
 
 if [ "$current" != "$listen" ]; then
     log "listen_addresses: $current -> $listen"

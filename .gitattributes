@@ -1,5 +1,5 @@
 # This is a Linux tool: always check out LF, whatever the user's
-# core.autocrlf happens to be. CRLF would break the ./lemondx shebang.
+# core.autocrlf happens to be. CRLF would break the ./waterpump shebang.
 * text=auto eol=lf
 *.png filter=lfs diff=lfs merge=lfs -text
 *.jpg binary

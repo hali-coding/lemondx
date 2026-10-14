@@ -37,7 +37,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Syntax check (no post-3.10 syntax; see CLAUDE.md "Hard constraints")
-        run: python3 -m compileall -q src/lemondx
+        run: python3 -m compileall -q src/waterpump
 
       - name: Import every module
         # compileall only parses; it will not catch an accidentally-added
@@ -47,11 +47,11 @@ jobs:
         # fails loudly if a module reaches outside it.
         run: python3 .github/scripts/check_imports.py
 
-      - name: CLI parser builds cleanly (./lemondx --help)
+      - name: CLI parser builds cleanly (./waterpump --help)
         # build_parser() constructs every subcommand eagerly, so this alone
         # catches things like two subcommands accidentally claiming the same
         # short flag -- argparse raises before anything is even printed.
-        run: ./lemondx --help
+        run: ./waterpump --help
 
   modules:
     name: Bootstrap modules (POSIX sh)
@@ -106,10 +106,10 @@ jobs:
         # the same archive here, from the dist just built above.
         run: |
           .github/scripts/bundle.sh 0.0.0-pr "$RUNNER_TEMP/bundle"
-          tar xzf "$RUNNER_TEMP/bundle/lemondx-0.0.0-pr.tar.gz" -C "$RUNNER_TEMP"
-          cd "$RUNNER_TEMP/lemondx-0.0.0-pr"
+          tar xzf "$RUNNER_TEMP/bundle/waterpump-0.0.0-pr.tar.gz" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/waterpump-0.0.0-pr"
           test -f web/dist/index.html
-          ./lemondx --help > /dev/null
+          ./waterpump --help > /dev/null
 
   daemon:
     name: Live daemon (Incus)
@@ -119,7 +119,7 @@ jobs:
     # would be running its own code on our host. Same-repo PRs and manual runs
     # only; a fork's change is checked here after it is pushed to a branch.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, lemondx-daemon]
+    runs-on: [self-hosted, waterpump-daemon]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4

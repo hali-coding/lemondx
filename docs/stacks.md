@@ -2,7 +2,7 @@
 
 [← back to README](../README.md)
 
-A stack is how lemondx describes a deployment, and the thing it is built to
+A stack is how waterpump describes a deployment, and the thing it is built to
 run. It launches several [templates](templates.md) in a fixed order: one
 database server, then three app servers pointed at it, then six load-test
 runners pointed at those. Later launches are handed the names and addresses of
@@ -11,7 +11,7 @@ health gates hold a stage back until what it depends on is actually up.
 
 Once launched, the stack is operated as a whole: stopped, started, relaunched
 and destroyed together, marked stale when its definition changes, and followed
-in the web UI, the CLI and `lemondx top`. Templates and modules are its parts;
+in the web UI, the CLI and `waterpump top`. Templates and modules are its parts;
 launching a template on its own is for a single tier with nothing to wire up.
 
 Stacks are meant to span **several nodes**: each launch step can name nodes or
@@ -124,8 +124,8 @@ but never bootstrapped.
 ## A stack's instances: stop, start, relaunch, destroy
 
 Every instance a stack launches is tagged with the stack's name
-(`user.lemondx.stack`) on the instance itself, next to its template tag. That
-tag is the stack's state. It survives a restart of lemondx, it is wherever the
+(`user.waterpump.stack`) on the instance itself, next to its template tag. That
+tag is the stack's state. It survives a restart of waterpump, it is wherever the
 instance is in a cluster, and recreating the instance from its template keeps
 it. There is no separate list that could disagree with what is actually running.
 
@@ -145,13 +145,13 @@ node does not answer, nothing happens either, since its instances cannot be
 checked.
 
 ```bash
-./lemondx stacks                        # includes how many instances each has running
-./lemondx stack-stop "Load test"        # also stack-start, stack-restart
-./lemondx stack-launch "Load test" --relaunch    # lists them, asks, then relaunches
-./lemondx stack-destroy "Load test" -y
+./waterpump stacks                    # includes how many instances each has running
+./waterpump stack-stop "Load test"    # also stack-start, stack-restart
+./waterpump stack-launch "Load test" --relaunch  # lists them, asks, then relaunches
+./waterpump stack-destroy "Load test" -y
 ```
 
-A stack launched onto a node running an older lemondx gets its instances there
+A stack launched onto a node running an older waterpump gets its instances there
 untagged, so they are not counted as the stack's.
 
 Because the tag is the state, deleting a stack -- or renaming one, which saves
@@ -208,15 +208,15 @@ is written in capitals:
 
 | Variable | Contents |
 | --- | --- |
-| `LEMONDX_STACK` | the stack's name |
-| `LEMONDX_STACK_<ID>_NAMES` | instance names, e.g. `db-1` |
-| `LEMONDX_STACK_<ID>_IPS` | each instance's first IPv4 address |
-| `LEMONDX_STACK_<ID>_IPV6` | each instance's first global IPv6 address |
-| `LEMONDX_STACK_<ID>_NODES` | the nodes the instances are on |
+| `WATERPUMP_STACK` | the stack's name |
+| `WATERPUMP_STACK_<ID>_NAMES` | instance names, e.g. `db-1` |
+| `WATERPUMP_STACK_<ID>_IPS` | each instance's first IPv4 address |
+| `WATERPUMP_STACK_<ID>_IPV6` | each instance's first global IPv6 address |
+| `WATERPUMP_STACK_<ID>_NODES` | the nodes the instances are on |
 
 ```sh
 # in a module run by the "runners" launch
-for ip in $LEMONDX_STACK_APP_IPS; do
+for ip in $WATERPUMP_STACK_APP_IPS; do
   echo "server $ip:8080" >> /etc/loadtest/targets
 done
 ```
@@ -287,7 +287,7 @@ running but has no IPv4 address after a minute is passed on by name only.
 ## Script steps
 
 **Run a script** runs a shell script on the node driving the stack -- the one
-it was launched from -- as the account lemondx runs as: a webhook to call once
+it was launched from -- as the account waterpump runs as: a webhook to call once
 the addresses are known, a DNS record to add, an external system to tell. It is
 the one step that runs on a host rather than in an instance. The default script
 is `exit 0`, which does nothing.
@@ -301,8 +301,8 @@ is `exit 0`, which does nothing.
   `{{db.ip}}` or `{{db.param.POSTGRES_DB}}`, a stack variable, a stack secret, a
   value entered at launch -- and each is handed to the script as an environment
   variable of that name. The script also gets every value entered at launch
-  under its own name, `LEMONDX_STACK_<ID>_IPS`/`_NAMES`/`_IPV6`/`_NODES` for each
-  earlier launch, and `LEMONDX_STACK_STEP`. References can also be written
+  under its own name, `WATERPUMP_STACK_<ID>_IPS`/`_NAMES`/`_IPV6`/`_NODES` for each
+  earlier launch, and `WATERPUMP_STACK_STEP`. References can also be written
   straight into the script, where they are filled in as text first -- quote them
   (`"{{vars.NFS_SERVER}}"`). A secret is better passed as a parameter, so it never
   sits in the script's text.
@@ -442,17 +442,17 @@ member is asked whether it is running that stack. One that is refuses the
 start ("busy with a swarm heavy on prdev1"), and the preview says so. A member
 that does not answer is passed over. **Stop** works from any node: a swarm
 running on another member is stopped there. Each run of a swarm also tags its
-instances with its own run (`user.lemondx.swarm-run`), and its teardown takes
+instances with its own run (`user.waterpump.swarm-run`), and its teardown takes
 only those, so one run can never destroy another's generators.
 
 From the CLI:
 
 ```bash
-./lemondx stack-swarm "Load test" heavy --count runners=150 --dry-run   # preview
-./lemondx stack-swarm "Load test" heavy --count runners=150 --var DURATION=600
-./lemondx stack-swarm-stop "Load test" heavy
-./lemondx stack-swarm "Load test" --sequence                     # the stack's sequence
-./lemondx stack-swarm "Load test" smoke heavy --count heavy/runners=150  # these, in order
+./waterpump stack-swarm "Load test" heavy --count runners=150 --dry-run  # preview
+./waterpump stack-swarm "Load test" heavy --count runners=150 --var DURATION=600
+./waterpump stack-swarm-stop "Load test" heavy
+./waterpump stack-swarm "Load test" --sequence                 # the stack's sequence
+./waterpump stack-swarm "Load test" smoke heavy --count heavy/runners=150  # these, in order
 ```
 
 `stack-swarm` hands the run to `serve` when one is running here, like
@@ -478,7 +478,7 @@ the run on the Stacks tab downloads it as Markdown. The report has:
 It is built from the run record, so it holds nothing the tab does not show.
 Outputs are already redacted of the run's secrets and launch inputs. From the
 CLI, `stack-swarm ... --report FILE` writes it when the run ends (a directory
-names the file for the run, `-` is stdout). `lemondx stack-report NAME [-o
+names the file for the run, `-` is stdout). `waterpump stack-report NAME [-o
 FILE]` prints the last finished run's report: the run held by `serve` here,
 like everything the tab shows. The API route is `GET
 /api/stack-runs/{name}/report` → `{"stack", "filename", "markdown"}`. It is
@@ -492,8 +492,8 @@ and said in its log.
 **How it knows the stack's addresses.** The launch that made the stack's
 instances may be days old, and its run only ever lived in memory. So every
 instance a stack launches is tagged with its stack **step**
-(`user.lemondx.stack-step`), and a swarm's also with the swarm
-(`user.lemondx.swarm`). A swarm rebuilds `{{db.ip}}`, `{{app.ips}}` and
+(`user.waterpump.stack-step`), and a swarm's also with the swarm
+(`user.waterpump.swarm`). A swarm rebuilds `{{db.ip}}`, `{{app.ips}}` and
 `{{app.param.NAME}}` from the instances as they are now, using the fabric
 address where there is one, exactly as a launch would have handed them on.
 Instances launched before steps were tagged are matched by template, where
@@ -503,10 +503,10 @@ swarm, keep it as a stack variable or secret.
 
 **Ephemeral.** Swarm templates are expected to be ephemeral. One that is not
 is allowed, and noted on save, in the designer and when starting. Its
-instances are destroyed when the swarm ends all the same. But if lemondx stops
+instances are destroyed when the swarm ends all the same. But if waterpump stops
 mid-swarm without a chance to tear down (killed, or the host lost power), the
 instances stay, tagged with their swarm. The Stacks tab lists them as **left
-behind** with a **Clear** button. `lemondx stacks` shows them as `heavy (6
+behind** with a **Clear** button. `waterpump stacks` shows them as `heavy (6
 left)` and says which `stack-swarm-stop` clears them, and `stack-show` notes
 them under the swarm. Clearing destroys exactly those, after confirmation.
 
@@ -566,7 +566,7 @@ typing it at launch. What the stack keeps is only the name, a description, and
 whether to generate it:
 
 - **Set a value** in the designer (applied when the stack is saved), with
-  `lemondx stack-secret-set STACK NAME` (from `$NAME`, a prompt, or stdin --
+  `waterpump stack-secret-set STACK NAME` (from `$NAME`, a prompt, or stdin --
   never the command line), or by giving it the first time the stack is
   launched, when the launch dialog asks for any secret with no value.
 - **Generate** instead: the first launch that needs it makes a random value
@@ -575,7 +575,7 @@ whether to generate it:
   one.
 - **Read it back**: **Reveal…** in the designer, for an admin. Signed in with a
   password, you type it again first; an admin API token is enough on its own.
-  The value is shown for 30 seconds. `lemondx stack-secret-reveal STACK NAME` on
+  The value is shown for 30 seconds. `waterpump stack-secret-reveal STACK NAME` on
   the node itself needs no password: the CLI runs as the account that owns the
   data, which could read the key anyway. Every reveal is logged with who and
   which secret, never the value.
@@ -583,9 +583,8 @@ whether to generate it:
 The value is never in the stack file, a listing, a run record or the event log.
 It is encrypted on each node under `auth/` (see [Security](security.md#stack-secrets))
 and travels between members only over the members-only sync route. Reveal is
-refused through another node (`/api/nodes/{node}/…`): the relayed call would
-arrive under the cluster credential and skip the password, and the secret is
-on every node anyway.
+refused through another node (`/api/nodes/{node}/…`): the password can only
+be confirmed where you signed in, and the secret is on every node anyway.
 
 **A stack secret named like a module's secret fills it everywhere.** A stack
 secret called `POSTGRES_PASSWORD` goes to every launch whose modules declare a
@@ -618,8 +617,8 @@ environment variables of the same name, or prompts, as `launch` does.
 ## Clusters
 
 A stack on one host works, and is a fine way to develop one. A stack across
-several is what lemondx is for: losing a host costs its share rather than the
-deployment, tiers can be put where there is room (`lemondx cluster group auto`
+several is what waterpump is for: losing a host costs its share rather than the
+deployment, tiers can be put where there is room (`waterpump cluster group auto`
 sorts nodes into `large` and `small`), and one join code is all a new host
 needs. For tiers to reach each other across hosts, put their templates on a
 [fabric](networking.md) — a step's `{{db.ip}}` is then the fabric address,
@@ -628,7 +627,7 @@ which means something on every node. See
 
 A launch step can name nodes or a node group, like the Launch dialog. In a
 cluster, a new launch step in the designer starts out on the first node group
-in alphabetical order (with `lemondx cluster group auto`, that is `large`),
+in alphabetical order (with `waterpump cluster group auto`, that is `large`),
 so a stack spreads over the cluster unless told otherwise. A single node, or a
 cluster with no groups, starts it on this node. Either way it is only where the
 step starts: the group is saved on the step and can be changed under
@@ -642,7 +641,7 @@ Stacks are kept level across a cluster like templates: saving one pushes it,
 **with the templates it launches**, to every member. Its secret values follow
 on their own route whenever one changes, and reconciliation brings a node that
 was off up to date, so a generated password is the same everywhere. Deleting one removes it
-everywhere unless you pass `--local-only` or untick the box. `lemondx cluster
+everywhere unless you pass `--local-only` or untick the box. `waterpump cluster
 sync --kind stacks` catches up a node that was down.
 
 ## From the CLI
@@ -650,19 +649,19 @@ sync --kind stacks` catches up a node that was down.
 A stack is saved from a JSON definition, which `stack-show --json` prints back:
 
 ```bash
-./lemondx stack-save "Load test" loadtest.json
-./lemondx stacks                                    # with its swarms and instances
-./lemondx stack-show "Load test"                    # what each step and swarm does
-./lemondx stack-show "Load test" --json > loadtest.json   # edit, then save again
-./lemondx stack-launch "Load test" --dry-run        # what a launch would do; changes nothing
-./lemondx stack-launch "Load test"                  # prints each step as it goes
-./lemondx stack-launch "Load test" --var NFS_SERVER=nas2.lan   # this launch only
-./lemondx stack-secrets "Load test"                 # which secrets hold a value
-DB_PASSWORD=... ./lemondx stack-secret-set "Load test" DB_PASSWORD
-./lemondx stack-secret-reveal "Load test" DB_PASSWORD
-./lemondx stack-secret-clear "Load test" DB_PASSWORD
-./lemondx stack-delete "Load test" -y              # its instances are kept
-./lemondx stack-delete "Load test" --destroy        # destroys them too (asks)
+./waterpump stack-save "Load test" loadtest.json
+./waterpump stacks                                # with its swarms and instances
+./waterpump stack-show "Load test"                # what each step and swarm does
+./waterpump stack-show "Load test" --json > loadtest.json  # edit, then save again
+./waterpump stack-launch "Load test" --dry-run    # what a launch would do; changes nothing
+./waterpump stack-launch "Load test"              # prints each step as it goes
+./waterpump stack-launch "Load test" --var NFS_SERVER=nas2.lan  # this launch only
+./waterpump stack-secrets "Load test"             # which secrets hold a value
+DB_PASSWORD=... ./waterpump stack-secret-set "Load test" DB_PASSWORD
+./waterpump stack-secret-reveal "Load test" DB_PASSWORD
+./waterpump stack-secret-clear "Load test" DB_PASSWORD
+./waterpump stack-delete "Load test" -y          # its instances are kept
+./waterpump stack-delete "Load test" --destroy    # destroys them too (asks)
 ```
 
 `stack-show` describes the stack in words:
@@ -690,7 +689,7 @@ real address, in its parameters and in its script. The command exits 1 if the
 start would be refused. `--json` prints the same preview as
 `POST /api/stacks/{name}/preview` and `.../swarms/{swarm}/preview` return.
 
-`lemondx top` shows each instance's stack and the step that made it
+`waterpump top` shows each instance's stack and the step that made it
 (`shop·db`), or its swarm (`shop ⚡heavy`). The stacks panel names a running
 swarm and counts the stack's own instances apart from its load generators.
 
@@ -784,7 +783,7 @@ the final record.
 
 ## On disk
 
-One JSON file per stack in `~/.local/share/lemondx/stacks/`, named after a slug
+One JSON file per stack in `~/.local/share/waterpump/stacks/`, named after a slug
 of its name, in the format above. Secret values are not in it: they are in
 `auth/stack-secrets.json`, encrypted under `auth/secrets.key`. Copy them between machines or check them into
 a project, as with templates.

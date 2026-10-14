@@ -16,7 +16,7 @@ export function ModuleOrigin({ module }: { module: BootstrapModule }) {
   if (module.shadows_builtin) return <span className="badge badge-info">customised</span>
   if (module.builtin) return <span className="badge badge-dim">built in</span>
   if (module.editable) return <span className="badge badge-info">uploaded</span>
-  return <span className="badge badge-dim" title="From a directory in $LEMONDX_MODULES">external</span>
+  return <span className="badge badge-dim" title="From a directory in $WATERPUMP_MODULES">external</span>
 }
 
 interface Props {
@@ -374,7 +374,7 @@ export function ModuleDetail({ module, usage, onBack, onChanged, onDeleted, onNo
             <div className="script-note">
               This is a built-in module. Saving writes your own copy to the modules
               directory, which is used in its place; <strong>Revert to built-in</strong>{' '}
-              deletes the copy again. Updates to lemondx will not change your copy.
+              deletes the copy again. Updates to waterpump will not change your copy.
             </div>
           )}
           {scriptError && <div className="script-note script-error">{scriptError}</div>}

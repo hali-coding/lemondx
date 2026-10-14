@@ -36,9 +36,9 @@ export interface Container {
   /** The task and run it exists for: a throwaway instance, gone when the run ends. */
   task?: string | null
   task_run?: string | null
-  /** Who made it: lemondx, a person importing it, or null when it was made some
+  /** Who made it: waterpump, a person importing it, or null when it was made some
    *  other way (`lxc launch`, a script) and the inventory flags it. */
-  origin: 'lemondx' | 'imported' | null
+  origin: 'waterpump' | 'imported' | null
   /** Which version of each it was made from; blank when made before this was kept. */
   revisions: { template: string; stack: string }
   /** Which of its template and stack have changed since it was made. */
@@ -234,7 +234,7 @@ export interface ModuleParam {
 
 export interface BootstrapModule {
   id: string
-  /** Shipped with lemondx; cannot be deleted, only shadowed. */
+  /** Shipped with waterpump; cannot be deleted, only shadowed. */
   builtin: boolean
   /** An upload: its script can be rewritten and the module deleted. */
   editable: boolean
@@ -413,7 +413,7 @@ export interface NetworkSummary {
   default: boolean
   /** Managed networks and host bridges; what an instance can be put on. */
   attachable: boolean
-  /** A managed bridge lemondx can edit and delete. */
+  /** A managed bridge waterpump can edit and delete. */
   manageable: boolean
   read_only_reason: string
   /** How it puts instances on a host NIC's LAN, or null when it does not. */
@@ -424,7 +424,7 @@ export interface NetworkSummary {
  * A network whose instances are addressed by the LAN's own DHCP (the
  * router), not by the daemon. `bridge`: a daemon bridge over a spare NIC.
  * `macvlan`: beside a NIC, so the host cannot reach them over it.
- * `converted`: the NIC the host uses, made a port of a bridge by lemondx.
+ * `converted`: the NIC the host uses, made a port of a bridge by waterpump.
  * `host`: a bridge with a NIC in it that was made some other way.
  */
 export interface LanInfo {
@@ -462,13 +462,13 @@ export interface LanInterface {
   master: string
   /** The NetworkManager connection running it, blank when NM does not. */
   network_manager: string
-  /** `manual`: possible, but lemondx cannot run it as root, so it shows the commands. */
+  /** `manual`: possible, but waterpump cannot run it as root, so it shows the commands. */
   modes: Record<LanMode, { available: boolean; reason: string; manual: boolean }>
 }
 
 export interface LanInterfaces {
   interfaces: LanInterface[]
-  /** lemondx can run its helper as root. */
+  /** waterpump can run its helper as root. */
   helper: boolean
   /** Docker is here, so LAN bridges need an exception in its firewall. */
   docker: boolean
@@ -673,7 +673,7 @@ export interface NodeImage {
   /** Pulled from a remote to launch something, not made or copied here. */
   cached: boolean
   created_at: string | null
-  /** `instance/snapshot` when lemondx published it from one. */
+  /** `instance/snapshot` when waterpump published it from one. */
   source: string | null
 }
 
@@ -814,7 +814,7 @@ export interface StackWaitStep {
 }
 
 /**
- * A shell script, run on the node driving the stack as the account lemondx
+ * A shell script, run on the node driving the stack as the account waterpump
  * runs as. Fails the stack on a non-zero exit or the timeout.
  */
 export interface StackScriptStep {
@@ -1244,7 +1244,7 @@ export interface HealthRecord {
   cpu: { percent: number; cores_used: number; cores: number } | null
   memory: { usage: number; limit: number | null; percent: number | null }
   /**
-   * `source: cgroup` is counted by lemondx from the container's cgroup: 1, 5 and
+   * `source: cgroup` is counted by waterpump from the container's cgroup: 1, 5 and
    * 15 minute averages from `serve` (`warming` for its first minute), or one
    * average over `window` seconds from a one-off check. `guest` is a VM's own;
    * `proc` is what a container reports, usually the host's (`scope: host`).
@@ -1726,7 +1726,7 @@ export interface SyncOutcome {
 
 /**
  * What the rest of the cluster made of a save or a delete that was propagated
- * automatically. Null on a lemondx that is not federated, which is most.
+ * automatically. Null on a waterpump that is not federated, which is most.
  */
 export interface AutoSync {
   ok: boolean
@@ -1762,7 +1762,7 @@ export interface ClusterContainers {
 
 /**
  * Where the Containers and Templates tabs are looking. `local` is this node
- * alone, which is what an unfederated lemondx always shows; the others widen
+ * alone, which is what an unfederated waterpump always shows; the others widen
  * it, and both tabs read the same value so a template's instances and the
  * container list never disagree about which hosts are in view.
  */
@@ -1915,7 +1915,7 @@ export interface ClusterMetrics {
   nodes: NodeMetrics[]
 }
 
-/** An instance lemondx did not make or import, as the inventory found it. */
+/** An instance waterpump did not make or import, as the inventory found it. */
 export interface ForeignInstance {
   node: string
   name: string
@@ -1926,13 +1926,13 @@ export interface ForeignInstance {
   ipv4: string[]
 }
 
-/** Every node listed just now, and what on them lemondx did not make. */
+/** Every node listed just now, and what on them waterpump did not make. */
 export interface Inventory {
   /** Unix seconds. */
   checked_at: number
   nodes: string[]
   foreign: ForeignInstance[]
-  /** Nodes that could not be listed, or run a lemondx too old to tell. */
+  /** Nodes that could not be listed, or run a waterpump too old to tell. */
   errors: { node: string; error: string }[]
 }
 
@@ -1945,7 +1945,7 @@ export interface ImportResult {
 
 // -- tasks -------------------------------------------------------------------
 
-/** What an invocation may hand a run; a job sees it as `LEMONDX_INPUT_<NAME>`. */
+/** What an invocation may hand a run; a job sees it as `WATERPUMP_INPUT_<NAME>`. */
 export interface TaskInput {
   description: string
   /** Used when a run is not given one, and by every scheduled run. Never set on a secret. */

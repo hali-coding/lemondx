@@ -93,7 +93,7 @@ const NAV: {
     },
     items: [
       { id: 'cluster', label: 'Cluster', icon: <ServerIcon size={16} />,
-        about: 'The hosts running lemondx, each with its own LXD or Incus. Joined into a '
+        about: 'The hosts running waterpump, each with its own LXD or Incus. Joined into a '
           + 'cluster they share templates, stacks and modules, and launches can spread '
           + 'across them. Settings for the whole cluster, such as logging, are here too.' },
       { id: 'monitor', label: 'Monitor', icon: <PulseIcon size={16} />,
@@ -108,7 +108,7 @@ const NAV: {
         about: 'Users and API tokens, and whether each may only look, operate what exists, '
           + 'or change everything.' },
       { id: 'logs', label: 'Logs', icon: <LogsIcon size={16} />,
-        about: 'Everything lemondx does and who asked for it, live from every node: '
+        about: 'Everything waterpump does and who asked for it, live from every node: '
           + 'follow one request across the cluster, or one instance’s history.' },
     ] },
 ]
@@ -121,13 +121,13 @@ const STATE_VERB: Record<StateAction, string> = {
 export default function App() {
   const { theme, toggle } = useTheme()
   const { scope, choose: chooseScope, nodes, groups, federated, reload: reloadCluster } = useScope()
-  // Where this lemondx sits, so a row here can be told apart from one elsewhere.
+  // Where this waterpump sits, so a row here can be told apart from one elsewhere.
   const localNode = nodes.find((n) => n.self)?.name ?? ''
 
   // Which node a tab is on, in the tab itself: with several nodes' UIs open
-  // side by side, "lemondx" six times tells them apart by nothing.
+  // side by side, "waterpump" six times tells them apart by nothing.
   useEffect(() => {
-    document.title = localNode ? `${localNode} (lemondx)` : 'lemondx'
+    document.title = localNode ? `${localNode} (waterpump)` : 'waterpump'
   }, [localNode])
   // Refused by the server anyway; said up front so nobody fills in a create first.
   const localMaintenance = nodes.find((n) => n.self)?.maintenance ?? null
@@ -669,8 +669,8 @@ export default function App() {
     <div className="app">
       <aside className={`sidebar${navOpen ? ' sidebar-open' : ''}`} aria-label="Main menu">
         <div className="brand">
-          <img src="/lemon.svg" alt="" />
-          <span>lemondx</span>
+          <img src="/waterpump.svg" alt="" />
+          <span>waterpump</span>
         </div>
         <nav className="sidebar-nav" aria-label="Views">
           <button className="sidebar-item"
@@ -785,7 +785,7 @@ export default function App() {
         {connectionError && (
           <div className="banner banner-error">
             <div className="banner-body">
-              <h3>Lost contact with the lemondx server</h3>
+              <h3>Lost contact with the waterpump server</h3>
               <p style={{ margin: 0 }}>{connectionError}</p>
             </div>
           </div>
@@ -833,7 +833,7 @@ export default function App() {
               <h3>This node is unconfigured</h3>
               <p>
                 It listens on this host only, with no login and no HTTPS — fine for trying
-                lemondx here, but no other host can reach it, so it cannot join a cluster
+                waterpump here, but no other host can reach it, so it cannot join a cluster
                 either. Configuring it adds an admin login and a certificate, and can open
                 it to other hosts.
               </p>
@@ -970,7 +970,7 @@ export default function App() {
         )}
 
         {(() => {
-          // The prompt to review instances made outside lemondx; each row
+          // The prompt to review instances made outside waterpump; each row
           // carries a badge too. Null, not undefined: a peer too old to mark
           // its instances says nothing, rather than calling them all foreign.
           const foreign = (containers ?? []).filter((c) => c.origin === null).length
@@ -979,8 +979,8 @@ export default function App() {
               <div className="banner-body">
                 <p style={{ margin: 0 }}>
                   {foreign === 1 ? '1 instance here was' : `${foreign} instances here were`} made
-                  outside lemondx (with <span className="mono">lxc</span>, a script, or an older
-                  lemondx). Import {foreign === 1 ? 'it' : 'them'} to stop the warning, and
+                  outside waterpump (with <span className="mono">lxc</span>, a script, or an older
+                  waterpump). Import {foreign === 1 ? 'it' : 'them'} to stop the warning, and
                   optionally attach {foreign === 1 ? 'it' : 'them'} to a template.
                 </p>
               </div>
