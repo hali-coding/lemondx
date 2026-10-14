@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.10.0](https://github.com/hali-coding/waterpump/compare/v0.9.1...v0.10.0) (2026-10-14)
+
+
+### Features
+
+* adds the task feature ([d2cabf6](https://github.com/hali-coding/waterpump/commit/d2cabf6cfcad3af5361c40e335190f9cff16e355))
+* adds the task feature ([c7a952c](https://github.com/hali-coding/waterpump/commit/c7a952c9402c4efd3a50098ae1f7a7f9e48dea2e))
+* renames to waterpump ([a4626d8](https://github.com/hali-coding/waterpump/commit/a4626d8aa42b8774897dda69d3dec2794a3743ba))
+
+
+### Bug fixes
+
+* ui cleanups and tweaks ([4fd4203](https://github.com/hali-coding/waterpump/commit/4fd4203f46091d5274d3002019ce691ea367310b))
+* ui cleanups and tweaks ([c197dd8](https://github.com/hali-coding/waterpump/commit/c197dd8b80697ab7ec23b8359771010d91514ede))
+
 ## [0.9.1](https://github.com/hali-coding/waterpump/compare/v0.9.0...v0.9.1) (2026-10-04)
 
 
