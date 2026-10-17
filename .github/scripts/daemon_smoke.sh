@@ -1,16 +1,19 @@
 #!/bin/sh
 # CI check against a live daemon: the part of waterpump pr.yml's other jobs
-# cannot reach, run by daemon.yml on the self-hosted `waterpump-daemon` runner. Everything goes
-# through ./waterpump, so the CLI, ContainerService and lxd.py are exercised the
-# way a user drives them, and `serve` is checked over real HTTP.
+# cannot reach, run by daemon.yml on the self-hosted `waterpump-daemon` runner,
+# once per Python version in its matrix. Everything goes through ./waterpump,
+# so the CLI, ContainerService and lxd.py are exercised the way a user drives
+# them, and `serve` is checked over real HTTP.
 #
-# The runner is long-lived, so every name carries the run id and the trap
+# The runner is long-lived, so every name carries the run id (and the Python,
+# since daemon.yml runs this once per version in one run) and the trap
 # removes what this run made even when a step fails -- a leftover instance
 # would otherwise sit on a 1 GB VM until someone noticed.
 set -eu
 
 flavor=${WATERPUMP_FLAVOR:-incus}
-run=${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}
+py=$(python3 -c 'import sys; print("py%d%d" % sys.version_info[:2])')
+run=${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-$py
 name=ci-$run
 template=ci-t-$run
 port=${DAEMON_SMOKE_PORT:-18099}
@@ -42,7 +45,7 @@ for c in sorted(json.load(sys.stdin), key=lambda c: c["name"]):
         print(c["name"], c["status"])' "$1"
 }
 
-step "status ($flavor)"
+step "status ($flavor, $(python3 --version))"
 ./waterpump status
 ./waterpump status --json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ready"], d'
 end

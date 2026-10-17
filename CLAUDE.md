@@ -25,6 +25,7 @@ npm --prefix web run build          # the build step alone (web/dist is not comm
 .github/scripts/bundle.sh 1.2.3     # the release archive, exactly as CI builds it
 npm --prefix web run lint           # oxlint
 python3 -m compileall -q src/waterpump # syntax check; there is no Python linter configured
+uvx vermin --target=3.10- --violations --no-tips src/waterpump  # CI's 3.10 stdlib-API floor check
 sh -n modules/foo.sh                # modules must parse as POSIX sh
 WATERPUMP_FLAVOR=incus ./waterpump status  # force the other daemon
 WATERPUMP_DATA_DIR=/tmp/n1 ./waterpump cluster status  # a second node's state, for testing federation

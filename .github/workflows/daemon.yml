@@ -18,12 +18,37 @@ permissions:
 
 jobs:
   smoke:
-    name: Smoke test (Incus)
+    name: Smoke test (Incus, Python ${{ matrix.python }})
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, waterpump-daemon]
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      # One runner, and the smoke serves on one port.
+      max-parallel: 1
+      matrix:
+        # The floor and the newest: the hosted Python jobs only parse and
+        # import, so this is the only place real code paths -- HTTP to the
+        # daemon, exec, serve, template runs -- execute on either end of the
+        # supported range. Keep it in step with pr.yml's matrix.
+        python: ["3.10", "3.15"]
     steps:
       - uses: actions/checkout@v4
 
+      # uv rather than setup-python, whose prebuilt interpreters are built
+      # for Ubuntu and not this Debian VM. It keeps the interpreters it
+      # downloads in the runner user's cache, so the long-lived VM fetches
+      # each once.
+      - uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Python ${{ matrix.python }}
+        run: |
+          uv venv --quiet --python "${{ matrix.python }}" "$RUNNER_TEMP/py"
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+
+      # The launcher is `#!/usr/bin/env python3`, so the PATH above is what
+      # runs waterpump -- and the script's own JSON checks -- on that version.
       - name: Smoke test against the daemon
-        run: .github/scripts/daemon_smoke.sh
+        run: |
+          python3 --version
+          .github/scripts/daemon_smoke.sh

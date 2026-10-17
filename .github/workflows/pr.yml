@@ -51,10 +51,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The floor from pyproject.toml's requires-python and the two newest --
-        # `from __future__ import annotations` is what keeps every module
-        # syntax-valid on 3.10, and compileall below is what actually checks it.
-        python-version: ["3.10", "3.13", "3.14"]
+        # The floor from pyproject.toml's requires-python and the two newest
+        # releases -- `from __future__ import annotations` is what keeps every
+        # module syntax-valid on 3.10, and compileall below is what actually
+        # checks it. Move the two newest along when a Python is released.
+        python-version: ["3.10", "3.14", "3.15"]
     steps:
       - uses: actions/checkout@v4
 
@@ -70,14 +71,35 @@ jobs:
         # third-party import (dependencies = [] in pyproject.toml is a hard
         # constraint) or any other error that only surfaces at import time.
         # A fresh setup-python install has nothing but the stdlib, so this
-        # fails loudly if a module reaches outside it.
-        run: python3 .github/scripts/check_imports.py
+        # fails loudly if a module reaches outside it. Deprecations are errors
+        # so an API on its way out fails here on the newest Python, the first
+        # to warn, rather than on the release that removes it.
+        run: python3 -W error::DeprecationWarning .github/scripts/check_imports.py
 
-      - name: CLI parser builds cleanly (./waterpump --help)
-        # build_parser() constructs every subcommand eagerly, so this alone
-        # catches things like two subcommands accidentally claiming the same
-        # short flag -- argparse raises before anything is even printed.
-        run: ./waterpump --help
+      - name: CLI parser builds, every command's help formats
+        run: python3 -W error::DeprecationWarning .github/scripts/check_cli.py
+
+  compat:
+    name: Python 3.10 API floor (vermin)
+    needs: commit-style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: No stdlib API newer than requires-python
+        # The 3.10 matrix entry only parses and imports, so a newer API used
+        # inside a function -- datetime.UTC, itertools.batched -- passes there
+        # and fails only when that code runs on a 3.10 host. vermin knows
+        # when each stdlib member arrived. It is a CI tool only: nothing
+        # waterpump runs depends on it. No --eval-annotations, since every
+        # module has `from __future__ import annotations` and they never run.
+        run: |
+          python3 -m pip install --quiet vermin==1.9.1
+          vermin --target=3.10- --violations --no-tips src/waterpump .github/scripts waterpump
 
   modules:
     name: Bootstrap modules (POSIX sh)
@@ -148,6 +170,6 @@ jobs:
     # incus-admin (root-equivalent), so a fork's PR never gets here -- it
     # would be running its own code on our host. Same-repo PRs and manual runs
     # only; a fork's change is checked here after it is pushed to a branch.
-    needs: [python, modules, web]
+    needs: [python, compat, modules, web]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/daemon.yml
