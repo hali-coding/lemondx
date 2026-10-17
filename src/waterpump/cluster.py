@@ -127,7 +127,7 @@ SYNC_KINDS = ("templates", "modules", "profiles", "groups", "users", "stacks", "
 
 # What a task record carries, and so all a member's push of one may set.
 TASK_FIELDS = ("description", "enabled", "template", "bootstrap", "script", "schedule", "nodes",
-               "groups", "timeout_seconds", "overlap", "inputs", "secrets")
+               "groups", "timeout_seconds", "overlap", "inputs", "secrets", "webhook")
 
 # Cluster-wide settings: one record each in store's cluster-settings/, synced
 # like a template. The function is what makes a value valid, and the only

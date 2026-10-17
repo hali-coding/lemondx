@@ -64,7 +64,9 @@ on this node that no live run owns.
 
 from __future__ import annotations
 
+import collections
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -104,6 +106,10 @@ SWEEP_SECONDS = 300
 TICK_SECONDS = 1
 # Asking members what they are running: short, a silent one is not waited for.
 RUNS_TIMEOUT = 5
+# Handing a run to another member: it answers once the run is recorded. A
+# member that cannot be reached within FORWARD_CONNECT is passed over at once.
+FORWARD_TIMEOUT = 30
+FORWARD_CONNECT = 3
 PAYLOAD_LIMIT = 256 * 1024
 PAYLOAD_PATH = "/tmp/waterpump-task-payload"
 SCRIPT_PATH = "/tmp/waterpump-task-script"
@@ -115,6 +121,23 @@ PLACEHOLDER = re.compile(r"\{\{\s*([^{}]*?)\s*\}\}")
 INPUT_REFERENCE = re.compile(r"^inputs\.([A-Za-z_][A-Za-z0-9_]{0,63})$")
 SECRET_REFERENCE = re.compile(r"^secrets\.([A-Za-z_][A-Za-z0-9_]{0,63})$")
 GRANT_KEY = re.compile(r"^[^\x00-\x1f]{1,200}@[0-9]{1,12}$")
+
+# A webhook delivery: the most a body may be (GitHub's workflow_job is a few
+# KB; its own cap is 25 MB), and how many delivery ids a process remembers.
+# GitHub resends a delivery with the same id, so remembering them is what
+# stops a replayed or redelivered `queued` from starting a second runner.
+WEBHOOK_BYTES = 1024 * 1024
+WEBHOOK_REMEMBERED = 2000
+# GitHub marks a delivery failed after 10 seconds, and never redelivers by
+# itself: placing the run must answer inside that, short of the time to read
+# the body and reply, or a member that hangs costs a run another would take.
+WEBHOOK_SECONDS = 8
+HOOK_PATH = "/api/hooks/%s"
+# The inputs a GitHub workflow_job delivery offers. A task receives only the
+# ones it declares, since an invocation naming any other input is refused.
+GITHUB_INPUTS = ("GITHUB_URL", "GITHUB_REPOSITORY", "GITHUB_JOB_ID", "GITHUB_JOB_NAME",
+                 "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_WORKFLOW", "GITHUB_LABELS",
+                 "GITHUB_DELIVERY")
 
 RUNNING, OK, FAILED, TIMED_OUT, CANCELLED, MISSED, VETOED, LOST = (
     "running", "ok", "failed", "timed_out", "cancelled", "missed", "vetoed", "lost")
@@ -181,6 +204,7 @@ class TaskService:
         self._lock = threading.Lock()
         self._started = False
         self._tasks_seen = (None, {})
+        self._deliveries = collections.OrderedDict()
 
     # -- definitions -------------------------------------------------------
 
@@ -224,6 +248,7 @@ class TaskService:
         elif not eligible:
             placement = "its node groups have no members here, so it runs nowhere"
         return dict(task, bootstrap=dict(task["bootstrap"], params=params),
+                    hook_path=HOOK_PATH % _seg(task["name"]) if task["webhook"] else None,
                     next_run=next_run if eligible else None, eligible=eligible,
                     placement_problem=placement,
                     schedule_text=cron.describe(schedule["cron"]) if schedule else None,
@@ -234,7 +259,8 @@ class TaskService:
     def save_task(self, name, template=None, bootstrap=None, script=None, description="",
                   schedule=None,
                   nodes=None, groups=None, timeout_seconds=None, overlap=None, inputs=None,
-                  secrets=None, enabled=True, previous=None, propagate=True, **_ignored):
+                  secrets=None, webhook=None, enabled=True, previous=None, propagate=True,
+                  **_ignored):
         """Save a task to the rules a person's save meets; a member's push meets them too."""
         name = self.service._record_name(name, "task")
         warnings = []
@@ -302,13 +328,18 @@ class TaskService:
         overlap = overlap or "skip"
         if overlap not in store.TASK_OVERLAP:
             raise ServiceError("overlap is one of: %s." % ", ".join(store.TASK_OVERLAP))
+        webhook = _check_webhook(webhook, declared_secrets)
+        if webhook and overlap == "skip":
+            warnings.append("Its overlap is skip, so a webhook starts one run at a time and "
+                            "refuses the rest while one runs; a runner per job wants allow.")
 
         saved = store.save_task(name, {
             "description": str(description or "")[:200], "enabled": enabled is not False,
             "template": template, "bootstrap": selection, "script": script,
             "schedule": cleaned_schedule,
             "nodes": nodes, "groups": groups, "timeout_seconds": timeout_seconds,
-            "overlap": overlap, "inputs": declared_inputs, "secrets": declared_secrets})
+            "overlap": overlap, "inputs": declared_inputs, "secrets": declared_secrets,
+            "webhook": webhook})
         result = self.cluster._with_sync(self._public(saved), "tasks", saved["name"], propagate)
         moved = previous and previous != saved["name"] and propagate and \
             store.rename_stack_secrets(str(previous), saved["name"], store.TASK_SECRETS_KIND)
@@ -468,14 +499,14 @@ class TaskService:
             return "this node is already running %d task instances" % live
         return None
 
-    def _running_anywhere(self, task):
+    def _running_anywhere(self, task, timeout=RUNS_TIMEOUT):
         """A member (this one included) running ``task`` now, or None. Best effort."""
         with self._lock:
             if any(r["task"] == task and r["status"] == RUNNING for r in self._live.values()):
                 return self.cluster.local_name()
         if not self.cluster.in_cluster():
             return None
-        for run in self._peer_runs(task, live=True)[0]:
+        for run in self._peer_runs(task, live=True, timeout=timeout)[0]:
             return run["node"]
         return None
 
@@ -529,14 +560,24 @@ class TaskService:
 
     # -- invoking ----------------------------------------------------------
 
-    def invoke(self, name, inputs=None, payload=None, node=None, wait=False, here=False):
+    def invoke(self, name, inputs=None, payload=None, node=None, wait=False, here=False,
+               deadline=None):
         """Start one run of a task now, on the first node that will take it.
 
         ``node`` names where it must run instead; ``here`` is a member's
         forward of a choice already made, which runs on this node or refuses.
         Inputs and the payload are checked on the node asked, before anything
         is forwarded, so a mistake is reported once and by the right node.
+        ``deadline`` (a ``time.monotonic()``) bounds placement: each peer call
+        gets only what is left, and no candidate is tried once it has passed.
+        A member that refuses, or cannot be reached, is passed over; one that
+        took the request and never answered may have started the run, so
+        placement stops there rather than risk starting it twice.
         """
+        def left(most):
+            if deadline is None:
+                return most
+            return min(most, deadline - time.monotonic())
         task = self._task(name)
         self._resolve_inputs(task, inputs)
         self._payload_bytes(payload)
@@ -550,7 +591,7 @@ class TaskService:
         if here or node == local:
             return self._run_here(task, inputs, payload, wait)
         if task["overlap"] == "skip":
-            busy = self._running_anywhere(name)
+            busy = self._running_anywhere(name, timeout=left(RUNS_TIMEOUT))
             if busy:
                 raise ServiceError("Task '%s' is already running on %s, and its overlap "
                                    "setting is skip." % (name, busy), 409)
@@ -567,18 +608,32 @@ class TaskService:
                     return self._run_here(task, inputs, payload, wait, checked=True)
                 refusals.append("%s: %s" % (candidate, reason))
                 continue
+            budget = left(FORWARD_TIMEOUT)
+            if deadline is not None and budget < 1:
+                refusals.append("%s: not tried, out of time" % candidate)
+                break
             try:
-                return self._forward(candidate, name, inputs, payload, wait)
+                return self._forward(candidate, name, inputs, payload, wait, timeout=budget,
+                                     connect_timeout=min(FORWARD_CONNECT, budget))
             except (NodeError, ClusterError) as exc:
                 refusals.append("%s: %s" % (candidate, exc.message))
+                if getattr(exc, "ambiguous", False):
+                    raise ServiceError(
+                        "Task '%s' may have started on %s, which took the request but "
+                        "did not answer; not trying another node, so it cannot run "
+                        "twice. Check %s's runs." % (name, candidate, candidate), 504)
         raise ServiceError("No node would take task '%s': %s." % (name, "; ".join(refusals)), 409)
 
-    def _forward(self, node, name, inputs, payload, wait):
+    def _forward(self, node, name, inputs, payload, wait, timeout=None, connect_timeout=None):
         task = store.load_tasks().get(name) or {}
-        timeout = (task.get("timeout_seconds") or 900) + 120 if wait else 30
+        if wait:
+            timeout = (task.get("timeout_seconds") or 900) + 120
+        elif timeout is None:
+            timeout = FORWARD_TIMEOUT
         return self.cluster.client(node, timeout=timeout).request(
             "POST", "/api/tasks/%s/invoke" % _seg(name),
-            {"inputs": inputs or {}, "payload": payload, "here": True, "wait": bool(wait)})
+            {"inputs": inputs or {}, "payload": payload, "here": True, "wait": bool(wait)},
+            connect_timeout=connect_timeout)
 
     def _run_here(self, task, inputs, payload, wait, checked=False):
         if not checked:
@@ -594,6 +649,105 @@ class TaskService:
                 raise ServiceError("Task '%s' is already running here, and its overlap "
                                    "setting is skip." % task["name"], 409)
         return self._start(task, "invoke", None, inputs, payload, wait)
+
+    # -- webhooks ----------------------------------------------------------
+
+    def receive_webhook(self, name, headers, raw):
+        """``(status, data)`` for one webhook delivery to task ``name``, or raise.
+
+        The signature is the whole of the credential: GitHub signs the body
+        with a secret both ends hold and never sends the secret itself, so
+        there is no token here to authenticate. Every reason a delivery cannot
+        be checked -- no such task, no webhook on it, its secret not set, a
+        wrong signature -- is the same 403 to the caller, so the endpoint
+        cannot be used to learn which tasks exist; the log says which it was.
+        Only a verified ``queued`` job whose labels the task offers starts a
+        run, and nothing waits for it: GitHub gives a delivery 10 seconds.
+        """
+        deadline = time.monotonic() + WEBHOOK_SECONDS
+        delivery = _header(headers, "X-GitHub-Delivery")[:100]
+        event = _header(headers, "X-GitHub-Event")[:100]
+        fields = {"task": name, "delivery": delivery, "event": event,
+                  "agent": _header(headers, "User-Agent")[:100]}
+        problem = self._webhook_problem(name, headers, raw)
+        if problem:
+            eventlog.event("auth", "task.webhook", level=logging.WARNING, result="refused",
+                           reason=problem, **fields)
+            raise ServiceError("Webhook signature does not match.", 403)
+        content_type = _header(headers, "Content-Type").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            eventlog.event("system", "task.webhook", level=logging.WARNING,
+                           result="refused", reason="content type " + content_type, **fields)
+            raise ServiceError("Webhook content type must be application/json (GitHub: "
+                               "Settings -> Webhooks -> Content type).", 415)
+        if event == "ping":
+            eventlog.event("system", "task.webhook", result="pong", **fields)
+            return 200, {"result": "pong"}
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            raise ServiceError("Webhook body is not valid JSON.", 400)
+        if not isinstance(body, dict):
+            raise ServiceError("Webhook body must be a JSON object.", 400)
+        task = self._task(name)
+        reason = _github_ignored(event, body, task["webhook"]["labels"])
+        if reason is None and delivery and not self._first_delivery(delivery):
+            reason = "delivery %s was already received" % delivery
+        if reason:
+            eventlog.event("system", "task.webhook", level=logging.DEBUG, result="ignored",
+                           reason=reason, **fields)
+            return 200, {"result": "ignored", "reason": reason}
+        offered = _github_inputs(body, task["webhook"]["scope"], delivery)
+        inputs = {k: v for k, v in offered.items() if k in task["inputs"]}
+        payload = raw.decode("utf-8") if len(raw) <= PAYLOAD_LIMIT else None
+        try:
+            run = self.invoke(name, inputs=inputs, payload=payload, deadline=deadline)
+        except (ServiceError, NodeError, ClusterError) as exc:
+            # Not taken, so a redelivery must be allowed to try again -- unless
+            # a member may have taken it without answering (504), when a
+            # redelivery could start the job's runner twice.
+            if getattr(exc, "code", None) != 504:
+                self._forget_delivery(delivery)
+            eventlog.event("system", "task.webhook", level=logging.WARNING, result="failed",
+                           reason=exc.message, **fields)
+            code = getattr(exc, "code", 503)
+            raise ServiceError(exc.message, 503 if code in (409, 502, 503) else code)
+        eventlog.event("system", "task.webhook", result="started", run=run.get("id"),
+                       node=run.get("node"), job=offered["GITHUB_JOB_ID"], **fields)
+        return 202, {"result": "started", "run": run.get("id"), "node": run.get("node")}
+
+    def _webhook_problem(self, name, headers, raw):
+        """Why a delivery cannot be verified, for the log; None when it is genuine."""
+        task = store.load_tasks().get(name)
+        if task is None:
+            return "no such task"
+        if not task["webhook"]:
+            return "the task has no webhook"
+        secret = store.load_stack_secrets(name, store.TASK_SECRETS_KIND).get(
+            task["webhook"]["secret"])
+        if not secret or not secret.get("value"):
+            return "its secret %s is not set" % task["webhook"]["secret"]
+        given = _header(headers, "X-Hub-Signature-256")
+        if not given:
+            return "no X-Hub-Signature-256 header"
+        expected = "sha256=" + hmac.new(secret["value"].encode("utf-8"), raw,
+                                        hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected.encode("ascii"), given.encode("utf-8", "replace")):
+            return "wrong signature"
+        return None
+
+    def _first_delivery(self, delivery):
+        with self._lock:
+            if delivery in self._deliveries:
+                return False
+            self._deliveries[delivery] = time.time()
+            while len(self._deliveries) > WEBHOOK_REMEMBERED:
+                self._deliveries.popitem(last=False)
+            return True
+
+    def _forget_delivery(self, delivery):
+        with self._lock:
+            self._deliveries.pop(delivery, None)
 
     # -- negotiating a scheduled occurrence --------------------------------
 
@@ -1041,7 +1195,7 @@ class TaskService:
         found = found[:LISTED_RUNS]
         return {"runs": found if detail else [_brief(r) for r in found], "errors": errors}
 
-    def _peer_runs(self, task, live):
+    def _peer_runs(self, task, live, timeout=RUNS_TIMEOUT):
         me = self.cluster.local_name()
         peers = [n for n in self.cluster.all_nodes() if n != me]
         params = {"local": "1"}
@@ -1052,7 +1206,7 @@ class TaskService:
 
         def ask(node):
             try:
-                answer = self.cluster.client(node, timeout=RUNS_TIMEOUT).request(
+                answer = self.cluster.client(node, timeout=max(timeout, 0.5)).request(
                     "GET", "/api/task-runs", params=params)
                 return node, answer.get("runs") or [], None
             except (NodeError, ClusterError, OSError) as exc:
@@ -1206,6 +1360,92 @@ def _names(value, what):
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise ServiceError("%s must be a list of names." % what)
     return list(dict.fromkeys(v.strip() for v in value if v.strip()))
+
+
+def _check_webhook(raw, secrets):
+    """A task's webhook as stored, or None for none; raise on a bad one."""
+    if raw in (None, "", {}):
+        return None
+    if not isinstance(raw, dict):
+        raise ServiceError("webhook must be an object: {provider, secret, labels, scope}.")
+    provider = raw.get("provider") or "github"
+    if provider not in store.TASK_WEBHOOK_PROVIDERS:
+        raise ServiceError("A webhook's provider is one of: %s."
+                           % ", ".join(store.TASK_WEBHOOK_PROVIDERS))
+    secret = str(raw.get("secret") or "")
+    if secret not in secrets:
+        raise ServiceError("A webhook is checked with one of the task's own secrets: declare "
+                           "%s under secrets and name it here."
+                           % (("'%s'" % secret) if secret else "one"))
+    labels = raw.get("labels")
+    if isinstance(labels, str):
+        labels = labels.split(",")
+    if not isinstance(labels, list):
+        raise ServiceError("A webhook's labels are a list of the labels its runner offers.")
+    labels = list(dict.fromkeys(str(label).strip() for label in labels if str(label).strip()))
+    if not labels:
+        raise ServiceError("A webhook needs the labels its runner offers: a job whose "
+                           "runs-on asks for anything else is left alone.")
+    if len(labels) > store.TASK_WEBHOOK_LABELS or any(len(label) > 100 for label in labels):
+        raise ServiceError("A webhook has at most %d labels of at most 100 characters."
+                           % store.TASK_WEBHOOK_LABELS)
+    scope = raw.get("scope") or "repo"
+    if scope not in store.TASK_WEBHOOK_SCOPES:
+        raise ServiceError("A webhook's scope is one of: %s."
+                           % ", ".join(store.TASK_WEBHOOK_SCOPES))
+    return {"provider": provider, "secret": secret, "labels": labels, "scope": scope}
+
+
+def _header(headers, name):
+    return str((headers.get(name) if headers is not None else None) or "").strip()
+
+
+def _github_ignored(event, body, offered):
+    """Why a verified GitHub delivery starts nothing, or None when it should.
+
+    GitHub gives a queued job to any runner offering every label its runs-on
+    asks for, so that is the test -- case-insensitively, as GitHub does.
+    `in_progress`, `completed` and `waiting` are the same job moving on.
+    """
+    if event != "workflow_job":
+        return "event %s is not workflow_job" % (event or "(none)")
+    action = body.get("action")
+    if action != "queued":
+        return "action %s is not queued" % action
+    job = body.get("workflow_job")
+    if not isinstance(job, dict) or not isinstance(body.get("repository"), dict):
+        return "no workflow_job or repository in the body"
+    wanted = [str(label) for label in job.get("labels") or [] if label]
+    if not wanted:
+        return "the job asks for no labels"
+    have = {label.lower() for label in offered}
+    missing = [label for label in wanted if label.lower() not in have]
+    if missing:
+        return "the job asks for %s, which this task's runner does not offer" % ", ".join(
+            missing)
+    return None
+
+
+def _github_inputs(body, scope, delivery):
+    """The GITHUB_* inputs a queued workflow_job offers a run."""
+    job, repo = body["workflow_job"], body["repository"]
+    url = str(repo.get("html_url") or "")
+    if scope == "org":
+        # The organisation's page is the repository's minus its own name --
+        # right for GHES too, where the host is not github.com.
+        url = url.rsplit("/", 1)[0]
+
+    def text(value):
+        return "" if value is None else str(value)[:store.TASK_INPUT_BYTES]
+    return {
+        "GITHUB_URL": text(url), "GITHUB_REPOSITORY": text(repo.get("full_name")),
+        "GITHUB_JOB_ID": text(job.get("id")), "GITHUB_JOB_NAME": text(job.get("name")),
+        "GITHUB_RUN_ID": text(job.get("run_id")),
+        "GITHUB_RUN_ATTEMPT": text(job.get("run_attempt")),
+        "GITHUB_WORKFLOW": text(job.get("workflow_name")),
+        "GITHUB_LABELS": text(",".join(str(label) for label in job.get("labels") or [])),
+        "GITHUB_DELIVERY": text(delivery),
+    }
 
 
 def _check_schedule(raw):

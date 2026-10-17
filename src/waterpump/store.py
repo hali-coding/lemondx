@@ -505,6 +505,26 @@ def _clean_task_input(entry):
             "secret": secret}
 
 
+# What a webhook may start a run from. The secret is the name of one of the
+# task's own secrets, never a value: this file is synced in the clear.
+TASK_WEBHOOK_PROVIDERS = ("github",)
+TASK_WEBHOOK_SCOPES = ("repo", "org")
+TASK_WEBHOOK_LABELS = 100                  # GitHub's own limit on a runner's labels
+
+
+def _clean_task_webhook(stored):
+    if not isinstance(stored, dict) or stored.get("provider") not in TASK_WEBHOOK_PROVIDERS:
+        return None
+    secret = _text(stored.get("secret"), 64)
+    labels = [label for label in (_text(v, 100) for v in _strings(stored.get("labels")))
+              if label][:TASK_WEBHOOK_LABELS]
+    if not secret or not labels:
+        return None
+    scope = stored.get("scope")
+    return {"provider": stored["provider"], "secret": secret, "labels": labels,
+            "scope": scope if scope in TASK_WEBHOOK_SCOPES else "repo"}
+
+
 def _clean_task(stored, name):
     bootstrap = stored.get("bootstrap")
     overlap = stored.get("overlap")
@@ -530,6 +550,7 @@ def _clean_task(stored, name):
         # Declarations only, like a stack's: the values are in auth/.
         "secrets": _clean_stack_values(stored.get("secrets"), lambda e: {
             "description": _text(e.get("description"), 200)}),
+        "webhook": _clean_task_webhook(stored.get("webhook")),
     }
 
 

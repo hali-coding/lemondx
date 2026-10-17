@@ -212,7 +212,7 @@ function ParamField({ param, n, value, disabled, secretsAtLaunch, secretReferenc
           value={value.params[key] ?? param.value}
           placeholder={shared ? 'same as the first' : param.default}
           disabled={disabled}
-          aria-invalid={param.secret && !value.params[key] && !shared}
+          aria-invalid={param.secret && !param.optional && !value.params[key] && !shared}
           onChange={(event) => onChange(key, event.target.value)}
         />
       )}
@@ -224,7 +224,7 @@ function ParamField({ param, n, value, disabled, secretsAtLaunch, secretReferenc
           )}
           {param.secret && (
             <span className="faint">
-              {' '}· required, never saved or shown in logs
+              {' '}· {param.optional ? 'optional' : 'required'}, never saved or shown in logs
             </span>
           )}
         </span>

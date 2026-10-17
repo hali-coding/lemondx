@@ -29,6 +29,7 @@ has a **Bootstrap** tab with the same picker and a live log.
 | `apache2` | Apache httpd, optionally with a virtual host you paste in | `VHOST_CONFIG` (text), `VHOST_NAME`, `ENABLE_MODULES`, `DISABLE_DEFAULT_SITE` |
 | `nfs-mount` | the NFS client, and a remote export mounted now and at every boot; add it once per mount | `NFS_SOURCE`, `NFS_MOUNTPOINT`, `NFS_OPTIONS` |
 | `mdns` | Avahi announcing the instance as `<name>.local`, optionally advertising services, and resolving other `.local` names | `MDNS_HOSTNAME`, `MDNS_SERVICES`, `MDNS_RESOLVE` |
+| `github-agent` | a self-hosted GitHub Actions runner, registered and running as a service; add it once per repository | `GITHUB_RUNNER_TOKEN` (secret), `GITHUB_REPO_URL`, `RUNNER_MODE`, `RUNNER_NAME`, `RUNNER_LABELS`, `RUNNER_GROUP`, `RUNNER_USER`, `RUNNER_VERSION`, `RUNNER_SHA256`, `RUNNER_IDLE_SECONDS` |
 
 Modules run in `order`, low to high, so `base` (10) precedes `ssh-access` (20)
 whatever sequence you tick them in. A failing module stops the run and its
@@ -289,7 +290,10 @@ grammar, different handling:
 ```
 
 A secret has no default (anything after `=` is ignored) and must be supplied on
-every run; bootstrap refuses to start without it. It is never remembered as a
+every run; bootstrap refuses to start without it. A module that needs a secret
+only in some modes lists it under `optional:` (`# optional: GITHUB_RUNNER_TOKEN`),
+and then checks for it itself: an empty one is let through, and it is still a
+secret in every other way. It is never remembered as a
 setting, cannot be saved with `module-set`, is stripped from bootstrap profiles
 and templates (including hand-edited ones), and every occurrence of its value is replaced
 with `********` in the output shown in the UI, the terminal and `--json`. The
@@ -471,6 +475,74 @@ Where systemd-resolved runs, the module turns its own mDNS off
 port 5353. It also comments out Avahi's `rlimit-nproc`: on host kernels
 before 5.14 that limit was counted across every container sharing the
 daemon's ID map, so a second instance running Avahi could not start it.
+
+## The GitHub runner module
+
+`github-agent` installs the [Actions runner](https://github.com/actions/runner),
+registers it with a repository, organisation or enterprise, and runs it as a
+systemd unit through the runner's own `svc.sh`, so it survives a restart.
+It needs glibc, so not Alpine, and `service` mode needs systemd.
+Verified up to registration with a Debian 13 container, and `install` and `jit` (against
+a stand-in for the GitHub API) with Ubuntu 24.04, on x64.
+
+```bash
+GITHUB_RUNNER_TOKEN="$(pass show gh/runner-pat)" waterpump create ci-1 \
+    -i images:debian/13 -b base -b docker -b github-agent \
+    --param GITHUB_REPO_URL=https://github.com/owner/repo --param RUNNER_LABELS=lxd
+```
+
+- **`GITHUB_RUNNER_TOKEN`** is either a registration token (from the repo's
+  *Settings → Actions → Runners → New runner*, valid for an hour) or a
+  credential -- a `ghp_`/`github_pat_` token with admin on the repository or
+  organisation, or an app's `ghs_` installation token -- which the module
+  uses to mint a registration token on every run. Use a credential in a
+  template, or the first launch more than an hour after you pasted the token
+  fails. Neither reaches a command line: curl reads the header on stdin and
+  `config.sh` reads `ACTIONS_RUNNER_INPUT_TOKEN`.
+- **`GITHUB_REPO_URL`** is `https://<host>/owner/repo`, `https://<host>/org`
+  or `https://<host>/enterprises/name`; a host other than `github.com` is
+  taken as GitHub Enterprise Server (`/api/v3`).
+- **`RUNNER_VERSION`** `latest` asks the GitHub API, and the tarball's
+  SHA-256 comes from the release notes unless **`RUNNER_SHA256`** gives it.
+  Pin both to make no API call at all: unauthenticated it allows 60 calls an
+  hour per address, which a swarm behind one NAT runs through.
+- **`RUNNER_NAME`** blank is the instance's name, and the runner registers
+  with `--replace`, so a recreated instance takes over its predecessor's
+  registration.
+- **`RUNNER_USER`** (`runner`) owns the runner and runs every job. It joins
+  the `docker` group when one exists, so select the `docker` module too if
+  jobs need Docker -- it runs first (order 60 against 90).
+
+**`RUNNER_MODE`** picks what it does:
+
+- **`service`** (the default) registers the runner and runs it under systemd,
+  as above: a runner that stays.
+- **`install`** only downloads, verifies and installs the runner and its
+  dependencies; no URL or token is needed. For a template's setup, or an
+  image or snapshot to start from. A later pass finds it installed and skips
+  the download.
+- **`jit`** registers a just-in-time runner for **one job** and runs it in
+  the foreground: the module returns when the job is done, and GitHub removes
+  the runner itself. It needs a credential (a JIT config cannot be had with a
+  registration token), `RUNNER_LABELS` (the job's own, which a webhook task
+  passes as `{{inputs.GITHUB_LABELS}}`), and in it `RUNNER_GROUP` is a numeric
+  group id (blank: 1, *Default*). The config reaches the runner as
+  `ACTIONS_RUNNER_INPUT_JITCONFIG`, never argv. If no job has started after
+  **`RUNNER_IDLE_SECONDS`** (300) -- another runner took it, or it was
+  cancelled -- it stops and removes the registration. This is what a task
+  started by a [GitHub webhook](tasks.md#github-actions-runners-from-a-webhook)
+  runs; it needs no systemd. Repository and organisation runners only.
+
+Running the module again on a registered runner only makes sure the service
+runs. Each repeat is another runner in `/opt/actions-runner-N`, named with a
+`-N` suffix, sharing the first copy's token unless given
+`GITHUB_RUNNER_TOKEN@N`.
+
+Destroying the instance does not unregister the runner: GitHub shows it
+offline until it removes it. And a runner on a **public** repository runs
+whatever a fork's pull request asks it to -- require approval for outside
+contributors, or register it with a private repository or a restricted
+runner group.
 
 ## If modules cannot install anything
 

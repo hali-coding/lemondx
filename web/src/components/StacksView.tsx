@@ -113,9 +113,11 @@ function stackSecrets(stack: Stack, templates: InstanceTemplate[],
     for (const module of modules) {
       if (!used.includes(module.id)) continue
       // One the step fills in itself is not asked for, and neither is one a
-      // stack secret of the same name fills -- the server hands it over.
+      // stack secret of the same name fills -- the server hands it over --
+      // nor one the module marks optional, which a step can still set.
       for (const param of module.params) {
-        if (param.secret && !(param.name in step.params) && !(param.name in stack.secrets)) {
+        if (param.secret && !param.optional && !(param.name in step.params)
+            && !(param.name in stack.secrets)) {
           found.set(param.name, param)
         }
       }

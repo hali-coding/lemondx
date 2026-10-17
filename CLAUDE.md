@@ -273,10 +273,11 @@ what keeps that from locking the user out of their own UI with no way back in.
 Trust between nodes is pinned certificates. `NodeClient._connect()` checks the
 pin after the handshake and **before writing the request**, so a wrong
 certificate never sees the credential -- keep any new call path going through
-`_connect()`. `/api/cluster/enroll` is the one unauthenticated endpoint, handled
+`_connect()`. `/api/cluster/enroll` is unauthenticated, handled
 in `_handle_enroll()` before routing like login, because the one-time code in
 the body *is* the credential; invite hashes live in `auth/` on disk, so a code
-issued by the CLI is redeemable against a running `serve`.
+issued by the CLI is redeemable against a running `serve`. `/api/hooks/{task}`
+is the only other one (see Tasks).
 
 `/api/nodes/{node}/{path}` forwards one call to a member (`_forward()` in
 server.py, `ClusterService.proxy()` for the transport), which is what lets the
@@ -616,8 +617,26 @@ and vetoed when it is the candidate's. Grants expire well after
 `late_limit()`, so an occurrence can never be granted afresh. Invoking needs
 no vote: the receiving node picks the first non-declining eligible node in a
 random rank and forwards with `here: true`, which a route believes only from
-a member. Don't add anything that runs an occurrence without a majority --
+a member. Unreachable (a `NodeError` raised before sending) passes to the next
+node; `ambiguous` (sent, never answered) stops with a 504, since the next node
+would make it twice. A webhook places under `WEBHOOK_SECONDS`, inside GitHub's
+10-second delivery limit, and keeps a 504'd delivery id remembered. Don't add anything that runs an occurrence without a majority --
 that is the one property the whole design exists for.
+
+**Webhooks** are the other way in: `POST /api/hooks/{task}` is handled before
+routing like enroll (`_handle_hook()`), because the HMAC over the raw body is
+the credential -- GitHub signs with a secret and never sends it, so there is
+no token to check, and the body must be read raw since re-serialised JSON
+would not match. The secret is one of the task's own (`webhook.secret` names
+it; the value is sealed and synced like any task secret), which is what lets
+any member verify a delivery. `receive_webhook()` gives one 403 for every
+reason a delivery cannot be verified, unknown task included, so the endpoint
+does not say which tasks exist; the log does. Only a `workflow_job` `queued`
+whose labels are all offered starts anything, through plain `invoke()` --
+no vote, since one delivery is one run -- and only `GITHUB_*` inputs the task
+declares are passed, since `_resolve_inputs` refuses others. Delivery ids are
+remembered per process (GitHub keeps the id on redelivery) and forgotten when
+no node took the run, so a redelivery can try again.
 
 ### Fabrics
 
@@ -797,7 +816,7 @@ goes through the pinned `_connect()` like every other peer call.
 ### Bootstrap modules
 
 A module is a POSIX shell script with a `# key: value` metadata header (`name`,
-`description`, `order`, `uses`, `param`, `secret`, `text`, `repeatable`). `BootstrapRunner` sorts by `order`, prepends
+`description`, `order`, `uses`, `param`, `secret`, `optional`, `text`, `repeatable`). `BootstrapRunner` sorts by `order`, prepends
 `modules/_prelude.sh` to each script, pushes it to `/tmp` in the container, runs it with
 declared params as environment variables, and deletes it. Modules run under `/bin/sh`
 (dash, busybox ash) because minimal images often have no bash — **keep them POSIX**, and
@@ -817,7 +836,8 @@ each occurrence's own values as plain `NAME`, falling back to the first's.
 `secret:` declares a param that must never persist. Params carry `"secret": True`, and
 every path that stores or reports a value checks it: `effective_params()` ignores a saved
 one, `_remember_params()` and `update_module_settings()` skip or reject it, profiles strip
-it on save and on list, the runner refuses to start when one is empty and passes every
+it on save and on list, the runner refuses to start when one is empty (unless the header lists it
+under `optional:`, for a module that checks it itself) and passes every
 module result through `redact()`, and the CLI takes it from an env var of the same name or
 `getpass` rather than argv. A new place that persists or echoes params needs the same check.
 

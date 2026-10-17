@@ -2182,6 +2182,13 @@ def cmd_task_show(args, service):
         for name in sorted(t["secrets"]):
             lines.append("  secret:    %s  %s" % (name, "set" if name in t["secret_status"]
                                                   else YELLOW("not set")))
+        hook = t.get("webhook")
+        if hook:
+            lines.append("  webhook:   %s %s, signed with secret %s%s" % (
+                hook["provider"], t["hook_path"], hook["secret"],
+                "" if hook["secret"] in t["secret_status"] else YELLOW(" (not set)")))
+            lines.append("             runner offers %s; %s URL" % (
+                ", ".join(hook["labels"]), hook["scope"]))
         if runs:
             lines.append("")
             lines.extend(render_task_run(r, full=False) for r in runs)
@@ -2253,6 +2260,18 @@ def _task_definition(args, existing):
         given = getattr(args, key)
         if given is not None:
             record[key] = [v for item in given for v in item.split(",") if v]
+    if args.no_webhook:
+        record["webhook"] = None
+    elif args.webhook_secret or args.webhook_label or args.webhook_scope:
+        webhook = dict(record.get("webhook") or {"provider": "github"})
+        if args.webhook_secret:
+            webhook["secret"] = args.webhook_secret
+        if args.webhook_label:
+            webhook["labels"] = [v for item in args.webhook_label
+                                 for v in item.split(",") if v]
+        if args.webhook_scope:
+            webhook["scope"] = args.webhook_scope
+        record["webhook"] = webhook
     if args.timeout is not None:
         record["timeout_seconds"] = args.timeout
     if args.overlap:
@@ -2273,7 +2292,7 @@ def cmd_task_save(args, service):
     record.pop("name", None)
     saved = tasks.save_task(args.name, **{k: v for k, v in record.items() if k in (
         "template", "bootstrap", "script", "description", "schedule", "nodes", "groups",
-        "timeout_seconds", "overlap", "inputs", "secrets", "enabled")})
+        "timeout_seconds", "overlap", "inputs", "secrets", "webhook", "enabled")})
     emit(args, saved, lambda t: "%s saved task %s: %s on %s, %s%s%s" % (
         GREEN("+"), BOLD(t["name"]), _task_job(t), t["template"],
         _task_schedule(t), sync_note(t), "".join(
@@ -2398,6 +2417,16 @@ def cmd_task_run(args, service):
     return 0 if run["status"] == "ok" else 1
 
 
+def _run_said(run):
+    """A task run's last word: its last module's last summary line, else its error."""
+    modules = (run.get("job") or {}).get("modules")
+    if not modules:
+        return run.get("error") or ""
+    summary = next((m["summary"] for m in reversed(modules) if m.get("summary")), "")
+    lines = summary.splitlines()
+    return lines[-1] if lines else ""
+
+
 def cmd_task_runs(args, service):
     found = task_service(service).runs(task=args.name, local=args.local_only)
     for problem in found["errors"]:
@@ -2409,10 +2438,7 @@ def cmd_task_runs(args, service):
           r["id"], r["node"], r["trigger"], _when(r["started_at"]),
           "%ds" % ((r["finished_at"] or time.time()) - r["started_at"]),
           "-" if r.get("exit_code") is None else str(r["exit_code"]),
-          short_value(next((m.get("summary") for m in reversed(
-              (r.get("job") or {}).get("modules") or []) if m.get("summary")), "")
-              .splitlines()[-1:][0] if (r.get("job") or {}).get("modules") else
-              (r.get("error") or ""))]
+          short_value(_run_said(r))]
          for r in runs],
         ["status", "task", "run", "node", "trigger", "started", "took", "exit", "said"]))
     return 0
@@ -2739,6 +2765,8 @@ def fill_secrets(modules, params, service, only=None):
             elif sys.stdin.isatty():
                 label = "%s (%s)" % (name, param["description"]) if param["description"] \
                     else name
+                if param.get("optional"):
+                    label += " [optional, Enter to skip]"
                 value = getpass.getpass("%s: " % label)
                 if value:
                     params[name] = value
@@ -4971,6 +4999,16 @@ def build_parser():
                         "member of them for each run (repeatable)")
     p.add_argument("--node", dest="nodes", action="append", metavar="NODE[,NODE]",
                    help="also these members, beside its groups (repeatable)")
+    p.add_argument("--webhook-secret", metavar="SECRET",
+                   help="start a run from a GitHub workflow_job webhook, its signature "
+                        "checked with this task secret (see docs/tasks.md)")
+    p.add_argument("--webhook-label", action="append", metavar="LABEL[,LABEL]",
+                   help="a label the runner offers; a queued job asking for any other "
+                        "is ignored (repeatable)")
+    p.add_argument("--webhook-scope", choices=("repo", "org"),
+                   help="whether GITHUB_URL is the repository's (default) or its "
+                        "organisation's")
+    p.add_argument("--no-webhook", action="store_true", help="remove the webhook")
     p.add_argument("--timeout", type=int, metavar="SECONDS",
                    help="the whole run, create to destroy (default 900)")
     p.add_argument("--overlap", choices=("skip", "allow"),

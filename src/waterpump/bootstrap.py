@@ -119,7 +119,7 @@ def parse_module(path):
     with open(path, encoding="utf-8") as handle:
         text = handle.read()
 
-    meta = {"param": [], "uses": []}
+    meta = {"param": [], "uses": [], "optional": []}
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("#!"):
@@ -137,8 +137,8 @@ def parse_module(path):
                                   multiline=key == "text")
             if parsed:
                 meta["param"].append(parsed)
-        elif key == "uses":
-            meta["uses"].extend(value.replace(",", " ").split())
+        elif key in ("uses", "optional"):
+            meta[key].extend(value.replace(",", " ").split())
         else:
             meta[key] = value
 
@@ -147,6 +147,11 @@ def parse_module(path):
         order = int(meta.get("order", 50))
     except ValueError:
         order = 50
+
+    # A secret the module only needs in some modes, and checks for itself:
+    # still a secret for storage and redaction, just not refused when empty.
+    for param in meta["param"]:
+        param["optional"] = param["secret"] and param["name"] in meta["optional"]
 
     directory = os.path.dirname(os.path.abspath(path))
     builtin = directory == os.path.abspath(builtin_module_dir())
@@ -241,7 +246,7 @@ def missing_secrets(available, module_ids, values):
     return sorted({param["name"] for module_id, n in occurrences(module_ids)
                    if module_id in available
                    for param in available[module_id]["params"]
-                   if param.get("secret")
+                   if param.get("secret") and not param.get("optional")
                    and not occurrence_value(values, param["name"], n, secret=True)})
 
 

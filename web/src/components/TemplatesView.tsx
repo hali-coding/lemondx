@@ -656,7 +656,7 @@ function ActionDialog({ template, action, members, stale, secrets, count, nodes,
   const [group, setGroup] = useState(scope.kind === 'group' ? scope.name : '')
   const skipped = group
     ? (groups.find((g) => g.name === group)?.members ?? []).filter((m) => held.has(m)) : []
-  const complete = secrets.every((p) => values[p.name])
+  const complete = secrets.every((p) => p.optional || values[p.name])
   const launch = action === 'launch'
   const federated = launch && nodes.length > 1
   const somewhere = !federated || !!group || chosen.length > 0

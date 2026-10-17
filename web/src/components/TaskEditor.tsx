@@ -62,6 +62,11 @@ export function TaskEditor({ task, templates, modules, groups, nodes, onSaved, o
     groups: task?.groups ?? [], nodes: task?.nodes ?? [] })
   const [timeout, setTimeoutText] = useState(String(task?.timeout_seconds ?? TIMEOUT.fallback))
   const [overlap, setOverlap] = useState<'skip' | 'allow'>(task?.overlap ?? 'skip')
+  const [hooked, setHooked] = useState(!!task?.webhook)
+  const [hookSecret, setHookSecret] = useState(task?.webhook?.secret ?? '')
+  const [hookLabels, setHookLabels] = useState(
+    (task?.webhook?.labels ?? ['self-hosted', 'Linux', 'X64']).join(', '))
+  const [hookScope, setHookScope] = useState<'repo' | 'org'>(task?.webhook?.scope ?? 'repo')
   const [previewed, setPreview] = useState<CronPreview | null>(null)
   const [previewFailure, setPreviewError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -98,6 +103,10 @@ export function TaskEditor({ task, templates, modules, groups, nodes, onSaved, o
   const inputsValid = inputs.every((i) => VALUE_NAME.test(i.name))
     && new Set(inputs.map((i) => i.name.toUpperCase())).size === inputs.length
   const secretsValid = secrets.every((s) => VALUE_NAME.test(s.name))
+  const labelList = useMemo(
+    () => hookLabels.split(',').map((l) => l.trim()).filter(Boolean), [hookLabels])
+  const hookValid = !hooked
+    || (secrets.some((s) => s.name === hookSecret) && labelList.length > 0)
   const unattended = scheduled
     ? inputs.filter((i) => i.required && !i.default).map((i) => i.name) : []
 
@@ -115,10 +124,13 @@ export function TaskEditor({ task, templates, modules, groups, nodes, onSaved, o
     inputs: Object.fromEntries(inputs.map(({ name: n, ...spec }) => [
       n, { ...spec, default: spec.secret ? '' : spec.default }])),
     secrets: Object.fromEntries(secrets.map((s) => [s.name, { description: s.description }])),
+    webhook: hooked
+      ? { provider: 'github', secret: hookSecret, labels: labelList, scope: hookScope } : null,
     enabled,
     ...(task && task.name !== name.trim() ? { previous: task.name } : {}),
   }), [template, job, jobKind, script, description, scheduled, cron, timezone, targets, timeoutValid,
-    timeoutValue, overlap, inputs, secrets, enabled, task, name])
+    timeoutValue, overlap, inputs, secrets, hooked, hookSecret, labelList, hookScope,
+    enabled, task, name])
 
   const placed = targets.groups.length > 0
   // What the chosen groups hold now, said under the box.
@@ -130,7 +142,7 @@ export function TaskEditor({ task, templates, modules, groups, nodes, onSaved, o
     : script.trim().length > 0 && scriptBytes <= SCRIPT_LIMIT
   const canSubmit = !busy && nameValid && !!template && hasJob && timeoutValid
     && placed
-    && inputsValid && secretsValid && unattended.length === 0
+    && inputsValid && secretsValid && unattended.length === 0 && hookValid
     && (!scheduled || !previewError)
 
   async function submit(event: FormEvent) {
@@ -426,6 +438,62 @@ export function TaskEditor({ task, templates, modules, groups, nodes, onSaved, o
             onClick={() => setSecrets((rows) => [...rows, { name: '', description: '' }])}>
             <PlusIcon /> Add secret
           </button>
+        </details>
+
+        <details className="bootstrap-section" open={hooked}>
+          <summary>
+            GitHub webhook
+            {hooked && <span className="badge badge-info">on</span>}
+          </summary>
+          <label className="check">
+            <input type="checkbox" checked={hooked} disabled={busy}
+              onChange={(e) => setHooked(e.target.checked)} />
+            Start a run for each queued GitHub Actions job (a <span className="mono">workflow_job</span> webhook)
+          </label>
+          {hooked && (
+            <>
+              <div className="grid-2">
+                <div className="field">
+                  <label htmlFor="task-hook-secret">Signed with secret</label>
+                  <select id="task-hook-secret" className="input" value={hookSecret}
+                    disabled={busy} aria-invalid={!secrets.some((s) => s.name === hookSecret)}
+                    onChange={(e) => setHookSecret(e.target.value)}>
+                    <option value="">pick one of the task&rsquo;s secrets</option>
+                    {secrets.filter((s) => VALUE_NAME.test(s.name)).map((s) => (
+                      <option key={s.name} value={s.name}>{s.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="field">
+                  <label htmlFor="task-hook-scope">GITHUB_URL is the</label>
+                  <select id="task-hook-scope" className="input" value={hookScope} disabled={busy}
+                    onChange={(e) => setHookScope(e.target.value as 'repo' | 'org')}>
+                    <option value="repo">repository</option>
+                    <option value="org">organisation</option>
+                  </select>
+                </div>
+              </div>
+              <div className="field">
+                <label htmlFor="task-hook-labels">Labels the runner offers</label>
+                <input id="task-hook-labels" className="input mono" value={hookLabels}
+                  disabled={busy} aria-invalid={labelList.length === 0}
+                  onChange={(e) => setHookLabels(e.target.value)} />
+              </div>
+              <span className="hint">
+                In GitHub: Settings &rarr; Webhooks &rarr; Add webhook, payload URL{' '}
+                <span className="mono">
+                  {window.location.origin}/api/hooks/{encodeURIComponent(name.trim() || 'NAME')}
+                </span>{' '}
+                (through your public proxy), content type <span className="mono">application/json</span>,
+                the same value as the secret, and only <em>Workflow jobs</em>. A job runs here
+                only when every label its <span className="mono">runs-on</span> asks for is
+                above; declare <span className="mono">GITHUB_URL</span>,{' '}
+                <span className="mono">GITHUB_LABELS</span> and the other{' '}
+                <span className="mono">GITHUB_*</span> inputs you want handed on.
+                {overlap === 'skip' && ' Set overlap to "Run another alongside", or only one job runs at a time.'}
+              </span>
+            </>
+          )}
         </details>
 
         <details className="bootstrap-section">
