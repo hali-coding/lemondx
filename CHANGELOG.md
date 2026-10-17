@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.0](https://github.com/hali-coding/waterpump/compare/v0.10.0...v0.11.0) (2026-10-17)
+
+
+### Features
+
+* code cleanup ([56247ae](https://github.com/hali-coding/waterpump/commit/56247aef0f84806fb25b9b9eba048581edef5366))
+* code cleanup ([41ccc42](https://github.com/hali-coding/waterpump/commit/41ccc42a63bce4e1444f70901f03366a8ab11803))
+
 ## [0.10.0](https://github.com/hali-coding/waterpump/compare/v0.9.1...v0.10.0) (2026-10-14)
 
 
