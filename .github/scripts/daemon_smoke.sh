@@ -36,13 +36,30 @@ trap cleanup EXIT
 step() { echo "::group::$*"; }
 end() { echo "::endgroup::"; }
 
+# Every listing is taken in an assignment of its own, never at the head of a
+# pipeline: there only the last command's status counts, so a listing that
+# failed would be judged on whatever it printed.
+
 # The names of the instances tagged with a template, one per line, sorted.
 tagged() {
-    ./waterpump list --json | python3 -c '
+    listing=$(./waterpump list --json)
+    printf '%s' "$listing" | python3 -c '
 import json, sys
 for c in sorted(json.load(sys.stdin), key=lambda c: c["name"]):
     if c["template"] == sys.argv[1]:
         print(c["name"], c["status"])' "$1"
+}
+
+# Fail unless `waterpump <listing> --json` has nothing called <name>. An
+# assertion, not an exit code read as "absent", so a listing that is not
+# valid JSON fails too rather than passing for an empty one.
+absent() {
+    listing=$(./waterpump "$1" --json)
+    printf '%s' "$listing" | python3 -c '
+import json, sys
+names = [r["name"] for r in json.load(sys.stdin)]
+if sys.argv[1] in names:
+    sys.exit("::error::%s still listed after delete" % sys.argv[1])' "$2"
 }
 
 step "status ($flavor, $(python3 --version))"
@@ -150,17 +167,11 @@ assert [i["name"] for i in r["result"]["instances"]] == [sys.argv[1] + "-1"], r'
 [ "$(tagged "$template")" = "$template-1 Running" ] || { echo "::error::not running after a serve launch"; exit 1; }
 ./waterpump template-destroy -y "$template"
 ./waterpump template-delete -y "$template"
-if ./waterpump templates --json | python3 -c 'import json,sys; sys.exit(0 if any(t["name"]==sys.argv[1] for t in json.load(sys.stdin)) else 1)' "$template"; then
-    echo "::error::$template still saved after delete"
-    exit 1
-fi
+absent templates "$template"
 end
 
 step "stop, delete"
 ./waterpump stop "$name"
 ./waterpump delete -y "$name"
-if ./waterpump list --json | python3 -c 'import json,sys; sys.exit(0 if any(c["name"]==sys.argv[1] for c in json.load(sys.stdin)) else 1)' "$name"; then
-    echo "::error::$name still exists after delete"
-    exit 1
-fi
+absent list "$name"
 end
