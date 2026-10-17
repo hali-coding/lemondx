@@ -58,22 +58,52 @@ way. Under it is just `npm --prefix web run build`, if you would rather drive
 that directly. There is nothing to commit afterwards: `.gitignore` covers
 `web/dist`.
 
+## Python versions in CI
+
+waterpump supports Python 3.10 and up with no dependencies, and `pr.yml` checks
+both halves of that without a daemon:
+
+- **Python (3.10, and the two newest releases):**
+  - every module compiles and imports with nothing but the stdlib
+  - deprecation warnings are errors, so an API on its way out fails on the
+    newest Python before the release that removes it
+  - every CLI command's help formats (`.github/scripts/check_cli.py`); a
+    command's help is only built when someone asks for it
+- **Python 3.10 API floor:** [vermin](https://github.com/netromdk/vermin) checks
+  that nothing uses a stdlib member newer than 3.10. The 3.10 import check
+  cannot see that inside a function body. vermin is a CI tool only. To run it
+  locally: `uvx vermin --target=3.10- --violations --no-tips src/waterpump`.
+
+The live-daemon job below then runs real code paths on the floor and the newest
+Python.
+
 ## The live-daemon CI job
 
-GitHub's hosted runners have no LXD or Incus, so `pr.yml`'s `daemon` job runs on
-a self-hosted runner labelled `waterpump-daemon`. The runner is a small Debian
-13 VM (1 vCPU, 1 GB) with Incus. The job runs `.github/scripts/daemon_smoke.sh`,
-which you can also run by hand on any host with a daemon. It covers:
+GitHub's hosted runners have no LXD or Incus, so the live-daemon check is a
+workflow of its own, `daemon.yml`, run on a self-hosted runner labelled
+`waterpump-daemon`. The runner is a small Debian 13 VM (2 vCPU, 1 GB) with
+Incus. `pr.yml` calls it only after the hosted jobs pass, so a change that
+fails those never takes the runner's time. It can also be started on its own
+from the Actions tab, against any branch.
+
+It runs `.github/scripts/daemon_smoke.sh` twice, one run after the other:
+under Python 3.10 and under the newest release. Each interpreter comes from uv,
+so nothing on the VM is set up by hand. You can also run the script by hand on
+any host with a daemon. It covers:
 
 - `status`
 - a create on Alpine with the `base` module
 - exec, including an exit code of 127
 - snapshot and restore
+- a template with an app check: save, launch two instances, `template-exec`
+  (a failing command must fail the run), destroy
 - `serve` answering the API
-- delete
+- a template launch handed to `serve`, and the run it reports at
+  `/api/template-runs`
+- template delete, then stop and delete
 
-Every name in the script carries the run id, and a trap removes what the run
-made, because the VM is long-lived.
+Every name in the script carries the run id and the Python version, and a
+trap removes what the run made, because the VM is long-lived.
 
 The repository is public, and the runner's user can drive the daemon, which is
 as good as root on that VM. So:

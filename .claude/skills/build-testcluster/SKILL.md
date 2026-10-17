@@ -154,15 +154,27 @@ host's when NAT'd).
 
 ## Legacy: sysvmbox5
 
-The previous host (`github@sysvmbox5.trustsno1.com`, vmbr29 `192.168.29.0/24`)
-still has:
-- VM 103 `waterpump-runner` (.20), the self-hosted GitHub Actions runner for
-  `pr.yml`'s `daemon` job, label `waterpump-daemon`
-- 104/105 `debian13-test1/2`, stopped
-- 106–108 `waterpump-fd1..3`, the firedrill cluster
+The previous host, Proxmox VE 9.2, reached as `ssh root@sysvmbox5`. VMs on
+vmbr29 (`192.168.29.0/24`, static addresses, NAT'd out by the host's
+192.168.0.0/16 masquerade). The firedrill VMs are gone; it now has:
+- VM 103 `waterpump-runner` (.20; Debian 13, Incus 6.0.4, 2 vCPU / 1 GB / 20G),
+  rebuilt 2026-10-17: the self-hosted GitHub Actions runner for `pr.yml`'s
+  `daemon` job, label `waterpump-daemon`. It runs as `ci` (in `incus-admin`) from
+  `~ci/actions-runner`, as system unit
+  `actions.runner.hali-coding-waterpump.waterpump-runner`.
+  Reach it with `ssh -J root@sysvmbox5 ci@192.168.29.20`.
+- 100–102 are not ours (`syspbs1` is a PBS server). Leave them alone.
 
-Its API token `root@pam!github` has no ACLs. To target it, set
-`PVE_HOST=github@sysvmbox5.trustsno1.com PVE_BRIDGE=vmbr29 PVE_NET=192.168.29 PVE_STORAGE=local`.
+To build there, set
+`PVE_HOST=root@sysvmbox5 PVE_BRIDGE=vmbr29 PVE_NET=192.168.29 PVE_STORAGE=local`.
+`scripts/install-runner.sh <octet>` defaults to that host. Then register as
+`ci` in `~/actions-runner`, with a token from `gh api -X POST
+repos/hali-coding/waterpump/actions/runners/registration-token`:
+`./config.sh --unattended --url https://github.com/hali-coding/waterpump
+--token … --name waterpump-runner --labels waterpump-daemon --replace`, then
+`sudo ./svc.sh install ci && sudo ./svc.sh start`. To check it by hand, run
+`sg incus-admin -c 'sh .github/scripts/daemon_smoke.sh'` from an unpacked
+`git archive`.
 
 The runner was registered with the repo's fork-PR approval set to
 `all_external_contributors`. Keep it that way: the repo is public, and the
