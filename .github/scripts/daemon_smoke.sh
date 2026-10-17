@@ -1,6 +1,6 @@
 #!/bin/sh
 # CI check against a live daemon: the part of waterpump pr.yml's other jobs
-# cannot reach, run on the self-hosted `waterpump-daemon` runner. Everything goes
+# cannot reach, run by daemon.yml on the self-hosted `waterpump-daemon` runner. Everything goes
 # through ./waterpump, so the CLI, ContainerService and lxd.py are exercised the
 # way a user drives them, and `serve` is checked over real HTTP.
 #
@@ -12,6 +12,7 @@ set -eu
 flavor=${WATERPUMP_FLAVOR:-incus}
 run=${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}
 name=ci-$run
+template=ci-t-$run
 port=${DAEMON_SMOKE_PORT:-18099}
 export WATERPUMP_FLAVOR=$flavor
 export WATERPUMP_DATA_DIR=${RUNNER_TEMP:-/tmp}/waterpump-$run
@@ -23,12 +24,23 @@ cleanup() {
     # -y: with no TTY the confirmation prompt reads as "no", which skips the
     # delete and still exits 0.
     ./waterpump delete -y -f "$name" >/dev/null 2>&1 || true
+    ./waterpump template-destroy -y "$template" >/dev/null 2>&1 || true
+    ./waterpump template-delete -y "$template" >/dev/null 2>&1 || true
     rm -rf "$WATERPUMP_DATA_DIR"
 }
 trap cleanup EXIT
 
 step() { echo "::group::$*"; }
 end() { echo "::endgroup::"; }
+
+# The names of the instances tagged with a template, one per line, sorted.
+tagged() {
+    ./waterpump list --json | python3 -c '
+import json, sys
+for c in sorted(json.load(sys.stdin), key=lambda c: c["name"]):
+    if c["template"] == sys.argv[1]:
+        print(c["name"], c["status"])' "$1"
+}
 
 step "status ($flavor)"
 ./waterpump status
@@ -58,6 +70,50 @@ step "snapshot, restore"
 ./waterpump restore "$name" s1
 end
 
+step "template save"
+# The app check goes in as a file and comes back as the script itself: it is
+# read from the template every round, never copied onto the instance.
+printf '#!/bin/sh\ncommand -v curl >/dev/null\n' >"$WATERPUMP_DATA_DIR/check.sh"
+./waterpump template-save "$template" -i images:alpine/3.22 -b base -c 1 -m 256MiB \
+    --prefix "$template" --app-check "$WATERPUMP_DATA_DIR/check.sh"
+./waterpump templates --json | python3 -c '
+import json, sys
+t = {t["name"]: t for t in json.load(sys.stdin)}[sys.argv[1]]
+assert t["image"] == "images:alpine/3.22", t
+assert t["bootstrap"]["modules"] == ["base"], t
+assert "command -v curl" in t["app_check"]["script"], t' "$template"
+end
+
+# --no-serve: the run happens in this command. Nothing is serving yet anyway,
+# but this keeps the step about the CLI path; the launch through serve is
+# checked below.
+step "template launch"
+./waterpump launch --no-serve -n 2 "$template"
+got=$(tagged "$template")
+want=$(printf '%s-1 Running\n%s-2 Running' "$template" "$template")
+[ "$got" = "$want" ] || { echo "::error::after launch: $got"; exit 1; }
+end
+
+step "template exec"
+./waterpump template-exec --json "$template" -- hostname | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+assert r["ok"], r
+out = sorted(i["exec"]["stdout"].strip() for i in r["instances"])
+assert out == [sys.argv[1] + "-1", sys.argv[1] + "-2"], out' "$template"
+# A command failing in the instances is the run failing, not a quiet success.
+if ./waterpump template-exec "$template" -- sh -c 'exit 3'; then
+    echo "::error::template-exec of a failing command exited 0"
+    exit 1
+fi
+end
+
+step "template destroy"
+./waterpump template-destroy -y "$template"
+got=$(tagged "$template")
+[ -z "$got" ] || { echo "::error::left after destroy: $got"; exit 1; }
+end
+
 step "serve and the API"
 ./waterpump serve --port "$port" >"$WATERPUMP_DATA_DIR/serve.log" 2>&1 &
 serve_pid=$!
@@ -69,6 +125,32 @@ until curl -sf "http://127.0.0.1:$port/api/status" >/dev/null; do
 done
 curl -sf "http://127.0.0.1:$port/api/containers" \
     | python3 -c 'import json,sys; names=[c["name"] for c in json.load(sys.stdin)["data"]]; assert sys.argv[1] in names, names' "$name"
+end
+
+# With serve up, `launch` hands the run to it rather than running it in this
+# command, and the run is then serve's to report -- the path the UI follows.
+step "template launch through serve"
+# Into a file, not through tee, which would hide launch's own exit status.
+rc=0
+./waterpump launch -n 1 "$template" >"$WATERPUMP_DATA_DIR/launch.log" 2>&1 || rc=$?
+cat "$WATERPUMP_DATA_DIR/launch.log"
+[ "$rc" -eq 0 ] || exit "$rc"
+grep -q 'running on serve here' "$WATERPUMP_DATA_DIR/launch.log" \
+    || { echo "::error::launch did not go through serve"; exit 1; }
+curl -sf "http://127.0.0.1:$port/api/template-runs" | python3 -c '
+import json, sys
+runs = [r for r in json.load(sys.stdin)["data"] if r["template"] == sys.argv[1]]
+assert len(runs) == 1, runs
+r = runs[0]
+assert r["action"] == "launch" and r["finished_at"] and r["result"]["ok"], r
+assert [i["name"] for i in r["result"]["instances"]] == [sys.argv[1] + "-1"], r' "$template"
+[ "$(tagged "$template")" = "$template-1 Running" ] || { echo "::error::not running after a serve launch"; exit 1; }
+./waterpump template-destroy -y "$template"
+./waterpump template-delete -y "$template"
+if ./waterpump templates --json | python3 -c 'import json,sys; sys.exit(0 if any(t["name"]==sys.argv[1] for t in json.load(sys.stdin)) else 1)' "$template"; then
+    echo "::error::$template still saved after delete"
+    exit 1
+fi
 end
 
 step "stop, delete"

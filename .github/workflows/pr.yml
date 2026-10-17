@@ -112,20 +112,17 @@ jobs:
           ./waterpump --help > /dev/null
 
   daemon:
-    name: Live daemon (Incus)
-    # The one job with a real daemon: a small Debian 13 VM with Incus, running
-    # a self-hosted runner. The repo is public and that VM's runner user is in
+    name: Live daemon
+    # The one job with a real daemon, in its own workflow (daemon.yml): a
+    # small Debian 13 VM with Incus, running a self-hosted runner. It waits
+    # for the hosted jobs, so a change that fails those never takes the one
+    # runner's time. The repo is public and that VM's runner user is in
     # incus-admin (root-equivalent), so a fork's PR never gets here -- it
     # would be running its own code on our host. Same-repo PRs and manual runs
     # only; a fork's change is checked here after it is pushed to a branch.
+    needs: [python, modules, web]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, waterpump-daemon]
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Smoke test against the daemon
-        run: .github/scripts/daemon_smoke.sh
+    uses: ./.github/workflows/daemon.yml
 
   commit-style:
     name: PR title is a conventional commit

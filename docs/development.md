@@ -31,17 +31,26 @@ that directly. There is nothing to commit afterwards: `.gitignore` covers
 
 ## The live-daemon CI job
 
-GitHub's hosted runners have no LXD or Incus, so `pr.yml`'s `daemon` job runs on
-a self-hosted runner labelled `waterpump-daemon`. The runner is a small Debian
-13 VM (1 vCPU, 1 GB) with Incus. The job runs `.github/scripts/daemon_smoke.sh`,
-which you can also run by hand on any host with a daemon. It covers:
+GitHub's hosted runners have no LXD or Incus, so the live-daemon check is a
+workflow of its own, `daemon.yml`, run on a self-hosted runner labelled
+`waterpump-daemon`. The runner is a small Debian 13 VM (2 vCPU, 1 GB) with
+Incus. `pr.yml` calls it only after the Python, module and web jobs pass, so a
+change that fails those never takes the runner's time. It can also be started
+on its own from the Actions tab, against any branch.
+
+It runs `.github/scripts/daemon_smoke.sh`, which you can also run by hand on
+any host with a daemon. It covers:
 
 - `status`
 - a create on Alpine with the `base` module
 - exec, including an exit code of 127
 - snapshot and restore
+- a template with an app check: save, launch two instances, `template-exec`
+  (a failing command must fail the run), destroy
 - `serve` answering the API
-- delete
+- a template launch handed to `serve`, and the run it reports at
+  `/api/template-runs`
+- template delete, then stop and delete
 
 Every name in the script carries the run id, and a trap removes what the run
 made, because the VM is long-lived.
