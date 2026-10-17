@@ -19,8 +19,34 @@ permissions:
   contents: read
 
 jobs:
+  commit-style:
+    name: PR title is a conventional commit
+    # First, and everything else needs it: a title that would release nothing
+    # is the cheapest thing to get wrong and to fix, so it fails in seconds
+    # rather than after every other job has run. The `if:` is on the step, not
+    # the job -- a skipped job would skip every job that needs it, and a manual
+    # run has no title to check.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the title release-please will read
+        if: github.event_name == 'pull_request'
+        # A squash merge takes the PR title as the commit subject, and that
+        # subject is the entire input to the next version number -- an
+        # unparseable one silently releases nothing. See docs/development.md.
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if printf '%s' "$TITLE" | grep -Eq '^(feat|fix|perf|refactor|docs|deps|build|ci|chore|style|test|revert)(\([a-z0-9._/-]+\))?!?: .+'; then
+            echo "ok: $TITLE"
+          else
+            echo "::error::PR title must be a conventional commit, e.g. 'feat(web): add a bulk stop button'."
+            echo "::error::Got: $TITLE"
+            exit 1
+          fi
+
   python:
     name: Python (${{ matrix.python-version }})
+    needs: commit-style
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -55,6 +81,7 @@ jobs:
 
   modules:
     name: Bootstrap modules (POSIX sh)
+    needs: commit-style
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -76,6 +103,7 @@ jobs:
 
   web:
     name: Web (lint, typecheck, build)
+    needs: commit-style
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -123,23 +151,3 @@ jobs:
     needs: [python, modules, web]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/daemon.yml
-
-  commit-style:
-    name: PR title is a conventional commit
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - name: Check the title release-please will read
-        # A squash merge takes the PR title as the commit subject, and that
-        # subject is the entire input to the next version number -- an
-        # unparseable one silently releases nothing. See docs/development.md.
-        env:
-          TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          if printf '%s' "$TITLE" | grep -Eq '^(feat|fix|perf|refactor|docs|deps|build|ci|chore|style|test|revert)(\([a-z0-9._/-]+\))?!?: .+'; then
-            echo "ok: $TITLE"
-          else
-            echo "::error::PR title must be a conventional commit, e.g. 'feat(web): add a bulk stop button'."
-            echo "::error::Got: $TITLE"
-            exit 1
-          fi
