@@ -154,6 +154,7 @@ credentials get `401`, too little access `403`, too many failed logins `429`.
 | `PUT` | `/api/tasks/{name}` | `{"template","bootstrap","schedule","inputs","secrets",...}` → create or replace one |
 | `DELETE` | `/api/tasks/{name}` | delete one |
 | `POST` | `/api/tasks/{name}/invoke` | `{"inputs":{},"payload":...,"node"}` → start a run now on whichever member takes it (`operator`) |
+| `POST` | `/api/hooks/{name}` | a GitHub `workflow_job` webhook delivery, signed with one of the task's secrets — no token (see [Tasks](tasks.md#github-actions-runners-from-a-webhook)) |
 | `GET` | `/api/task-runs` | every member's task runs, newest first; `?task=&detail=1` |
 | `POST` | `/api/task-runs/{id}/cancel` | stop a run of this node's and destroy its instance (`operator`) |
 | `GET` | `/api/cron` | `?expr=&tz=` → what a schedule means and when it next fires |
@@ -242,6 +243,10 @@ shared credential plus its whole member list — so joining any member joins the
 cluster. A node that is in a cluster requires a token from callers on other
 hosts even when authentication is otherwise off; loopback is unaffected. See
 [Nodes and federation](cluster.md).
+
+`/api/hooks/{task}` is the other: a webhook delivery carries no token, only an
+HMAC of its body (`X-Hub-Signature-256`) under a secret the sender and the
+task share. See [Tasks](tasks.md#github-actions-runners-from-a-webhook).
 
 See also [Nodes and federation](cluster.md) for `/api/cluster`,
 [Bootstrap modules](modules.md) for `/api/modules`,

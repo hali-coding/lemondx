@@ -223,6 +223,12 @@ export function TasksView({ localNode, onNotify }: Props) {
                           )}
                         </>
                       ) : <span className="faint">when invoked</span>}
+                      {task.webhook && (
+                        <span className="faint">
+                          {' '}· per queued GitHub job at{' '}
+                          <span className="mono">{task.hook_path}</span>
+                        </span>
+                      )}
                       {task.schedule_problem && (
                         <div className="err">{task.schedule_problem}</div>
                       )}

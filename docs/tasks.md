@@ -251,10 +251,119 @@ shows up as a warning naming the node, not as runs quietly going missing.
 An invocation needs no vote: one request is one run. The member that receives
 it checks the inputs and the payload. It then tries the eligible nodes in a
 random rank order, starting the run on the first that does not decline, and
-forwards the request to that node if it is not itself. `node` in the request,
+forwards the request to that node if it is not itself. A node that cannot be
+reached within 3 seconds is passed over. One that took the request but never
+answered may have started the run, so the invocation stops there with a `504`
+rather than risk starting it twice. `node` in the request,
 or `--node`, names where the run must go instead. Either way the answer is the
 run record, as soon as the run has started. The run is then followed in the
 run list.
+
+## GitHub Actions runners from a webhook
+
+A task can start a run for every GitHub Actions job that is queued: GitHub
+sends a `workflow_job` webhook, the run's instance holds a runner that takes
+one job and exits, and the instance is destroyed when the run ends. Every job
+gets a clean machine and nothing is left registered. It is the
+[`github-agent`](modules.md#the-github-runner-module) module in `jit` mode as
+the job.
+
+**The template** has what every job needs. `RUNNER_MODE=install` puts the
+runner and its dependencies in without registering anything:
+
+```bash
+./waterpump template-save gh-runner -i ubuntu:24.04 -c 4 -m 8GiB \
+    -b base -b docker -b github-agent --param RUNNER_MODE=install
+```
+
+That runs on every job (a minute or two). To start in seconds, run the same
+modules on one instance, snapshot it, and point the template at the snapshot
+(`--snapshot`, see [Templates](templates.md)).
+
+**The task** runs the module again in `jit` mode, with what the webhook hands
+it:
+
+```bash
+./waterpump task-save gh-jobs -t gh-runner -b github-agent \
+    --param RUNNER_MODE=jit \
+    --param 'GITHUB_REPO_URL={{inputs.GITHUB_URL}}' \
+    --param 'RUNNER_LABELS={{inputs.GITHUB_LABELS}}' \
+    --param 'GITHUB_RUNNER_TOKEN={{secrets.GITHUB_PAT}}' \
+    --input GITHUB_URL --input GITHUB_LABELS --input GITHUB_JOB_ID \
+    --secret GITHUB_PAT --secret WEBHOOK_SECRET \
+    --webhook-secret WEBHOOK_SECRET --webhook-label self-hosted,Linux,X64,waterpump \
+    --group small --overlap allow --timeout 21600
+WEBHOOK_SECRET=$(openssl rand -hex 32); echo "$WEBHOOK_SECRET"    # paste it into GitHub too
+WEBHOOK_SECRET=$WEBHOOK_SECRET ./waterpump task-secret-set gh-jobs WEBHOOK_SECRET
+./waterpump task-secret-set gh-jobs GITHUB_PAT                       # prompts
+```
+
+- **`WEBHOOK_SECRET`** is a random string you make up, entered in GitHub and
+  stored here. GitHub signs every delivery with it and never sends it, so it
+  cannot be used for anything else -- it is not a waterpump or GitHub token.
+- **`GITHUB_PAT`** is what the runner registers with: a fine-grained token
+  with *Administration: write* on the repository, a classic one with `repo`
+  (`admin:org` for an organisation's runners), or an app's installation
+  token. It stays in waterpump; GitHub never sees it in the webhook.
+- **The labels** are what the runner offers. A queued job is started here only
+  when every label its `runs-on` asks for is among them, which is how GitHub
+  itself matches jobs to runners; anything else is acknowledged and ignored.
+  The run registers with exactly the labels the job asked for.
+- **`--overlap allow`** lets jobs run side by side; each node takes at most
+  8 task runs at once, and a member that declines is skipped.
+- **`--webhook-scope org`** makes `GITHUB_URL` the organisation's, for an
+  organisation webhook and runners shared across its repositories.
+
+**On GitHub**, under the repository's (or organisation's) *Settings →
+Webhooks → Add webhook*:
+
+| Field | Value |
+| --- | --- |
+| Payload URL | `https://<public name>/api/hooks/gh-jobs` |
+| Content type | `application/json` (a form-encoded body is refused) |
+| Secret | the `WEBHOOK_SECRET` value |
+| SSL verification | enabled |
+| Events | *Let me select individual events* → only **Workflow jobs** |
+
+GitHub has to reach a member over HTTPS with a certificate it trusts, so the
+payload URL is a reverse proxy or tunnel in front of one or more members, not a
+node's own self-signed address. A delivery to any member works: it is placed
+by the task's groups like any invocation. Point the proxy at more than one
+member, or a member that is down receives nothing.
+
+What the endpoint answers, which GitHub shows under *Recent Deliveries*:
+
+| Answer | When |
+| --- | --- |
+| `202` + run id | a queued job matched and a run started |
+| `200` ignored, with the reason | `ping`, another event or action, a label not offered, a delivery id already received |
+| `403` | no signature, a wrong one, or no such task or webhook -- one answer, so the URL does not say which tasks exist; the log says which it was |
+| `413` / `415` | a body over 1 MiB / not `application/json` |
+| `503` | no member would take the run (all busy, in maintenance or unreachable); press *Redeliver* once there is room |
+| `504` | a member took the run but did not answer, so it may be running there; check its runs before redelivering, since this node now ignores a redelivery of that id |
+
+A run receives the `GITHUB_*` inputs it declares: `GITHUB_URL`,
+`GITHUB_REPOSITORY`, `GITHUB_JOB_ID`, `GITHUB_JOB_NAME`, `GITHUB_RUN_ID`,
+`GITHUB_RUN_ATTEMPT`, `GITHUB_WORKFLOW`, `GITHUB_LABELS` and
+`GITHUB_DELIVERY`. The whole delivery is its payload file. A runner whose job
+went to another runner, or was cancelled, gives up after `RUNNER_IDLE_SECONDS`
+and removes its registration, so the run ends instead of waiting out its
+timeout.
+
+Things to know:
+
+- GitHub does not retry a failed delivery by itself. A job whose delivery got
+  a `503` waits in the queue until someone redelivers it.
+- GitHub gives a delivery 10 seconds. Placing the run gets 8 of them: an
+  unreachable member costs 3, and the rest are tried in turn while time is
+  left.
+- A runner on a **public** repository runs whatever a fork's pull request
+  asks of it. Require approval for outside contributors, use a label only
+  your own workflows ask for, and keep the template off fabrics and LAN
+  networks so a job cannot reach the rest of the cluster.
+- A delivery id is remembered by the process that received it, so a
+  redelivery to a different member, or after a restart, starts a second run.
+  That costs one idle runner, which gives up as above.
 
 ## In the web UI
 
@@ -269,6 +378,9 @@ secrets and last run. Its buttons:
 
 Below the tasks, **Runs** lists every member's runs. Click one for its full
 output.
+
+The editor's **GitHub webhook** section turns the webhook on, picks the
+secret it is signed with, and shows the URL to give GitHub.
 
 The editor's **Job**, **Inputs** and **Secrets** headings, and the run dialog,
 each have a **?** that opens an explanation filled in from the task itself.
@@ -285,6 +397,7 @@ for the run as typed.
     [--cron EXPR --tz TZ]
     [--input NAME[=DEFAULT]] [--require NAME] [--secret-input NAME] [--secret NAME]
     --group G [--node N] [--timeout S] [--overlap skip|allow] [--disable|--enable]
+    [--webhook-secret SECRET --webhook-label L[,L] [--webhook-scope repo|org] | --no-webhook]
 ./waterpump task-save NAME --file task.json     # the whole definition as JSON
 ./waterpump task-enable NAME / task-disable NAME
 ./waterpump task-run NAME [--input K=V] [--payload FILE|-] [--node N] [--no-wait]
@@ -307,10 +420,11 @@ shows in the UI.
 | --- | --- | --- | --- |
 | `GET` | `/api/tasks` | read | every task, with `next_run`, `schedule_text`, `secret_status`, `eligible` (its members now) and `placement_problem` |
 | `GET` | `/api/tasks/{name}` | read | one |
-| `PUT` | `/api/tasks/{name}` | admin | `{template, bootstrap or script, description, schedule:{cron,timezone}\|null, groups (required), nodes, timeout_seconds, overlap, inputs, secrets, enabled, previous}` → saved and pushed to every member |
+| `PUT` | `/api/tasks/{name}` | admin | `{template, bootstrap or script, description, schedule:{cron,timezone}\|null, groups (required), nodes, timeout_seconds, overlap, inputs, secrets, webhook:{provider,secret,labels,scope}\|null, enabled, previous}` → saved and pushed to every member |
 | `DELETE` | `/api/tasks/{name}` | admin | delete it everywhere (`?everywhere=false` for here only) |
 | `PUT` | `/api/tasks/{name}/enabled` | admin | `{"enabled": false}` pauses the schedule |
 | `POST` | `/api/tasks/{name}/invoke` | operator | `{inputs, payload, node, wait}` → the run record once started (`wait`: once finished) |
+| `POST` | `/api/hooks/{name}` | signature | a GitHub webhook delivery; see [below](#github-actions-runners-from-a-webhook) |
 | `GET` | `/api/tasks/{name}/secrets` | read | which secrets hold a value, never the values |
 | `PUT`/`DELETE` | `/api/tasks/{name}/secrets/{secret}` | admin | `{"value"}` → set one, or forget it |
 | `GET` | `/api/task-runs` | read | `?task=&live=1&detail=1&local=1` → `{runs, errors}` from every member (`local`: this node's only); outputs are last lines unless `detail` |

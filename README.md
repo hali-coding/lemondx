@@ -1,189 +1,164 @@
 # waterpump
 
-Application orchestration on LXD and Incus. Describe a deployment once, as a
-**stack** of instance templates, and waterpump launches it in order across a set
-of hosts, hands each tier the addresses of the ones before it, waits for them
-to be healthy, and from then on runs it as one thing: stop, start, relaunch and
-destroy the whole deployment, see when it has drifted from its definition,
-watch it live.
+**Deploy whole applications on LXD and Incus, across every host you have, from
+one definition.**
+
+You describe a deployment once, as a **stack**. A stack might be a database,
+then three web servers that are given its address, then a health gate, then a
+script that announces it is live. waterpump launches it in order across your
+nodes, wires the tiers together and waits until they are healthy. From then on
+you run the deployment as one thing: stop it, start it, relaunch it, load-test
+it, watch it live, and see when it has drifted from its definition.
+
+![waterpump's Home view: nodes, containers, health, stacks and templates across a six-node cluster](docs/screenshots/home.jpg)
 
 ```
   stack "shop"                     node-a          node-b          node-c
   ──────────────────────────────   ─────────────   ─────────────   ─────────────
   1  db    Postgres x1        ──▶  shop-db-1
-  2  wait until healthy
-  3  app   App x3             ──▶  app-1           app-2           app-3
-       DB_HOST={{db.ip}}           └──────────── fabric 10.101.0.0/16 ─────────┘
-  4  load  Runner x6          ──▶  … round robin over the "small" group …
+  2  web   Apache x3          ──▶  shop-web-1      shop-web-2      shop-web-3
+       DB_HOST={{db.ip}}           └──────────── fabric 10.100.0.0/16 ─────────┘
+  3  wait until healthy
+  4  swarm "smoke"            ──▶  … load runners, torn down when they finish …
 ```
 
-There is a web UI, a CLI and a REST API, and they are the same thing: the UI
-and the CLI are both clients of the one API. The backend is stdlib-only Python
-that talks to each host's daemon over its unix socket.
+## Why waterpump
 
-![Containers list](docs/screenshot1.png)
+- **Plain system containers and VMs, orchestrated.** You get the speed and
+  density of LXD/Incus with the "describe it, launch it, operate it" workflow
+  of a container orchestrator. Your workloads don't have to be rebuilt as OCI
+  images first.
+- **A cluster with no control plane.** Each node is a complete waterpump.
+  Nodes join with one code, there is no leader and no quorum, and losing a
+  host costs you that host only. Templates, stacks and modules sync to every
+  node as you save them.
+- **A network that spans hosts.** A *fabric* gives every node a routed subnet
+  of one prefix, so `{{db.ip}}` works from any host. You can also put
+  instances straight onto your LAN.
+- **Health you can gate on.** Every instance gets machine checks (responsive,
+  load, near limits) plus your own Nagios-style app check. A stack waits for
+  them, and the UI and `waterpump top` show them live.
+- **One API, three front ends.** The web UI, the CLI and the REST API are the
+  same thing: `--json` on any command prints exactly what the API returns.
+- **Nothing to install.** The backend is stdlib-only Python 3.10+, with no pip,
+  virtualenv or database. The release archive ships with the UI already built.
+
+<table>
+<tr>
+<td width="50%"><a href="docs/screenshots/stack-designer.jpg"><img src="docs/screenshots/stack-designer.jpg" alt="Stack designer"></a><br><b>Design a stack</b> by dragging steps onto a canvas. Each step shows exactly what it hands on to later ones.</td>
+<td width="50%"><a href="docs/screenshots/stack-run.jpg"><img src="docs/screenshots/stack-run.jpg" alt="A stack running a load-test swarm"></a><br><b>Operate it as one thing.</b> Here a load-test swarm runs against the live stack and is torn down when it ends.</td>
+</tr>
+<tr>
+<td><a href="docs/screenshots/instance.jpg"><img src="docs/screenshots/instance.jpg" alt="Instance drawer"></a><br><b>Every instance, any node:</b> health, app check, resources, snapshots, bootstrap and a live console.</td>
+<td><a href="docs/screenshots/monitor.jpg"><img src="docs/screenshots/monitor.jpg" alt="Monitor view"></a><br><b>Watch the cluster</b>: CPU, memory and network for every node and instance, live.</td>
+</tr>
+</table>
 
 ## How it fits together
 
-Each layer is built from the one before it, and a stack is what you deploy:
+Each building block is made from the one before it:
 
-| | What it is | Docs |
+| | What it is | Read more |
 | --- | --- | --- |
-| **Module** | A POSIX shell script that configures an instance: packages, users, services. Parameters, and secrets that are never stored. | [modules](docs/modules.md) |
-| **Template** | A whole instance: image, container or VM, limits, network, the modules to run and an app health check. | [templates](docs/templates.md) |
-| **Stack** | Templates launched in stages, each handed the names and addresses of earlier ones, with health gates between. **The unit you deploy and operate.** | [stacks](docs/stacks.md) |
-| **Task** | Modules run in a throwaway instance of a template, on a cron schedule or when invoked with inputs. The cluster votes on which node runs each occurrence. | [tasks](docs/tasks.md) |
-| **Nodes** | Several hosts, each with its own daemon and its own waterpump, joined with one code. A stack step lands on named nodes or a node group. | [nodes](docs/cluster.md) |
-| **Fabric** | A routed network across every node, so a stack's tiers reach each other by their own addresses, whichever host they are on. | [networking](docs/networking.md) |
+| **Module** | A POSIX shell script that configures an instance (packages, users, services), with parameters and never-stored secrets. | [modules](docs/modules.md) |
+| **Template** | A whole instance: image, container or VM, limits, network, modules and an app health check. | [templates](docs/templates.md) |
+| **Stack** | Templates launched in stages, each one handed the names and addresses of the earlier ones, with health gates, scripts and load-test swarms. **This is the unit you deploy.** | [stacks](docs/stacks.md) |
+| **Task** | A job run in a throwaway instance, on a cron schedule, on demand or from a GitHub webhook. The cluster votes so that each occurrence runs at most once. | [tasks](docs/tasks.md) |
+| **Nodes** | Hosts joined with one code, each with its own daemon. Steps land on named nodes or on node groups. | [nodes](docs/cluster.md) |
+| **Fabric** | A routed network across every node, so tiers reach each other whichever host they are on. | [networking](docs/networking.md) |
 
-Health checks — the machine, plus each template's app check — are what a
-stack's gates wait on, and what the UI and `waterpump top` show.
+![The Cluster view: six nodes mixing LXD and Incus, with groups, maintenance and sync](docs/screenshots/cluster.jpg)
 
-## Recommended deployment: several nodes
+## Getting started
 
-waterpump works on one host, and that is the easiest way to try it. It is meant
-for **several**: a stack spread over nodes survives losing a host, can put each
-tier where there is room for it, and is the case the fabric, node groups and
-cluster-wide views are built for. A typical setup:
+**1. Check the prerequisites.** You need **LXD or Incus** with its daemon
+running (`snap install lxd`, or `apt install incus` on Debian 13+), and
+**Python 3.10+**. Your user must be in the daemon's admin group, `lxd` or
+`incus-admin`. Check with `id`; after `sudo usermod -aG lxd $USER`, log out
+and back in.
 
-1. **Two or more hosts on one L2 network**, each with LXD or Incus and its own
-   waterpump [run as a service](docs/service.md). Turn on logins before
-   exposing it — see [security](docs/security.md).
-2. **Join them:** `waterpump cluster invite` on one, `waterpump cluster join CODE`
-   on each of the others. Nothing else needs configuring. There is no leader,
-   and a node that is down costs you that node only.
-3. **Group them:** `waterpump cluster group auto` sorts nodes into `large` and
-   `small` by what they have, or make your own groups for steps to target.
-4. **Connect them:** `waterpump fabric create` gives every node a routed network
-   its instances share.
-5. **Write templates and a stack, and launch it.** Templates, modules, profiles
-   and stacks are pushed to every node as you save them, so any node can launch
-   and operate the deployment, and a node that was off catches up by itself.
-
-## What waterpump is not
-
-- **Not a host management tool.** It does some host work — initialising a
-  daemon (`waterpump init`), storage pools and bridges, a maintenance mark that
-  keeps new instances off a node, a view of what instances have claimed
-  against a host — because a deployment needs a host that is ready and you
-  need to see what it is using. Provisioning, patching and monitoring the hosts
-  themselves belong to the tools built for that.
-- **Not LXD or Incus clustering.** Those make several daemons one database and
-  one API. waterpump sits above that: each node talks to its own daemon,
-  clustered or not, and nodes only learn how to call each other.
-- **Not a scheduler.** A step's instances go round robin over the nodes it
-  names. Nothing is moved or restarted elsewhere when a host fails, and there
-  is no live migration: an instance belongs to the node that made it.
-
-## Requirements
-
-- **LXD or Incus** on every host, with the daemon running:
-  - Ubuntu: `snap install lxd` (or `apt install lxd`)
-  - Debian 13+: `apt install incus`
-- Membership of the daemon's admin group — `lxd` for LXD, `incus-admin` for
-  Incus. Check with `id`; after `usermod -aG`, run `newgrp <group>` or log out
-  and back in.
-- **Python 3.10+**. That is the whole dependency list — the backend is stdlib
-  only, so there is no pip install, virtualenv or lockfile.
-
-Node is **not** required to run a release: the archive on the
-[releases page](../../releases) already contains the built UI. You only need it
-to build from a clone or to change the frontend — see
-[Development](docs/development.md).
-
-Not to be confused with liblxc's `lxc-create` / `lxc-ls` tools, which have no
-REST API. waterpump targets the LXD/Incus API — see
-[Daemons, images and storage](docs/daemons-and-storage.md) for how it finds
-and adapts to whichever one is installed.
-
-## Quick start
-
-Download the latest release — Python 3.10+ is all it needs, the UI is already
-built:
+**2. Download and start it.** The release archive already contains the built
+UI:
 
 ```bash
 curl -LO <repo>/releases/latest/download/waterpump-<version>.tar.gz
 tar xzf waterpump-<version>.tar.gz && cd waterpump-<version>
-./waterpump serve --open
+./waterpump serve --open          # opens http://127.0.0.1:8099
 ```
 
-Then open <http://127.0.0.1:8099>. A first start is *unconfigured mode*:
-this host only, no login, plain HTTP. **Configure node** adds an admin login
-and a certificate and can listen on every interface, then restarts waterpump on
-those terms (`waterpump configure node` from a shell) — see
-[Security](docs/security.md#unconfigured-mode). On a host whose daemon has
-never been initialised, the UI also offers **Initialize**; the CLI equivalent
-is `./waterpump init`.
+The first start is *unconfigured mode*: it listens on `127.0.0.1` only, has no
+login and serves plain HTTP. Nothing off this host can reach it, so it is safe
+to look around. If the daemon has never been set up, press **Initialize** (or
+run `./waterpump init`) to create a storage pool, a bridge and a default
+profile.
 
-From a clone instead, build the UI once — `./build.sh` checks for a usable
-Node toolchain, installs the frontend dependencies and builds; it is the only
-step that needs Node:
+**3. Turn on logins and HTTPS.** Press **Configure node** in the banner. Choose
+an admin username and password, a certificate (generate a self-signed one, or
+upload your own) and whether to listen on every interface. waterpump saves
+everything and restarts itself, then the browser continues at `https://` and
+asks for the new login. With a self-signed certificate, the browser warns once.
+Compare the fingerprint the dialog shows before accepting it. From a shell, run
+`./waterpump configure node` and then restart `serve`.
+
+**4. Add people and tokens.** Accounts have a role: `read`, `operator` (run
+and stop what exists) or `admin`. Add them in the **Access** tab, or:
 
 ```bash
-git clone <repo> waterpump && cd waterpump
-./build.sh
-./waterpump serve --open
+./waterpump user-add alice --role operator   # asks for a password
+./waterpump token-create ci --role read --expires 30d   # for scripts; shown once
 ```
 
-Handy on PATH: `ln -s "$PWD/waterpump" ~/.local/bin/waterpump`. From there, run it
-as a service on each host and join them — see
-[the recommended deployment](#recommended-deployment-several-nodes).
+To log in with host accounts (PAM) or through a reverse proxy instead, run
+`./waterpump configure auth`. See [Security](docs/security.md).
+
+**5. Keep it running.** Run `./systemd/install-service.sh` to install
+waterpump as a systemd user service. It runs as you and uses the settings you
+just saved. See [Running as a service](docs/service.md).
+
+**6. Launch something.** Press **+ New** for a single container, or save a
+template and launch several:
+
+```bash
+./waterpump template-save web -i images:debian/13 -c 1 -m 1GiB -b base -b apache2
+./waterpump launch web -n 2
+```
+
+From there, put templates together into a [stack](docs/stacks.md).
+
+Building from a clone instead? Run `./build.sh` once to build the UI. It is the
+only step that needs Node. See [Development](docs/development.md).
+
+### Then add more hosts
+
+waterpump works on one host, but it is built for several:
+
+1. Set up each host as in steps 1–5, listening on every interface.
+2. `waterpump cluster invite` on one, then `waterpump cluster join CODE` on the others.
+3. `waterpump cluster group auto` sorts nodes into `large` and `small`.
+4. `waterpump fabric create` gives them a shared routed network.
+5. Write templates and a stack, and launch it from any node.
 
 ## CLI
 
 ```
-# stacks: the deployment
-waterpump stacks               # every stack, its swarms, and how many instances it runs
-waterpump stack-show NAME      # what each step and swarm does; --json is the definition
-waterpump stack-save NAME FILE  # from a JSON definition (stack-show --json prints one)
-waterpump stack-launch NAME    # run it step by step; --dry-run previews, --relaunch replaces
-waterpump stack-swarm NAME SWARM...  # swarms against the running stack, in order; each torn down
-waterpump stack-stop|stack-start|stack-restart NAME
-waterpump stack-destroy NAME
+waterpump stacks | stack-show NAME | stack-save NAME FILE
+waterpump stack-launch NAME          # --dry-run previews, --relaunch replaces
+waterpump stack-swarm NAME SWARM...  # load tests against the running stack
+waterpump stack-stop|stack-start|stack-restart|stack-destroy NAME
 
-# templates, modules and profiles: what a stack is built from
-waterpump template-save NAME -i images:debian/12 -c 2 -b base  # a whole instance setup
-waterpump templates
-waterpump launch NAME -n 3 --group large  # a template on its own, over nodes
-waterpump template-recreate|template-destroy|template-exec NAME
-waterpump modules              # module-add FILE.sh, module-set ID --param K=V
-waterpump profiles             # profile-save NAME -b base -b docker
+waterpump template-save NAME -i images:debian/13 -c 2 -b base
+waterpump launch NAME -n 3 --group large   # a template on its own, over nodes
+waterpump templates | modules | profiles | tasks
 
-# the cluster
-waterpump configure node       # leave unconfigured mode: admin login, HTTPS, 0.0.0.0
-waterpump cluster invite       # start a cluster here and print a one-time join code
-waterpump cluster join CODE    # join it -- nothing else to set up on this host
-waterpump cluster status       # this node and every member
-waterpump cluster containers   # every instance on every node, with health
-waterpump cluster group auto   # size nodes into large/small groups
-waterpump cluster maintenance on  # keep new instances off this node
-waterpump fabric create        # a routed network across every node
+waterpump cluster invite | join CODE | status | containers | group auto
+waterpump cluster maintenance on     # keep new instances off this node
+waterpump fabric create              # a routed network across every node
+waterpump image-pin IMAGE            # one build, copied to every node, as pin:NAME
 
-# watching it
-waterpump top                  # live view of nodes, instances, stacks and templates;
-                                 # console, bootstrap, stack and template actions
-waterpump health               # are instances responsive, overloaded, near limits?
-waterpump status               # daemon, readiness, cluster membership
-waterpump logs -f              # live tail of what every node does, and who asked
-waterpump logging              # every change is logged to syslog; logging-set adds a remote host
-
-# single instances, on this node
-waterpump ls                   # info NAME for one; create NAME -i ubuntu:24.04 -c 2
-waterpump start|stop|restart|delete NAME...
-waterpump exec NAME -- uname -a  # shell NAME for an interactive one
-waterpump bootstrap NAME -b docker # run modules on an existing instance
-waterpump snapshot NAME SNAP   # snapshots, restore, snap-delete
-waterpump snapshot-publish NAME SNAP ALIAS --to NODE  # as an image, copied to nodes
-waterpump image-search debian 12  # the remotes' catalogs; image-pin IMAGE keeps one build as pin:NAME
-waterpump image-prune --dry-run  # downloaded images nothing uses or pins, on every node
-
-# this host, to get it ready
-waterpump init                 # storage pool + bridge + default profile
-waterpump resources            # what instances have claimed against the host
-waterpump storage pools        # storage volumes; network ls|create|set|delete
-waterpump network lan          # put instances on a NIC's LAN: lan-create, convert, revert
-
-waterpump serve                # web UI + API
+waterpump top                        # live view of nodes, instances and stacks, with a console
+waterpump health | status | logs -f  # health, readiness, a live tail of who did what
+waterpump ls | create | exec | shell | snapshot | bootstrap   # single instances
+waterpump serve                      # web UI + API
 ```
 
 Every command takes `--json` and prints exactly what the REST API returns:
@@ -192,78 +167,39 @@ Every command takes `--json` and prints exactly what the REST API returns:
 waterpump cluster containers --json | jq -r '.instances[] | select(.stack=="shop") | .name'
 ```
 
-CPU is a core count; memory and disk take a unit like `4GiB` or `512MiB` — see
-[Units](docs/daemons-and-storage.md#units) and
-[Image aliases](docs/daemons-and-storage.md#image-aliases).
-
-![Container detail panel](docs/screenshot2.png)
+`waterpump --help` lists everything, and `waterpump COMMAND --help` explains one.
 
 ## Documentation
 
 | Doc | Covers |
 | --- | --- |
-| [Stacks](docs/stacks.md) | designing a deployment: stages, launch steps, handing addresses along, health gates, secrets, operating it |
-| [Tasks](docs/tasks.md) | scheduled and invoked jobs in throwaway instances: inputs, payloads, who runs each occurrence, the clock veto |
-| [Instance templates](docs/templates.md) | a full instance setup, launched by a stack or on its own; app health checks |
-| [Bootstrap modules](docs/modules.md) | writing and uploading modules, parameters, secrets, profiles, the shipped modules |
-| [Nodes and federation](docs/cluster.md) | joining nodes, node groups, maintenance, sync and reconciliation, `waterpump top` |
+| [Stacks](docs/stacks.md) | stages, handing values along, health gates, secrets, scripts, swarms and reports |
+| [Tasks](docs/tasks.md) | scheduled, invoked and webhook jobs; inputs; the vote on who runs each one |
+| [Instance templates](docs/templates.md) | a full instance setup; app health checks |
+| [Bootstrap modules](docs/modules.md) | writing modules, parameters, secrets, profiles, the shipped modules |
+| [Nodes and federation](docs/cluster.md) | joining, groups, maintenance, sync and reconciliation, `waterpump top` |
 | [Networking between nodes](docs/networking.md) | fabrics: routed networks shared by every node |
-| [Containers on your LAN](docs/lan.md) | addresses from your router: a bridge, macvlan, or the host's own NIC bridged |
-| [Web UI tour](docs/web-ui.md) | Home, health checks, bulk actions, the Storage, Network and Access views |
-| [Security](docs/security.md) | logins (local users, PAM, proxy), roles, API tokens, TLS |
+| [Containers on your LAN](docs/lan.md) | addresses from your router: a bridge, macvlan, or the host's NIC |
+| [Web UI tour](docs/web-ui.md) | Home, health, bulk actions, Storage, Network and Access |
+| [Security](docs/security.md) | logins (local, PAM, proxy), roles, API tokens, TLS |
 | [Running as a service](docs/service.md) | systemd units, user vs system install |
-| [Logging](docs/logging.md) | what is logged and who did it, the live tail (UI, CLI, API), levels, local and remote syslog |
-| [REST API](docs/api.md) | every endpoint, request and response shapes, curl examples |
-| [Daemons, images and storage](docs/daemons-and-storage.md) | LXD vs Incus, socket discovery, image remotes, disk quotas, units |
-| [Development](docs/development.md) | Vite dev server, building `web/dist`, how releases are cut |
+| [Logging](docs/logging.md) | who did what, the live tail, local and remote syslog |
+| [REST API](docs/api.md) | every endpoint, with request and response shapes |
+| [Daemons, images and storage](docs/daemons-and-storage.md) | LXD vs Incus, image remotes and pins, quotas, units |
+| [Development](docs/development.md) | source layout, the Vite dev server, how releases are cut |
 
-## Security
+## Good to know
 
-`serve` starts in unconfigured mode — bound to `127.0.0.1`, no login, plain
-HTTP — so only this host can reach it. **Configure node** (or `waterpump
-configure node`) turns on logins and HTTPS together before it opens the port.
-`waterpump configure auth` goes further — PAM, a trusted proxy, API tokens,
-read, operator and admin roles — and `configure tls` names your own
-certificate. A cluster member refuses other hosts without a credential even
-with logins off. Members share one credential, so every node in a cluster is
-an admin of every other: federate hosts you administer. See
-[Security](docs/security.md).
-
-![Network view](docs/screenshot3.png)
-
-## Notes and limitations
-
-- The web UI's console runs commands through `sh -c`, non-interactively. For a
-  real terminal use `waterpump shell NAME`, or `c` in `waterpump top`, which
-  attaches to an instance's console on any node.
-- Launches, creates and stack runs happen on the server: closing the browser
-  does not stop them, stopping `serve` does.
-- Virtual machines work wherever the daemon supports them, but need a
-  VM-capable image.
-- LXD and Incus are both supported, and a cluster may mix them; every
-  difference between the two is a table at the top of `lxd.py`.
-
-## Layout
-
-```
-waterpump        # CLI entry point, runs from the checkout
-src/waterpump/
-  lxd.py           # LXD/Incus REST client over the unix socket
-  service.py       # domain logic for this node, shared by the API and the CLI
-  stacks.py        # stacks: staged launches, values between steps, health gates
-  cluster.py       # federation: joining, groups, sync, reconciliation, cluster launches
-  fabric.py        # fabrics: routed networks across nodes
-  hostnet.py       # the host's routes and firewall -- the one place that shells out
-  health.py        # health judgement, load sampling, app checks
-  metrics.py       # the Monitor page's usage history, sampled by serve
-  auth.py, pam.py  # logins, roles, API tokens
-  server.py        # HTTP routing, JSON API, terminals, static hosting
-  cli.py, top.py   # argparse front end; the live `waterpump top` view
-  bootstrap.py     # module discovery, SSH key validation, the runner
-  nodeclient.py    # REST client for another node, over pinned TLS
-  store.py         # persistent state under ~/.local/share/waterpump
-modules/           # bootstrap modules (POSIX sh); _prelude.sh is prepended to each
-web/               # Vite + React + TypeScript UI; builds to web/dist, not in git
-systemd/           # service units and installer
-docs/              # everything linked above
-```
+- **Not a host manager.** The host features (init, storage, bridges,
+  maintenance) exist to get a node ready. Provisioning and patching hosts
+  belong to other tools.
+- **Not LXD/Incus clustering.** Each node talks to its own daemon, clustered
+  or not, and a cluster may mix LXD and Incus.
+- **Not a scheduler.** A step's instances go round robin over the nodes it
+  names. Nothing is moved when a host fails, and an instance belongs to the
+  node that made it.
+- **Members trust each other.** Nodes share one credential, so every node is an
+  admin of every other. Only federate hosts you administer. See
+  [Security](docs/security.md).
+- Launches and stack runs happen on the server. Closing the browser doesn't
+  stop them; stopping `serve` does.

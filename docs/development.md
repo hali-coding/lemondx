@@ -2,6 +2,35 @@
 
 [← back to README](../README.md)
 
+## Source layout
+
+```
+waterpump        # CLI entry point, runs from the checkout
+src/waterpump/
+  lxd.py           # LXD/Incus REST client over the unix socket
+  service.py       # domain logic for this node, shared by the API and the CLI
+  stacks.py        # stacks: staged launches, values between steps, health gates
+  tasks.py, cron.py  # tasks: scheduled and invoked jobs, the vote on who runs each
+  cluster.py       # federation: joining, groups, sync, reconciliation, cluster launches
+  fabric.py        # fabrics: routed networks across nodes
+  hostnet.py       # the host's routes and firewall -- the one place that shells out
+  health.py        # health judgement, load sampling, app checks
+  metrics.py       # the Monitor page's usage history, sampled by serve
+  auth.py, pam.py  # logins, roles, API tokens
+  server.py        # HTTP routing, JSON API, terminals, static hosting
+  cli.py, top.py   # argparse front end; the live `waterpump top` view
+  bootstrap.py     # module discovery, SSH key validation, the runner
+  nodeclient.py    # REST client for another node, over pinned TLS
+  store.py         # persistent state under ~/.local/share/waterpump
+modules/           # bootstrap modules (POSIX sh); _prelude.sh is prepended to each
+web/               # Vite + React + TypeScript UI; builds to web/dist, not in git
+systemd/           # service units and installer
+docs/              # the user documentation
+```
+
+The design behind those layers -- why each module is shaped the way it is --
+is in [CLAUDE.md](../CLAUDE.md).
+
 ## Frontend
 
 Only needed if you are changing the UI. `npm run dev` serves it with hot reload

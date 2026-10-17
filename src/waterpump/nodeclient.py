@@ -43,12 +43,18 @@ RELAYED_HEADER = "X-Waterpump-Relayed"
 
 
 class NodeError(Exception):
-    """A peer refused, or could not be reached. ``code`` is HTTP-ish."""
+    """A peer refused, or could not be reached. ``code`` is HTTP-ish.
 
-    def __init__(self, message, code=502):
+    ``ambiguous`` is a request that was sent but never answered: the peer may
+    have acted on it. A refusal or a failed connect is not -- nothing ran --
+    which is what lets a caller try somewhere else without doing it twice.
+    """
+
+    def __init__(self, message, code=502, ambiguous=False):
         super().__init__(message)
         self.message = message
         self.code = code
+        self.ambiguous = ambiguous
 
 
 def fingerprint_of(der):
@@ -159,25 +165,31 @@ class NodeClient:
 
     # -- plumbing ----------------------------------------------------------
 
-    def _connect(self, timeout):
+    def _connect(self, timeout, connect_timeout=None):
         """An open, verified connection -- or a NodeError saying why not.
 
         Every failure below is a node that cannot be reached or is not who it
         claims to be, so none of them should escape as a socket error: a caller
         turns a NodeError into a message, and anything else into a 500.
+        ``connect_timeout`` bounds reaching the node (TLS included) apart from
+        ``timeout``, which then bounds each read: a host that is down is known
+        quickly, while one that is working on the request gets its time.
         """
+        reach = connect_timeout or timeout
         if self.scheme == "http":
-            return http.client.HTTPConnection(self.host, self.port, timeout=timeout)
-        context = _pinned_context() if self.fingerprint else _ca_context()
-        conn = http.client.HTTPSConnection(self.host, self.port, timeout=timeout,
-                                           context=context)
+            conn = http.client.HTTPConnection(self.host, self.port, timeout=reach)
+        else:
+            context = _pinned_context() if self.fingerprint else _ca_context()
+            conn = http.client.HTTPSConnection(self.host, self.port, timeout=reach,
+                                               context=context)
         try:
             # Connected explicitly rather than lazily inside request(): the
             # certificate has to be judged before a single byte of the request
             # -- token included -- is handed to the socket.
             conn.connect()
-            if self.fingerprint:
+            if self.scheme == "https" and self.fingerprint:
                 self._check_pin(conn.sock)
+            conn.sock.settimeout(timeout)
         except NodeError:
             conn.close()
             raise
@@ -200,7 +212,8 @@ class NodeClient:
                 % (self.url, pretty_fingerprint(presented)[:23] + "...",
                    pretty_fingerprint(self.fingerprint)[:23] + "..."), 495)
 
-    def request(self, method, path, body=None, params=None, timeout=None, relayed=False):
+    def request(self, method, path, body=None, params=None, timeout=None, relayed=False,
+                connect_timeout=None):
         """One API call. Returns the ``data`` envelope, or raises NodeError.
 
         ``relayed`` says the call is a person's, passed on (see RELAYED_HEADER).
@@ -221,7 +234,7 @@ class NodeClient:
         if relayed:
             headers[RELAYED_HEADER] = "1"
 
-        conn = self._connect(timeout or self.timeout)
+        conn = self._connect(timeout or self.timeout, connect_timeout)
         try:
             conn.request(method, target, body=payload, headers=headers)
             response = conn.getresponse()
@@ -230,7 +243,8 @@ class NodeClient:
         except NodeError:
             raise
         except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
-            raise NodeError("%s %s failed: %s" % (method, self.url + path, exc), 502)
+            raise NodeError("%s %s failed: %s" % (method, self.url + path, exc), 502,
+                            ambiguous=True)
         finally:
             conn.close()
 

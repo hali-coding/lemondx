@@ -228,6 +228,8 @@ export interface ModuleParam {
   saved: boolean
   /** Never stored or pre-filled; must be entered on every run. */
   secret: boolean
+  /** A secret the module needs only sometimes (`# optional:`): may be left empty. */
+  optional: boolean
   /** Declared with `# text:`: a config file or similar, edited in a text area. */
   multiline: boolean
 }
@@ -1955,6 +1957,17 @@ export interface TaskInput {
   secret: boolean
 }
 
+/** Starts a run from a GitHub workflow_job delivery to `hook_path`, signed with `secret`. */
+export interface TaskWebhook {
+  provider: 'github'
+  /** One of the task's own secrets: the value GitHub signs each delivery with. */
+  secret: string
+  /** What the runner offers; a queued job asking for any other label is ignored. */
+  labels: string[]
+  /** Whether GITHUB_URL is the repository's or its organisation's. */
+  scope: 'repo' | 'org'
+}
+
 export interface TaskSchedule {
   cron: string
   timezone: string
@@ -1977,6 +1990,9 @@ export interface Task {
   overlap: 'skip' | 'allow'
   inputs: Record<string, TaskInput>
   secrets: Record<string, { description: string }>
+  webhook: TaskWebhook | null
+  /** Where GitHub delivers to, on any member; null without a webhook. */
+  hook_path: string | null
   next_run: number | null
   schedule_text: string | null
   schedule_problem: string | null
@@ -2002,6 +2018,7 @@ export interface TaskRequest {
   overlap: 'skip' | 'allow'
   inputs: Record<string, TaskInput>
   secrets: Record<string, { description: string }>
+  webhook: TaskWebhook | null
   enabled: boolean
   previous?: string
 }

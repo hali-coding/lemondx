@@ -30,7 +30,7 @@ from .nodesetup import DEFAULT_HOST, DEFAULT_PORT, NodeSetup, SetupError
 from .nodesetup import is_loopback as _is_loopback
 from .service import ContainerService, ServiceError
 from .stacks import StackService
-from .tasks import TaskService
+from .tasks import WEBHOOK_BYTES, TaskService
 
 TLS_HANDSHAKE_TIMEOUT = 10
 # Long enough for the answer to a configure request to reach the browser
@@ -514,6 +514,7 @@ def build_router(service, auth=None, cluster=None, stacks=None, setup=None, task
               nodes=body.get("nodes"), groups=body.get("groups"),
               timeout_seconds=body.get("timeout_seconds"), overlap=body.get("overlap"),
               inputs=body.get("inputs"), secrets=body.get("secrets"),
+              webhook=body.get("webhook"),
               enabled=body.get("enabled", True), previous=body.get("previous"),
               propagate=not from_peer(who)), principal=True)
     r.add("DELETE", r"/api/tasks/%s" % NAME,
@@ -642,7 +643,8 @@ def build_router(service, auth=None, cluster=None, stacks=None, setup=None, task
     # -- federation --------------------------------------------------------
     # /api/cluster/enroll is handled before routing, like login: it is how a
     # node that has no credential yet gets one, so it authenticates itself with
-    # the one-time join code in its body instead.
+    # the one-time join code in its body instead. /api/hooks/{task} is the
+    # same again for a webhook, whose signature over the body is its credential.
     r.add("GET", r"/api/cluster", lambda body, q: cluster.info())
     r.add("GET", r"/api/cluster/nodes", lambda body, q: cluster.list_nodes(
         probe=_flag(q.get("probe")) if "probe" in q else True))
@@ -853,6 +855,7 @@ class WaterpumpHandler(BaseHTTPRequestHandler):
     router = None
     service = None
     stacks = None
+    tasks = None
     auth = None
     cluster = None
     web_root = None
@@ -928,6 +931,12 @@ class WaterpumpHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Not found"}, 404)
 
     def _handle_api(self, method, path, query):
+        if HOOK_ROUTE.match(path):
+            # Logged by TaskService.receive_webhook(): there is no principal,
+            # only a signature, and which task it was for is the news.
+            with eventlog.acting(actor="webhook", via="webhook", channel="api"):
+                self._answer_api(method, path, query)
+            return
         if path in ("/api/auth", "/api/auth/login", "/api/auth/logout") \
                 or path == "/api/cluster/enroll":
             # Logged by AuthService and ClusterService themselves: a login has
@@ -999,6 +1008,10 @@ class WaterpumpHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/cluster/enroll":
                 self._handle_enroll(method)
+                return
+            hook = HOOK_ROUTE.match(path)
+            if hook:
+                self._handle_hook(method, unquote(hook.group(1)))
                 return
             if method not in ("GET", "HEAD") and not explicit and not self._same_origin():
                 refuse("Cross-origin request refused", 403)
@@ -1232,6 +1245,29 @@ class WaterpumpHandler(BaseHTTPRequestHandler):
                        client=self._client_ip(), result="ok")
         self._send_json({"data": result})
 
+    def _handle_hook(self, method, task):
+        """A webhook delivery for ``task``: verified and acted on by TaskService.
+
+        Unauthenticated in the session-and-token sense, like enroll: the
+        sender proves itself with an HMAC of the body under a secret it shares
+        with the task, so the raw bytes are read here rather than parsed --
+        re-serialised JSON would not match the signature. Nothing a browser
+        holds can produce one, so the same-origin check has nothing to add.
+        """
+        if method != "POST":
+            raise ServiceError("Method not allowed (try: POST)", 405)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ServiceError("Bad Content-Length.", 400)
+        if length > WEBHOOK_BYTES:
+            raise ServiceError("A webhook body is at most %d KiB." % (WEBHOOK_BYTES // 1024),
+                               413)
+        raw = self.rfile.read(length) if length > 0 else b""
+        self._body_read = True
+        status, data = self.tasks.receive_webhook(task, self.headers, raw)
+        self._send_json({"data": data}, status)
+
     def _cookie(self, name):
         raw = self.headers.get("Cookie")
         if not raw:
@@ -1433,6 +1469,10 @@ _COMPARED = ("Only a cluster member compares what this node holds. Run `waterpum
              "cluster reconcile` on a node to settle its own copies against the "
              "rest; what the last pass found is on the Cluster tab and at "
              "GET /api/cluster/drift.")
+
+# Where a webhook is delivered: one path per task, so the task names the
+# secret its signature is checked with.
+HOOK_ROUTE = re.compile(r"^/api/hooks/([^/]+)$")
 
 _VOTED = ("Only a cluster member votes on who runs a task's occurrence. Invoke the "
           "task (POST /api/tasks/{name}/invoke) to run it now.")
